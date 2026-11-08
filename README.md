@@ -2,12 +2,12 @@
 
 # MeshRadar
 
-[![CI](https://github.com/charlottemeshtastic/meshradar/actions/workflows/ci.yml/badge.svg)](https://github.com/charlottemeshtastic/meshradar/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/charlottemeshtastic/meshradar)](https://github.com/charlottemeshtastic/meshradar/blob/main/LICENSE)
+[![CI](https://github.com/TheLogsAreScreaming/meshradar/actions/workflows/ci.yml/badge.svg)](https://github.com/TheLogsAreScreaming/meshradar/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/TheLogsAreScreaming/meshradar)](https://github.com/TheLogsAreScreaming/meshradar/blob/main/LICENSE)
 
 A comprehensive web application for monitoring off-grid mesh networks — Meshtastic, MeshCore, and MQTT — from a single dashboard. Built with React, TypeScript, and Node.js, featuring a neon **Miami Vice** dark theme and multi-database support (SQLite, PostgreSQL, MySQL).
 
-> MeshRadar is a fork of [MeshMonitor](https://github.com/Yeraze/meshmonitor) by Yeraze, released under the same license. The Docker image is published at `ghcr.io/charlottemeshtastic/meshradar`; links to meshmonitor.org point at the original project's documentation.
+> MeshRadar is a fork of [MeshMonitor](https://github.com/Yeraze/meshmonitor) by Yeraze, released under the same license. The Docker image is published at `ghcr.io/thelogsarescreaming/meshradar`; links to meshmonitor.org point at the original project's documentation.
 
 ![MeshRadar Interface](docs/images/main.png)
 
@@ -31,7 +31,7 @@ Get MeshRadar running in **60 seconds**:
 cat > docker-compose.yml << 'EOF'
 services:
   meshmonitor:
-    image: ghcr.io/charlottemeshtastic/meshradar:latest
+    image: ghcr.io/thelogsarescreaming/meshradar:latest
     ports:
       - "8080:3001"
     volumes:
@@ -91,7 +91,7 @@ MeshRadar supports authentication via reverse proxy headers for seamless single 
 ```yaml
 services:
   meshmonitor:
-    image: ghcr.io/charlottemeshtastic/meshradar:latest
+    image: ghcr.io/thelogsarescreaming/meshradar:latest
     environment:
       # Enable proxy authentication
       - PROXY_AUTH_ENABLED=true

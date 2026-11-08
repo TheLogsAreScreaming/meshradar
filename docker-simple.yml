@@ -1,6 +1,6 @@
 services:
   meshmonitor:
-    image: ghcr.io/charlottemeshtastic/meshradar:latest
+    image: ghcr.io/thelogsarescreaming/meshradar:latest
     container_name: meshmonitor
     ports:
       - "8080:3001"
