@@ -5,7 +5,7 @@ description = "MeshRadar Desktop - System tray application for Meshtastic monito
 authors = ["MeshMonitor Contributors"]
 edition = "2021"
 license = "BSD-3-Clause"
-repository = "https://github.com/charlottemeshtastic/meshradar"
+repository = "https://github.com/TheLogsAreScreaming/meshradar"
 
 [lib]
 name = "meshmonitor_desktop_lib"

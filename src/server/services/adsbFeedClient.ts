@@ -21,7 +21,7 @@ const packageJson = require('../../../package.json') as { version?: string };
 export const ADSB_REQUEST_TIMEOUT_MS = 10_000;
 /** adsb.lol's announced API-key header. Sent only when a key is configured. */
 export const ADSB_API_KEY_HEADER = 'X-API-Key';
-export const ADSB_USER_AGENT = `MeshRadar/${packageJson.version ?? 'dev'} (+https://github.com/charlottemeshtastic/meshradar)`;
+export const ADSB_USER_AGENT = `MeshRadar/${packageJson.version ?? 'dev'} (+https://github.com/TheLogsAreScreaming/meshradar)`;
 
 export interface AdsbHttpResponse {
   status: number;

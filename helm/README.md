@@ -170,7 +170,7 @@ env:
 
 # Image configuration
 image:
-  repository: "ghcr.io/charlottemeshtastic/meshradar"
+  repository: "ghcr.io/thelogsarescreaming/meshradar"
   pullPolicy: "IfNotPresent"
   tag: "latest"
 
