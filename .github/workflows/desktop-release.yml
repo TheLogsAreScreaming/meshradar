@@ -537,7 +537,7 @@ jobs:
           retention-days: 30
 
   build-macos-x64:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     permissions:
       contents: write
@@ -691,7 +691,7 @@ jobs:
           cp package-lock.json desktop/resources/dist/
           # Install production-only dependencies into the bundle (matches Windows step).
           # Excludes dev deps (vitest, esbuild, drizzle-kit, tsx, etc) — shrinks the DMG by hundreds of MB.
-          # IMPORTANT: this runner is macos-14 (arm64) but the bundle ships x64 binaries.
+          # IMPORTANT: this runner is macos-15 (arm64) but the bundle ships x64 binaries.
           # Force prebuild-install (better-sqlite3 et al.) to fetch x64 prebuilds — without
           # this, native .node files are downloaded for arm64 and the x64 DMG fails to load
           # them at runtime (see issue #2901).
@@ -762,7 +762,7 @@ jobs:
         run: npm install
 
       # Build the Tauri app (app bundle only, we'll create DMG after re-signing)
-      # IMPORTANT: --target is required because this runs on ARM64 (macos-14) but builds for x64
+      # IMPORTANT: --target is required because this runs on ARM64 (macos-15) but builds for x64
       - name: Build Tauri app (release)
         working-directory: desktop
         env:
