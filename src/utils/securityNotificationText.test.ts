@@ -14,10 +14,10 @@ describe('securityNotificationText', () => {
     );
   });
 
-  it('the example text is 69 bytes', () => {
+  it('the example text is 67 bytes', () => {
     const t = securityNotificationText('timeOffset', { offsetSeconds: 2 * 3600 + 14 * 60 });
     expect(t).toBe("MeshRadar: your node's clock is 2h 14m behind. Please set its time.");
-    expect(bytes(t)).toBe(69);
+    expect(bytes(t)).toBe(67);
   });
 
   it('every new text stays within the byte cap across the whole range', () => {
