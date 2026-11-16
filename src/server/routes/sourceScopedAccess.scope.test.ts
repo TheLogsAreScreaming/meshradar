@@ -992,6 +992,11 @@ describe('guard: per-source routes on these routers are registered with a source
       // Install-wide batch jobs over every source (maintainer ruling).
       'POST /auto-enrichment/run-now',
       'POST /position-estimation/run-now',
+      // What a source-less request resolves to; the setting is admin-only (#5245).
+      'GET /default-meshtastic-source',
+      // MeshWars forwarder: names the source whose position goes to a
+      // third-party server, so admin only like its settings.
+      'GET /meshwars/status',
     ],
     messages: [],
   };

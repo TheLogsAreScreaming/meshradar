@@ -9,7 +9,7 @@ run in the background.
 happens, do that — with conditions, variables, and `{{ token }}` substitution.
 :::
 
-MeshMonitor includes several automation features that can help you manage your mesh network more efficiently. These features run in the background and can be configured through the Info tab.
+MeshMonitor includes several automation features that can help you manage your mesh network more efficiently. These features run in the background. Set them up per source on that source's **Automation** tab, in the sidebar.
 
 ![Automation](/images/features/automation.png)
 
@@ -54,6 +54,8 @@ When enabled, MeshMonitor monitors all incoming messages for patterns matching t
 - **`{FEATURES}`**: Enabled automation features
 - **`{NODECOUNT}`**: Number of active nodes
 - **`{DIRECTCOUNT}`**: Number of direct nodes (0 hops)
+- **`{TOTALNODES}`**: Number of nodes in the database, active or not
+- **`{TRANSPORT}`**: How the message arrived: `LoRa` or `MQTT`
 
 **Default Template (Multi-hop)**:
 ```
@@ -89,7 +91,7 @@ When enabled, MeshMonitor monitors all incoming messages for patterns matching t
 📡 Signal test: {HOPS} hop(s) | Date: {DATE} | Time: {TIME}
 ```
 ```
-👋 Hey {LONG_NAME}! Got your message: "{MESSAGE}"
+👋 Hey {LONG_NAME}! Copy via {TRANSPORT}, last hop {LAST_HOP}
 ```
 
 **Token Insertion**: Click on any token button to insert it at your cursor position, making it easy to build complex templates.
@@ -111,12 +113,21 @@ This granular control lets you respond on your primary channel while ignoring tr
 Auto Acknowledge supports two independent response modes, each with separate toggles for **direct** and **multi-hop** messages:
 
 **Tapback (Emoji Reaction)**: React to the triggering message with an emoji instead of (or in addition to) a text reply:
-- Direct messages receive a 🎯 reaction
-- Multi-hop messages receive a keycap digit emoji indicating the hop count (0️⃣ through 7️⃣)
+- Direct (0-hop) messages receive a *️⃣ reaction
+- Multi-hop messages receive a keycap digit emoji for the hop count (1️⃣ through 7️⃣, with 7️⃣ for 7 or more)
+- **0-hop tapback** and **MQTT tapback** (per source) change these glyphs. Set the 0-hop one to 0️⃣ if your mesh uses that for "heard directly". The MQTT one is used for messages in the IP row (received over MQTT or UDP); left blank, those get their hop-count glyph as before. Automations' hop-count tapbacks and the `trigger.hopEmoji` token use the same two glyphs, the MQTT one in place of `#️⃣` for messages from an MQTT source.
 
 **Text Reply**: Send the configured message template as a text response. This is the traditional auto-ack behavior.
 
 Both modes can be enabled simultaneously — for example, you can send a tapback reaction *and* a text reply to every matched message. Each mode has independent toggles for direct and multi-hop, giving you full control over which connection types get which response.
+
+### IP Row (MQTT / UDP)
+
+The response matrix has a third row, **IP (MQTT / UDP)**, for messages your node got over MQTT or multicast UDP instead of over the air. Auto Acknowledge checks this first: an IP message always uses the IP row, whatever its hop count, and never the 0-hop or multi-hop rows. RF numbers like SNR mean nothing for these messages, so this row lets you answer them in their own way, or not at all.
+
+The IP row starts off on every install. Before this row existed, the 0-hop and multi-hop rows answered MQTT messages. If you want to keep answering them, turn on the IP row. An IP row reply still goes out over your radio, so a channel reply floods the mesh like any other. The cooldown, the reply cap, and the channel wait apply to it the same way.
+
+IP messages use the standard reply template, not the 0-hop one.
 
 ### Always Use Direct Message
 
@@ -156,6 +167,8 @@ A channel acknowledgement now arrives **5 to 30 seconds** after the message, abo
 
 **Why 5 to 30 seconds.** The 5-second floor gives other nodes' answers time to reach you before you decide; without it you would answer before anyone could have been heard. The spread up to 30 seconds is for large or slow meshes, where an answer needs many seconds to cross several hops: the wider the spread, the fewer nodes finish waiting before they have heard each other.
 
+**Nearer nodes answer first.** The lower end of the wait rises by 3 seconds for each hop the message took to reach your node; the 30-second upper end does not move. A node that heard the sender directly draws from 5 to 30 seconds, one hop away from 8 to 30, two hops from 11 to 30, three from 14 to 30, and so on up to 26 to 30 at seven hops. The node with the shortest path back to the sender is the one most likely to get its answer through, so it gets the first chance; farther nodes are then more likely to hear that answer and stay quiet. The wait is still random inside its window, so two nodes at the same distance do not answer at the same moment. When the hop count is unknown (older firmware, or a packet that came in over MQTT) no extra wait is added. This is fixed at 3 seconds for every MeshMonitor, because the ordering only works when all instances use the same number.
+
 **The wait follows your current settings.** When the wait ends, MeshMonitor decides again from scratch. If in the meantime you turned Auto Acknowledge off, changed the pattern so the message no longer matches, removed the channel, added the sender to the ignore list, lowered the maximum, or the message was deleted, no answer is sent. The answer is also dropped, not kept for later, if the source is disconnected, has TX disabled, or is over the airtime cutoff. Answers still waiting are dropped when the source disconnects or MeshMonitor restarts.
 
 **Cooldown.** The per-node cooldown is checked when the message arrives and starts again when the answer is sent, and a node with an answer still waiting cannot start a second one. Two answers to one node are never closer together than the cooldown, even when the cooldown is shorter than the wait.
@@ -172,11 +185,11 @@ This is on for every Meshtastic source after you upgrade, with the default of `2
 
 ### Long Replies on MeshCore {#meshcore-long-replies}
 
-A MeshCore text message is small. MeshMonitor caps one message at **150 bytes** for a DM, **130 bytes** for a channel, and **120 bytes** for a channel reply that carries a region scope. These are UTF-8 bytes, not characters: an emoji takes 4 bytes and a CJK character takes 3. A template that looks short can go over the cap once `{NODE_NAME}`, `{ROUTE}` and the other tokens are filled in.
+A MeshCore text message is small. A DM holds **160 bytes**. A channel message holds 160 bytes minus your node name and 2, because the radio puts `<name>: ` in front of the text (155 for a 3-byte name, 127 for a 31-byte name). A region scope does not change the cap. These are UTF-8 bytes, not characters: an emoji takes 4 bytes and a CJK character takes 3. A template that looks short can go over the cap once `{NODE_NAME}`, `{ROUTE}` and the other tokens are filled in.
 
-The MeshCore Auto-Acknowledge section has a **Split long messages** toggle that sets what happens to a reply over the cap. It is a per-source setting, it is **off by default**, and one toggle covers DM and channel replies.
+Five MeshCore senders have a **Split long messages** option that sets what happens to a message over the cap: Auto Acknowledge, Auto Responder (per trigger), Timer Triggers (per timer), Auto Announce, and the Automation Engine **Send a message** action. It is **off by default**. One setting covers DM and channel sends. Every one of them also cuts an over-long message to the cap itself, so the stored message matches what went on air.
 
-**Off (default)**: MeshMonitor cuts the reply to the cap and sends one message. The cut never lands inside a character. The message list shows the text that was sent.
+**Off (default)**: MeshMonitor cuts the reply to the cap and sends one message. The cut message ends in `...` so the reader can see text is missing. The cut never lands inside a character. The message list shows the text that was sent.
 
 ::: warning Behaviour change
 Before this option existed, MeshMonitor handed the full reply to the radio and stored the full text, even though the radio could not send all of it. MeshMonitor now cuts the reply itself, so the stored message matches what went on air. If your reply loses its tail, shorten the template or turn on **Split long messages**.
@@ -186,14 +199,53 @@ Before this option existed, MeshMonitor handed the full reply to the radio and s
 
 - Each part starts with a marker such as `(1/3)`, so the reader knows more is coming. The marker counts toward the byte cap.
 - MeshMonitor breaks at a line break, the end of a sentence, a comma, or a space when it can. It only breaks inside a word when there is no better place, and never inside a character.
-- A reply too long for 3 parts loses its tail: the third part is cut to fit.
+- A reply too long for 3 parts loses its tail: the third part is cut to fit and ends in `...`.
 - A reply that fits in one message goes out as before, with no marker.
 - If one part fails to send, MeshMonitor skips the rest. It also stops if the source is switched to receive-only between parts.
 - The per-sender cooldown counts the whole reply once, not once per part.
+- Split sequences on one source never mix: a new split message waits until the running one finishes, so the `(1/3)` markers stay in order.
+- When a timer, announce or action sends to several channels, part 1 goes to every channel, then part 2, and so on.
+- **Auto Responder and Timer scripts**: only a script that prints exactly one message can split. A script that prints several messages has each one cut to the cap.
+- **Timer Triggers**: a timer with splitting on must run at most every **5 minutes**. MeshMonitor refuses to save a faster one (interval or cron).
+- Meshtastic uses the same rules (#6330); see [Long Replies on Meshtastic](#meshtastic-long-replies).
 
 ::: warning Airtime
 Every part is a separate transmission, and every repeater in range repeats each one. A 3-part reply costs three times the airtime of a single reply across the whole mesh. With [channel-send auto-retry](/features/meshcore#automated-channel-send-auto-retry) on, a part that no repeater echoes is resent once, so a 3-part channel reply can reach 6 transmissions from your node. A DM part that gets no acknowledgement is retried up to 3 times. Set a per-sender cooldown, and keep the template short enough that most replies fit in one message.
 :::
+
+### Long Replies on Meshtastic {#meshtastic-long-replies}
+
+A Meshtastic text message holds **200 bytes**. The same **Split long messages** option covers Meshtastic, with the same limits as MeshCore: up to **3 messages**, **10 seconds apart**, each marked like `(1/3)`, and a reply too long for 3 messages is cut, ending in `...`.
+
+- **Auto Responder**: the per-trigger **Multiline** option (see [Multiline Support](#multiline-support)).
+- **Timer Triggers**: **Split long messages** in the timer editor. It is **off by default**. A timer with splitting on must run at most every **5 minutes**; MeshMonitor refuses to save a faster cron schedule.
+- **Auto Announce**: **Long Announcements** under the channel list. It is **off by default**.
+- **Automation Engine**: the **Split long messages** option of the **Send a message** action.
+
+With splitting off, each sender cuts the message to 200 bytes, ending in `...`. Auto Announce used to hand the whole text to the radio; it now cuts it too, so a long announcement no longer fails to send.
+
+Auto Responder, Timer and Auto Announce parts go through the source's outgoing queue, which waits 30 seconds between sends, so on air the parts are at least 30 seconds apart. The Automation Engine sends a channel message straight to the radio, 10 seconds between parts; a DM with **Max attempts** set keeps the queue. When a timer, announce or action sends to several channels, part 1 goes to every channel, then part 2. Timer scripts split only when they print exactly one message.
+
+::: warning Airtime
+Every part is a separate transmission, and every node that rebroadcasts repeats each one. A 3-part message costs three times the airtime of one. Keep templates short enough that most messages fit in one part.
+:::
+
+**Skip if still queued**: a Meshtastic Timer Trigger or Auto Announce fire is skipped while that timer's (or that source's announcement's) messages from the previous fire are still waiting in the outgoing queue. This holds with splitting on or off. The skip is logged with the timer id (or `announce`). A manual **Send Announcement** always goes through. The queue lives in memory, so a restart clears it and the next fire runs.
+
+#### Mesh impact {#split-mesh-impact}
+
+These figures are for one full 200-byte Meshtastic part (about 237 bytes on air, preamble 16):
+
+| Preset | 1 part | 3 parts, our node | 3 parts, hop limit 3 (about 4 sends each) |
+|---|---|---|---|
+| LongFast (SF11 / BW250 / CR 4/5) | about 2.0 s | about 6 s | about 24 s |
+| MediumFast (SF9 / BW250 / CR 4/5) | about 0.6 s | about 1.8 s | about 7 s |
+
+- **Auto Responder, Timer Triggers, Auto Announce**: every part goes through the source's outgoing queue, which sends at most one message every 30 seconds. Our node therefore stays under about 7% of the airtime on LongFast, however many parts or channels a fire has.
+- **Backlog bound**: because a timer or announcement is skipped while its previous fire is still queued, one timer or one source's announcement never has more than one fire waiting in the queue. A fire is at most 3 parts × the number of channels. A timer on 8 channels with splitting on queues 24 messages, which take 12 minutes to leave the queue, so a 5-minute timer then fires about every 15 minutes instead of piling up.
+- **Timer floor**: a timer with splitting on must run at most every 5 minutes.
+- **Automation Engine**: a channel message goes straight to the radio, 3 parts × channels × sources per fire, 10 seconds apart. The rule's rate limit counts fires, not parts, so set a cooldown.
+- **Off (default)**: one message per target, cut to 200 bytes. No extra packets.
 
 ### Skip Incomplete Nodes {#skip-incomplete-nodes-ack}
 
@@ -228,7 +280,7 @@ walkthrough.
 
 - Generates additional mesh traffic for each matched message
 - May contribute to network congestion if pattern matches too frequently
-- Replies are sent immediately upon receiving a matching message
+- Direct-message replies go out at once (after any pre-send delay); channel replies wait 5 to 30 seconds, see [Maximum Number of Responses](#auto-ack-max-responses)
 - Uses airtime on the mesh network for responses
 
 ### Use Cases
@@ -259,7 +311,7 @@ Each request goes out at your node's own **hop limit** (**Device Configuration �
 
 **Traceroute Interval**: How often to send traceroute requests to nodes
 
-- **Range**: 1-60 minutes
+- **Range**: 3-60 minutes
 - **Default**: 3 minutes
 - **Recommendation**: Use longer intervals (10-15 minutes) for larger networks or slower mesh presets
 
@@ -341,9 +393,21 @@ Built-in guards keep it polite to the mesh: per-tick **jitter**, a **schedule wi
 The airtime gate reads Channel Utilization from one of two sources, set on the Automation page:
 
 - **Local node** (default): the connected node's own self-reported ChUtil.
-- **Nearby infrastructure**: the average ChUtil of the strongest-RSSI router or repeater neighbours the local node has heard. Useful when the local node is well placed and its own reading under-represents the wider mesh.
+- **Nearby infrastructure**: the average ChUtil of router or repeater neighbours the local node has heard, either the strongest-RSSI ones or the ones you pick. Useful when the local node is well placed and its own reading under-represents the wider mesh.
 
-**Maximum hops for neighbour candidates** (`0`-`7`, default `0`): only reached when the source is Nearby infrastructure. `0` is strict, only directly heard routers count. Raise to `1` if a `CLIENT_BASE` (or similar) node relays routers into your local node, so those routers arrive as one hop away. If the "waiting for neighbours" banner persists after several minutes on a setup you expect to work, try `1` first. See [issue #4801](https://github.com/Yeraze/meshmonitor/issues/4801) for the details.
+**Choose infrastructure nodes** ([issue #6007](https://github.com/Yeraze/meshmonitor/issues/6007)), shown when the source is Nearby infrastructure:
+
+- **Auto (strongest RSSI)** (default): averages the strongest-RSSI routers within the maximum hops. **Number of infrastructure nodes to average** sets how many (`3`-`5`, default `3`).
+- **Manual (selected nodes)**: averages only the nodes you pick. The picker lists Router, Router Late and Client Base nodes (plus the deprecated Router Client and Repeater roles) heard in the last day, with role, hops, last ChUtil and how old that reading is. Pick `3` to `5`. A pick with no ChUtil reading in the last **3 hours** is skipped, and the status line names it. Use this when the strongest routers are not the ones that share your channel, for example a far router relayed by a strong local node.
+
+Rules that apply in both modes:
+
+- **Nodes heard over MQTT never count.** Their ChUtil describes a different RF area. The picker does not list them, and a saved pick that later becomes MQTT-only is skipped and named in the status line.
+- **The local reading fills the gap.** When fewer nodes qualify than wanted (the sample count in Auto, the pick count in Manual), the gate uses the higher of the local node's ChUtil and their average. With none qualifying it uses the local ChUtil. The status line says so, for example "2 of 3 infrastructure nodes qualify; using local 31% (higher than their average 18%)". If the local ChUtil is not known yet either, the gate stays open as before.
+
+![Airtime cutoff manual infrastructure picker](/images/features/6007-airtime-manual-infra.png)
+
+**Maximum hops for neighbour candidates** (`0`-`7`, default `0`): Auto mode only; Manual mode ignores it. `0` is strict, only directly heard routers count. Raise to `1` if a `CLIENT_BASE` (or similar) node relays routers into your local node, so those routers arrive as one hop away. If the "waiting for neighbours" banner persists after several minutes on a setup you expect to work, try `1` first. See [issue #4801](https://github.com/Yeraze/meshmonitor/issues/4801) for the details.
 
 ### Side Effects
 
@@ -386,7 +450,7 @@ Pings use Meshtastic's `NODEINFO_APP` request with `wantResponse: true`, which i
 
 ### Configuration
 
-Navigate to **Settings > Automation** and find the **Auto Ping** section.
+Open the source's **Automation** tab and find the **Auto Ping** section.
 
 **Enable/Disable**: Toggle the checkbox next to "Auto Ping"
 
@@ -440,6 +504,36 @@ Sessions update in real-time via WebSocket events. Admins can force-stop any act
 - **Timeout**: The default 60-second timeout is generous enough for multi-hop networks; reduce it for direct connections
 - **Max Pings**: Set the maximum to a reasonable value (20–50) to prevent excessive network usage from long sessions
 
+### MeshCore Companion Sources {#auto-ping-meshcore}
+
+A MeshCore **Companion** source has its own Auto Ping section on the MeshCore page's **Automations** view. It is built for coverage and route tests: carry a mobile companion around, DM `ping N` to a base companion that MeshMonitor manages, and the base pings you back while you move.
+
+**Companion sources only.** The section does not show on a Repeater source, and a Repeater ignores `ping`. The feature was requested for companion-to-companion tests, so Repeater support is out of scope.
+
+It works like the Meshtastic version, with these differences:
+
+- **Each ping is a short DM**, such as `Ping 3/20`. A MeshCore DM has no NodeInfo request, so the round trip comes from the DM's own ACK: the radio reports the ACK's trip time, and MeshMonitor records it as the ping's RTT.
+- **One attempt per ping.** A normal MeshCore DM is resent up to three times, and the last try resets the path and floods. A ping is never resent, so each result is one real try, and a ping never changes the route you are testing.
+- **Direct or flood.** Each ping records whether it went **direct** (the contact had a known path when the ping was sent) or by **flood** (no known path). A flood ACK can teach the radio a path part-way through a session, so later pings may show as direct.
+- **Timeout.** A ping times out after the **Ping Timeout** setting, or after the radio's own suggested wait when that is longer.
+- **No NAK.** MeshCore reports no delivery failure, so a ping is either ACKed or timed out.
+- **Summary.** The summary DM matches the Meshtastic one and adds the direct and flood counts, for example:
+
+  ```
+  Auto-ping done: 18/20 ok
+  Min/Avg/Max: 812/1450/3020ms
+  Timeouts: 2
+  Direct: 15 Flood: 5
+  ```
+
+- **Active sessions** show a **Direct / Flood** column, and the table refreshes every 5 seconds while a session runs.
+
+The settings, defaults and ranges are the same as on Meshtastic, saved per source. Saving the settings never starts or restarts a session. Sessions live in memory: a disconnect or a restart ends them, and they do not resume.
+
+**Airtime.** Each ping is a DM plus its ACK, so a 20-ping session puts about 40 packets on the air. With no known path both are flooded, and every repeater in range sends them again.
+
+**Loops.** Auto-Acknowledge and the Auto-Responder never answer an Auto Ping DM (the pings, the start reply or the summary), and a `ping N` from one of MeshMonitor's own nodes is ignored, so two MeshMonitor companions cannot ping each other in a loop. As on Meshtastic, a `ping N` command skips the Auto-Responder, but Auto-Acknowledge can still answer the command itself if its pattern matches.
+
 ### Troubleshooting
 
 **"ping 5" not working**:
@@ -454,7 +548,7 @@ Sessions update in real-time via WebSocket events. Admins can force-stop any act
 
 **Session not appearing in UI**:
 - Refresh the browser page
-- Verify you have `settings:read` permission to view the Automation tab
+- Verify you have `automation` read permission on the source, which the Automation tab needs, and `settings` read for the Auto Ping panel
 
 ### Permissions
 
@@ -575,12 +669,12 @@ A node is eligible for time sync if:
 
 ### Configuration
 
-Navigate to **Settings > Automation** and find the **Auto Time Sync** section.
+Open the source's **Automation** tab and find the **Auto Time Sync** section.
 
 | Setting | Description | Default | Range |
 |---------|-------------|---------|-------|
 | **Enable** | Turn auto time sync on or off | Off | - |
-| **Interval** | How often to sync the next eligible node (in minutes) | 60 | 15 - 1440 |
+| **Interval** | How often to sync the next eligible node (in minutes) | 15 | 15 - 1440 |
 | **Expiration** | How many hours before a previously synced node becomes eligible again | 24 | 1 - 24 |
 | **Filter to specific nodes** | When enabled, only sync nodes in the selected list | Off | - |
 
@@ -603,7 +697,7 @@ When the filter is disabled (default), all eligible nodes are included automatic
 
 ### Best Practices
 
-- Start with the default 60-minute interval; there is no need to sync more frequently unless nodes drift quickly
+- The default interval is 15 minutes, the shortest allowed. One node is synced per tick, so on a small mesh a longer interval such as 60 minutes saves airtime
 - Use a 24-hour expiration so each node gets synced roughly once per day
 - If you have a large mesh, the scheduler will cycle through all nodes automatically — one per interval tick
 - Use the node filter if you only want to sync specific nodes (e.g., solar-powered nodes that lose time on reboot)
@@ -619,51 +713,53 @@ Automatically sends a personalized welcome message to new nodes when they join y
 
 ### How It Works
 
-When enabled, MeshMonitor monitors for nodes that appear for the first time in the mesh network. When a new node is detected, it automatically sends a direct message to welcome them with your custom template.
+When enabled, MeshMonitor watches for nodes it has not seen before on this source. When one appears, it sends your welcome message, as a direct message to the new node or on a channel you pick. Each node is welcomed once.
 
 ### Configuration
 
 **Enable/Disable**: Toggle the checkbox next to "Auto Welcome"
 
-**Welcome Channel**: Select which channel to monitor for new nodes
+**Wait for Name**: Hold the welcome until the node has a real long name and short name, not the default `Node !xxxxxxxx`. With this off, the welcome goes out as soon as the node is discovered, and `{LONG_NAME}` may read as a placeholder.
 
-- **Primary**: Monitor only the primary channel (most common)
-- **All Channels**: Monitor all channels for new nodes
-- Choose the channel where you expect new users to appear
+**Maximum Hops**: Only welcome nodes within this many hops
 
-**Maximum Hops Filter**: Limit welcome messages to nodes within a specific hop range
+- **Range**: 1-10 hops
+- **Default**: 5
+- **Purpose**: Skips distant nodes that may not be regular network participants, and saves the airtime of a long multi-hop send
 
-- **Range**: 0-7 hops
-- **Default**: 7 (all nodes)
-- **Purpose**: Prevents welcoming distant nodes that may not be regular network participants
-- **Use Cases**:
-  - Set to 0-1 for welcoming only direct neighbors
-  - Set to 2-3 for local network participants
-  - Set to 7 to welcome all nodes regardless of distance
-- **Benefits**:
-  - Reduces unnecessary mesh traffic for distant nodes
-  - Focuses welcomes on local/active participants
-  - Helps manage network congestion in large meshes
+**Pre-send delay (seconds)**: How long to wait after first hearing a node before sending its welcome
 
-**Custom Welcome Message**: Craft your welcome message using dynamic tokens:
+- **Range**: 0-120 seconds
+- **Default**: 30
+- **Purpose**: Gives the node time to finish its startup burst and be ready to receive. This matters after a nodeDB reset, when many nodes appear at once
 
-- **`{LONG_NAME}`**: Long name of the new node joining (e.g., "Alice's Node")
-- **`{NODEID}`**: Hex ID of the new node (e.g., "!a2b3c4d5")
-- **`{DATE}`**: Date when the node was first seen (e.g., "1/15/2025")
-- **`{TIME}`**: Time when the node was first seen (e.g., "2:30:00 PM")
-- **`{VERSION}`**: Your MeshMonitor version (e.g., "v2.11.3")
+**Broadcast Target**: Where the welcome is sent
+
+- **Direct Message to New Node**: Only the new node sees it
+- **A channel**: Everyone on that channel sees it. Pick a channel from the list of this source's channels
+
+**Welcome Message**: Craft your welcome message using dynamic tokens:
+
+- **`{LONG_NAME}`**: Long name of the new node (e.g., "Alice's Node")
+- **`{SHORT_NAME}`**: Short name of the new node (e.g., "ALI")
+- **`{VERSION}`**: Your MeshMonitor version
+- **`{DURATION}`**: How long ago the node was first seen
+- **`{FEATURES}`**: Enabled automation features as emojis
+- **`{NODECOUNT}`**: Number of active nodes
+- **`{DIRECTCOUNT}`**: Number of direct nodes (0 hops)
+- **`{TOTALNODES}`**: Number of nodes in the database, active or not
 
 **Default Template**:
 ```
-👋 Welcome {LONG_NAME}! Thanks for joining the mesh.
+Welcome {LONG_NAME} ({SHORT_NAME}) to the mesh!
 ```
 
 **Example Custom Templates**:
 ```
-🎉 Hey {LONG_NAME}! Welcome to our mesh network on {DATE} at {TIME}
+🎉 Hey {LONG_NAME}! Welcome to our mesh network, {NODECOUNT} nodes and counting
 ```
 ```
-👋 Welcome aboard {LONG_NAME} ({NODEID})! Check meshmonitor.org for network stats.
+👋 Welcome aboard {LONG_NAME} ({SHORT_NAME})! Check meshmonitor.org for network stats.
 ```
 ```
 🌐 New node detected: {LONG_NAME}. MeshMonitor {VERSION} is watching!
@@ -671,12 +767,14 @@ When enabled, MeshMonitor monitors for nodes that appear for the first time in t
 
 **Token Insertion**: Click on any token button to insert it at your cursor position for easy template creation.
 
+**Mark All Welcomed**: Marks every node already in the database as welcomed, so none of them gets a welcome. Use it before you turn Auto Welcome on for an existing mesh.
+
 ### Side Effects
 
 - **Network Traffic**: Each welcome message consumes airtime and generates mesh traffic
-- **Privacy**: Welcome messages are sent as direct messages to the new node
-- **Spam Protection**: Built-in 24-hour cooldown prevents re-welcoming the same node
-- **First Join Only**: Only triggers when a node is seen for the very first time
+- **Privacy**: A welcome sent to a channel is seen by everyone on it; choose **Direct Message to New Node** to keep it private
+- **Once per node**: MeshMonitor records when it welcomed a node and never welcomes it again
+- **Busy mesh**: Welcomes are skipped while the automation airtime cutoff is active
 
 ### Use Cases
 
@@ -758,6 +856,7 @@ When enabled, MeshMonitor sends a scheduled message to the configured channel at
   - 🗺️ = Auto Traceroute enabled
   - 🤖 = Auto Acknowledge enabled
   - 📢 = Auto Announce enabled
+  - 👋 Auto Welcome, 🏓 Auto Ping, 🔑 Auto Key Management, 💬 Auto Responder, ⏱️ Timer Triggers, 📍 Geofence Triggers, 🔍 Remote Admin Scanner, 🕐 Auto Time Sync
 - **`{NODECOUNT}`**: Number of active nodes (e.g., "42 nodes")
 - **`{DIRECTCOUNT}`**: Number of direct nodes at 0 hops
 - **`{DATE}`**: Current date when the announcement is sent, formatted per your Date Format preference (e.g., "1/15/2025")
@@ -839,6 +938,23 @@ Trigger patterns can include parameters using curly braces `{parameter}` that ex
 - Parameters match any non-whitespace characters by default
 - Parameters support commas and special characters (e.g., "parkland,fl")
 - Patterns are matched against the entire message
+
+#### Match mode: Pattern or Regex
+
+Each trigger has a **Match mode**. It works the same on Meshtastic and MeshCore sources, so a trigger written for one works unchanged on the other.
+
+- **Pattern** (the default): the syntax on this page. The whole message must match, case-insensitive. `{name}` captures a word and `{name:regex}` a custom value; commas separate alternatives. Look-alike Cyrillic letters count as their Latin twins.
+- **Regex**: one regular expression, case-insensitive, that **matches anywhere in the message**. Anchor it with `^` and `$` to match the whole message. A named group such as `(?<level>\d+)` captures a value for the response as `{level}`. Commas are regex text, not separators. At most 100 characters, and patterns that can backtrack badly (such as `(a+)+` or `a{2,}`) are refused.
+
+A regex matches more messages than an anchored pattern, so it can fire more replies. Cooldowns and rate limits apply the same in both modes.
+
+Patterns in both modes may use any printable text: emoji (`🔋`, `👋\s*hi`), accented letters and CJK. Control characters are refused.
+
+Triggers saved before match modes existed keep their old behaviour: Meshtastic triggers read as **Pattern**, MeshCore triggers as **Regex**.
+
+![Meshtastic Auto-Responder trigger with a match mode](/images/features/5924-meshtastic-trigger-syntax.png)
+
+![MeshCore Auto-Responder trigger with a match mode](/images/features/5924-meshcore-trigger-syntax.png)
 
 #### Multiple Patterns Per Trigger
 
@@ -1014,43 +1130,21 @@ When someone sends "reboot !abc12345", the script is called with arguments `--de
 
 ### Multiline Support
 
-For **Text** and **HTTP** response types, you can enable multiline support to automatically split long responses into multiple messages. This feature is useful when responses exceed the 200-character limit.
+For **Text** and **HTTP** response types, **Multiline** splits a long reply instead of cutting it. A Meshtastic message holds **200 bytes**. These are UTF-8 bytes, not characters: an emoji takes 4 bytes. Multiline uses the same splitter and limits as MeshCore's **Split long messages** (see [Long Replies](#meshcore-long-replies)):
 
-**How It Works**:
+- At most **3 messages**, each marked like `(1/3)`. The marker counts toward the 200 bytes.
+- A reply too long for 3 messages loses its tail. The third message is cut to fit and ends in `...`.
+- A reply that fits in one message goes out as before, with no marker.
+- MeshMonitor breaks at a line break, the end of a sentence, a comma or a space when it can, and never inside a character.
+- Only a single reply splits. Each item of a `{"responses": [...]}` array is cut to 200 bytes instead (see [Multiple Responses Support](#multiple-responses-support)).
 
-When multiline is enabled, responses are intelligently split using the following priority:
+With Multiline off, MeshMonitor cuts a long reply to 200 bytes, ending in `...`.
 
-1. **Line Breaks** (if using >50% of available space)
-   - Splits on `\n` characters
-   - Best for pre-formatted multi-paragraph responses
+::: warning Behaviour change (#6330)
+Multiline used to split a reply into as many messages as it needed, with no marker. It now sends at most 3 marked messages and cuts the rest.
+:::
 
-2. **Sentence Endings** (if using >50% of space)
-   - Splits after `. `, `! `, or `? `
-   - Keeps complete sentences together
-
-3. **Punctuation** (if using >50% of space)
-   - Splits after `, `, `; `, `: `, or ` - `
-   - Preserves clause boundaries
-
-4. **Spaces** (if using >30% of space)
-   - Splits at word boundaries
-   - Avoids cutting words in half
-
-5. **Hyphens** (if using >30% of space)
-   - Splits at hyphenated words
-   - Last resort before character splitting
-
-6. **Character Split** (if no better option)
-   - Splits at exactly 200 characters
-   - Only used when absolutely necessary
-
-**Message Queue Behavior**:
-
-Each split message is:
-- Queued individually
-- Sent with 30-second intervals between messages
-- Retried up to 3 times on failure
-- Tracked for ACK delivery confirmation
+**Message queue**: each part goes through the source's outgoing queue, which waits 30 seconds between sends. Parts are queued 10 seconds apart, so on air they are at least 30 seconds apart. A DM part is retried and tracked for delivery like any other auto-reply. Split replies on one source never mix: a new split reply waits until the running one is queued.
 
 **Example**:
 
@@ -1066,7 +1160,7 @@ Welcome to our mesh bot! Available commands:
 For more info visit meshmonitor.org
 ```
 
-This would be split into approximately 3 messages, each sent 30 seconds apart.
+This reply is about 180 bytes, so it goes out as one message. A reply over 200 bytes would go out as `(1/2) …` and `(2/2) …`, 30 seconds apart.
 
 **When to Use Multiline**:
 - Help text with multiple commands
@@ -1120,7 +1214,7 @@ When using multiple responses, each message is queued individually and sent with
 **Interaction with the `multiline` trigger option**:
 
 - `multiline=true` only splits when the payload is a **single** response (plain text or `{"response": "…"}`). Each item in a `{"responses": [...]}` array is treated as already-chunked: items longer than 200 chars are **truncated**, not split. Pre-chunk your own messages when returning the array form.
-- `multiline=false` (default) truncates every response to 200 chars.
+- `multiline=false` (default) cuts every response to 200 bytes, ending in `...`.
 
 **HTTP responses that aren't MeshMonitor-shaped JSON**:
 
@@ -1321,20 +1415,29 @@ See the [examples/auto-responder-scripts/README.md](https://github.com/MeshAddic
 
 ### Managing Triggers
 
+Each trigger shows as a card with its pattern, a one-line summary of the response, and small tags for the type, channels, multiline, verify and cooldown. MeshCore's Auto-Responder uses the same cards.
+
 **Adding Triggers**:
-1. Enter your trigger pattern (e.g., "weather {location}")
-2. Select response type (text, http, or script)
-3. Enter your response (text message, URL, or script path)
-4. Click "Add Trigger"
+1. Click **Add Trigger**. A new card opens below the list.
+2. Enter your trigger pattern (e.g., "weather {location}")
+3. Select the response type (text, HTTP, script, traceroute or mailbox) and enter the response (text message, URL, or script)
+4. Set the cooldown, channels, multiline and verify options as needed
+5. Click **Done**. MeshMonitor checks the trigger and shows any problem under the field.
+6. Click **Save** in the save bar
 
 **Editing Triggers**:
-1. Click the "Edit" button next to any trigger
-2. Modify the pattern, type, or response
-3. Click "Save" to apply changes or "Cancel" to discard
-4. Edited triggers show a blue border while in edit mode
+1. Click **Edit** on a trigger card
+2. Change any field, then click **Done**
+3. Click **Save** in the save bar, or **Dismiss** to drop your changes
 
 **Removing Triggers**:
-- Click the "Remove" button next to any trigger
+- Click **Delete** on a trigger card and confirm. The trigger is deleted when you click **Save**.
+
+**Testing Patterns**:
+- Type sample messages in **Test Pattern Matching**, one per line. Each line shows which trigger matches, the parameters it pulls out, and the reply it would send. Only the first matching trigger replies. Nothing is sent, and channel filters are not applied.
+- For HTTP and script triggers, the **Test** button in the open card runs the request or script on the server once, using example values. A script test runs the script for real, so a script that talks to the node itself can still reach the mesh.
+
+With more than five triggers, a search box and type filter appear above the list.
 
 **Multiline Text Support**:
 - Text responses automatically use a multiline textarea
@@ -1543,7 +1646,7 @@ Forwarding to a channel broadcasts to everyone on that channel, and every hop re
 
 ### Limitations
 
-- **Same source only.** A rule forwards within the source that received the message. It cannot forward from one source to another (for example, from a MeshCore source to a Meshtastic source). Use the [Automation Engine](/features/automation-engine) for cross-source work.
+- **Same source only.** A rule forwards within the source that received the message. It cannot forward from one source to another (for example, from a MeshCore source to a Meshtastic source, or to an LXMF destination on a Reticulum source). Use the [Automation Engine](/features/automation-engine) for cross-source work; see the [Meshtastic ↔ MeshCore bridge](/features/automation-engine#recipe-mt-mc-bridge) and [Meshtastic ↔ Reticulum DM relay](/features/automation-engine#recipe-mt-ret-relay) recipes.
 - **MeshCore channel messages carry no sender key.** On MeshCore, a rule with **Only from sender** set can match DMs, but never channel messages.
 - **MeshCore channel targets** do not use the automatic re-send that other MeshCore automations can use for missed channel sends.
 
@@ -1557,18 +1660,19 @@ Schedule scripts to run automatically at specified times using cron expressions.
 
 ### How It Works
 
-Timer Triggers execute scripts from `/data/scripts/` on a schedule defined by cron expressions. When a timer fires, the associated script runs and its output is sent to a specified channel on your mesh network.
+Timer Triggers run on a schedule defined by cron expressions. A timer either sends a fixed **Text Message** or runs a **Script** from `/data/scripts/` and sends its output. The output goes to the channel you pick, or nowhere when the channel is set to **None (no mesh output)** for a script that handles its own output.
 
 ### Configuration
 
 **Adding a Timer**:
-1. Navigate to the Automation settings (Info tab)
-2. Scroll to the "Timed Events" section
+1. Open the source's **Automation** tab
+2. Scroll to the "Timer Triggers" section
 3. Fill out the timer configuration:
    - **Name**: A descriptive name for your timer (e.g., "Daily Weather Report")
    - **Schedule**: A cron expression defining when to run
-   - **Script**: Select a script from `/data/scripts/`
-   - **Channel**: The channel to send script output to
+   - **Type**: Text Message or Script
+   - **Message** or **Script**: The text to send, or a script from `/data/scripts/`
+   - **Channel**: The channel to send the output to
 4. Click "Add Timer"
 5. Click "Save" to persist your changes
 
@@ -1578,7 +1682,7 @@ Each timer has:
 - **Name**: Human-readable identifier for the timer
 - **Cron Expression**: Standard 5-field cron format (minute hour day month weekday)
 - **Script**: Path to the script in `/data/scripts/`
-- **Channel**: Channel index (0-7) where output is sent
+- **Channels**: One or more channels (0-7) that get the output. Meshtastic sends to each selected channel through the source's outgoing queue, spaced by the normal send gap. A MeshCore timer sends to at most **4 channels**, each a separate flood **10 seconds apart**; MeshMonitor skips extra channels and logs a warning. Pick at least one channel, or **None** for a script that handles its own output.
 - **Enabled**: Toggle to enable/disable individual timers
 - **Last Run**: Timestamp of last execution (shown in timer list)
 - **Last Result**: Success or error status of last execution
@@ -1799,7 +1903,7 @@ Geofence Triggers monitor node positions and compare them against defined geogra
 
 **Adding a Geofence Trigger**:
 
-1. Navigate to the Automation settings (Info tab)
+1. Open the source's **Automation** tab
 2. Scroll to the "Geofence Triggers" section
 3. Fill out the trigger configuration:
    - **Name**: A descriptive name for the trigger (e.g., "Base Camp Entry Alert")
@@ -2049,7 +2153,7 @@ The repair process for each node with a key mismatch:
 
 ### Configuration
 
-Navigate to **Settings > Automation** and find the **Auto Key Management** section.
+Open the source's **Automation** tab and find the **Auto Key Management** section.
 
 **Enable/Disable**: Toggle the checkbox next to "Auto Key Management"
 
@@ -2126,12 +2230,12 @@ MeshMonitor distinguishes between **manual** and **auto-managed** favorites usin
 
 ### Configuration
 
-Navigate to **Settings > Automation** and find the **Auto Favorite** section.
+Open the source's **Automation** tab and find the **Auto Favorite** section.
 
 | Setting | Description | Default |
 |---------|-------------|---------|
 | Enable Auto Favorite | Toggle the feature on/off | Off |
-| Stale Hours | Hours since last heard before a node is considered stale and unfavorited | 24 |
+| Stale Hours | Hours since last heard before a node is considered stale and unfavorited (1 to 720) | 72 |
 | Exclude likely aircraft | Never auto-favorite a node flagged by [likely-aircraft detection](/features/settings#likely-aircraft-detection); remove one that was already auto-favorited before it got flagged | On |
 
 ### Eligibility Rules
@@ -2211,7 +2315,7 @@ Favorite commands sent over Remote Admin request a response, so the target node 
 
 The same confirmation is shown as a toast on the manual **Set Favorite** / **Remove Favorite** buttons in Node Management.
 
-> **Caveat:** an ACK confirms the *remote processed the request*. If the favorited node is not yet in the remote node's database, the firmware accepts and ACKs the command but the favorite is a no-op there until that node is known. This is why the **re-favorite** pass exists — it re-sends previously assigned favorites (un-confirmed ones first) to recover any whose command was dropped or didn't stick.
+> **Caveat:** an ACK confirms the *remote processed the request*. Historically, if the favorited node was not yet in the remote node's database, the firmware accepted and ACKed `set_favorite_node` but the favorite was a no-op there until that node was known. MeshMonitor now sends an `add_contact` admin message **before** `set_favorite_node` (#6153), built from the node's stored user data. The firmware's `addFromContact` creates the NodeDB entry and, for most device roles, sets the favorite flag in the same step — so MeshMonitor only sends the extra `set_favorite_node` follow-up when the target radio's role is `CLIENT_BASE` (which skips the flag in `addFromContact`) or when MeshMonitor does not know the target's role. For every other known role the `add_contact` alone sets the favorite, saving one admin packet. If MeshMonitor holds essentially no user data for the node, it skips `add_contact` and falls back to sending `set_favorite_node` alone. The **re-favorite** pass still exists to recover any favorites whose command was dropped or didn't stick.
 
 ### Configuration
 
@@ -2281,7 +2385,7 @@ The Ignored Nodes panel displays:
 ### How to Un-ignore a Node
 
 **From the Automation tab**:
-1. Navigate to **Settings > Automation > Ignored Nodes**
+1. Open the source's **Automation** tab and find **Ignored Nodes**
 2. Find the node in the table
 3. Click the **Un-ignore** button
 

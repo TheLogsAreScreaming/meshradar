@@ -13,6 +13,9 @@ import {
  */
 export const VALID_SETTINGS_KEYS = [
   'maxNodeAgeHours',
+  // P7a (#6254): Security tab dead-node threshold, per source, whole days.
+  // Unset reads as the protocol default (see securityDeadNodeDays below).
+  'securityDeadNodeDays',
   'maxInfraNodeAgeHours', // #4899 — separate age window for MeshCore repeaters/room servers
   'txTargetMaxAgeHoursWhenUnlimited', // #5376 — TX-target window when maxNodeAgeHours is 0
   'tracerouteIntervalMinutes',
@@ -22,8 +25,19 @@ export const VALID_SETTINGS_KEYS = [
   'telemetryVisualizationHours',
   'telemetryFavorites',
   'telemetryCustomOrder',
+  // Scheduled-telemetry retry burst + cooldown (#6033). Per-source: after a
+  // missed/timed-out scheduled pull, a node retries after N seconds up to M
+  // attempts, then cools down for K minutes. Defaults 90s / 5 / 30m. Shared by
+  // the MeshCore remote-telemetry scheduler and the Meshtastic remote-LocalStats
+  // scheduler (each reads them per its own source).
+  'telemetryRetryDelaySeconds',
+  'telemetryRetryMaxAttempts',
+  'telemetryRetryCooldownMinutes',
   'dashboardWidgets',
   'dashboardSolarVisibility',
+  // Fixed Y-axis min/max per dashboard chart widget (#6348). Per-source,
+  // client-only JSON; validated and normalized in settingsRoutes on save.
+  'dashboardChartYRange',
   'autoAckEnabled',
   'autoAckRegex',
   'autoAckMessage',
@@ -55,7 +69,10 @@ export const VALID_SETTINGS_KEYS = [
   // have answered the same message. 0 = no cap; default 2; 0-10 enforced on
   // save (settingsRoutes) and clamped on read (autoAckResponseCap.ts).
   'autoAckMaxResponses',
-  // Auto-ack 2x2 matrix (discussion #3564): {Channel,Direct} × {ZeroHop,MultiHop},
+  // #5890: operator-chosen 0-hop / MQTT tapback glyphs (blank = built-in).
+  'hopEmojiZeroHop',
+  'hopEmojiMqtt',
+  // Auto-ack matrix (discussion #3564, #5796): {Channel,Direct} × {ZeroHop,MultiHop,Ip},
   // each cell with Reply / Tapback / Respond-via-DM. These supersede the legacy
   // hop-only keys above (autoAckDirect*/autoAckMultihop*/autoAckUseDM/
   // autoAckDirectMessages), which migration 093 folds into these.
@@ -71,10 +88,21 @@ export const VALID_SETTINGS_KEYS = [
   'autoAckDirectMultiHopReplyEnabled',
   'autoAckDirectMultiHopTapbackEnabled',
   'autoAckDirectMultiHopReplyDmEnabled',
+  // IP row (#5796): messages that reached the node over MQTT or multicast UDP.
+  'autoAckChannelIpReplyEnabled',
+  'autoAckChannelIpTapbackEnabled',
+  'autoAckChannelIpReplyDmEnabled',
+  'autoAckDirectIpReplyEnabled',
+  'autoAckDirectIpTapbackEnabled',
+  'autoAckDirectIpReplyDmEnabled',
   'customTapbackEmojis',
   'automationAirtimeCutoffThreshold',
   'automationAirtimeCutoffSource',
   'automationAirtimeCutoffNeighborMaxHops',
+  // Issue #6007: auto vs manual neighbour picks, sample count (3-5), manual node list
+  'automationAirtimeCutoffNeighborMode',
+  'automationAirtimeCutoffNeighborSampleCount',
+  'automationAirtimeCutoffNeighborNodes',
   'autoAnnounceEnabled',
   'autoAnnounceIntervalHours',
   'autoAnnounceMessage',
@@ -82,6 +110,7 @@ export const VALID_SETTINGS_KEYS = [
   'autoAnnounceChannelIndexes',
   // Hop-limit override for auto-announcements (#5121).
   'autoAnnounceHopLimit',
+  'autoAnnounceSplitLongMessages',
   'autoAnnounceOnStart',
   'autoAnnounceUseSchedule',
   'autoAnnounceSchedule',
@@ -138,11 +167,19 @@ export const VALID_SETTINGS_KEYS = [
   // Report RF-reception log (#5277 P1 WP2). Global, default 7, clamped 1-90
   // (see clampCoverageRetentionDays in src/utils/coverage.ts).
   'coverage_retention_days',
+  // Rolling retention window (days) for direct_rf_contacts, the Direct RF
+  // Contacts daily rollup (#6210). Global, default 30, clamped 1-365 (see
+  // clampDirectRfRetentionDays in src/utils/directRfContacts.ts).
+  'direct_rf_contacts_retention_days',
   // Opt-in MQTT gateway-reception recording for the Coverage Report (#5277
   // P2, per-source, MQTT sources only, default off). Read via
   // getSettingForSource, never the bare key (#5080) — see
   // src/server/services/coverageMqttSettings.ts.
   'coverage_mqtt_enabled',
+  // #5156: per-source, default off. Hide nodes that declined ok_to_mqtt (and
+  // were never heard over direct RF) from anonymous viewers. Read via
+  // getSettingForSource only — see src/server/utils/mqttConsentVisibility.ts.
+  'anonHideMqttNoConsent',
   'solarMonitoringEnabled',
   'solarMonitoringLatitude',
   'solarMonitoringLongitude',
@@ -169,6 +206,8 @@ export const VALID_SETTINGS_KEYS = [
   'tracerouteRetentionDays',
   'routeSegmentRetentionDays',
   'neighborInfoRetentionDays',
+  'auditLogRetentionDays', // #5870
+  'meshcoreCliHistoryRetentionDays', // #5892
   // Position estimation (global, batch — issue #3271)
   'position_estimation_enabled',
   'position_estimation_frequency_hours',
@@ -184,6 +223,14 @@ export const VALID_SETTINGS_KEYS = [
   'autoEnrichmentIntervalMinutes',
   'autoEnrichmentCron',
   'autoEnrichmentPushToNodeDb',
+  // MeshWars forwarder: posts MeshCore heard-repeater results to MeshWars.
+  // Global, admin-only write (ADMIN_ONLY_SETTINGS_KEYS). The API key is
+  // server-only via the `_token` suffix. Its last-forward time is server-owned
+  // and written directly by meshwarsForwarder, so it is absent here.
+  'meshwarsEnabled',
+  'meshwarsSourceId',
+  'meshwarsBaseUrl',
+  'meshwars_api_token',
   // Mesh Issues Analysis (global, batch, passive — issue #4964)
   'mesh_issues_enabled',
   'mesh_issues_frequency_hours',
@@ -207,8 +254,14 @@ export const VALID_SETTINGS_KEYS = [
   // Max km between positioned nodes for B1/B6 cluster adjacency (#4976) —
   // default 30, clamp 1-500, resolved via resolveThresholds.
   'mesh_issues_router_cluster_max_link_km',
+  // Node-health tunables (#6279): A6 stale windows (hours, per protocol) and
+  // A8/A3 low-battery lines — each clamped in resolveThresholds.
+  'mesh_issues_stale_hours_meshtastic',
+  'mesh_issues_stale_hours_meshcore',
+  'mesh_issues_low_battery_pct',
+  'mesh_issues_low_battery_mv',
   // Per-rule mute list, CSV of MESH_ISSUE_RULE_IDS (report reorg #4964 WP2,
-  // spec §5.2/§9.5). One key for all 18 rules — see thresholds.ts's
+  // spec §5.2/§9.5). One key for all 22 rules — see thresholds.ts's
   // resolveDisabledRules for the clamp-on-read parse.
   'mesh_issues_disabled_rules',
   'mesh_issues_last_run_summary',
@@ -248,6 +301,8 @@ export const VALID_SETTINGS_KEYS = [
   'aircraftAgeOutEnabled',
   'aircraftAgeOutHours',
   'aircraftAgeOutAction',
+  // #5704: ask a newly flagged aircraft for its position (opt-in; transmits).
+  'aircraftPositionRequestsEnabled',
   // Sign-flipped position correction (#5363), Settings -> Node Display.
   // Per source: the reference is the source's own node. Display only.
   'signFlipCorrectionEnabled',
@@ -258,6 +313,12 @@ export const VALID_SETTINGS_KEYS = [
   // -> Auto Favorite section.
   'autoFavoriteExcludeAircraft',
   'homoglyphEnabled',
+  // Reliable PKI (#5691): send a node our NodeInfo before a PKI send when the
+  // last PKI exchange with it failed. `reliablePkiMode` is the install-wide
+  // default ('off' | 'asNeeded', default 'off'); `reliablePkiSourceMode` is a
+  // per-source override ('inherit' | 'off' | 'asNeeded'). Validated on save.
+  'reliablePkiMode',
+  'reliablePkiSourceMode',
   // Global privacy toggle (issue #3416): when '0'/'false', the /api/link-preview
   // endpoint refuses to fetch external URLs and the UI renders no preview cards.
   'linkPreviewsEnabled',
@@ -272,6 +333,19 @@ export const VALID_SETTINGS_KEYS = [
   // serves a disallow-all `/robots.txt`, discouraging search engines and LLM
   // crawlers from indexing a publicly-exposed dashboard. See robotsConfig.ts.
   'noIndexEnabled',
+  // Public-instance mode (#5156): redacts API responses for signed-out viewers.
+  'publicInstanceModeEnabled',
+  'publicInstanceHideLongNames',
+  'publicInstanceHidePublicKeys',
+  'publicInstanceRoundTimestamps',
+  'publicInstanceHideMessageText',
+  // Node-name anti-spam (#6382, default OFF). Global, admin-only write. When
+  // on, invite links in node names are replaced with a placeholder before the
+  // name is stored. See src/utils/nodeNameSanitizer.ts.
+  'nodeNameSanitizeEnabled',
+  'nodeNameSanitizeBuiltins',
+  'nodeNameSanitizeCustomPatterns',
+  'nodeNameSanitizePlaceholder',
   // Global privacy disclosure links (issue #5156). A publicly-reachable
   // MeshRadar re-serves mesh data to anonymous visitors and to tokenless
   // embed viewers; these let the operator disclose the policy that applies.
@@ -286,18 +360,27 @@ export const VALID_SETTINGS_KEYS = [
   // Auto-Acknowledge, auto-responder, auto-announce, timer triggers) — never to
   // user-initiated sends. Distinct from the always-on DM ack-retry (#3977/#3980).
   'meshcoreChannelRetryEnabled',
+  // MeshCore reactions (#5759): global opt-in. When on, a received reaction is
+  // still offered to Auto-Acknowledge with its raw text. Default off.
+  'meshcoreReactionsAckOnReceive',
   // Global reply-timeout (seconds) for the MeshCore CLI console — the window the
   // server waits for a repeater/room-server to answer a `/admin/cli` or `/cli`
   // command before returning a 504 (issue #4027). Lower it when your repeater is
   // in direct range so you can re-fire a command sooner instead of waiting the
   // default 15s. Clamped to 1..60s; absent/invalid => the built-in 15s default.
   'meshcoreCliTimeoutSeconds',
+  // Global opt-in (#5909, default OFF): when a relay hash in a MeshCore message
+  // route matches none of the source's own contacts, the route view may look it
+  // up among MeshCore nodes on OTHER sources the viewer can read (meshcore_mqtt
+  // nodes only with a verified advert). Read by the hop-candidates route.
+  'meshcoreCrossSourceHopResolution',
   // How many times a remote admin command is attempted before settling as
   // timed_out (#4487). Only a timeout is retried — an explicit routing
   // rejection settles immediately. Clamped 1..10; absent/invalid => 1, i.e.
   // exactly the pre-#4487 single-attempt behaviour.
   'adminRetryAttempts',
   'localStatsIntervalMinutes',
+  'statusMessageReapplyAfterReboot', // #5745: opt-in, per source; re-apply the last verified Status Message after a reboot
   'nodeHopsCalculation',
   'nodeDimmingEnabled',
   'nodeDimmingStartHours',
@@ -378,6 +461,19 @@ export const VALID_SETTINGS_KEYS = [
   // MeshCore discovery responder (be discoverable; see issue #1027)
   'meshcoreRespondToDiscovery',
   // MeshCore auto-acknowledge
+  'meshcoreAutoFavoriteEnabled',
+  'meshcoreAutoFavoriteIntervalHours',
+  'meshcoreAutoFavoriteStaleHours',
+  'meshcoreAutoFavoriteNodes',
+  'meshcoreAutoWelcomeEnabled',
+  'meshcoreAutoWelcomeMessage',
+  'meshcoreAutoWelcomeTarget',
+  'meshcoreAutoWelcomeWaitForName',
+  'meshcoreAutoWelcomeMaxHops',
+  'meshcoreAutoWelcomeDelaySeconds',
+  'meshcoreAutoWelcomeMaxPerHour',
+  'meshcoreAutoWelcomeWelcomed',
+  'meshcoreAutoWelcomeSendTimes',
   'meshcoreAutoAckEnabled',
   'meshcoreAutoAckRegex',
   'meshcoreAutoAckMessage',
@@ -396,6 +492,8 @@ export const VALID_SETTINGS_KEYS = [
   'meshcoreAutoAnnounceIntervalHours',
   'meshcoreAutoAnnounceMessage',
   'meshcoreAutoAnnounceChannelIndexes',
+  // Split a long announce into up to 3 sends instead of truncating it (#6316)
+  'meshcoreAutoAnnounceSplitLongMessages',
   'meshcoreAutoAnnounceOnStart',
   'meshcoreAutoAnnounceUseSchedule',
   'meshcoreAutoAnnounceSchedule',
@@ -420,6 +518,21 @@ export const VALID_SETTINGS_KEYS = [
   // MeshCore strict receive-only mode (#4547) — per source. Blocks every
   // RF-transmitting command/scheduler on this MeshCore source when true.
   'meshcoreReceiveOnly',
+  // MeshCore reactions (#5759) — per source. Unset or anything but 'false' = on.
+  'meshcoreReactionsInboundEnabled',
+  // MeshCore outbound reactions (#5762) — per source; default in MESHCORE_REACTIONS_OUTBOUND_DEFAULT
+  'meshcoreReactionsOutboundEnabled',
+  // MeshCore Required Repeater (#6178) — per source. Full public key (hex) of
+  // the one repeater whose relay keeps a channel send "unheard" (so the resend
+  // button stays). Empty/unset = default "heard by any repeater". Kept for read
+  // back-compat; #6193 replaced it with the list keys below (no migration).
+  'meshcoreRequiredRepeater',
+  // MeshCore Required Repeaters list (#6193) — per source. JSON array of full
+  // public-key hex strings; the gate ends the resend window per `...Mode`.
+  'meshcoreRequiredRepeaters',
+  // MeshCore Required Repeater mode (#6193) — per source. 'any' | 'all';
+  // anything but 'all' reads as 'any' (the default).
+  'meshcoreRequiredRepeaterMode',
   // Terrain Link Profile / elevation backend (#4111 Phase 1). Global (not
   // per-source) — elevation is source-agnostic public DEM data.
   // `elevationEnabled` is the public availability flag the Map Analysis page
@@ -429,12 +542,30 @@ export const VALID_SETTINGS_KEYS = [
   // every elevation fetch is server-proxied.
   'elevationEnabled',
   'elevationSourceUrl',
+  // Tropospheric ducting overlay (#5734). Global, off by default, admin-only
+  // write (ADMIN_ONLY_SETTINGS_KEYS below). Not secret: every map viewer reads
+  // it to decide whether to show the toggle.
+  'ductingOverlayEnabled',
+  // MQTT root finder live directory refresh (#6337). Global, off by default,
+  // admin-only write (ADMIN_ONLY_SETTINGS_KEYS below). When on, a finder use
+  // may fetch the community root list from api.meshtastic.org.
+  'mqttRootDirectoryRefreshEnabled',
+  // Default Meshtastic source (#5245). Global, admin-only write
+  // (ADMIN_ONLY_SETTINGS_KEYS), hidden from non-admins (SECRET_SETTINGS_KEYS).
+  // Empty = Automatic (first TCP source started). Applied live to the registry.
+  'defaultMeshtasticSourceId',
   // ADS-B flight matching for likely aircraft (#5374). Global (not per-source):
   // it configures one outbound service, like elevation. `adsb_api_token` is
   // server-only via SECRET_SETTINGS_KEY_PATTERN (`_token` suffix).
   'adsbMatchEnabled',
   'adsbFeed',
   'adsb_api_token',
+  // OpenSky Network feed credentials (#5877). Both server-only: the secret via
+  // the `_secret` suffix, the id via SECRET_SETTINGS_KEYS. The feed's
+  // Retry-After pause (`adsb_opensky_paused_until`) is written by the server
+  // only and deliberately NOT listed here, so a save cannot clear it.
+  'adsb_opensky_client_id',
+  'adsb_opensky_client_secret',
   // ATAK/CoT Phase 3 (issue #3691): plaintext TCP CoT feed for ATAK/WinTAK.
   // Default OFF. When enabled, streams CoT <event> XML on cotFeedPort.
   'cotFeedEnabled',
@@ -454,6 +585,14 @@ export const VALID_SETTINGS_KEYS = [
   'translationProvider',
   'translationDefaultLanguage',
   'translationDefaultOutgoingLanguage',
+  // Virtual Node message replay (#6160). Global, opt-in (default off). When on,
+  // a reconnecting app is re-sent the text messages stored since its last sign
+  // of life. The exclude list (CSV of IPs for scripts/loggers) overrides the
+  // VN_REPLAY_EXCLUDE_IPS env var when non-empty. Read globally via getSetting;
+  // the per-source last-seen mark lives under virtualNode.replayLastSeen.<id>,
+  // written directly by the server (not POSTable).
+  'virtualNodeReplayEnabled',
+  'virtualNodeReplayExcludeIps',
   ...TRANSLATION_PROVIDER_SETTING_KEYS,
 ] as const;
 
@@ -478,6 +617,8 @@ export type ValidSettingKey = typeof VALID_SETTINGS_KEYS[number];
  *     reads target a registered key.
  */
 export const PER_SOURCE_SETTINGS_KEYS = [
+  // Reliable PKI per-source override (#5691), read with getSettingForSource.
+  'reliablePkiSourceMode',
   // Auto-ack
   'autoAckChannels',
   'autoAckCooldownSeconds',
@@ -485,6 +626,8 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'autoAckMaxAttempts',
   'autoAckHopLimit',
   'autoAckMaxResponses',
+  'hopEmojiZeroHop',
+  'hopEmojiMqtt',
   'autoAckDirectEnabled',
   'autoAckDirectMessages',
   'autoAckDirectReplyEnabled',
@@ -512,13 +655,25 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'autoAckDirectMultiHopReplyEnabled',
   'autoAckDirectMultiHopTapbackEnabled',
   'autoAckDirectMultiHopReplyDmEnabled',
+  // IP row (#5796): messages that reached the node over MQTT or multicast UDP.
+  'autoAckChannelIpReplyEnabled',
+  'autoAckChannelIpTapbackEnabled',
+  'autoAckChannelIpReplyDmEnabled',
+  'autoAckDirectIpReplyEnabled',
+  'autoAckDirectIpTapbackEnabled',
+  'autoAckDirectIpReplyDmEnabled',
   // Automation airtime cutoff (pauses all automations above channel-utilization threshold)
   'automationAirtimeCutoffThreshold',
   'automationAirtimeCutoffSource',
   'automationAirtimeCutoffNeighborMaxHops',
+  // Issue #6007: auto vs manual neighbour picks, sample count (3-5), manual node list
+  'automationAirtimeCutoffNeighborMode',
+  'automationAirtimeCutoffNeighborSampleCount',
+  'automationAirtimeCutoffNeighborNodes',
   // Auto-announce
   'autoAnnounceChannelIndexes',
   'autoAnnounceHopLimit',
+  'autoAnnounceSplitLongMessages',
   'autoAnnounceEnabled',
   'autoAnnounceIntervalHours',
   'autoAnnounceMessage',
@@ -552,8 +707,25 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'aircraftAgeOutEnabled',
   'aircraftAgeOutHours',
   'aircraftAgeOutAction',
+  // #5704: ask a newly flagged aircraft for its position (opt-in; transmits).
+  'aircraftPositionRequestsEnabled',
   'aircraftAgeOutLastRunAt',
   'aircraftAgeOutLastResult',
+  // #5704: start times of recent aircraft position-request sequences (JSON
+  // ms array), written only by aircraftPositionRequestService.
+  'aircraftPositionRequestStarts',
+  // #5723: per-path last-run times and the hourly count for scheduled
+  // MeshCore traces (JSON), written only by tracePathScheduleService.
+  'tracePathScheduleState',
+  'statusMessageReapplyAfterReboot', // #5745
+  'statusMessageLastVerified', // #5745: server-written, see PER_SOURCE_KEYS_NOT_POSTABLE
+  // Per-sender last-alert times for MeshCore mention notifications (JSON),
+  // written only by meshcoreMentionNotificationService.
+  'meshcoreMentionNotifyState',
+  // New-node alert gate state (learning window end, hourly counter), written only
+  // by newNodeAlertGate.
+  'newNodeAlertLearnUntil',
+  'newNodeAlertRate',
   // Sign-flipped position correction (#5363), Settings -> Node Display.
   'signFlipCorrectionEnabled',
   'signFlipCorrectionRangeKm',
@@ -607,6 +779,19 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   // MeshCore discovery responder (be discoverable; see issue #1027)
   'meshcoreRespondToDiscovery',
   // MeshCore auto-acknowledge
+  'meshcoreAutoFavoriteEnabled',
+  'meshcoreAutoFavoriteIntervalHours',
+  'meshcoreAutoFavoriteStaleHours',
+  'meshcoreAutoFavoriteNodes',
+  'meshcoreAutoWelcomeEnabled',
+  'meshcoreAutoWelcomeMessage',
+  'meshcoreAutoWelcomeTarget',
+  'meshcoreAutoWelcomeWaitForName',
+  'meshcoreAutoWelcomeMaxHops',
+  'meshcoreAutoWelcomeDelaySeconds',
+  'meshcoreAutoWelcomeMaxPerHour',
+  'meshcoreAutoWelcomeWelcomed',
+  'meshcoreAutoWelcomeSendTimes',
   'meshcoreAutoAckEnabled',
   'meshcoreAutoAckRegex',
   'meshcoreAutoAckMessage',
@@ -625,6 +810,8 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'meshcoreAutoAnnounceIntervalHours',
   'meshcoreAutoAnnounceMessage',
   'meshcoreAutoAnnounceChannelIndexes',
+  // Split a long announce into up to 3 sends instead of truncating it (#6316)
+  'meshcoreAutoAnnounceSplitLongMessages',
   'meshcoreAutoAnnounceOnStart',
   'meshcoreAutoAnnounceUseSchedule',
   'meshcoreAutoAnnounceSchedule',
@@ -636,6 +823,10 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   // Last flood advert sent from this source (ms). Server-managed floor for
   // automated flood adverts; see PER_SOURCE_KEYS_NOT_POSTABLE.
   'meshcoreLastFloodAdvertAt',
+  // Last LXMF announce from a Reticulum source (ms, #6011). Server-managed: it
+  // drives the Announce now cooldown and the periodic timer; see
+  // PER_SOURCE_KEYS_NOT_POSTABLE.
+  'reticulumLastAnnounceAt',
   // MeshCore auto-responder
   'meshcoreAutoResponderEnabled',
   'meshcoreAutoResponderTriggers',
@@ -654,8 +845,24 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'meshcoreDefaultScope',
   // MeshCore default path hash size (#4945) — per source (per node)
   'meshcoreDefaultPathHashSize',
+  // P7a (#6254): Security tab dead-node threshold (days) — per source
+  'securityDeadNodeDays',
   // MeshCore strict receive-only mode (#4547) — per source (#4547 §2.1)
   'meshcoreReceiveOnly',
+  // MeshCore inbound reactions (#5759) — per source; unset reads as on
+  'meshcoreReactionsInboundEnabled',
+  // MeshCore outbound reactions (#5762) — per source; default in MESHCORE_REACTIONS_OUTBOUND_DEFAULT
+  'meshcoreReactionsOutboundEnabled',
+  // MeshCore sender-name override policy (#6282) — per source, JSON
+  // {enabled, allowedNames[]}. Written ONLY by PUT
+  // /api/sources/:id/meshcore/config/sender-names (per-source `configuration`
+  // write, audited), so it is NOT_POSTABLE and kept out of the public GET.
+  'meshcoreSenderNameOverride',
+  // MeshCore Required Repeater (#6178) — per source (full repeater public key)
+  'meshcoreRequiredRepeater',
+  // MeshCore Required Repeaters list + mode (#6193) — per source
+  'meshcoreRequiredRepeaters',
+  'meshcoreRequiredRepeaterMode',
   // Node Display (#4412 / per-source node display epic). All ten keys in the
   // Settings → Node Display section are per-source as of Phase 1; Phase 2 converts
   // the server reads to getSettingForSource(). `localStatsIntervalMinutes` is
@@ -742,9 +949,33 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'remoteLocalStatsFilterRegexEnabled',
   'remoteLocalStatsFilterLastHeardEnabled',
   'remoteLocalStatsFilterLastHeardHours',
+  // Scheduled-telemetry retry burst + cooldown (#6033). Per-source, POSTable,
+  // shared by the MeshCore remote-telemetry scheduler and the Meshtastic
+  // remote-LocalStats scheduler (each reads them for its own source).
+  'telemetryRetryDelaySeconds',
+  'telemetryRetryMaxAttempts',
+  'telemetryRetryCooldownMinutes',
+  // Server-managed Meshtastic remote-LocalStats retry/cooldown state (#6033).
+  // JSON map keyed by nodeNum, written ONLY by meshtasticManager — see
+  // PER_SOURCE_KEYS_NOT_POSTABLE.
+  'remoteLocalStatsRetryState',
   // Coverage Report MQTT gateway-reception recording (#5277 P2). Per-source,
   // MQTT sources only, default off. Read via coverageMqttSettings.ts.
   'coverage_mqtt_enabled',
+  // #5156: anonymous-viewer filter for nodes that declined ok_to_mqtt.
+  // Per-source, POSTable, default off. Read via mqttConsentVisibility.ts.
+  'anonHideMqttNoConsent',
+  // #4305: MQTT-native send. Per-source, MQTT sources only, default off.
+  // Written only by PUT /api/sources/:id/mqtt/native (see
+  // PER_SOURCE_KEYS_NOT_POSTABLE); read via services/mqttNative/mqttNativeConfig.ts.
+  'mqttNativeSendEnabled',
+  'mqttNativeHopLimit',
+  'mqttNativeMaxPerMinute',
+  'mqttNativeMaxPerHour',
+  'mqttNativeLongName',
+  'mqttNativeShortName',
+  'mqttNativeRootTopic',
+  'mqttNativeAnnounceChannelId',
 ] as const;
 
 export type PerSourceSettingKey = typeof PER_SOURCE_SETTINGS_KEYS[number];
@@ -780,6 +1011,9 @@ export const GLOBAL_ONLY_SETTINGS_KEYS = new Set<string>([
   'cartoApiKey',
   // Documented "global" in this file's own inline comments:
   'pkiDmDecryptionGloballyEnabled',         // :82 master switch, gates every source
+  // Reliable PKI default (#5691). A source overrides it with reliablePkiSourceMode,
+  // so a per-source copy of this key would be stored and never read.
+  'reliablePkiMode',
   'position_estimation_enabled',            // :141 global batch job (#3271)
   'position_estimation_frequency_hours',    // :141
   'position_estimation_lookback_hours',     // :141
@@ -789,6 +1023,10 @@ export const GLOBAL_ONLY_SETTINGS_KEYS = new Set<string>([
   'autoEnrichmentIntervalMinutes',          // "
   'autoEnrichmentCron',                     // "
   'autoEnrichmentPushToNodeDb',             // "
+  'meshwarsEnabled',                        // global forwarder
+  'meshwarsSourceId',                       // "
+  'meshwarsBaseUrl',                        // "
+  'meshwars_api_token',                     // "
   'mesh_issues_enabled',                    // global batch job (#4964)
   'mesh_issues_frequency_hours',            // "
   'mesh_issues_lookback_hours',             // "
@@ -804,22 +1042,49 @@ export const GLOBAL_ONLY_SETTINGS_KEYS = new Set<string>([
   'mesh_issues_snr_asymmetry_db',           // "
   'mesh_issues_over_broadcast_seconds',     // "
   'mesh_issues_auto_close_runs',            // global batch job (#4964 post-epic follow-up)
+  'mesh_issues_stale_hours_meshtastic',     // global batch job (#6279 node health)
+  'mesh_issues_stale_hours_meshcore',       // "
+  'mesh_issues_low_battery_pct',            // "
+  'mesh_issues_low_battery_mv',             // "
   'mesh_issues_disabled_rules',             // global batch job (#4964 report reorg)
   'mesh_issues_last_run_summary',           // "
   'linkPreviewsEnabled',                    // :175 global privacy toggle (#3416)
   'discardInvalidPositions',                // :178 global ingest gate
   'noIndexEnabled',                         // :184 global robots gate (#4202)
+  'publicInstanceModeEnabled',              // global public-instance mode (#5156)
+  'publicInstanceHideLongNames',            // global public-instance mode (#5156)
+  'publicInstanceHidePublicKeys',           // global public-instance mode (#5156)
+  'publicInstanceRoundTimestamps',          // global public-instance mode (#5156)
+  'publicInstanceHideMessageText',          // global public-instance mode (#5156)
+  'nodeNameSanitizeEnabled',                // global ingest rewrite (#6382)
+  'nodeNameSanitizeBuiltins',               // "
+  'nodeNameSanitizeCustomPatterns',         // "
+  'nodeNameSanitizePlaceholder',            // "
   'privacyPolicyUrl',                       // global disclosure link (#5156)
   'termsOfServiceUrl',                      // "
   'contactUrl',                             // "
   'meshcoreChannelRetryEnabled',            // :189 global opt-in (#3979)
+  'meshcoreReactionsAckOnReceive',          // global opt-in: Auto-Ack may answer reactions (#5759)
+  'meshcoreCrossSourceHopResolution',       // global opt-in: cross-source hop names (#5909)
   'meshcoreCliTimeoutSeconds',              // :195 global CLI reply timeout (#4027)
   'adminRetryAttempts',                     // :201 global admin retry count (#4487)
   'elevationEnabled',                       // :305 "Global (not per-source)" (#4111)
   'elevationSourceUrl',                     // :305, also SECRET_SETTINGS_KEYS
+  'ductingOverlayEnabled',                  // global outbound service (#5734), read via getSetting
+  'mqttRootDirectoryRefreshEnabled',        // global outbound service (#6337), read via getSetting
+  'defaultMeshtasticSourceId',              // one install-wide default source (#5245), read via getSetting
   'adsbMatchEnabled',                       // global outbound service (#5374), read via getSetting
   'adsbFeed',                               // "
   'adsb_api_token',                         // ", secret via the _token pattern
+  'adsb_opensky_client_id',                 // " (#5877), secret via SECRET_SETTINGS_KEYS
+  'adsb_opensky_client_secret',             // " (#5877), secret via the _secret pattern
+  // Solar Monitoring (#6258 D5): one install-wide forecast, read via bare
+  // getSetting by solarMonitoringService; edited in Global Settings only.
+  'solarMonitoringEnabled',
+  'solarMonitoringLatitude',
+  'solarMonitoringLongitude',
+  'solarMonitoringAzimuth',
+  'solarMonitoringDeclination',
   // Global singletons driven only by the global POST branch:
   'cotFeedEnabled',                         // settingsRoutes.ts:900-911 — "global singleton"
   'cotFeedPort',                            // "
@@ -830,6 +1095,9 @@ export const GLOBAL_ONLY_SETTINGS_KEYS = new Set<string>([
   // Global retention sweep (#5277), read via getSettingAsync by
   // coverageRetentionService — no per-source variant to read.
   'coverage_retention_days',
+  // Global retention sweep (#6210), read via getSettingAsync by
+  // directRfContactsRetentionService.
+  'direct_rf_contacts_retention_days',
   // User-interface preferences (#5558). SettingsTab saves them only on the
   // unscoped POST (they live in GLOBAL_SETTINGS_SECTIONS: appearance, units,
   // sorting) and the server reads them only via getSetting. A source copy used
@@ -860,6 +1128,11 @@ export const GLOBAL_ONLY_SETTINGS_KEYS = new Set<string>([
   'translationDefaultLanguage',
   'translationDefaultOutgoingLanguage',
   ...TRANSLATION_PROVIDER_SETTING_KEYS,
+  // Virtual Node message replay (#6160). One switch + one exclude list for the
+  // install, read by the VirtualNodeServer via getSetting — no per-source
+  // variant to read, so a source copy would be stored and never used.
+  'virtualNodeReplayEnabled',
+  'virtualNodeReplayExcludeIps',
 ]);
 
 /**
@@ -907,8 +1180,16 @@ export const PER_SOURCE_KEYS_NOT_POSTABLE = new Set<string>([
   'localNodeNum',           // meshtasticManager.ts:4688,4748
   'transportTrafficCheckpoint', // transportTrafficService.ts checkpointAll/restoreAndRecover (#5101 P3 WP3)
   'meshcoreLastFloodAdvertAt', // meshcoreManager.ts recordFloodAdvert (automated flood-advert floor)
+  'reticulumLastAnnounceAt', // reticulumManager.ts recordAnnounce (#6011; announce cooldown + periodic timer, persisted so a restart or save cannot reset them)
   'autoFavoriteAircraftStrikes', // favoritesService.ts autoFavoriteSweep (#5364/#5365 D19 two-strike rule)
   'aircraftAgeOutLastRunAt',  // aircraftAgeOutService.ts runSweep (#5364/#5365 Phase 2; persisted so a restart is not a run)
+  'aircraftPositionRequestStarts',  // aircraftPositionRequestService.ts (#5704; persisted hourly cap, so a restart or save cannot reset it)
+  'statusMessageLastVerified',  // deviceAdminService.ts rememberVerifiedStatusMessage (#5745; last Status Message a read-back confirmed on the node)
+  'tracePathScheduleState',  // tracePathScheduleService.ts (#5723; persisted per-path intervals and hourly cap)
+  'meshcoreMentionNotifyState',  // meshcoreMentionNotificationService.ts (persisted per-sender mention cooldown, never client-writable)
+  'newNodeAlertLearnUntil',  // newNodeAlertGate.ts (#6306; persisted learning-window end, only a purge re-arms it)
+  'newNodeAlertRate',  // newNodeAlertGate.ts (#6306; persisted hourly alert counter, so a restart or save cannot reopen the hour)
+  'remoteLocalStatsRetryState',  // meshtasticManager.ts remote-LocalStats scheduler (#6033; persisted per-node miss counter + cooldown, so a restart/save cannot re-arm or clear it)
   'aircraftAgeOutLastResult', // aircraftAgeOutService.ts runSweep (#5364/#5365 Phase 2; JSON counts for the settings status line)
   // POST /api/sources/:id/forwarding (forwardingRoutes.ts, #5446) — gated on
   // per-source `automation` write, so the generic `settings` POST must not
@@ -916,6 +1197,21 @@ export const PER_SOURCE_KEYS_NOT_POSTABLE = new Set<string>([
   'forwardingRules',
   // PUT /api/sources/:id/forwarding/enabled (#5537) — same gate as the rules.
   'forwardingEnabled',
+  // PUT /api/sources/:id/meshcore/config/sender-names (#6282): the per-source
+  // sender-name allowlist. A generic POST must not be able to widen it.
+  'meshcoreSenderNameOverride',
+  // PUT /api/sources/:id/mqtt/native (mqttNativeRoutes.ts, #4305) — gated on
+  // `sources:write`. The route clamps hop limit to 0-7 and the send caps to
+  // at most 6/min and 60/h; a generic POST must not be able to raise them or
+  // turn the transmit path on.
+  'mqttNativeSendEnabled',
+  'mqttNativeHopLimit',
+  'mqttNativeMaxPerMinute',
+  'mqttNativeMaxPerHour',
+  'mqttNativeLongName',
+  'mqttNativeShortName',
+  'mqttNativeRootTopic',
+  'mqttNativeAnnounceChannelId',
 ]);
 
 /**
@@ -934,6 +1230,9 @@ export const SECRET_SETTINGS_KEYS = new Set<string>([
   // May embed an API key; server-only (all elevation fetches are
   // server-proxied, so no frontend consumer ever needs the raw URL).
   'elevationSourceUrl',
+  // OpenSky client id (#5877). Not secret alone, but half of a credential
+  // pair; the secret half is caught by the `_secret` suffix.
+  'adsb_opensky_client_id',
   // One API key per translation provider (#5518): every `kind: 'secret'`
   // field in the provider descriptors.
   ...TRANSLATION_PROVIDER_SECRET_SETTING_KEYS,
@@ -944,6 +1243,47 @@ export const SECRET_SETTINGS_KEYS = new Set<string>([
   'forwardingRules',
   // Forwarding master switch (#5537) — same reasoning as the rules.
   'forwardingEnabled',
+  // Sender-name allowlist (#6282): the names a source may post as. Readable
+  // only through the dedicated per-source `configuration` route.
+  'meshcoreSenderNameOverride',
+  // Default Meshtastic source (#5245). Not a secret, but it names a source a
+  // non-admin viewer may not be able to read, and only admins can change it.
+  'defaultMeshtasticSourceId',
+]);
+
+/**
+ * Settings only an admin may write. A non-admin `settings:write` save drops
+ * them (the same way it drops secret keys), so a Settings page save by a
+ * non-admin carries the stored value through untouched.
+ *
+ * `ductingOverlayEnabled` (#5734): turning it on lets every map viewer make
+ * the server contact NOAA, so the maintainer reserved it for admins.
+ */
+export const ADMIN_ONLY_SETTINGS_KEYS = new Set<string>([
+  'ductingOverlayEnabled',
+  // #6337: turning it on lets any finder user make the server contact
+  // api.meshtastic.org.
+  'mqttRootDirectoryRefreshEnabled',
+  // #5245: picks the radio every source-less send goes out on.
+  'defaultMeshtasticSourceId',
+  // #6064: the analytics provider + config inject a <script> into the HTML
+  // <head> served to EVERY visitor, and the `custom` provider is intentional
+  // arbitrary-script injection. The Settings UI already gates this section on
+  // isAdmin; without this the server let any `settings:write` grantee (not just
+  // an admin) POST a stored XSS that runs in an admin's browser — a privilege
+  // escalation. Restricting the write to admins matches the UI and closes it.
+  'analyticsProvider',
+  'analyticsConfig',
+  // MeshWars forwarder: sends the radio's position to a third-party server.
+  'meshwarsEnabled',
+  'meshwarsSourceId',
+  'meshwarsBaseUrl',
+  'meshwars_api_token',
+  // #6382: rewrites every stored node name; the Settings UI is admin-only too.
+  'nodeNameSanitizeEnabled',
+  'nodeNameSanitizeBuiltins',
+  'nodeNameSanitizeCustomPatterns',
+  'nodeNameSanitizePlaceholder',
 ]);
 
 /**
@@ -974,4 +1314,27 @@ export function stripSecretSettings<T extends Record<string, unknown>>(
     out[k] = v;
   }
   return out as Partial<T>;
+}
+
+/** P7a (#6254): allowed range for the per-source `securityDeadNodeDays` setting (whole days). */
+export const SECURITY_DEAD_NODE_DAYS_RANGE = { min: 1, max: 365 } as const;
+
+/** P7a (#6254): protocol defaults for `securityDeadNodeDays`. Applied by the reader, never stored. */
+export const SECURITY_DEAD_NODE_DAYS_DEFAULTS = { meshtastic: 7, meshcore: 14 } as const;
+
+/** True when `raw` is a whole number of days inside {@link SECURITY_DEAD_NODE_DAYS_RANGE}. */
+export function isValidSecurityDeadNodeDays(raw: unknown): boolean {
+  const s = typeof raw === 'number' ? String(raw) : raw;
+  if (typeof s !== 'string' || !/^\d+$/.test(s.trim())) return false;
+  const n = Number(s);
+  return n >= SECURITY_DEAD_NODE_DAYS_RANGE.min && n <= SECURITY_DEAD_NODE_DAYS_RANGE.max;
+}
+
+/**
+ * Resolve the effective dead-node threshold in days from the stored per-source
+ * value (null/unset/invalid falls back to the protocol default).
+ */
+export function resolveSecurityDeadNodeDays(raw: string | null | undefined, isMeshCore: boolean): number {
+  if (raw != null && isValidSecurityDeadNodeDays(raw)) return Number(String(raw).trim());
+  return isMeshCore ? SECURITY_DEAD_NODE_DAYS_DEFAULTS.meshcore : SECURITY_DEAD_NODE_DAYS_DEFAULTS.meshtastic;
 }

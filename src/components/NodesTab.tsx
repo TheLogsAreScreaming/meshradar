@@ -1,15 +1,15 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import '../styles/nodes.css';
-import { Popup, Tooltip, Polyline, Circle, useMap } from 'react-leaflet';
+import { Popup, Tooltip, Polyline, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import type { Marker as LeafletMarker } from 'leaflet';
 import { DeviceInfo } from '../types/device';
-import { TabType } from '../types/ui';
+import { TabType, SortField } from '../types/ui';
 import { nodePassesTransportFilter, transportCutoffSec, isMqttOnlySourceType } from '../utils/nodeTransport';
-import { getNodeTypeCategory, categoryGlyphFamily, NODE_TYPE_CATEGORY_META, NodeTypeCategory } from '../utils/nodeTypeCategory';
-import { buildGroupedNodeItems, countNodesByCategory, GroupedNodeListItem, RoleGroupCount } from '../utils/nodeGrouping';
+import { getNodeTypeCategory, categoryGlyphFamily, markerRoleProps } from '../utils/nodeTypeCategory';
 import { effectiveMapMaxAgeHours } from '../utils/mapAge';
+import { isSecurityFlagged } from '../utils/nodeAdvancedFilter';
 import { resolveClusterZoomThreshold, resolveClusteredMapCenterTargetZoom } from '../utils/mapZoomAnimation';
 import MapAgeFilterControl from './map/MapAgeFilterControl';
 import MapAircraftDisplayControl from './map/MapAircraftDisplayControl';
@@ -34,8 +34,17 @@ import { formatTime, formatDateTime } from '../utils/datetime';
 import { getDistanceToNode, calculateDistance, formatDistance } from '../utils/distance';
 import { getTilesetById } from '../config/tilesets';
 import { getEffectiveHops, getMapHoverTooltipMeta } from '../utils/nodeHops';
-import { buildNodeExportRows, nodesToCsv, nodesToHtml, downloadTextFile } from '../utils/nodeExport';
+import { sortNodesByField } from '../utils/nodeSort';
+import { buildNodeExportRows, NODE_EXPORT_COLUMNS, exportNodeList, type ExportColumn, type NodeExportRow } from '../utils/nodeExport';
+import { orderFavoritesFirst } from '../utils/nodeSort';
+import { useNodeRoleGrouping } from '../hooks/useNodeRoleGrouping';
+import { NodeSortControls } from './nodes/NodeSortControls';
+import { ExportMenuButton } from './nodes/ExportMenuButton';
+import { NodeStatChips } from './nodes/NodeStatChips';
+import { RoleDistributionSummary } from './nodes/RoleDistributionSummary';
+import { RoleGroupHeader } from './nodes/RoleGroupHeader';
 import { useMapContext } from '../contexts/MapContext';
+import { useMapViewStore, useMapViewSelector } from '../contexts/mapViewStore';
 import { useTelemetryNodes, useDeviceConfig, useNodes, useChannels, setNodeFieldInCache } from '../hooks/useServerData';
 import { useQueryClient } from '@tanstack/react-query';
 import { sourcePollQueryKey } from '../hooks/usePoll';
@@ -46,6 +55,12 @@ import { nodeColorStyle } from '../utils/nodeColor';
 import { useAuth } from '../contexts/AuthContext';
 import { useSource } from '../contexts/SourceContext';
 import DashboardWaypoints from './Dashboard/DashboardWaypoints';
+import { LocalMarkers } from './map/layers/MapMarkersLayer';
+import LocalMarkerAuthoringUi from './map/LocalMarkerAuthoringUi';
+import { MapInstanceBridge } from './map/MapInstanceBridge';
+import LocalMarkerPlacementBridge from './map/LocalMarkerPlacementBridge';
+import { useLocalMarkerAuthoring } from '../hooks/useLocalMarkerAuthoring';
+import { useMap3DToggle } from '../hooks/useMap3DToggle';
 import DashboardAtakContacts from './Dashboard/DashboardAtakContacts';
 import WaypointEditorModal from './WaypointEditorModal';
 import { useWaypoints } from '../hooks/useWaypoints';
@@ -72,9 +87,6 @@ import { Map3DView } from './map/Map3DView';
 import DashboardNodePopup from './Dashboard/DashboardNodePopup';
 import type { Node3DFeature } from './map/Base3DMap';
 import { TilesetSelector } from './TilesetSelector';
-import { resolve3DBasemap, buildTerrainTileUrl } from '../config/basemap3d';
-import { useTerrainCapabilities } from '../hooks/useTerrainCapabilities';
-import { appBasename } from '../init';
 import { MapLoadingOverlay } from './map/MapLoadingOverlay';
 import { MapModeIndicator } from './map/MapModeIndicator';
 import { NodeUnmessageableBadge } from './NodeUnmessageableBadge';
@@ -84,13 +96,18 @@ import { useNodeIdentityChanges } from '../hooks/useNodeIdentityChanges';
 import { NodeDetailsButton } from './NodeDetailsButton';
 import nodeRowStyles from './NodeRowActions.module.css';
 import nodeStatusStyles from './NodeStatusLine.module.css';
-import roleGroupingStyles from './NodeRoleGrouping.module.css';
 import listHeaderStyles from './NodesListHeader.module.css';
 import { NeighborLinksLayer, type NeighborLinkDescriptor } from './map/layers/NeighborLinksLayer';
 import { CrossSourceLinksLayer } from './map/layers/CrossSourceLinksLayer';
 import { TracerouteConfirmedLinksLayer } from './map/layers/TracerouteConfirmedLinksLayer';
+import DuctingLayer from './map/layers/DuctingLayer';
+import { DuctingControl } from './map/DuctingControl';
+import { PacketFlightsControl } from './map/PacketFlightsControl';
+import { PacketFlightsLayer } from './map/layers/PacketFlightsLayer';
+import type { FlightNodeEntry, PacketFlightStats } from '../utils/packetFlightEdges';
 import subToggleStyles from './map/MapSubToggle.module.css';
 import { AccuracyRegionsLayer, type AccuracyRegionDescriptor } from './map/layers/AccuracyRegionsLayer';
+import { EstimatedPositionRadiiLayer, type EstimatedPositionRadius } from './map/layers/EstimatedPositionRadiiLayer';
 import { NodeCard } from './map/popups/NodeCard';
 import { IdentityItems, SignalItems, LastHeardFooter, TracerouteBody, NodeActions, type NodeActionSpec } from './map/popups/sections';
 import { toNodeCardModel, type NodeCardModel } from './map/popups/nodeCardModel';
@@ -101,6 +118,7 @@ import { CopyNodeInfoModal } from './CopyNodeInfoModal';
 import { UiIcon } from './icons';
 import { useToast } from './ToastContainer';
 import { logger } from '../utils/logger';
+import { calculateNodeOpacity } from '../utils/nodeDimming';
 
 interface NodesTabProps {
   processedNodes: DeviceInfo[];
@@ -157,33 +175,23 @@ const isToday = (date: Date): boolean => {
     date.getFullYear() === today.getFullYear();
 };
 
-// Helper function to calculate node opacity based on last heard time
-const calculateNodeOpacity = (
-  lastHeard: number | undefined,
-  enabled: boolean,
-  startHours: number,
-  minOpacity: number,
-  maxNodeAgeHours: number
-): number => {
-  if (!enabled || !lastHeard) return 1;
+const MESHTASTIC_SORT_OPTIONS: { value: SortField; labelKey: string }[] = [
+  { value: 'longName', labelKey: 'nodes.sort_name' },
+  { value: 'shortName', labelKey: 'nodes.sort_short_name' },
+  { value: 'id', labelKey: 'nodes.sort_id' },
+  { value: 'lastHeard', labelKey: 'nodes.sort_updated' },
+  { value: 'uptime', labelKey: 'nodes.sort_uptime' },
+  { value: 'snr', labelKey: 'nodes.sort_signal' },
+  { value: 'battery', labelKey: 'nodes.sort_charge' },
+  { value: 'hwModel', labelKey: 'nodes.sort_hardware' },
+  { value: 'hops', labelKey: 'nodes.sort_hops' },
+];
 
-  const now = Date.now();
-  const lastHeardMs = lastHeard * 1000;
-  const ageHours = (now - lastHeardMs) / (1000 * 60 * 60);
-
-  // No dimming if node was heard within the start threshold
-  if (ageHours <= startHours) return 1;
-
-  // Calculate opacity linearly from 1 at startHours to minOpacity at maxNodeAgeHours
-  const dimmingRange = maxNodeAgeHours - startHours;
-  if (dimmingRange <= 0) return 1;
-
-  const ageInDimmingRange = ageHours - startHours;
-  const dimmingProgress = Math.min(1, ageInDimmingRange / dimmingRange);
-
-  // Linear interpolation from 1 to minOpacity
-  return 1 - (dimmingProgress * (1 - minOpacity));
-};
+const MESHTASTIC_EXPORT_COLUMNS: ExportColumn<NodeExportRow>[] = NODE_EXPORT_COLUMNS.map((c) => ({
+  key: c.key,
+  label: c.label,
+  value: (row: NodeExportRow) => row[c.key],
+}));
 
 // Memoized distance display component to avoid recalculating on every render
 const DistanceDisplay = React.memo<{
@@ -204,96 +212,6 @@ const DistanceDisplay = React.memo<{
     <span className="stat" title={t('nodes.distance')}>
       <UiIcon name="ruler" size={14} /> {distance}
     </span>
-  );
-});
-
-// Number of role categories the distribution summary gives a distinct
-// `--chart-N` colour (the app's categorical scale only defines 8 slots, and
-// per the dataviz convention categorical hues are assigned in fixed order and
-// never cycled — a 9th+ category folds into a single muted "Other" segment
-// rather than reusing an earlier colour).
-const ROLE_SUMMARY_MAX_COLORED_CATEGORIES = 8;
-
-/**
- * Compact role-distribution summary shown above the node list when the
- * "Group by role" toggle is on (grouping requirement #3). A single-row
- * stacked bar (inline SVG, coloured with the app's `--chart-N` categorical
- * custom properties so it tracks every Catppuccin variant) plus a legend of
- * role name + count chips — the chips are the accessible source of truth
- * (identity is never colour-alone), so the SVG itself is decorative.
- */
-const RoleDistributionSummary = React.memo<{
-  distribution: RoleGroupCount[];
-  t: (key: string, defaultValue: string, options?: Record<string, unknown>) => string;
-}>(({ distribution, t }) => {
-  const total = distribution.reduce((sum, r) => sum + r.count, 0);
-  if (total === 0) return null;
-
-  const colored = distribution.slice(0, ROLE_SUMMARY_MAX_COLORED_CATEGORIES);
-  const overflow = distribution.slice(ROLE_SUMMARY_MAX_COLORED_CATEGORIES);
-  const otherCount = overflow.reduce((sum, r) => sum + r.count, 0);
-
-  const chips = colored.map((r, i) => {
-    const meta = NODE_TYPE_CATEGORY_META[r.category];
-    return {
-      key: r.category as string,
-      label: t(meta.labelKey, meta.label),
-      count: r.count,
-      color: `var(--chart-${i + 1})`,
-    };
-  });
-  if (otherCount > 0) {
-    chips.push({
-      key: 'other',
-      label: t('nodes.other_roles', 'Other'),
-      count: otherCount,
-      color: 'var(--color-text-disabled)',
-    });
-  }
-
-  // Lay segments out in a fixed 1000-unit viewBox with a small fixed gap
-  // between them (renders as ~2px at typical sidebar widths), stretched to
-  // fill the wrapper's actual width/height — the wrapper clips to a pill
-  // shape via border-radius + overflow:hidden, so segments themselves stay
-  // plain rectangles rather than fighting non-uniform SVG scaling with rx.
-  const VIEWBOX_WIDTH = 1000;
-  const GAP_UNITS = chips.length > 1 ? 6 : 0;
-  const usableWidth = VIEWBOX_WIDTH - GAP_UNITS * (chips.length - 1);
-  let cursor = 0;
-  const segments = chips.map((chip) => {
-    const width = Math.max((chip.count / total) * usableWidth, 0);
-    const x = cursor;
-    cursor += width + GAP_UNITS;
-    return { ...chip, x, width };
-  });
-
-  return (
-    <div className={roleGroupingStyles.summary}>
-      <div className={roleGroupingStyles.summaryTitle}>{t('nodes.role_distribution', 'Role distribution')}</div>
-      <div className={roleGroupingStyles.summaryBarWrap}>
-        <svg
-          viewBox={`0 0 ${VIEWBOX_WIDTH} 14`}
-          preserveAspectRatio="none"
-          className={roleGroupingStyles.summaryBar}
-          aria-hidden="true"
-        >
-          {segments.map((seg) => (
-            <rect key={seg.key} x={seg.x} y={0} width={seg.width} height={14} fill={seg.color}>
-              <title>{`${seg.label}: ${seg.count}`}</title>
-            </rect>
-          ))}
-        </svg>
-      </div>
-      <div className={roleGroupingStyles.summaryLegend}>
-        {chips.map((chip) => (
-          <span className={roleGroupingStyles.summaryChip} key={chip.key}>
-            <span className={roleGroupingStyles.summarySwatch} style={{ background: chip.color }} />
-            {chip.label}
-            <span className={roleGroupingStyles.summaryChipCount}>{chip.count}</span>
-          </span>
-        ))}
-      </div>
-    </div>
   );
 });
 
@@ -367,20 +285,6 @@ export function isTracerouteRunDisabled(
 ): boolean {
   return connectionStatus !== 'connected' || tracerouteLoading === nodeUserId || txDisabled;
 }
-
-/**
- * Hands the Leaflet map instance out of BaseMap (#5354 Phase 3). The asset
- * playback bar is a sibling of the map (so it can sit over it as a DOM
- * overlay) but moves its marker imperatively on the map.
- */
-const MapInstanceBridge: React.FC<{ onMap: (map: L.Map | null) => void }> = ({ onMap }) => {
-  const map = useMap();
-  useEffect(() => {
-    onMap(map);
-    return () => onMap(null);
-  }, [map, onMap]);
-  return null;
-};
 
 /**
  * Controller that applies the configured default map center once server settings load.
@@ -583,6 +487,14 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setShowCrossSourceLinks,
     showTracerouteConfirmedLinks,
     setShowTracerouteConfirmedLinks,
+    showPacketFlights,
+    setShowPacketFlights,
+    packetFlightRate,
+    setPacketFlightRate,
+    showDucting,
+    setShowDucting,
+    ductingHoursAhead,
+    setDuctingHoursAhead,
     showRoute,
     setShowRoute,
     showMotion,
@@ -597,6 +509,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setShowRfNodes,
     showWaypoints,
     setShowWaypoints,
+    showLocalMarkers,
+    setShowLocalMarkers,
     showAtakContacts,
     setShowAtakContacts,
     showAnimations,
@@ -623,9 +537,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     triggerNodeAnimation,
     mapCenterTarget,
     setMapCenterTarget,
-    mapCenter,
-    mapZoom,
-    setMapZoom,
     selectedNodeId,
     setSelectedNodeId,
     neighborInfo,
@@ -637,6 +548,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     mapMaxAgeHours,
     setMapMaxAgeHours,
   } = useMapContext();
+  const mapViewStore = useMapViewStore();
 
   const { currentNodeId } = useDeviceConfig();
   // `isLoading` reflects TanStack Query's pending state for the shared poll
@@ -905,6 +817,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     }),
     [canWriteWaypoints, lockedToOther, handleEditWaypoint, handleDeleteWaypoint],
   );
+
+  // ----- Local map markers (#5686): planning notes, never transmitted -----
+  // Same per-source grant as waypoints: read to see, write to edit.
+  const markerAuthoring = useLocalMarkerAuthoring(currentSourceId, canWriteWaypoints);
+  const { placing: placingMarker, setPlacing: setPlacingMarker } = markerAuthoring;
 
   // Parse current node ID to get node number for effective hops calculation
   const currentNodeNum = currentNodeId ? parseNodeId(currentNodeId) : null;
@@ -1244,14 +1161,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // #4704: 2D/3D toggle. `viewMode` is ephemeral (not persisted); the toggle is
   // only offered when the server can serve DEM terrain tiles, and any
   // capability loss forces 2D on the spot (mirrors `useEffectiveViewMode`).
-  const terrainCaps = useTerrainCapabilities();
-  const canUse3D = !terrainCaps.isLoading && terrainCaps.enabled && terrainCaps.terrainTiles;
-  const [viewMode, setViewMode] = useState<'2d' | '3d'>('2d');
-  const basemap3D = useMemo(
-    () => resolve3DBasemap(mapTileset, customTilesets, cartoApiKey),
-    [mapTileset, customTilesets, cartoApiKey],
-  );
-  const terrainTileUrl = useMemo(() => buildTerrainTileUrl(appBasename), []);
+  const { canUse3D, viewMode, setViewMode, effective3D, basemap3D, terrainTileUrl } =
+    useMap3DToggle(mapTileset, customTilesets, cartoApiKey);
 
   const sidebarRef = useRef<HTMLDivElement>(null);
 
@@ -1609,65 +1520,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     }
   };
 
-  // Helper function to sort nodes
-  const sortNodes = useCallback((nodes: DeviceInfo[]): DeviceInfo[] => {
-    return [...nodes].sort((a, b) => {
-      let aVal: any, bVal: any;
-
-      switch (sortField) {
-        case 'longName':
-          aVal = a.user?.longName || `Node ${a.nodeNum}`;
-          bVal = b.user?.longName || `Node ${b.nodeNum}`;
-          break;
-        case 'shortName':
-          aVal = a.user?.shortName || '';
-          bVal = b.user?.shortName || '';
-          break;
-        case 'id':
-          aVal = a.user?.id || a.nodeNum;
-          bVal = b.user?.id || b.nodeNum;
-          break;
-        case 'lastHeard':
-          aVal = a.lastHeard || 0;
-          bVal = b.lastHeard || 0;
-          break;
-        case 'snr':
-          aVal = a.snr ?? -999;
-          bVal = b.snr ?? -999;
-          break;
-        case 'battery':
-          aVal = a.deviceMetrics?.batteryLevel ?? -1;
-          bVal = b.deviceMetrics?.batteryLevel ?? -1;
-          break;
-        case 'uptime':
-          // Never-reported uptime sorts to the bottom. Top-level uptimeSeconds is
-          // enriched by /api/nodes (#4814), with the device-metrics copy as fallback.
-          aVal = a.uptimeSeconds ?? a.deviceMetrics?.uptimeSeconds ?? -1;
-          bVal = b.uptimeSeconds ?? b.deviceMetrics?.uptimeSeconds ?? -1;
-          break;
-        case 'hwModel':
-          aVal = a.user?.hwModel ?? 0;
-          bVal = b.user?.hwModel ?? 0;
-          break;
-        case 'hops':
-          aVal = getEffectiveHops(a, nodeHopsCalculation, traceroutes, currentNodeNum);
-          bVal = getEffectiveHops(b, nodeHopsCalculation, traceroutes, currentNodeNum);
-          break;
-        default:
-          return 0;
-      }
-
-      // Compare values
-      let comparison = 0;
-      if (typeof aVal === 'string' && typeof bVal === 'string') {
-        comparison = aVal.localeCompare(bVal);
-      } else {
-        comparison = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
-      }
-
-      return sortDirection === 'asc' ? comparison : -comparison;
-    });
-  }, [sortField, sortDirection, nodeHopsCalculation, traceroutes, currentNodeNum]);
+  // Helper function to sort nodes. Keys are computed once per node rather
+  // than per comparison (see sortNodesByField) — the 'hops' key in
+  // traceroute mode scans and parses every traceroute.
+  const sortNodes = useCallback((nodes: DeviceInfo[]): DeviceInfo[] =>
+    sortNodesByField(nodes, sortField, sortDirection, node =>
+      getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum)),
+  [sortField, sortDirection, nodeHopsCalculation, traceroutes, currentNodeNum]);
 
   // The filtered node set: processedNodes (text filter already applied upstream)
   // → security/channel/incomplete/remote-admin filters. Shared by the flat
@@ -1676,10 +1535,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const filteredNodes = useMemo(() => {
     return processedNodes.filter(node => {
       if (securityFilter === 'flaggedOnly') {
-        if (!node.keyIsLowEntropy && !node.duplicateKeyDetected && !node.keySecurityIssueDetails) return false;
+        if (!isSecurityFlagged(node)) return false;
       }
       if (securityFilter === 'hideFlagged') {
-        if (node.keyIsLowEntropy || node.duplicateKeyDetected || node.keySecurityIssueDetails) return false;
+        if (isSecurityFlagged(node)) return false;
       }
       if (channelFilter !== 'all') {
         const nodeChannel = node.channel ?? 0;
@@ -1693,10 +1552,9 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Favorites-first ordering, applied within whatever set it's handed — the
   // whole filtered list (flat/ungrouped) or one role group's nodes (grouped).
-  const orderNodes = useCallback((nodesToOrder: DeviceInfo[]) => [
-    ...sortNodes(nodesToOrder.filter(node => node.isFavorite)),
-    ...sortNodes(nodesToOrder.filter(node => !node.isFavorite)),
-  ], [sortNodes]);
+  const orderNodes = useCallback((nodesToOrder: DeviceInfo[]) =>
+    orderFavoritesFirst(nodesToOrder, sortNodes),
+  [sortNodes]);
 
   // The displayed node set for the flat (ungrouped) list and for CSV/HTML
   // export, which always exports the flat order regardless of the grouping
@@ -1711,32 +1569,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // message a node this source has never heard.
   const [showImportContactModal, setShowImportContactModal] = useState(false);
 
-  const [collapsedRoleGroups, setCollapsedRoleGroups] = useState<Set<NodeTypeCategory>>(() => new Set());
-  const toggleRoleGroupCollapsed = useCallback((category: NodeTypeCategory) => {
-    setCollapsedRoleGroups(prev => {
-      const next = new Set(prev);
-      if (next.has(category)) next.delete(category); else next.add(category);
-      return next;
-    });
-  }, []);
-
-  const roleDistribution = useMemo(
-    () => (groupNodesByRole ? countNodesByCategory(filteredNodes) : null),
-    [groupNodesByRole, filteredNodes]
-  );
-
-  // The single flat array the virtualizer renders: either plain node rows
-  // (grouping off) or group headers interleaved with their rows (grouping
-  // on). A collapsed group's rows are left out of this array entirely — not
-  // merely hidden — so the virtualizer never mounts or measures them; this is
-  // what keeps grouping from undoing the perf win of virtualizing the node
-  // list with @tanstack/react-virtual.
-  const nodeListItems = useMemo<GroupedNodeListItem<DeviceInfo>[]>(() => {
-    if (groupNodesByRole) {
-      return buildGroupedNodeItems(filteredNodes, orderNodes, collapsedRoleGroups);
-    }
-    return displayedNodes.map(node => ({ type: 'node' as const, node }));
-  }, [groupNodesByRole, filteredNodes, orderNodes, collapsedRoleGroups, displayedNodes]);
+  const {
+    items: nodeListItems,
+    distribution: roleDistribution,
+    toggleCollapsed: toggleRoleGroupCollapsed,
+  } = useNodeRoleGrouping(filteredNodes, orderNodes, groupNodesByRole, displayedNodes);
 
   // Virtualize the node list: with thousands of nodes, rendering a full DOM
   // subtree per row was measured at 179k-217k elements and made scrolling
@@ -1758,33 +1595,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     },
   });
 
-  // Export format dropdown (Issue #3499) — a single icon button in the controls
-  // row reveals this menu, keeping the header compact for a rarely-used action.
-  const [showExportMenu, setShowExportMenu] = useState(false);
-  const exportMenuRef = useRef<HTMLDivElement>(null);
-
-  // Close the export menu on outside click or Escape.
-  useEffect(() => {
-    if (!showExportMenu) return;
-    const onPointerDown = (e: MouseEvent) => {
-      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
-        setShowExportMenu(false);
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setShowExportMenu(false);
-    };
-    document.addEventListener('mousedown', onPointerDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onPointerDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [showExportMenu]);
-
   // Export the currently-displayed nodes as CSV or HTML (Issue #3499).
   const handleExportNodes = useCallback((format: 'csv' | 'html') => {
-    setShowExportMenu(false);
     if (displayedNodes.length === 0) return;
     const rows = buildNodeExportRows(displayedNodes, {
       nodeHopsCalculation,
@@ -1793,14 +1605,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       currentNodeId,
       formatLastHeard: (s) => formatDateTime(new Date(s * 1000), timeFormat, dateFormat),
     });
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    if (format === 'csv') {
-      // Prepend a UTF-8 BOM so Excel detects the encoding correctly.
-      downloadTextFile(`meshmonitor-nodes-${stamp}.csv`, '\uFEFF' + nodesToCsv(rows), 'text/csv;charset=utf-8');
-    } else {
-      const html = nodesToHtml(rows, { generatedAt: new Date().toLocaleString() });
-      downloadTextFile(`meshmonitor-nodes-${stamp}.html`, html, 'text/html;charset=utf-8');
-    }
+    exportNodeList(format, MESHTASTIC_EXPORT_COLUMNS, rows, { filenamePrefix: 'meshmonitor-nodes' });
   }, [displayedNodes, nodeHopsCalculation, traceroutes, currentNodeNum, currentNodeId, timeFormat, dateFormat]);
 
   // Calculate nodes with position - uses effective position (respects position overrides, Issue #1526)
@@ -1900,7 +1705,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     [nodePositions, nodesWithPosition.map(n => `${n.nodeNum}-${n.user?.shortName ?? ''}`).join(',')],
   );
 
-  const showLabel = mapZoom >= 13;
+  // Map centre/zoom live in the map view store (not MapContext) so a pan
+  // re-renders nothing and a zoom re-renders this tab only when a threshold
+  // it draws against flips.
+  const showLabel = useMapViewSelector(s => s.zoom >= 13);
 
   // Node marker descriptors for the shared NodeMarkersLayer (#4047 Phase 4,
   // WP6) — the layer owns spiderfy wiring, the icon/position caches that used
@@ -1947,6 +1755,20 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // Phase 1 count bug) — and independent of the checkbox itself.
   const agedOutCountOnMap = [...processedWithPosition, ...agedOutWithPosition]
     .filter(node => isAgedOutAircraft(node) && passesMapFilters(node)).length;
+  // #4835: live packet traffic resolves each flight against the nodes this
+  // map draws, at their marker positions. Built only while the layer is on.
+  const [packetFlightsStats, setPacketFlightsStats] = useState<PacketFlightStats | null>(null);
+  const packetFlightNodesSig = showPacketFlights ? visibleMapNodes.map(n => n.nodeNum).join(',') : '';
+  const packetFlightNodes: FlightNodeEntry[] = useMemo(() => {
+    if (!showPacketFlights) return [];
+    const out: FlightNodeEntry[] = [];
+    for (const node of visibleMapNodes) {
+      const pos = nodePositions.get(node.nodeNum);
+      if (pos) out.push({ nodeNum: node.nodeNum, lat: pos[0], lng: pos[1] });
+    }
+    return out;
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- #4835 keyed on the drawn-node signature + nodePositions, like measurePoints
+  }, [showPacketFlights, packetFlightNodesSig, nodePositions]);
   // #4704: node features for the 3D surface — the same visible+positioned set
   // the 2D markers use, at the same (precision-offset) positions from
   // `nodePositions`. Computed unconditionally (no hooks); only consumed in 3D.
@@ -2006,14 +1828,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const nodeMarkers: NodeMarkerDescriptor[] = visibleMapNodes
     .map(node => {
       const markerKey = String(node.user?.id ?? node.nodeNum);
-      const roleNum = typeof node.user?.role === 'string'
-        ? parseInt(node.user.role, 10)
-        : (typeof node.user?.role === 'number' ? node.user.role : 0);
-      const isRouter = roleNum === 2;
-      // #4075: pass the role category so ROUTER_LATE (and REPEATER) get the
-      // repeater-tower glyph like ROUTER, matching MapAnalysis. isRouter alone
-      // is role===2 only, so ROUTER_LATE would fall through to the generic pin.
-      const roleCategory = getNodeTypeCategory(node);
+      // #6008: the shared helper decides infrastructure (ROUTER, ROUTER_LATE,
+      // CLIENT_BASE and the deprecated router roles), and the role category
+      // drives the glyph or corner badge in createNodeIcon, the same on every map.
+      const { isRouter, roleCategory } = markerRoleProps(node);
       const isSelected = selectedNodeId === node.user?.id;
       const isLocalNode = node.user?.id === currentNodeId;
       const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
@@ -2275,6 +2093,27 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         })
     : [];
 
+  // Estimated-position uncertainty circles — adapter over the shared
+  // `EstimatedPositionRadiiLayer` (#6260 WP5).
+  const estimatedRadii: EstimatedPositionRadius[] = showEstimatedPositions && showAccuracyRegions
+    ? nodesWithPosition
+        .filter(node => node.user?.id && nodesWithEstimatedPosition.has(node.user.id) && nodePassesTransportFilter(node, { showRfNodes, showUdpNodes, showMqttNodes }, transportCutoff) && (showIncompleteNodes || isNodeComplete(node)) && (!tracerouteNodeNums || tracerouteNodeNums.has(node.nodeNum)))
+        .map(node => {
+          // Real multilateration uncertainty radius (issue #3271); 500m base
+          // for legacy/missing data.
+          const uncertaintyKm = node.user?.id ? estimatedUncertainty[node.user.id] : undefined;
+          const radiusMeters = uncertaintyKm != null && uncertaintyKm > 0 ? uncertaintyKm * 1000 : 500;
+          const isLocalNode = node.user?.id === currentNodeId;
+          const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
+          return {
+            key: `estimated-${node.nodeNum}`,
+            center: [node.position!.latitude, node.position!.longitude] as [number, number],
+            radiusMeters,
+            color: getHopColor(hops, overlayColors.hopColors),
+          };
+        })
+    : [];
+
   // Neighbor-info links (#4047 Phase 7 WP11) — adapter over the shared
   // `NeighborLinksLayer` (WP2). Zoom-adaptive gate hoisted to the top of the
   // expression (was a per-item early return in the pre-migration inline map)
@@ -2284,7 +2123,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // for the arrow icons is now computed by the shared layer itself
   // (`bearingBetween`, verified to reproduce this file's former inline
   // `atan2` calculation exactly), so it's no longer computed here.
-  const neighborLinks: NeighborLinkDescriptor[] = (showNeighborInfo && neighborInfo.length > 0 && mapZoom >= neighborInfoMinZoom)
+  const zoomShowsNeighborLinks = useMapViewSelector(s => s.zoom >= neighborInfoMinZoom);
+  const neighborLinks: NeighborLinkDescriptor[] = (showNeighborInfo && neighborInfo.length > 0 && zoomShowsNeighborLinks)
     ? neighborInfo
         .map((ni, idx): NeighborLinkDescriptor | null => {
           // Anchor each endpoint to where the node's MARKER is rendered
@@ -2373,6 +2213,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Calculate center point of all nodes for initial map view
   // Use saved map center from localStorage if available, otherwise calculate from nodes
+  // Read (not subscribed): the result only seeds a map at mount — BaseMap and
+  // Map3DView treat center/zoom as mount-only — so this tab needn't re-render
+  // on every pan to keep it fresh; any later render reads the latest view.
+  const { center: mapCenter, zoom: mapZoom } = mapViewStore.get();
   const getMapCenter = (): { center: [number, number]; zoom: number } => {
     // 1. Saved localStorage position (logged-in user's last session)
     if (mapCenter) {
@@ -2424,7 +2268,6 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const mapDefaults = getMapCenter();
 
   // #4704: whether the 3D surface is actually on screen right now.
-  const effective3D = viewMode === '3d' && canUse3D;
   const unavailableIn3DTitle = effective3D ? 'Not available in 3D' : undefined;
 
   // Flight trails (#5364/#5365 Phase 3): one per aircraft this map draws a
@@ -2450,7 +2293,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
           <button
             className="collapse-nodes-btn"
             onClick={handleCollapseNodeList}
-            title={isNodeListCollapsed ? 'Expand node list' : 'Collapse node list'}
+            title={isNodeListCollapsed
+              ? t('nodes.expand_node_list', 'Expand node list')
+              : t('nodes.collapse_node_list', 'Collapse node list')}
+            aria-label={isNodeListCollapsed
+              ? t('nodes.expand_node_list', 'Expand node list')
+              : t('nodes.collapse_node_list', 'Collapse node list')}
+            aria-expanded={!isNodeListCollapsed}
           >
             <UiIcon name={isNodeListCollapsed ? 'forward' : 'back'} size={18} />
           </button>
@@ -2460,10 +2309,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               const filteredCount = processedNodes.filter(node => {
                 // Security filter
                 if (securityFilter === 'flaggedOnly') {
-                  if (!node.keyIsLowEntropy && !node.duplicateKeyDetected && !node.keySecurityIssueDetails) return false;
+                  if (!isSecurityFlagged(node)) return false;
                 }
                 if (securityFilter === 'hideFlagged') {
-                  if (node.keyIsLowEntropy || node.duplicateKeyDetected || node.keySecurityIssueDetails) return false;
+                  if (isSecurityFlagged(node)) return false;
                 }
                 // Incomplete nodes filter
                 if (!showIncompleteNodes && !isNodeComplete(node)) {
@@ -2553,85 +2402,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   <UiIcon name="plus" />
                 </button>
               )}
-              <select
+              <NodeSortControls
                 value={sortField}
-                onChange={(e) => setSortField(e.target.value as any)}
-                className="sort-dropdown"
-                title={t('nodes.sort_by')}
-              >
-                <option value="longName">{t('nodes.sort_name')}</option>
-                <option value="shortName">{t('nodes.sort_short_name')}</option>
-                <option value="id">{t('nodes.sort_id')}</option>
-                <option value="lastHeard">{t('nodes.sort_updated')}</option>
-                <option value="uptime">{t('nodes.sort_uptime')}</option>
-                <option value="snr">{t('nodes.sort_signal')}</option>
-                <option value="battery">{t('nodes.sort_charge')}</option>
-                <option value="hwModel">{t('nodes.sort_hardware')}</option>
-                <option value="hops">{t('nodes.sort_hops')}</option>
-              </select>
-              <button
-                className="sort-direction-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  e.nativeEvent.stopImmediatePropagation();
-                  handleToggleSortDirection();
-                }}
-                onMouseDown={(e) => {
-                  e.stopPropagation();
-                  e.nativeEvent.stopImmediatePropagation();
-                }}
-                title={sortDirection === 'asc' ? t('nodes.ascending') : t('nodes.descending')}
-              >
-                <UiIcon name={sortDirection === 'asc' ? 'sortAscending' : 'sortDescending'} />
-              </button>
-              <div className="export-dropdown" ref={exportMenuRef}>
-                <button
-                  className="sort-direction-btn export-trigger-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    e.nativeEvent.stopImmediatePropagation();
-                    setShowExportMenu((v) => !v);
-                  }}
-                  onMouseDown={(e) => {
-                    e.stopPropagation();
-                    e.nativeEvent.stopImmediatePropagation();
-                  }}
-                  disabled={displayedNodes.length === 0}
-                  title={t('nodes.export', 'Export node list')}
-                  aria-haspopup="menu"
-                  aria-expanded={showExportMenu}
-                >
-                  <UiIcon name="download" />
-                </button>
-                {showExportMenu && (
-                  <div className="export-menu" role="menu">
-                    <button
-                      className="export-menu-item"
-                      role="menuitem"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        e.nativeEvent.stopImmediatePropagation();
-                        handleExportNodes('csv');
-                      }}
-                      title={t('nodes.export_csv', 'Export node list as CSV')}
-                    >
-                      CSV
-                    </button>
-                    <button
-                      className="export-menu-item"
-                      role="menuitem"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        e.nativeEvent.stopImmediatePropagation();
-                        handleExportNodes('html');
-                      }}
-                      title={t('nodes.export_html', 'Export node list as HTML')}
-                    >
-                      HTML
-                    </button>
-                  </div>
-                )}
-              </div>
+                direction={sortDirection}
+                options={MESHTASTIC_SORT_OPTIONS.map(o => ({ value: o.value, label: t(o.labelKey) }))}
+                onChange={setSortField}
+                onToggleDirection={handleToggleSortDirection}
+                bare
+              />
+              <ExportMenuButton disabled={displayedNodes.length === 0} onExport={handleExportNodes} />
             </div>
           </div>
           )}
@@ -2639,7 +2418,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         {!isNodeListCollapsed && (
         <>
         {groupNodesByRole && roleDistribution && roleDistribution.length > 0 && (
-          <RoleDistributionSummary distribution={roleDistribution} t={t} />
+          <RoleDistributionSummary distribution={roleDistribution} />
         )}
         {showImportContactModal && currentSourceId && (
           <ImportContactUrlModal
@@ -2675,15 +2454,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 if (!item) return null;
 
                 if (item.type === 'header') {
-                  const meta = NODE_TYPE_CATEGORY_META[item.category];
-                  const roleLabel = t(meta.labelKey, meta.label);
-                  const collapsed = item.collapsed;
                   return (
-                    <div
+                    <RoleGroupHeader
                       key={`group:${item.category}`}
                       data-index={virtualRow.index}
                       ref={nodesRowVirtualizer.measureElement}
-                      className={roleGroupingStyles.groupHeader}
+                      category={item.category}
+                      count={item.count}
+                      collapsed={item.collapsed}
+                      onToggle={toggleRoleGroupCollapsed}
                       style={{
                         position: 'absolute',
                         top: 0,
@@ -2691,27 +2470,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                         width: '100%',
                         transform: `translateY(${virtualRow.start}px)`,
                       }}
-                      role="button"
-                      tabIndex={0}
-                      aria-expanded={!collapsed}
-                      onClick={() => toggleRoleGroupCollapsed(item.category)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          toggleRoleGroupCollapsed(item.category);
-                        }
-                      }}
-                      title={collapsed
-                        ? t('nodes.expand_role_group', 'Expand {{role}} group', { role: roleLabel })
-                        : t('nodes.collapse_role_group', 'Collapse {{role}} group', { role: roleLabel })}
-                    >
-                      {/* Collapsed = right-pointing chevron ("expand this"),
-                          expanded = down chevron ("collapse this") — the more
-                          common disclosure-triangle convention. */}
-                      <UiIcon name={collapsed ? 'chevronRight' : 'chevronDown'} size={14} />
-                      <span className={roleGroupingStyles.groupName}>{roleLabel}</span>
-                      <span className={roleGroupingStyles.groupCount}>{item.count}</span>
-                    </div>
+                    />
                   );
                 }
 
@@ -2927,41 +2686,23 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
                   <div className="node-details">
                     <div className="node-stats">
-                      {node.hopsAway === 0 && node.snr != null && (
-                        <span className="stat" title={t('nodes.snr')}>
-                          <UiIcon name="wifi" size={14} /> {node.snr.toFixed(1)}dB
-                        </span>
-                      )}
-                      {node.hopsAway === 0 && node.rssi != null && (
-                        <span className="stat" title={t('nodes.rssi')}>
-                          <UiIcon name="radioSignal" size={14} /> {node.rssi}dBm
-                        </span>
-                      )}
-                      {node.deviceMetrics?.batteryLevel !== undefined && node.deviceMetrics.batteryLevel !== null && (
-                        <span className="stat" title={node.deviceMetrics.batteryLevel === 101 ? t('nodes.plugged_in') : t('nodes.battery_level')}>
-                          <UiIcon name={node.deviceMetrics.batteryLevel === 101 ? 'batteryCharging' : 'battery'} size={14} /> {node.deviceMetrics.batteryLevel === 101 ? t('nodes.plugged_in') : `${node.deviceMetrics.batteryLevel}%`}
-                        </span>
-                      )}
-                      {node.deviceMetrics?.voltage !== undefined && node.deviceMetrics.voltage !== null && (
-                        <span className="stat" title={t('nodes.voltage')}>
-                          <UiIcon name="zap" size={14} /> {node.deviceMetrics.voltage.toFixed(2)}V
-                        </span>
-                      )}
-                      {(node.hopsAway != null || node.lastMessageHops != null) && (() => {
-                        const effectiveHops = getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
-                        return effectiveHops < 999 ? (
-                          <span className="stat" title={t('nodes.hops_away')}>
-                            <UiIcon name="link" size={14} /> {effectiveHops} {t('nodes.hop', { count: effectiveHops })}
-                            {node.channel != null && node.channel !== 0 && ` (ch:${node.channel})`}
-                          </span>
-                        ) : null;
-                      })()}
-                      <DistanceDisplay
-                        homeNode={homeNode}
-                        targetNode={node}
-                        distanceUnit={distanceUnit}
-                        t={t}
-                      />
+                      <NodeStatChips
+                        snr={node.hopsAway === 0 ? node.snr : undefined}
+                        rssi={node.hopsAway === 0 ? node.rssi : undefined}
+                        batteryLevel={node.deviceMetrics?.batteryLevel}
+                        voltage={node.deviceMetrics?.voltage}
+                        hops={(node.hopsAway != null || node.lastMessageHops != null)
+                          ? getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum)
+                          : undefined}
+                        hopsSuffix={node.channel != null && node.channel !== 0 ? ` (ch:${node.channel})` : undefined}
+                      >
+                        <DistanceDisplay
+                          homeNode={homeNode}
+                          targetNode={node}
+                          distanceUnit={distanceUnit}
+                          t={t}
+                        />
+                      </NodeStatChips>
                     </div>
 
                     <div className="node-time">
@@ -3126,6 +2867,24 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       <span>{t('map.traceroute_confirmed.toggle', 'Traceroute-Confirmed Links')}</span>
                     </label>
                   )}
+                  {/* #4835: live packet traffic (dots flying to the receiver). */}
+                  <PacketFlightsControl
+                    checked={showPacketFlights}
+                    onCheckedChange={setShowPacketFlights}
+                    rate={packetFlightRate}
+                    onRateChange={setPacketFlightRate}
+                    stats={packetFlightsStats}
+                    disabledTitle={unavailableIn3DTitle}
+                  />
+                  {/* #5734: tropospheric ducting overlay. Renders nothing
+                      unless an admin turned the overlay on. */}
+                  <DuctingControl
+                    checked={showDucting}
+                    onCheckedChange={setShowDucting}
+                    hoursAhead={ductingHoursAhead}
+                    onHoursAheadChange={setDuctingHoursAhead}
+                    disabledTitle={unavailableIn3DTitle}
+                  />
                   <label className="map-control-item">
                     <input
                       type="checkbox"
@@ -3185,6 +2944,15 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       onChange={(e) => setShowWaypoints(e.target.checked)}
                     />
                     <span>{t('map.showWaypoints', 'Show Waypoints')}</span>
+                  </label>
+                  <label className="map-control-item" title={unavailableIn3DTitle}>
+                    <input
+                      type="checkbox"
+                      checked={showLocalMarkers}
+                      disabled={effective3D}
+                      onChange={(e) => setShowLocalMarkers(e.target.checked)}
+                    />
+                    <span>{t('map.showLocalMarkers', 'Show Local Markers')}</span>
                   </label>
                   <label className="map-control-item" title={unavailableIn3DTitle}>
                     <input
@@ -3404,12 +3172,24 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       <UiIcon name="plus" /> Waypoint
                     </button>
                   )}
+                  {canWriteWaypoints && shouldShowData() && currentSourceId && (
+                    <button
+                      type="button"
+                      className="waypoint-create-button"
+                      onClick={() => { setPlacingWaypoint(false); setPlacingMarker(true); if (!showLocalMarkers) setShowLocalMarkers(true); }}
+                      disabled={placingMarker || effective3D}
+                      title={t('localMarkers.addTitle', 'Place a local marker by clicking on the map. It is never sent to the mesh.')}
+                    >
+                      <UiIcon name="plus" /> {t('localMarkers.add', 'Local marker')}
+                    </button>
+                  )}
                 </>
               </div>
               {!effective3D && showLegend && (
                 <MapLegend
                   positionHistory={positionHistoryLegendData}
                   unmappedCount={unmappedCount}
+                  showRoleMarkers
                   embedded
                 />
               )}
@@ -3490,7 +3270,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               />
               <TracerouteBoundsController bounds={tracerouteBounds} />
               <FitAllNodesController request={fitAllRequest} positions={fitAllPositions} />
-              <ZoomHandler onZoomChange={setMapZoom} />
+              <ZoomHandler onZoomChange={mapViewStore.setZoom} />
               <MapPositionHandler />
               <MapInstanceBridge onMap={setPlaybackMap} />
               <WaypointMapEventBridge
@@ -3499,6 +3279,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 onPick={(lat, lon) => startCreateAtCoords(lat, lon)}
               />
               {showWaypoints && <DashboardWaypoints sourceId={currentSourceId ?? null} actions={waypointActions} />}
+              <LocalMarkerPlacementBridge placing={placingMarker} onPick={markerAuthoring.pickSpot} />
+              {showLocalMarkers && <LocalMarkers sourceId={currentSourceId ?? null} actions={markerAuthoring.actions} />}
               {showAtakContacts && <DashboardAtakContacts sourceId={currentSourceId ?? null} />}
               <DefaultCenterController
                 lat={defaultMapCenterLat}
@@ -3527,45 +3309,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 <NodeMarkersLayer markers={nodeMarkers} onOmsClick={onOmsClick} />
               )}
 
-              {/* Draw uncertainty circles for estimated positions. The "Show
-                  Accuracy" map toggle now governs the radius (issue #3271
+              {/* Uncertainty circles for estimated positions. The "Show
+                  Accuracy" map toggle governs the radius (issue #3271
                   follow-up) — turning it off declutters the circles while the
                   estimated-node markers stay under "Show Estimated Positions".
-                  Both are required so a circle never renders without its marker.
-                  Single-consumer (#4047 Phase 7 spec §5.2) — no other map draws
-                  estimated-position uncertainty radii, so this stays inline
-                  rather than becoming a speculative one-consumer abstraction. */}
-              {showEstimatedPositions && showAccuracyRegions && nodesWithPosition
-                .filter(node => node.user?.id && nodesWithEstimatedPosition.has(node.user.id) && nodePassesTransportFilter(node, { showRfNodes, showUdpNodes, showMqttNodes }, transportCutoff) && (showIncompleteNodes || isNodeComplete(node)) && (!tracerouteNodeNums || tracerouteNodeNums.has(node.nodeNum)))
-                .map(node => {
-                  // Use the real multilateration uncertainty radius (issue #3271) when
-                  // available; fall back to a 500m base for legacy/missing data.
-                  const uncertaintyKm = node.user?.id ? estimatedUncertainty[node.user.id] : undefined;
-                  const radiusMeters = uncertaintyKm != null && uncertaintyKm > 0
-                    ? uncertaintyKm * 1000
-                    : 500;
-
-                  // Get hop color for the circle (same as marker)
-                  const isLocalNode = node.user?.id === currentNodeId;
-                  const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
-                  const color = getHopColor(hops, overlayColors.hopColors);
-
-                  return (
-                    <Circle
-                      key={`estimated-${node.nodeNum}`}
-                      center={[node.position!.latitude, node.position!.longitude]}
-                      radius={radiusMeters}
-                      pathOptions={{
-                        color: color,
-                        fillColor: color,
-                        fillOpacity: 0.1,
-                        opacity: 0.4,
-                        weight: 2,
-                        dashArray: '5, 5'
-                      }}
-                    />
-                  );
-                })}
+                  Both are required so a circle never renders without its
+                  marker. Shared with the MeshCore map (#6260 WP5). */}
+              <EstimatedPositionRadiiLayer radii={estimatedRadii} />
 
               {/* Position accuracy regions — shared layer (#4047 Phase 7 WP11),
                   hop-colored `pathOptions` computed in the `accuracyRegions`
@@ -3610,6 +3360,24 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   sourceIds={[currentSourceId]}
                   lookbackHours={effectiveMapMaxAge}
                 />
+              )}
+
+              {/* Live packet traffic (#4835): mounted only while on, so the
+                  socket subscribes on mount and unsubscribes on unmount. */}
+              {showPacketFlights && currentSourceId && (
+                <PacketFlightsLayer
+                  sourceIds={[currentSourceId]}
+                  nodes={packetFlightNodes}
+                  maxPerSecond={packetFlightRate}
+                  onStatsChange={setPacketFlightsStats}
+                />
+              )}
+
+              {/* Tropospheric ducting overlay (#5734): one atmosphere for
+                  every source. Mounted only while on; it fetches only while
+                  the admin switch is on. */}
+              {showDucting && (
+                <DuctingLayer hoursAhead={ductingHoursAhead} />
               )}
 
               {/* Note: Selected node traceroute with separate forward and back paths */}
@@ -3683,6 +3451,8 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
           </button>
         </div>
       )}
+
+      <LocalMarkerAuthoringUi authoring={markerAuthoring} />
 
       <WaypointEditorModal
         isOpen={waypointEditorOpen}

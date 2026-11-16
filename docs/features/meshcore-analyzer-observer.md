@@ -26,11 +26,11 @@ Because it only ever publishes outbound to a broker over the network, the Analyz
 
 To start contributing:
 
-1. Open the Dashboard, edit your MeshCore source, and expand the **Analyzer Observer** fieldset.
-2. Check the enable box, and set the **Region (IATA)** code for your area (e.g. `MCO`).
-3. Click the **MeshMapper** preset button — it fills in a broker row with the right URL and token audience, no typing required.
+1. Open your MeshCore source's **MeshCore → Configuration** page and find the **Analyzer Observer** section.
+2. Under **Status**, check the enable box. Under **Brokers**, set the **Observer location (IATA)** code for where you publish from (e.g. `MCO`).
+3. Click the **MeshMapper** preset chip under **Add a broker** — it adds a broker with the right URL and token audience, no typing required.
 4. Optionally, also click **LetsMesh US** or **LetsMesh EU** for redundancy. MeshMapper ingests from both LetsMesh regions too and dedupes packets it sees from more than one broker, so publishing to both gives you a fallback path for free.
-5. Save. Then, on the source's **MeshCore → Configuration** page, fetch or paste the signing key so the presets (all signed-token mode) can authenticate — see [Step 2](#step-2-provide-broker-credentials).
+5. Click **Save** in the save bar. Then, under **Credentials** in the same section, fetch or paste the signing key so the presets (all signed-token mode) can authenticate — see [Step 2](#step-2-provide-broker-credentials).
 
 Once connected, your node should appear on meshmapper.net within a minute or two.
 
@@ -38,24 +38,26 @@ Contributing to MeshMapper is **passive**, like every use of this feature: MeshM
 
 ## Requirements
 
-- A **Companion** source (not a Repeater, not a Room Server) — only the Companion backend reports the packets this feature relays.
+- A **Companion** source (not a Repeater, not a Room Server). The Observer publishes only from the Companion backend, and a repeater cannot export the signing key.
 - The source connected at least once, so MeshMonitor knows the node's public key (and, in signed-token mode, can fetch the signing key from the device — or you can paste one by hand, see [Step 2](#step-2-provide-broker-credentials)).
 - A fixed `SESSION_SECRET`. MeshMonitor encrypts the stored signing key **and** every stored broker password with keys derived from `SESSION_SECRET`. If yours is auto-generated, credential storage is disabled and the UI tells you so. See [Credential store](/features/meshcore#credential-store) for the same requirement on the remote-admin password store, and set `SESSION_SECRET=$(openssl rand -hex 32)` in your environment to enable it.
 - For each broker: a **broker URL**, plus either a **token audience** (signed-token brokers) or a **username and password** (static-credential brokers). A shared **region code** covers every broker on the source.
 
 ## Step 1 — Enable and configure
 
-Open the Dashboard, edit the MeshCore source, and expand the **Analyzer Observer** fieldset. Check the enable box, set the region code, then build your broker list — up to **8 brokers** per source.
+Open the source's **MeshCore → Configuration** page and find the **Analyzer Observer** section. It has three groups: **Status** (the enable box and live publish status), **Brokers** (the region code and the broker list) and **Credentials** (the signing key and each broker's login). Check the enable box, set the region code, then build your broker list — up to **8 brokers** per source. Changing the broker list needs both `configuration:write` and `sources:write` on the source, because it is saved into the source's settings.
+
+Edits to the enable box, region and broker list are a draft: the save bar appears, **Save** stores them in one go and **Dismiss** puts them back. Credentials are not part of that draft — they save on their own buttons. (Until 4.16 this lived in the Dashboard source form; that form now only links here.)
 
 ### Region
 
 | Field | Example | Notes |
 |---|---|---|
-| Region (IATA) | `MCO` | A 3-letter IATA code for your region, or `test` for a local broker. Case-insensitive — MeshMonitor uppercases it on save. This is shared by every broker on the source — it's the region segment of the MQTT topic, not a per-broker setting. |
+| Observer location (IATA) | `MCO` | A 3-letter IATA airport code for where this observer publishes from, or `test` for a local test broker. It is the location part of the MQTT topic, not a MeshCore RF region or repeater forwarding scope. Case-insensitive — MeshMonitor uppercases it on save. This is shared by every broker on the source — it's the region segment of the MQTT topic, not a per-broker setting. |
 
 ### Brokers
 
-Each broker gets its own row, added either from a preset button or blank (**Custom…**):
+Each broker gets its own card, added either from a preset chip or blank (**Custom…**):
 
 | Field | Example | Notes |
 |---|---|---|
@@ -64,7 +66,7 @@ Each broker gets its own row, added either from a preset button or blank (**Cust
 | Broker authentication | Signed token | How MeshMonitor authenticates to *this* broker — see [Which authentication mode?](#which-authentication-mode) below. Each broker picks its own; a source can mix signed-token and username/password rows. |
 | Token audience | `mqtt.meshmapper.net` | **Signed-token mode only.** Must match this broker's expected audience exactly, or it rejects the login. Hidden in username/password mode. |
 
-Remove a row with the trash icon next to it. There's no per-broker enable/disable toggle — removing the row is how you turn one broker off without touching the others.
+Remove a broker with the trash icon on its card; MeshMonitor asks before it removes one, and the removal takes effect when you save. There's no per-broker enable/disable toggle — removing the broker is how you turn one off without touching the others.
 
 ### One-click presets
 
@@ -82,12 +84,12 @@ The two **meshcore.ca** presets are the primary and backup brokers of [MeshCore 
 
 The **RF Lab** preset is the broker behind [RF Lab](https://rflab.io/)'s analyzer; its values come from RF Lab's [observer setup guide](https://rflab.io/guides/observer-firmware.html).
 
-A preset button just appends a pre-filled row — every field on it stays editable afterward, including switching it to username/password mode. Clicking the same preset twice adds a duplicate URL, which is rejected on save; remove the extra row instead.
+A preset chip just appends a pre-filled broker — every field on it stays editable afterward, including switching it to username/password mode. Clicking the same preset twice adds a duplicate URL, which is rejected on save; remove the extra row instead.
 
-Check the enable box, fill in the fields, and save. Saving an Analyzer Observer change hot-swaps the publisher — it starts, stops, or reconfigures every broker without bouncing the radio link, so your MeshCore connection stays up the whole time.
+Check the enable box, fill in the fields, and save. Saving an Analyzer Observer change hot-swaps the publisher once — it starts, stops, or reconfigures every broker without bouncing the radio link, so your MeshCore connection stays up the whole time.
 
 ::: tip Upgrading from a single-broker config
-If your source still has the pre-4.16 single-broker layout, opening the fieldset shows exactly one broker row, pre-filled from your existing URL and audience. Nothing on disk changes until you save — the first save after upgrading rewrites the stored config into the broker-list format automatically. Open the modal and cancel, and nothing changes.
+If your source still has the pre-4.16 single-broker layout, the section shows exactly one broker, pre-filled from your existing URL and audience. Nothing on disk changes until you save the broker list — that save rewrites the stored config into the broker-list format automatically. Saving the Dashboard source form leaves the stored Observer settings exactly as they are.
 :::
 
 ## Multiple brokers
@@ -118,7 +120,7 @@ Either way, the topics stay the same per broker: `meshcore/{REGION}/{YOUR_NODE_P
 Auth mode is set per broker row, so a source can publish to a signed-token broker (like MeshMapper) and a username/password broker at the same time.
 
 ::: warning Companion only
-Every mode is Companion-only. The repeater/serial backend never reports the over-the-air packets this feature relays, so an observer on a Repeater would sit idle. The enable checkbox is disabled with an explanation when the source's device type is Repeater.
+Every mode is Companion-only. The Observer publishes only from the Companion backend. A Repeater source on a packet-logging firmware build fills its own Packet Monitor, but MeshMonitor does not publish those packets to a broker. The enable checkbox is disabled with an explanation when the source's device type is Repeater.
 :::
 
 ## Step 2 — Provide broker credentials
@@ -140,7 +142,9 @@ The signing key is the same key that proves your node's identity on the mesh. Tr
 
 ### Username / password — the broker login
 
-Each username/password broker has its own separate credential, matched to it by its URL. Enter the **broker username** and **broker password** your region's operator publishes for that specific broker, then save.
+Each username/password broker has its own separate credential, matched to it by its URL. Enter the **broker username** and **broker password** your region's operator publishes for that specific broker, then save. Do this on the **MeshCore → Configuration** page, under **Credentials**, where each username/password broker's card shows whether a login is stored for it and has its own **Set** and **Clear** buttons. **Clear** removes that one broker's login and names the broker before it does; other brokers keep theirs.
+
+Installs that stored a single shared login before per-broker credentials may still hold it. Only a broker whose URL matches the old single broker URL uses it. While it exists, the Configuration page shows a note with a **Remove old shared credential** button, which removes that shared login and nothing else.
 
 Each password gets the same treatment as the signing key: it is encrypted at rest with a key derived from `SESSION_SECRET`, it is never written into the source's config, and **no API ever returns it**. Only the username comes back (it isn't a secret — a non-TLS broker sees it in the clear anyway), so the page can show which account is configured for that broker. A password sent inside a source's config block is rejected outright.
 
@@ -150,7 +154,7 @@ Where the secret lives, precisely:
 - In the process: decrypted only when the publisher builds that broker's MQTT CONNECT packet. No route reads it.
 - Who can write it: anyone with `configuration:write` **on that source**. Who can read it back: nobody, including admins.
 
-**Save order matters.** A broker's credential can only be stored once that broker exists in the source's saved config — on a brand-new source, save the source first (which creates the broker), then come back to this page to set its password. The Dashboard fieldset's "Configuration" shortcut button takes you straight there.
+**Save order matters.** A broker's credential can only be stored once that broker exists in the source's saved config — save the broker list first (which creates the broker), then set its password under **Credentials**. The Dashboard source form's **Configuration** button takes you straight to this page.
 
 ::: warning Most of these brokers are plaintext MQTT
 A static-credential broker on `mqtt://…:1883` has no TLS, so your username and password cross the network in the clear. Use a password you don't use anywhere else — with these shared regional logins (`meshcore`/`meshcore`), assume it's public.
@@ -158,7 +162,7 @@ A static-credential broker on `mqtt://…:1883` has no TLS, so your username and
 
 ### If SESSION_SECRET changes
 
-If `SESSION_SECRET` changes after a credential is stored, that credential can no longer be decrypted. The Configuration page shows a **rotated** warning for the affected broker in that case — re-import/re-paste the signing key, or re-enter that broker's password, to recover. In signed-token mode the public key stays correct and visible throughout, for every broker.
+If `SESSION_SECRET` changes after a credential is stored, that credential can no longer be decrypted. The Configuration page shows a **rotated** warning for the affected broker in that case — re-import/re-paste the signing key, or re-enter that broker's password, to recover. **Remove unreadable credentials** deletes broker logins that can no longer be decrypted, which you need when no new password can be stored. In signed-token mode the public key stays correct and visible throughout, for every broker.
 
 ### Backups
 
@@ -196,6 +200,7 @@ The rows below now apply **per broker** — a source with several brokers can sh
 | "Key rotated" / "rotated" warning | `SESSION_SECRET` changed since the credential was stored | Re-import the key (fixes all signed-token brokers), or re-enter the affected broker's password |
 | One broker not connected, error mentions the token | That broker's `tokenAudience` doesn't match its broker's expected value | Match it exactly — check with that broker's operator |
 | "Broker rejected the observer username/password" | Wrong static credentials for that broker, or it actually wants a signed token | Re-check the login with that broker's operator; if they publish a token audience instead, switch that row's mode back |
+| One broker stays disconnected after a rejected login | That broker rejected the login five times in a row, so MeshMonitor stopped retrying it. The other brokers keep publishing | Fix that broker's audience, key or password and save; saving starts it again |
 | One broker not connected, no error shown | That broker is unreachable | Check that row's URL, scheme, and port |
 | "The node has not reported its public key yet" | A username/password broker on a source that hasn't finished connecting | Connect the source — the topic path needs the node's public key |
 | Dropped-packet count climbing on one broker | That broker's socket was down when packets arrived | Expected during a broker outage — nothing is lost on the mesh, only unpublished to that broker |

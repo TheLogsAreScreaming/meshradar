@@ -10,10 +10,15 @@ import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
 import { ScopeSelectField, type ScopeMode } from './ScopeSelectField';
 import { MESHCORE_AUTOMATION_TOKENS } from './meshcoreAutomationTokens';
-import { MeshCoreReceiveOnlyNote } from './MeshCoreReceiveOnlyNote';
+import { ConfigSection } from '../shared/config/ConfigSection';
+import { ConfigGroup } from '../shared/config/ConfigGroup';
+import { TokenInsertButtons } from '../shared/automation/TokenInsertButtons';
+import { meshCoreReceiveOnlyText } from './meshCoreReceiveOnlyText';
 import { isTxDisabledBody } from '../../utils/txDisabled';
+import { SplitLongMessagesField } from '../shared/automation/SplitLongMessagesField';
 import { MeshCoreAdvertModeField } from './MeshCoreAdvertModeField';
 import { DEFAULT_MESHCORE_ADVERT_MODE, isMeshCoreAdvertMode, type MeshCoreAdvertMode } from '../../types/meshcoreAdvert';
+import { insertTokenAtSelection } from '../../utils/tokenInsert';
 
 interface MeshCoreAutoAnnounceSectionProps {
   baseUrl: string;
@@ -29,6 +34,7 @@ interface AutoAnnounceSettings {
   intervalHours: number;
   message: string;
   channelIndexes: number[];
+  splitLongMessages: boolean;
   announceOnStart: boolean;
   useSchedule: boolean;
   schedule: string;
@@ -54,6 +60,7 @@ const DEFAULTS: AutoAnnounceSettings = {
   intervalHours: 6,
   message: DEFAULT_MESSAGE,
   channelIndexes: [0],
+  splitLongMessages: false,
   announceOnStart: false,
   useSchedule: false,
   schedule: DEFAULT_SCHEDULE,
@@ -106,6 +113,7 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
           intervalHours: typeof json.data.intervalHours === 'number' ? json.data.intervalHours : 6,
           message: json.data.message || DEFAULT_MESSAGE,
           channelIndexes: Array.isArray(json.data.channelIndexes) ? json.data.channelIndexes : [0],
+          splitLongMessages: !!json.data.splitLongMessages,
           announceOnStart: !!json.data.announceOnStart,
           useSchedule: !!json.data.useSchedule,
           schedule: json.data.schedule || DEFAULT_SCHEDULE,
@@ -182,6 +190,7 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
       settings.intervalHours !== initial.intervalHours ||
       settings.message !== initial.message ||
       !arraysEqual(settings.channelIndexes, initial.channelIndexes) ||
+      settings.splitLongMessages !== initial.splitLongMessages ||
       settings.announceOnStart !== initial.announceOnStart ||
       settings.useSchedule !== initial.useSchedule ||
       settings.schedule !== initial.schedule ||
@@ -220,6 +229,7 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
             intervalHours: settings.intervalHours,
             message: settings.message,
             channelIndexes: settings.channelIndexes,
+            splitLongMessages: settings.splitLongMessages,
             announceOnStart: settings.announceOnStart,
             useSchedule: settings.useSchedule,
             schedule: settings.schedule,
@@ -273,19 +283,17 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
 
   const insertToken = (token: string) => {
     const ta = textareaRef.current;
-    if (!ta) {
-      update('message', settings.message + token);
-      return;
-    }
-    const start = ta.selectionStart;
-    const end = ta.selectionEnd;
-    const next = settings.message.substring(0, start) + token + settings.message.substring(end);
-    update('message', next);
+    const { text, caret } = insertTokenAtSelection(
+      settings.message,
+      token,
+      ta ? { start: ta.selectionStart, end: ta.selectionEnd } : null,
+    );
+    update('message', text);
+    if (!ta) return;
     // Restore caret after the inserted token on next paint
     requestAnimationFrame(() => {
       ta.focus();
-      const pos = start + token.length;
-      ta.setSelectionRange(pos, pos);
+      ta.setSelectionRange(caret, caret);
     });
   };
 
@@ -335,50 +343,35 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
   return (
     <NumberInputScope scope={numberScope}>
     <>
-      <div className="automation-section-header" style={{
-        display: 'flex',
-        alignItems: 'center',
-        marginBottom: '1.5rem',
-        marginTop: '2rem',
-        padding: '1rem 1.25rem',
-        background: 'var(--color-surface-hover)',
-        border: '1px solid var(--color-surface-active)',
-        borderRadius: '8px',
-      }}>
-        <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <input
-            type="checkbox"
-            checked={settings.enabled}
-            onChange={(e) => update('enabled', e.target.checked)}
-            disabled={!canWrite}
-            style={{ width: 'auto', margin: 0, cursor: canWrite ? 'pointer' : 'not-allowed' }}
-          />
-          {t('meshcore.automation.announce.title', 'Auto-Announce')}
-        </h2>
-        <button
-          onClick={sendNow}
-          disabled={sendNowDisabled || receiveOnly}
-          title={receiveOnly ? t('meshcore.receive_only.control_tooltip', 'Receive-only mode is on for this MeshCore source. Turn it off in MeshCore Settings to use this.') : undefined}
-          className="meshcore-btn meshcore-btn-primary meshcore-send-now"
-        >
-          {isSendingNow
-            ? t('meshcore.automation.announce.sending', 'Sending…')
-            : t('meshcore.automation.announce.send_now', 'Send Now')}
-        </button>
-      </div>
-
-      <MeshCoreReceiveOnlyNote receiveOnly={receiveOnly} />
-
-      <div className="settings-section" style={{ opacity: settings.enabled ? 1 : 0.5, transition: 'opacity 0.2s' }}>
-        <p style={{ marginBottom: '1rem', color: '#666', lineHeight: 1.5, marginLeft: '1.75rem' }}>
-          {t(
-            'meshcore.automation.announce.description',
-            'Periodically send a status message to one or more MeshCore channels. Supports interval-based or cron scheduling and an optional advert burst.',
-          )}
-        </p>
-
+      <ConfigSection
+        title={t('meshcore.automation.announce.title', 'Auto-Announce')}
+        enabled={settings.enabled}
+        onEnabledChange={(v) => update('enabled', v)}
+        enableLabel={t('meshcore.automation.announce.title', 'Auto-Announce')}
+        docsUrl="https://meshmonitor.org/features/meshcore#auto-announce"
+        canWrite={canWrite}
+        receiveOnly={receiveOnly}
+        receiveOnlyNote={meshCoreReceiveOnlyText(t)}
+        description={t(
+          'meshcore.automation.announce.description',
+          'Periodically send a status message to one or more MeshCore channels. Supports interval-based or cron scheduling and an optional advert burst.',
+        )}
+        headerActions={
+          <button
+            onClick={sendNow}
+            disabled={sendNowDisabled || receiveOnly}
+            title={receiveOnly ? t('meshcore.receive_only.control_tooltip', 'Receive-only mode is on for this MeshCore source. Turn it off in MeshCore Settings to use this.') : undefined}
+            className="meshcore-btn meshcore-btn-primary meshcore-send-now"
+          >
+            {isSendingNow
+              ? t('meshcore.automation.announce.sending', 'Sending…')
+              : t('meshcore.automation.announce.send_now', 'Send Now')}
+          </button>
+        }
+      >
+        <ConfigGroup name="when" title={t('automation.group.when', 'When')}>
         {/* On-start announcement */}
-        <div className="setting-item" style={{ marginTop: '1rem' }}>
+        <div className="setting-item">
           <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
             <input
               type="checkbox"
@@ -400,7 +393,7 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
         </div>
 
         {/* Schedule type toggle */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
             <input
               type="checkbox"
@@ -410,7 +403,7 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
               style={{ width: 'auto', margin: 0 }}
             />
             <span style={{ fontWeight: 'bold' }}>
-              {t('meshcore.automation.announce.use_schedule', 'Use cron schedule')}
+              {t('automation.auto_announce.scheduled_sends', 'Use Cron Schedule')}
             </span>
           </label>
           <div style={{ marginTop: '0.25rem', marginLeft: '1.75rem', fontSize: '0.85rem', color: 'var(--color-text-subtle)' }}>
@@ -423,9 +416,9 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
 
         {/* Interval vs schedule */}
         {!settings.useSchedule ? (
-          <div className="setting-item" style={{ marginTop: '1rem' }}>
+          <div className="setting-item">
             <label htmlFor="meshcoreAnnounceInterval">
-              {t('meshcore.automation.announce.interval_label', 'Interval (hours)')}
+              {t('automation.auto_announce.interval', 'Announcement Interval (hours)')}
             </label>
             <NumberInput
               id="meshcoreAnnounceInterval"
@@ -440,9 +433,12 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
             />
           </div>
         ) : (
-          <div className="setting-item" style={{ marginTop: '1rem' }}>
+          <div className="setting-item">
             <label htmlFor="meshcoreAnnounceSchedule">
-              {t('meshcore.automation.announce.schedule_label', 'Cron schedule (min hour dom mon dow)')}
+              {t('automation.auto_announce.cron_expression', 'Cron Expression')}
+              <span className="setting-description">
+                {t('automation.auto_announce.cron_expression_description', 'Schedule format: minute hour day month weekday.')}
+              </span>
             </label>
             <input
               id="meshcoreAnnounceSchedule"
@@ -461,11 +457,13 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
             )}
           </div>
         )}
+        </ConfigGroup>
 
+        <ConfigGroup name="where" title={t('automation.group.where', 'Where')}>
         {/* Channel selection */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label>
-            {t('meshcore.automation.announce.channels', 'Target channels')}
+            {t('automation.auto_announce.broadcast_channel', 'Broadcast Channels')}
             <span className="setting-description">
               {t(
                 'meshcore.automation.announce.channels_description',
@@ -504,8 +502,20 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
           </div>
         </div>
 
+        {/* Long announcements (#6316): truncate (default) or split into up to 3 sends. */}
+        <div className="setting-item">
+          <label>{t('meshcore.automation.announce.split_label', 'Long Announcements')}</label>
+          <SplitLongMessagesField
+            id="meshcoreAutoAnnounceSplitLongMessages"
+            checked={settings.splitLongMessages}
+            onChange={(v) => update('splitLongMessages', v)}
+            disabled={disabled || !canWrite}
+            perTargetCount={settings.channelIndexes.length}
+          />
+        </div>
+
         {/* MeshCore scope/region for the announcement (#3833) */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label>
             {t('meshcore.automation.announce.scope_label', 'Scope')}
             <span className="setting-description">
@@ -525,11 +535,13 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
             />
           </div>
         </div>
+        </ConfigGroup>
 
+        <ConfigGroup name="message" title={t('automation.group.message', 'Message')}>
         {/* Message template */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label htmlFor="meshcoreAnnounceMessage">
-            {t('meshcore.automation.announce.message_label', 'Message template')}
+            {t('automation.auto_announce.message_label', 'Announcement Message')}
             <span className="setting-description" style={{ display: 'block', marginTop: '0.25rem' }}>
               {t('meshcore.automation.announce.tokens_hint', 'Insert a token below, or see the reference at the top of this page.')}
             </span>
@@ -544,23 +556,14 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
             rows={3}
             style={{ fontFamily: 'monospace', resize: 'vertical', minHeight: '60px' }}
           />
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.25rem', marginTop: '0.5rem' }}>
-            {TOKENS.map((tok) => (
-              <button
-                key={tok}
-                type="button"
-                onClick={() => insertToken(tok)}
-                disabled={disabled || !canWrite}
-                className="meshcore-btn meshcore-btn-secondary"
-                style={{ padding: '0.2rem 0.5rem', fontSize: '0.8rem', fontFamily: 'monospace' }}
-              >
-                {tok}
-              </button>
-            ))}
-          </div>
+          <TokenInsertButtons
+            tokens={TOKENS}
+            onInsert={insertToken}
+            disabled={disabled || !canWrite}
+          />
           <div style={{ marginTop: '0.5rem' }}>
             <label style={{ fontSize: '0.9rem', color: 'var(--color-text-subtle)' }}>
-              {t('meshcore.automation.announce.preview', 'Live preview')}:
+              {t('automation.auto_announce.sample_preview', 'Live Preview')}:
             </label>
             <div style={{
               marginTop: '0.25rem',
@@ -577,9 +580,11 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
             </div>
           </div>
         </div>
+        </ConfigGroup>
 
+        <ConfigGroup name="extras" title={t('automation.group.extras', 'Extras')}>
         {/* Advert burst */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem' }}>
             <input
               type="checkbox"
@@ -627,11 +632,12 @@ export const MeshCoreAutoAnnounceSection: React.FC<MeshCoreAutoAnnounceSectionPr
 
         {lastRunAt && (
           <p style={{ fontSize: '0.85rem', color: 'var(--color-text-subtle)', marginTop: '1rem' }}>
-            {t('meshcore.automation.announce.last_run', 'Last run')}:{' '}
+            {t('automation.auto_announce.last_announcement', 'Last Announcement')}:{' '}
             {new Date(lastRunAt).toLocaleString()}
           </p>
         )}
-      </div>
+        </ConfigGroup>
+      </ConfigSection>
     </>
     </NumberInputScope>
   );

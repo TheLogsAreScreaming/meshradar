@@ -208,6 +208,15 @@ describe('buildMessageContext', () => {
       }
     });
 
+    it("uses the source's chosen 0-hop and MQTT glyphs (#5890)", () => {
+      const hopEmojis = { zeroHop: '0️⃣', mqtt: '🌐' };
+      expect(buildMessageContext(msg({ hopStart: 3, hopLimit: 3 }), 'default', 1, { hopEmojis }).fields.hopEmoji).toBe('0️⃣');
+      expect(buildMessageContext(msg({ hopStart: 3, hopLimit: 1 }), 'default', 1, { hopEmojis }).fields.hopEmoji).toBe('2️⃣');
+      expect(
+        buildMessageContext(msg({ hopStart: 3, hopLimit: 3 }), 'default', 1, { viaMqttSource: true, hopEmojis }).fields.hopEmoji,
+      ).toBe('🌐');
+    });
+
     it('an MQTT source yields #️⃣ even when the hop count is unknown', () => {
       const ctx = buildMessageContext(
         msg({ hopStart: undefined, hopLimit: undefined }), 'default', 1, { viaMqttSource: true },
@@ -493,6 +502,11 @@ describe('packetHash token (#5357)', () => {
     expect(ctx.fields.packetHash).toBe('931D5DA9D6054F49');
   });
 
+  it('exposes the message row id as meshcoreMessageId (#5762)', () => {
+    const ctx = buildMeshCoreMessageContext(mcMsg({ id: 'row-7' }), 'default', 1);
+    expect(ctx.fields.meshcoreMessageId).toBe('row-7');
+  });
+
   it('is undefined on a MeshCore message with no matched frame', () => {
     const ctx = buildMeshCoreMessageContext(mcMsg({ fromPublicKey: 'aabbcc', toPublicKey: 'me' }), 'default', 1);
     expect(ctx.fields.packetHash).toBeUndefined();
@@ -530,6 +544,25 @@ describe('buildMeshCoreMessageContext (#3833)', () => {
     expect(ctx.fields.scoped).toBe(true);
     expect(ctx.fields.hops).toBe(2);
     expect(ctx.fields.hopEmoji).toBe('2️⃣'); // #4340
+  });
+
+  it('maps our OWN outgoing channel post as a channel message, not a DM (#6409)', () => {
+    // An outgoing row keeps our pubkey in fromPublicKey and the channel slot in toPublicKey.
+    const ctx = buildMeshCoreMessageContext(
+      mcMsg({ fromPublicKey: 'selfkey', toPublicKey: 'channel-2', fromName: 'MyNode', text: 'hi' }),
+      'default',
+      1,
+    );
+    expect(ctx.fields.channel).toBe(2);
+    expect(ctx.fields.isDM).toBe(false);
+    expect(ctx.fields.isBroadcast).toBe(true);
+    expect(ctx.subjectNodeKey).toBeNull();
+  });
+
+  it('a received DM stays a DM (toPublicKey is our real key, not a channel slot)', () => {
+    const ctx = buildMeshCoreMessageContext(mcMsg({ fromPublicKey: 'aabbcc', toPublicKey: 'selfkey' }), 'default', 1);
+    expect(ctx.fields.isDM).toBe(true);
+    expect(ctx.fields.channel).toBeUndefined();
   });
 
   it('hopEmoji is undefined when msg.hopCount is absent (#4340)', () => {
@@ -652,6 +685,27 @@ describe('buildReticulumMessageContext (#3960 Phase 2 WP3)', () => {
     expect(ctx.fields.replyToHash).toBe('reply'.padEnd(32, '0'));
     expect(ctx.fields.threadHash).toBe('thread'.padEnd(32, '0'));
   });
+
+  it('#6143: messageHash is the LXMF hash (id with the `${sourceId}_` prefix stripped)', () => {
+    const ctx = buildReticulumMessageContext(retMsg({ id: 'src_abc123' }), 'src', 1000);
+    expect(ctx.fields.messageHash).toBe('abc123');
+  });
+
+  it('#6143: fromName/senderLabel use the announced display name when given', () => {
+    const ctx = buildReticulumMessageContext(retMsg(), 'src', 1000, { displayName: 'Alice' });
+    expect(ctx.fields.fromName).toBe('Alice');
+    expect(ctx.fields.senderLabel).toBe('Alice');
+  });
+
+  it('#6143: fromName/senderLabel fall back to the raw hash when no/blank display name', () => {
+    const hash = 'peer'.padEnd(32, '0');
+    const none = buildReticulumMessageContext(retMsg(), 'src', 1000);
+    expect(none.fields.fromName).toBeUndefined();
+    expect(none.fields.senderLabel).toBe(hash);
+    const blank = buildReticulumMessageContext(retMsg(), 'src', 1000, { displayName: '   ' });
+    expect(blank.fields.fromName).toBeUndefined();
+    expect(blank.fields.senderLabel).toBe(hash);
+  });
 });
 
 describe('protocolShort token (#4577)', () => {
@@ -711,6 +765,12 @@ describe('meshCoreMessageMatchesFilter (#3833)', () => {
     expect(meshCoreMessageMatchesFilter(mcMsg({ fromPublicKey: 'channel-1' }), { channelName: 'gauntlet' }, 'Gauntlet')).toBe(true);
     expect(meshCoreMessageMatchesFilter(mcMsg({ fromPublicKey: 'channel-1' }), { channelName: 'gauntlet' }, 'Primary')).toBe(false);
   });
+  it('matches our own outgoing channel post by its toPublicKey channel slot (#6409)', () => {
+    const own = mcMsg({ fromPublicKey: 'selfkey', toPublicKey: 'channel-2' });
+    expect(meshCoreMessageMatchesFilter(own, { channel: 2 })).toBe(true);
+    expect(meshCoreMessageMatchesFilter(own, { channel: 5 })).toBe(false);
+    expect(meshCoreMessageMatchesFilter(own, { channels: [{ name: 'Public' }] }, 'Public')).toBe(true);
+  });
   it('Meshtastic-only params force a non-match (no pubkey↔nodeNum coercion)', () => {
     expect(meshCoreMessageMatchesFilter(mcMsg(), { from: 111 })).toBe(false);
     expect(meshCoreMessageMatchesFilter(mcMsg(), { to: 222 })).toBe(false);
@@ -750,5 +810,59 @@ describe('resolveTriggerPath', () => {
     expect(resolveTriggerPath(ctx, 'NOW', 9999)).toBe(9999);
     expect(resolveTriggerPath(ctx, 'trigger.missing', 9999)).toBeUndefined();
     expect(resolveTriggerPath(ctx, 'var.x', 9999)).toBeUndefined();
+  });
+});
+
+describe('MeshCore reaction trigger fields (#5763)', () => {
+  const THUMB = '\u{1F44D}';
+  const rx = (o: Partial<MeshCoreMessage> = {}) =>
+    mcMsg({ fromPublicKey: 'channel-0', fromName: 'Bob', text: THUMB, reactionEmoji: THUMB, reactionTargetId: 't1', ...o });
+
+  it('a plain message is not a tapback', () => {
+    const f = buildMeshCoreMessageContext(mcMsg(), 'default', 1).fields;
+    expect(f.isTapback).toBe(false);
+    expect(f.replyContext).toBe('');
+    expect(f.emoji).toBeUndefined();
+    expect(f.reactionTargetId).toBeUndefined();
+  });
+
+  it('a resolved reaction carries the target fields', () => {
+    const f = buildMeshCoreMessageContext(rx(), 'default', 1, {
+      reactionTarget: { text: 'hello', fromName: 'Alice' },
+    }).fields;
+    expect(f).toMatchObject({
+      isTapback: true, emoji: 1, replyContext: REPLY_CONTEXT_TAPBACK, text: THUMB, 
+      reactionTargetId: 't1', reactionTargetText: 'hello', reactionTargetSender: 'Alice',
+    });
+  });
+
+  it('an unmatched reaction leaves target text unset', () => {
+    const f = buildMeshCoreMessageContext(rx({ reactionTargetId: null }), 'default', 1).fields;
+    expect(f.isTapback).toBe(true);
+    expect(f.reactionTargetId).toBeUndefined();
+    expect(f.reactionTargetText).toBeUndefined();
+  });
+
+  it('the filter drops a reaction unless includeMeshCoreReactions is exactly true', () => {
+    expect(meshCoreMessageMatchesFilter(rx(), {})).toBe(false);
+    expect(meshCoreMessageMatchesFilter(rx(), { includeMeshCoreReactions: false })).toBe(false);
+    expect(meshCoreMessageMatchesFilter(rx(), { includeMeshCoreReactions: 'true' })).toBe(false);
+    expect(meshCoreMessageMatchesFilter(rx(), { includeMeshCoreReactions: true })).toBe(true);
+    expect(meshCoreMessageMatchesFilter(rx(), { includeMeshCoreReactions: true, textContains: 'zzz' })).toBe(false);
+    expect(meshCoreMessageMatchesFilter(rx(), { includeMeshCoreReactions: true, channel: 1 })).toBe(false);
+  });
+
+  it('a plain message ignores the param', () => {
+    expect(meshCoreMessageMatchesFilter(mcMsg(), { includeMeshCoreReactions: true })).toBe(true);
+  });
+
+  it('explains the miss', () => {
+    expect(describeMeshCoreFilterMiss(rx(), {})).toContain('Also fire on MeshCore reactions');
+    expect(describeMeshCoreFilterMiss(rx(), { includeMeshCoreReactions: true })).toBeUndefined();
+  });
+
+  it('Meshtastic exposes isTapback', () => {
+    expect(buildMessageContext(msg({ emoji: 1, replyId: 5 }), 'default', 1).fields.isTapback).toBe(true);
+    expect(buildMessageContext(msg(), 'default', 1).fields.isTapback).toBe(false);
   });
 });

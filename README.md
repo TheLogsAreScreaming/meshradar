@@ -9,9 +9,43 @@ A comprehensive web application for monitoring off-grid mesh networks — Meshta
 
 > MeshRadar is a fork of [MeshMonitor](https://github.com/Yeraze/meshmonitor) by Yeraze, released under the same license. The Docker image is published at `ghcr.io/charlottemeshtastic/meshradar`; links to meshmonitor.org point at the original project's documentation.
 
-![MeshRadar Interface](docs/images/main.png)
+![MeshRadar unified map of every connected source](docs/images/main.png)
 
-![MeshRadar Interface](docs/images/channels.png)
+*The unified map. Every source (Meshtastic radios, MeshCore companions, MQTT bridges and the built-in broker) is listed down the left with its connection state and how many nodes were active in the last two hours. Nodes from all of them share one map.*
+
+## Screenshots
+
+All screenshots are from the original MeshMonitor project's public demo at **[meshmonitor.yeraze.com](https://meshmonitor.yeraze.com/)**, viewed signed out.
+
+### Source view: nodes and map
+
+![Node list and map for a single Meshtastic source](docs/images/source-nodes.png)
+
+Open a source to see its own nodes. The list shows each node's role, SNR and RSSI, power, hop count and last-heard time, and you can filter, sort and export it. On the map, nearby nodes group into numbered clusters until you zoom in. See [Interactive Maps](https://meshmonitor.org/features/maps.html) and [Multi-Source](https://meshmonitor.org/features/multi-source.html).
+
+### Channels
+
+![Channel messages with replies, reactions and hop counts](docs/images/channels.png)
+
+Channel chat supports threaded replies, emoji reactions, and a hop count on every message (for example `4/6 hops`). A toggle shows or hides messages that arrived over MQTT or a bridge.
+
+### Telemetry dashboard
+
+![Per-source telemetry dashboard with node status and hop distribution](docs/images/dashboard.png)
+
+Each source has a drag-and-drop dashboard of widgets. In this shot, **Node Status** shows last-heard, signal and voltage for favorited nodes, and **Hop Distribution** shows how far away the nodes this radio hears are, from direct to 7 hops. See [Telemetry Widgets](https://meshmonitor.org/features/telemetry-widgets.html).
+
+### Unified telemetry
+
+![Telemetry graphs merged across Meshtastic and MeshCore sources](docs/images/telemetry.png)
+
+Favorited telemetry from all sources on one page: RSSI and noise floor from a MeshCore repeater sit beside packet counters from a Meshtastic node. Pick a window from 15 minutes to 7 days, or narrow it to one source.
+
+### Analysis & Reports
+
+![Solar Monitoring Analysis report with battery and solar production chart](docs/images/reports.png)
+
+Reports run across every source. **Solar Monitoring Analysis** (shown here) spots solar-powered nodes from their daily charge and discharge pattern and charts battery level against expected solar production. Other reports include NodeInfo Enrichment, ok_to_mqtt Violations, Mesh Issues, Coverage Report and Traceroute Explorer. See [Analysis & Reports](https://meshmonitor.org/features/analysis-reports.html) and [Solar Monitoring](https://meshmonitor.org/features/solar-monitoring.html).
 
 ## Documentation
 

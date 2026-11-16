@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import express from 'express';
 import request from 'supertest';
 import type { Source } from '../../../db/repositories/sources.js';
@@ -115,6 +116,8 @@ const fullNode: DbNode = {
   rssi: -45,
   lastHeard: 1700000500,
   hopsAway: 0,
+  // Stored in ms; a fix observed 50.25 s before the node was last heard.
+  positionTimestamp: 1700000449750,
   isIgnored: false,
   createdAt: 1700000000,
   updatedAt: 1700000500,
@@ -136,6 +139,7 @@ const bareNode: DbNode = {
   rssi: null,
   lastHeard: 1700000400,
   hopsAway: null,
+  positionTimestamp: null,
   isIgnored: false,
   createdAt: 1700000000,
   updatedAt: 1700000400,
@@ -193,6 +197,14 @@ describe('Metrics API Routes', () => {
   });
 
   describe('GET /api/v1/metrics', () => {
+    it('Meshtastic-only scrape output is exactly the pre-collector output', async () => {
+      const app = createApp(adminUser);
+      const response = await request(app).get('/api/v1/metrics').expect(200);
+      expect(response.text.replace(/version="[^"]+"/, 'version="X"')).toBe(
+        readFileSync(new URL('./__fixtures__/metrics.meshtastic-only.golden.txt', import.meta.url), 'utf8')
+      );
+    });
+
     it('returns Prometheus text format with source and node metrics', async () => {
       const app = createApp(adminUser);
       const response = await request(app).get('/api/v1/metrics').expect(200);
@@ -229,6 +241,26 @@ describe('Metrics API Routes', () => {
       expect(body).toContain('meshmonitor_node_last_heard_timestamp_seconds{source="src_tcp",node_id="!11223344",short_name="unknown"} 1700000400');
       expect(body).not.toContain('meshmonitor_node_battery_level{source="src_tcp",node_id="!11223344"');
       expect(body).not.toContain('meshmonitor_node_channel_utilization_percent{source="src_tcp",node_id="!11223344"');
+    });
+
+    it('exports the last position time in seconds, alongside last-heard', async () => {
+      const app = createApp(adminUser);
+      const response = await request(app).get('/api/v1/metrics').expect(200);
+
+      expect(response.text).toContain(
+        'meshmonitor_node_last_position_timestamp_seconds{source="src_tcp",node_id="!a1b2c3d4",short_name="BASE"} 1700000449.75'
+      );
+    });
+
+    it('omits last position for a node that has never sent one, so "heard but no fix" is detectable', async () => {
+      const app = createApp(adminUser);
+      const response = await request(app).get('/api/v1/metrics').expect(200);
+
+      const body = response.text;
+      // Heard...
+      expect(body).toContain('meshmonitor_node_last_heard_timestamp_seconds{source="src_tcp",node_id="!11223344",short_name="unknown"} 1700000400');
+      // ...but no position series at all -- not a zero, which would read as a fix in 1970.
+      expect(body).not.toContain('meshmonitor_node_last_position_timestamp_seconds{source="src_tcp",node_id="!11223344"');
     });
 
     it('does not export ignored nodes', async () => {

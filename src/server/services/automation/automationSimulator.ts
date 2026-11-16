@@ -15,6 +15,11 @@
  * branch routing, resolved action params, simulated variable writes) and writes
  * NO run-log row. The live event-bus path (automationEngineService) is untouched.
  */
+import { planMeshCoreTextParts } from '../../utils/meshcoreSplitPlan.js';
+import { planAutomatedTextParts } from '../../utils/automatedTextSplit.js';
+import { MESHTASTIC_MAX_TEXT_BYTES } from '../../../utils/messageSplitLimits.js';
+import { sourceManagerRegistry } from '../../sourceManagerRegistry.js';
+import { isMeshtasticManager } from '../../sourceManagerTypes.js';
 import {
   categoryOf,
   stepOutputNameOf,
@@ -187,10 +192,23 @@ function recordingDeps(
       const previous = Boolean(row.enabled);
       return { sourceId: row.id, sourceName: row.name, previous, enabled: mode === 'toggle' ? !previous : Boolean(enabled) };
     },
-    async sendMessage(a) { return { action: 'sendMessage', ...a }; },
+    async sendMessage(a) {
+      // #6316/#6330: report how many parts a split would send. Nothing is sent.
+      let plannedParts: number | undefined;
+      if (a.splitLongMessages) {
+        const m = a.sourceId ? sourceManagerRegistry.getManager(a.sourceId) : undefined;
+        const meshtastic = typeof a.destination === 'number' || (m !== undefined && isMeshtasticManager(m));
+        plannedParts = meshtastic
+          ? planAutomatedTextParts(a.text, { maxBytes: MESHTASTIC_MAX_TEXT_BYTES, split: true }).parts.length
+          : planMeshCoreTextParts(a.text, { isDm: typeof a.destination === 'string', split: true }).parts.length;
+      }
+      return { action: 'sendMessage', ...a, ...(plannedParts !== undefined ? { plannedParts } : {}) };
+    },
     async sendTapback(a) { return { action: 'tapback', ...a }; },
     async manageNode(a) { return { action: 'nodeManage', ...a }; },
     async requestData(a) { return { action: 'requestData', ...a }; },
+    // Dry-run must never trace or use up a path's interval: report the path only.
+    async runScheduledTrace(a) { return { action: 'tracePathSchedule', sourceId: a.sourceId, publicKey: a.path.publicKey, label: a.path.label, intervalMinutes: a.path.intervalMinutes, hashBytes: a.path.hashBytes, autoReturn: a.autoReturn, dryRun: true }; },
     // Dry-run must never actually reboot a device — report the resolved params.
     async rebootDevice(a) { return { action: 'deviceReboot', ...a }; },
     async notify(a) { return { action: 'notify', ...a }; },

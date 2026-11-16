@@ -11,6 +11,7 @@ import {
 } from '@dnd-kit/core';
 import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import TelemetryChart from '../../TelemetryChart';
+import { type ChartYRange } from '../../../utils/chartYRange';
 import TransportSeriesChart from '../../TransportSeriesChart';
 import { isTransportSeriesType } from '../../../utils/transportSeries';
 import PacketRateChart, { isPacketRateType } from '../../PacketRateChart';
@@ -31,6 +32,10 @@ import {
 } from '../types';
 
 interface DashboardGridProps {
+  /** Source protocol; picks the trace source for the Traceroute widget. */
+  sourceKind?: 'meshtastic' | 'meshcore' | 'reticulum';
+  /** NodeStatus may read the Meshtastic-only voltage telemetry fallback. */
+  voltageFallback?: boolean;
   // Widgets
   customWidgets: CustomWidget[];
   onRemoveWidget: (widgetId: string) => void;
@@ -69,9 +74,15 @@ interface DashboardGridProps {
   solarMonitoringEnabled?: boolean;
   getSolarVisibility?: (nodeId: string, telemetryType: string) => boolean;
   onToggleSolar?: (nodeId: string, telemetryType: string, show: boolean) => void;
+
+  // Fixed Y-axis range per chart widget (#6348)
+  getYRange?: (nodeId: string, telemetryType: string) => ChartYRange | null;
+  onYRangeChange?: (nodeId: string, telemetryType: string, range: ChartYRange | null) => void;
 }
 
 const DashboardGrid: React.FC<DashboardGridProps> = ({
+  sourceKind = 'meshtastic',
+  voltageFallback = true,
   customWidgets,
   onRemoveWidget,
   onAddNodeToWidget,
@@ -99,6 +110,8 @@ const DashboardGrid: React.FC<DashboardGridProps> = ({
   solarMonitoringEnabled = false,
   getSolarVisibility,
   onToggleSolar,
+  getYRange,
+  onYRangeChange,
 }) => {
   const { t } = useTranslation();
 
@@ -143,6 +156,7 @@ const DashboardGrid: React.FC<DashboardGridProps> = ({
                     onAddNode={nodeId => onAddNodeToWidget(widget.id, nodeId)}
                     onRemoveNode={nodeId => onRemoveNodeFromWidget(widget.id, nodeId)}
                     onOpenNodeDetails={onOpenNodeDetails}
+                    voltageFallback={voltageFallback}
                     canEdit={canEdit}
                   />
                 );
@@ -156,6 +170,7 @@ const DashboardGrid: React.FC<DashboardGridProps> = ({
                     nodes={nodes}
                     onRemove={() => onRemoveWidget(widget.id)}
                     onSelectNode={nodeId => onSelectTracerouteNode(widget.id, nodeId)}
+                    sourceKind={sourceKind}
                     canEdit={canEdit}
                   />
                 );
@@ -299,6 +314,8 @@ const DashboardGrid: React.FC<DashboardGridProps> = ({
                   showSolar={getSolarVisibility ? getSolarVisibility(favorite.nodeId, favorite.telemetryType) : true}
                   onToggleSolar={onToggleSolar}
                   solarMonitoringEnabled={solarMonitoringEnabled}
+                  yRange={getYRange ? getYRange(favorite.nodeId, favorite.telemetryType) : null}
+                  onYRangeChange={canEdit ? onYRangeChange : undefined}
                 />
               );
             })}

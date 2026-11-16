@@ -32,7 +32,15 @@ vi.mock('../../contexts/AuthContext', () => ({
 let sourceStatusMap: Map<string, Record<string, unknown> | null> = new Map();
 vi.mock('../../hooks/useDashboardData', () => ({
   useSourceStatuses: () => sourceStatusMap,
+  useDashboardSources: () => ({ data: [] }),
 }));
+
+// --- Broker list draft (#5831) ----------------------------------------------
+// The editable broker list has its own test file
+// (MeshCoreObserverSection.brokerEditor.test.tsx). Here the source list is
+// empty and the SaveBar is a no-op, so these tests stay about the key and
+// credential blocks.
+vi.mock('../../hooks/useSaveBar', () => ({ useSaveBar: vi.fn() }));
 
 // --- useObserverKey ----------------------------------------------------------
 type MockResult = { ok: boolean; data?: ObserverKeyStatus; error?: ObserverKeyError };
@@ -244,6 +252,15 @@ describe('MeshCoreObserverSection — [B] key status block', () => {
     expect(screen.getByText('meshcore.observer.fetch_button').closest('button')).toBeDisabled();
     expect(screen.getByText('meshcore.observer.manual_button').closest('button')).toBeDisabled();
     expect(screen.getByText('meshcore.observer.clear_button').closest('button')).not.toBeDisabled();
+  });
+
+  it('styles Clear as a danger button, not red text on the form accent (#4173 N4)', () => {
+    mockInitialStatus = makeKeyStatus({ stored: true });
+    render(<MeshCoreObserverSection sourceId={SOURCE_ID} connected={true} />);
+    const btn = screen.getByText('meshcore.observer.clear_button').closest('button') as HTMLButtonElement;
+    expect(btn.className).toMatch(/dangerButton/);
+    // The old inline colour fought the purple `.meshcore-form-view button` fill.
+    expect(btn.style.color).toBe('');
   });
 
   it('disables Clear when no key is stored', () => {

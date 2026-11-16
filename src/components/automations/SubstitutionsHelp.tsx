@@ -55,16 +55,26 @@ export const TRIGGER_TOKENS: Record<string, Array<[string, string]>> = {
     ['snr', 'Receive SNR — RF-received messages only'], ['rssi', 'Receive RSSI dBm — RF only'],
     ['isBroadcast', 'true if broadcast (alias of isChannel)'],
     ['wantAck', 'Sender requested an ack'], ['replyId', 'Replied-to packet id'],
-    ['emoji', 'Tapback/reaction emoji flag'], ['viaMqtt', 'true if it arrived via MQTT'],
-    ['replyContext', `"${REPLY_CONTEXT_TAPBACK}"/"${REPLY_CONTEXT_REPLY}"/"" — Meshtastic only; a short marker for a tapback/reply so it doesn't read as a standalone message once relayed to a protocol with no thread concept`],
-    ['zeroHop', '1 when the message arrived over RF with 0 hops; 0 when relayed or received via MQTT'],
-    ['decryptedBy', 'Channel/key that decrypted it'], ['protocol', 'meshtastic or meshcore'],
-    ['protocolShort', 'Short protocol code: MT (Meshtastic) or MC (MeshCore)'],
+    ['emoji', 'Tapback flag: 1 on a Meshtastic tapback or a MeshCore reaction (the glyph is in text)'], ['isTapback', 'true on a tapback or reaction'],
+    ['reactionTargetId', 'MeshCore reaction: id of the message reacted to'], ['reactionTargetText', 'MeshCore reaction: text of the message reacted to'], ['reactionTargetSender', 'MeshCore reaction: sender of the message reacted to'], ['viaMqtt', 'true if it arrived via MQTT'],
+    ['replyContext', `"${REPLY_CONTEXT_TAPBACK}"/"${REPLY_CONTEXT_REPLY}"/"" — a short marker for a tapback/reply so it doesn't read as a standalone message once relayed to a protocol with no thread concept`],
+    ['zeroHop', '1 when the message arrived over RF with 0 hops; 0 when relayed or received over MQTT or UDP'],
+    ['viaIp', '1 when the message reached your node over MQTT or UDP; 0 when it came over RF'],
+    ['decryptedBy', 'Channel/key that decrypted it'], ['protocol', 'meshtastic, meshcore or reticulum'],
+    ['protocolShort', 'Short protocol code: MT (Meshtastic), MC (MeshCore) or RET (Reticulum)'],
     ['scopeName', 'Region/scope name (MeshCore)'],
     ['packetHash', 'MeshCore only: packet hash, 16 uppercase hex chars — matches map.meshcore.com.hr/#/packets/<hash>. Best-effort for DMs; empty when the raw frame could not be matched (room posts, messages synced after a reconnect)'],
     ['scopeCode', 'Region/scope code — 0 = unscoped (MeshCore)'], ['scoped', 'true if sent with a region (MeshCore)'],
+    // ── Reticulum / LXMF only (#6143). Empty on Meshtastic & MeshCore. ──
+    ['title', 'Reticulum only: the LXMF message title/subject (empty when none)'],
+    ['quality', 'Reticulum only: link quality of the receiving interface (0–100), when the bridge reported it'],
+    ['method', 'Reticulum only: how the message was delivered — e.g. opportunistic / direct / propagated'],
+    ['signatureValidated', 'Reticulum only: true when the sender signature was cryptographically verified'],
+    ['ratcheted', 'Reticulum only: true when the message used a forward-secret ratchet key'],
+    ['replyToHash', 'Reticulum only: the LXMF hash this message replies to (empty when it is not a reply)'],
+    ['threadHash', 'Reticulum only: the LXMF conversation/thread hash (empty when none)'],
   ],
-  'trigger.telemetry': [['nodeNum', 'Node number'], ['telemetryType', 'Metric name'], ['value', 'Reading value'], ['unit', 'Unit']],
+  'trigger.telemetry': [['nodeNum', 'Node number'], ['telemetryType', 'Metric name'], ['value', 'Reading value'], ['unit', 'Unit'], ['name', 'MeshCore only: node name'], ['publicKey', 'MeshCore only: public key'], ['roleName', 'MeshCore only: Companion / Repeater / Room Server / Sensor']],
   'trigger.nodeUpdated': [
     ['nodeNum', 'Node number (Meshtastic)'], ['changed', 'Changed field names (list). MeshCore: name, latitude, longitude, advType, outPath, pathLen'],
     ...NODE_EVENT_MESHCORE_TOKENS,
@@ -85,7 +95,9 @@ export const TRIGGER_TOKENS: Record<string, Array<[string, string]>> = {
   'trigger.nodeRebooted': [['nodeNum', 'Node number'], ['previousUptimeSeconds', 'Uptime before the reset (s)'], ['uptimeSeconds', 'Uptime after the reset (s)']],
   'trigger.nodePowerChanged': [['nodeNum', 'Node number'], ['direction', 'lost (now on battery) / restored (now powered)'], ['powered', 'true if now on external/USB power'], ['previousPowered', 'true if previously on external/USB power'], ['batteryLevel', 'Battery level (%, >100 = powered)']],
   'trigger.batteryTrend': [['nodeNum', 'Node number'], ['dropPercent', 'Observed drop over the window (percentage points)'], ['windowHours', 'Lookback window (hours)'], ['minDropPercent', 'Configured drop threshold (points)'], ['startLevel', 'Battery level at the window start (%)'], ['latestLevel', 'Latest battery level (%)']],
+  'trigger.clockOutOfSync': [['publicKey', 'MeshCore public key'], ['offsetSeconds', 'Clock offset in seconds (positive = the node is behind)'], ['offsetText', 'Readable offset, e.g. "2h 14m behind" or "Clock not set"'], ['direction', 'behind / ahead / notSet'], ['sampleSource', 'advert (heard from the node) or device (the attached device)'], ['thresholdSeconds', 'The threshold this rule uses (s)']],
   'trigger.becameLikelyAircraft': [['nodeNum', 'Node number'], ['altitude', 'Altitude (m MSL)'], ['heightAboveGround', 'Height above ground (m, AGL basis only)'], ['groundElevation', 'Ground elevation (m)'], ['basis', 'agl / msl'], ['thresholdM', 'Threshold crossed (m)'], ['previousLikelyAircraft', 'Previous likely-aircraft flag (false / null)'], ['latitude', 'Node latitude'], ['longitude', 'Node longitude']],
+  'trigger.neighborAdded': [['reporterName', 'Repeater name'], ['reporterPublicKey', 'Repeater public key'], ['neighborPublicKey', 'New neighbour public key'], ['snr', 'Neighbour SNR (dB)'], ['firstSeenAt', 'First seen (epoch ms)'], ['lastHeardAt', 'Last heard (epoch ms)'], ['confirmedAfterHours', 'Hours between first and last sighting'], ['sightings', 'Times seen']],
   'trigger.schedule': [],
 };
 
@@ -98,8 +110,10 @@ const TRIGGER_LABEL: Record<string, string> = {
   'trigger.nodeStale': 'Node silent', 'trigger.nodeOnline': 'Node recovered',
   'trigger.nodeRebooted': 'Node rebooted',
   'trigger.nodePowerChanged': 'Node power changed',
+  'trigger.clockOutOfSync': 'Clock out of sync',
   'trigger.batteryTrend': 'Battery draining',
   'trigger.becameLikelyAircraft': 'Became likely aircraft',
+  'trigger.neighborAdded': 'New neighbour confirmed',
 };
 
 /** Drawer listing every available substitution token (current trigger first). */

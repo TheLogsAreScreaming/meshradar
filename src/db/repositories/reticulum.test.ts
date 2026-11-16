@@ -57,7 +57,10 @@ const SQLITE_CREATE = `
     lastSeenAt INTEGER NOT NULL,
     createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
     frequency REAL, bandwidth REAL, spreadingFactor INTEGER, codingRate INTEGER, txPower INTEGER,
-    stAlock REAL, ltAlock REAL, radioState INTEGER, deviceInfoJson TEXT
+    stAlock REAL, ltAlock REAL, radioState INTEGER, deviceInfoJson TEXT,
+    airtimeShort REAL, airtimeLong REAL, channelLoadShort REAL, channelLoadLong REAL,
+    noiseFloor REAL, interference REAL, interferenceLastTs REAL, interferenceLastDbm REAL,
+    cpuLoad REAL, batteryState TEXT, batteryPercent REAL
   );
   CREATE UNIQUE INDEX reticulum_interfaces_source_name_idx ON reticulum_interfaces(sourceId, interfaceName);
   CREATE TABLE settings (
@@ -95,7 +98,12 @@ const POSTGRES_CREATE = `
     "createdAt" BIGINT NOT NULL, "updatedAt" BIGINT NOT NULL,
     frequency DOUBLE PRECISION, bandwidth DOUBLE PRECISION, "spreadingFactor" INTEGER,
     "codingRate" INTEGER, "txPower" INTEGER, "stAlock" DOUBLE PRECISION, "ltAlock" DOUBLE PRECISION,
-    "radioState" BOOLEAN, "deviceInfoJson" TEXT
+    "radioState" BOOLEAN, "deviceInfoJson" TEXT,
+    "airtimeShort" DOUBLE PRECISION, "airtimeLong" DOUBLE PRECISION,
+    "channelLoadShort" DOUBLE PRECISION, "channelLoadLong" DOUBLE PRECISION,
+    "noiseFloor" DOUBLE PRECISION, interference DOUBLE PRECISION,
+    "interferenceLastTs" DOUBLE PRECISION, "interferenceLastDbm" DOUBLE PRECISION,
+    "cpuLoad" DOUBLE PRECISION, "batteryState" TEXT, "batteryPercent" DOUBLE PRECISION
   );
   CREATE UNIQUE INDEX reticulum_interfaces_source_name_idx ON reticulum_interfaces("sourceId", "interfaceName");
   CREATE TABLE settings (
@@ -133,6 +141,9 @@ const MYSQL_CREATE = `
     createdAt BIGINT NOT NULL, updatedAt BIGINT NOT NULL,
     frequency DOUBLE, bandwidth DOUBLE, spreadingFactor INT, codingRate INT, txPower INT,
     stAlock DOUBLE, ltAlock DOUBLE, radioState TINYINT(1), deviceInfoJson TEXT,
+    airtimeShort DOUBLE, airtimeLong DOUBLE, channelLoadShort DOUBLE, channelLoadLong DOUBLE,
+    noiseFloor DOUBLE, interference DOUBLE, interferenceLastTs DOUBLE, interferenceLastDbm DOUBLE,
+    cpuLoad DOUBLE, batteryState VARCHAR(32), batteryPercent DOUBLE,
     UNIQUE KEY reticulum_interfaces_source_name_idx (sourceId, interfaceName)
   );
   CREATE TABLE settings (
@@ -289,6 +300,50 @@ function runReticulumTests(getBackend: () => TestBackend) {
     expect(row!.rxBytes).toBe(200);
   });
 
+  it('upsertInterface - round-trips the live RNode gauges (#6120) and leaves them null when absent', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    // An RNode interface reports the gauges...
+    await repo.upsertInterface(SRC_A, makeIface({
+      interfaceName: 'RNode LoRa Interface',
+      interfaceType: 'RNodeInterface',
+      airtimeShort: 0,
+      airtimeLong: 0.12,
+      channelLoadShort: 2.44,
+      channelLoadLong: 1.15,
+      noiseFloor: -109,
+      interference: -86,
+      interferenceLastTs: 1_700_000_000,
+      interferenceLastDbm: -86,
+      cpuLoad: 3.5,
+      batteryState: 'discharging',
+      batteryPercent: 100,
+    }));
+    const rnode = await repo.getInterface(SRC_A, 'RNode LoRa Interface');
+    expect(rnode!.airtimeLong).toBe(0.12);
+    expect(rnode!.channelLoadShort).toBe(2.44);
+    expect(rnode!.noiseFloor).toBe(-109);
+    expect(rnode!.interference).toBe(-86);
+    expect(rnode!.interferenceLastTs).toBe(1_700_000_000);
+    expect(rnode!.interferenceLastDbm).toBe(-86);
+    expect(rnode!.cpuLoad).toBe(3.5);
+    expect(rnode!.batteryState).toBe('discharging');
+    expect(rnode!.batteryPercent).toBe(100);
+
+    // ...a non-RNode interface that reports none leaves every gauge null.
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'AutoInterface', interfaceType: 'AutoInterface' }));
+    const auto = await repo.getInterface(SRC_A, 'AutoInterface');
+    expect(auto!.airtimeShort).toBeNull();
+    expect(auto!.channelLoadLong).toBeNull();
+    expect(auto!.noiseFloor).toBeNull();
+    expect(auto!.batteryState).toBeNull();
+    expect(auto!.batteryPercent).toBeNull();
+  });
+
   it('upsertInterface - repeated poll overwrites the full snapshot, preserves createdAt', async () => {
     const backend = getBackend();
     if (!backend.available) {
@@ -325,6 +380,64 @@ function runReticulumTests(getBackend: () => TestBackend) {
 
     const onB = await repo.listInterfaces(SRC_B);
     expect(onB.map((i) => i.interfaceName)).toEqual(['iface-3']);
+  });
+
+  it('pruneInterfacesNotIn - deletes rows absent from the snapshot, keeps present ones, scoped to source (#6121)', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    // SRC_A has three interfaces; SRC_B has one.
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'keep-1' }));
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'keep-2' }));
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'drop-me' }));
+    await repo.upsertInterface(SRC_B, makeIface({ interfaceName: 'other-source' }));
+
+    // Latest snapshot for SRC_A lists only keep-1 and keep-2 — drop-me is gone.
+    await repo.pruneInterfacesNotIn(SRC_A, ['keep-1', 'keep-2']);
+
+    const onA = await repo.listInterfaces(SRC_A);
+    expect(onA.map((i) => i.interfaceName).sort()).toEqual(['keep-1', 'keep-2']);
+    expect(await repo.getInterface(SRC_A, 'drop-me')).toBeNull();
+    expect(await repo.countInterfaces(SRC_A)).toBe(2);
+
+    // The other source is untouched — the prune never crosses source boundaries.
+    const onB = await repo.listInterfaces(SRC_B);
+    expect(onB.map((i) => i.interfaceName)).toEqual(['other-source']);
+    expect(await repo.countInterfaces(SRC_B)).toBe(1);
+  });
+
+  it('pruneInterfacesNotIn - empty keepNames deletes all rows for the source only (#6121)', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'a-1' }));
+    await repo.upsertInterface(SRC_A, makeIface({ interfaceName: 'a-2' }));
+    await repo.upsertInterface(SRC_B, makeIface({ interfaceName: 'b-1' }));
+
+    // Snapshot reports zero interfaces for SRC_A — clear them all.
+    await repo.pruneInterfacesNotIn(SRC_A, []);
+
+    expect(await repo.countInterfaces(SRC_A)).toBe(0);
+    expect(await repo.listInterfaces(SRC_A)).toHaveLength(0);
+    // SRC_B is unaffected.
+    expect(await repo.countInterfaces(SRC_B)).toBe(1);
+    expect((await repo.listInterfaces(SRC_B)).map((i) => i.interfaceName)).toEqual(['b-1']);
+  });
+
+  it('pruneInterfacesNotIn - throws without a sourceId', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    await expect(repo.pruneInterfacesNotIn('', ['x'])).rejects.toThrow(/sourceId/);
   });
 
   it('upsertDestination - retention: prunes oldest non-favorite rows beyond reticulum_destinations_max', async () => {

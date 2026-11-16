@@ -136,6 +136,9 @@ export function mapDbNodeToDeviceInfo(
   if (node.hideFromMap !== null && node.hideFromMap !== undefined) {
     deviceInfo.hideFromMap = Boolean(node.hideFromMap);
   }
+  if (node.channelLocked !== null && node.channelLocked !== undefined) {
+    deviceInfo.channelLocked = Boolean(node.channelLocked);
+  }
   if (node.notes !== null && node.notes !== undefined) {
     deviceInfo.notes = node.notes;
   }
@@ -178,6 +181,16 @@ export function mapDbNodeToDeviceInfo(
   }
   if (node.aircraftFixedAt !== null && node.aircraftFixedAt !== undefined) {
     deviceInfo.aircraftFixedAt = Number(node.aircraftFixedAt);
+  }
+  // #5715: manual aircraft mark.
+  if (node.aircraftManualMark === 'not_aircraft' || node.aircraftManualMark === 'aircraft') {
+    deviceInfo.aircraftManualMark = node.aircraftManualMark;
+    if (node.aircraftManualMarkAt !== null && node.aircraftManualMarkAt !== undefined) {
+      deviceInfo.aircraftManualMarkAt = Number(node.aircraftManualMarkAt);
+    }
+    if (node.aircraftManualMarkBy !== null && node.aircraftManualMarkBy !== undefined) {
+      deviceInfo.aircraftManualMarkBy = Number(node.aircraftManualMarkBy);
+    }
   }
 
   return deviceInfo;

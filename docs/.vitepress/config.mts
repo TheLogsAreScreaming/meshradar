@@ -72,7 +72,8 @@ const featuresSidebar = [
       { text: 'Delivery Details', link: '/features/delivery-diagnostics' },
       { text: 'Channel Database', link: '/features/channel-database' },
       { text: 'Store & Forward', link: '/features/store-forward' },
-      { text: 'Message Translation', link: '/features/message-translation' }
+      { text: 'Message Translation', link: '/features/message-translation' },
+      { text: 'SPIP Pixel Images', link: '/features/spip-images' }
     ]
   },
   {
@@ -82,6 +83,7 @@ const featuresSidebar = [
       { text: 'Interactive Maps', link: '/features/maps' },
       { text: 'Map Analysis', link: '/features/map-analysis' },
       { text: 'Waypoints', link: '/features/waypoints' },
+      { text: 'Local Markers', link: '/features/local-markers' },
       { text: 'Position Estimation', link: '/features/position-estimation' },
       { text: 'Estimated Accuracy', link: '/features/estimated-accuracy' },
       { text: 'Embed Maps', link: '/features/embed-maps' }
@@ -131,10 +133,12 @@ const featuresSidebar = [
     collapsed: false,
     items: [
       { text: 'Security Overview', link: '/features/security' },
+      { text: 'Passkeys', link: '/features/passkeys' },
       { text: 'Duplicate Encryption Keys', link: '/security-duplicate-keys' },
       { text: 'Low-Entropy Encryption Keys', link: '/security-low-entropy-keys' },
       { text: 'Impersonation Detection', link: '/features/impersonation-detection' },
       { text: 'PKI Direct Message Decryption', link: '/features/pki-dm-decryption' },
+      { text: 'Reliable PKI', link: '/features/reliable-pki' },
       { text: 'Security Advisories', link: '/security/SECURITY_ADVISORY' }
     ]
   },
@@ -152,6 +156,7 @@ const featuresSidebar = [
     text: 'Integrations',
     collapsed: false,
     items: [
+      { text: 'MQTT Setup Guide', link: '/features/mqtt-setups' },
       { text: 'Embedded MQTT Broker & Bridge', link: '/features/mqtt-broker' },
       { text: 'ATAK / CoT Integration', link: '/features/atak' }
     ]
@@ -163,7 +168,9 @@ const featuresSidebar = [
       { text: 'MeshCore Overview', link: '/features/meshcore' },
       { text: 'Receive-Only Mode', link: '/features/meshcore-receive-only' },
       { text: 'Analyzer Observer', link: '/features/meshcore-analyzer-observer' },
-      { text: 'MQTT Ingest', link: '/features/meshcore-mqtt-ingest' }
+      { text: 'MQTT Ingest', link: '/features/meshcore-mqtt-ingest' },
+      { text: 'MQTT Broker', link: '/features/meshcore-mqtt-broker' },
+      { text: 'MeshWars', link: '/features/meshwars' }
     ]
   },
   {
@@ -270,6 +277,7 @@ export default defineConfig({
           collapsed: false,
           items: [
             { text: 'SSO (OpenID Connect)', link: '/configuration/sso' },
+            { text: 'Passkeys', link: '/features/passkeys' },
             { text: 'Fail2ban Integration', link: '/configuration/fail2ban' }
           ]
         },

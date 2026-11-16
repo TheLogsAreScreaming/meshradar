@@ -22,6 +22,12 @@ import { decodeOutPathLen, formatOutPath } from './meshcoreNativeBackend.js';
 // to null (unset) so most tests exercise the built-in 15s fallback. Declared via
 // vi.hoisted so the hoisted vi.mock factory can reference it without a TDZ error.
 const { getSettingMock } = vi.hoisted(() => ({ getSettingMock: vi.fn().mockResolvedValue(null) }));
+// CLI history (#5892): spy on the recorder, keep the real outcome helper.
+const { recordCliHistoryMock } = vi.hoisted(() => ({ recordCliHistoryMock: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('./services/meshcoreCliHistoryService.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./services/meshcoreCliHistoryService.js')>()),
+  recordMeshcoreCliHistory: recordCliHistoryMock,
+}));
 vi.mock('../services/database.js', () => ({
   default: {
     auditLogAsync: vi.fn().mockResolvedValue(undefined),
@@ -373,7 +379,7 @@ describe('MeshCoreVirtualNodeServer — Phase 0 handshake', () => {
     expect(payload.readInt8(1)).toBe(SUPPORTED_COMPANION_PROTOCOL_VERSION);
   });
 
-  it('pins DeviceInfo protocol version to v1 even when the real node reports a higher firmwareVer (regression #3705)', async () => {
+  it('pins the DeviceInfo version byte even when the real node reports a higher firmwareVer (regression #3705)', async () => {
     // Once the manager's background deviceQuery() caches the real node's
     // firmware-version byte, that value must NOT leak into the VN's DeviceInfo
     // version field — the VN only speaks v1 frames, and the meshcore-flutter app
@@ -396,6 +402,55 @@ describe('MeshCoreVirtualNodeServer — Phase 0 handshake', () => {
     }
   });
 
+  it('reports the real node capacities in the v3 DeviceInfo layout (#5916)', async () => {
+    const realNode: MeshCoreNode = { ...LOCAL_NODE, maxContacts: 350, maxChannels: 40, model: 'Heltec V3', ver: 'v1.12.0' };
+    const realServer = new MeshCoreVirtualNodeServer({ port: 0, manager: new FakeManager(realNode), databaseService: CHANNELS_DB });
+    await realServer.start();
+    const realClient = new TestClient();
+    await realClient.connect(realServer.getListeningPort()!);
+    try {
+      const payload = await realClient.request([CommandCodes.DeviceQuery, 1]);
+      expect(payload.length).toBe(80);
+      expect(payload[1]).toBeGreaterThanOrEqual(3); // MeshCore One reads capacities only from v3
+      expect(payload[2]).toBe(175);
+      expect(payload[3]).toBe(40);
+      expect(payload.subarray(20, 60).toString('utf8').replace(/\0+$/, '')).toBe('Heltec V3');
+      // The version string stays empty: MeshCore One turns features on from it.
+      expect(payload.subarray(60, 80).every((x) => x === 0)).toBe(true);
+    } finally {
+      realClient.close();
+      await realServer.stop();
+    }
+  });
+
+  it('falls back to enough channel slots for every synced channel before DeviceQuery is cached (#5916)', async () => {
+    const db = {
+      channels: {
+        getAllChannels: vi.fn().mockResolvedValue([
+          { id: 0, name: 'Public', psk: null },
+          { id: 11, name: 'Far slot', psk: null },
+        ]),
+      },
+    };
+    const coldServer = new MeshCoreVirtualNodeServer({ port: 0, manager: new FakeManager(LOCAL_NODE), databaseService: db });
+    await coldServer.start();
+    const coldClient = new TestClient();
+    await coldClient.connect(coldServer.getListeningPort()!);
+    try {
+      const payload = await coldClient.request([CommandCodes.DeviceQuery, 1]);
+      expect(payload[3]).toBe(12);
+      expect(payload[2]).toBe(50); // 100 contacts / 2
+    } finally {
+      coldClient.close();
+      await coldServer.stop();
+    }
+  });
+
+  it('uses the stock 8 channel slots when no channels are synced', async () => {
+    const payload = await client.request([CommandCodes.DeviceQuery, 1]);
+    expect(payload[3]).toBe(8);
+  });
+
   it('replies to GetContacts with ContactsStart(N), Contact frames, then EndOfContacts', async () => {
     client.send([CommandCodes.GetContacts, 0, 0, 0, 0]); // since:u32
     const [start, contact, end] = await client.expectFrames(3);
@@ -413,10 +468,69 @@ describe('MeshCoreVirtualNodeServer — Phase 0 handshake', () => {
     expect(payload[1]).toBe(0); // channel index
   });
 
-  it('replies to GetChannel for an unknown slot with Err(NotFound)', async () => {
+  it('replies to an empty channel slot with a zero-filled ChannelInfo (#5933)', async () => {
     const payload = await client.request([CommandCodes.GetChannel, 7]);
-    expect(payload[0]).toBe(ResponseCodes.Err);
-    expect(payload[1]).toBe(Constants.ErrorCodes.NotFound);
+    expect(payload).toEqual(Buffer.from([ResponseCodes.ChannelInfo, 7, ...Buffer.alloc(48)]));
+  });
+
+  it.each([8, 9, 255])('replies to out-of-capacity GetChannel(%i) with Err(NotFound)', async (idx) => {
+    const payload = await client.request([CommandCodes.GetChannel, idx]);
+    expect(payload).toEqual(Buffer.from([ResponseCodes.Err, ErrorCodes.NotFound]));
+  });
+
+  it.each([
+    { label: 'real capacity', localNode: { ...LOCAL_NODE, maxChannels: 40 }, ids: [0, 23], capacity: 40 },
+    { label: 'stock fallback', localNode: LOCAL_NODE, ids: [], capacity: 8 },
+    { label: 'sparse fallback', localNode: LOCAL_NODE, ids: [0, 11], capacity: 12 },
+    { label: 'zero-capacity fallback', localNode: { ...LOCAL_NODE, maxChannels: 0 }, ids: [11], capacity: 12 },
+    { label: 'cold manager', localNode: null, ids: [11], capacity: 12 },
+    { label: 'wire capacity clamp', localNode: { ...LOCAL_NODE, maxChannels: 300 }, ids: [0], capacity: 255 },
+  ])('uses the DeviceInfo $label for empty channel reads (#5933)', async ({ localNode, ids, capacity }) => {
+    const db = {
+      channels: {
+        getAllChannels: vi.fn().mockResolvedValue(ids.map((id) => ({ id, name: 'Configured' }))),
+      },
+    };
+    const channelServer = new MeshCoreVirtualNodeServer({ port: 0, manager: new FakeManager(localNode), databaseService: db });
+    await channelServer.start();
+    const channelClient = new TestClient();
+    await channelClient.connect(channelServer.getListeningPort()!);
+    try {
+      const info = await channelClient.request([CommandCodes.DeviceQuery, 1]);
+      expect(info[3]).toBe(capacity);
+      // Queue a read for every slot, including gaps and the first invalid slot,
+      // as a pipelined app does. Correlate by index rather than arrival order.
+      for (let idx = 0; idx <= capacity; idx++) channelClient.send([CommandCodes.GetChannel, idx]);
+      const frames = await channelClient.expectFrames(capacity + 1);
+      const channels = frames.filter((frame) => frame[0] === ResponseCodes.ChannelInfo);
+      expect(channels).toHaveLength(capacity);
+      for (let idx = 0; idx < capacity; idx++) {
+        const frame = channels.find((channel) => channel[1] === idx);
+        expect(frame).toHaveLength(50);
+        if (!ids.includes(idx)) {
+          expect(frame).toEqual(Buffer.from([ResponseCodes.ChannelInfo, idx, ...Buffer.alloc(48)]));
+        }
+      }
+      expect(frames.filter((frame) => frame[0] === ResponseCodes.Err))
+        .toEqual([Buffer.from([ResponseCodes.Err, ErrorCodes.NotFound])]);
+      expect(db.channels.getAllChannels.mock.calls.every(([sourceId]) => sourceId === 'src-test')).toBe(true);
+    } finally {
+      channelClient.close();
+      await channelServer.stop();
+    }
+  });
+
+  it('keeps a channel DB failure distinct from an empty slot (#5933)', async () => {
+    CHANNELS_DB.channels.getAllChannels.mockRejectedValueOnce(new Error('DB unavailable'));
+    const payload = await client.request([CommandCodes.GetChannel, 7]);
+    expect(payload).toEqual(Buffer.from([ResponseCodes.Err, ErrorCodes.NotFound]));
+  });
+
+  it('still reports the stock DeviceInfo capacity when the channel DB fails (#5933)', async () => {
+    CHANNELS_DB.channels.getAllChannels.mockRejectedValueOnce(new Error('DB unavailable'));
+    const payload = await client.request([CommandCodes.DeviceQuery, 1]);
+    expect(payload[0]).toBe(ResponseCodes.DeviceInfo);
+    expect(payload[3]).toBe(8);
   });
 
   it('replies to GetBatteryVoltage with BatteryVoltage', async () => {
@@ -470,6 +584,24 @@ describe('MeshCoreVirtualNodeServer — Phase 0 handshake', () => {
     // sender name is reconstructed into the channel body the firmware would deliver.
     // ChannelMsgRecv header = code + channelIdx + pathLen + txtType + senderTs(4) = 8 bytes.
     expect(recv.subarray(8).toString('utf8')).toBe('Yeraze MC Sandbox: 🤖 Copy that');
+  });
+
+  it('relays a channel reaction as its raw wire text, so a client app can render it (#5761)', async () => {
+    const push = client.next();
+    const raw = '@[Bob]\u{1F44D}\nb45pc4ek';
+    // The manager hands the VN the RAW-text copy of a reaction (no reactionEmoji).
+    manager.emitMessage({
+      id: 'rx1',
+      fromPublicKey: 'channel-1',
+      fromName: 'Alice',
+      text: raw,
+      timestamp: 1_750_000_000_000,
+    });
+    expect((await push)[0]).toBe(PushCodes.MsgWaiting);
+
+    const recv = await client.request([CommandCodes.SyncNextMessage]);
+    expect(recv[0]).toBe(ResponseCodes.ChannelMsgRecv);
+    expect(recv.subarray(8).toString('utf8')).toBe(`Alice: ${raw}`);
   });
 
   it('does not echo our own channel transmission heard back (matching local name)', async () => {
@@ -1495,6 +1627,42 @@ describe('MeshCoreVirtualNodeServer — SendTxtMsg CLI relay (#4106)', () => {
     expect(res[1]).toBe(ErrorCodes.UnsupportedCmd);
     expect(manager.sendCliCommandMock).not.toHaveBeenCalled();
     expect(manager.sendMessageWithResultMock).not.toHaveBeenCalled();
+  });
+
+  it('records each relayed CLI command in the history as origin vn (#5892)', async () => {
+    await startWith(true);
+    recordCliHistoryMock.mockClear();
+    manager.sendCliCommandMock.mockResolvedValueOnce({ reply: 'name: MyRepeater', elapsedMs: 120 });
+    const frames = client.expectFrames(2);
+    client.send(cliFrame('get name'));
+    await frames;
+    await vi.waitFor(() => expect(recordCliHistoryMock).toHaveBeenCalledTimes(1));
+    expect(recordCliHistoryMock).toHaveBeenCalledWith(expect.objectContaining({
+      targetKind: 'remote',
+      targetPublicKey: REMOTE_KEY,
+      origin: 'vn',
+      userId: null,
+      username: expect.stringMatching(/^vn:/),
+      command: 'get name',
+      outcome: 'ok',
+      reply: 'name: MyRepeater',
+      elapsedMs: 120,
+    }));
+    expect(recordCliHistoryMock.mock.calls[0][0].ipAddress).toBeTruthy();
+
+    manager.sendCliCommandMock.mockRejectedValueOnce(new Error('CLI command timed out after 15000ms'));
+    await client.request(cliFrame('stats'));
+    await vi.waitFor(() => expect(recordCliHistoryMock).toHaveBeenCalledTimes(2));
+    expect(recordCliHistoryMock.mock.calls[1][0]).toMatchObject({ command: 'stats', outcome: 'timeout', origin: 'vn' });
+  });
+
+  it('records a CLI command refused because admin commands are off as blocked (#5892)', async () => {
+    await startWith(false);
+    recordCliHistoryMock.mockClear();
+    await client.request(cliFrame('reboot'));
+    expect(recordCliHistoryMock).toHaveBeenCalledWith(expect.objectContaining({
+      origin: 'vn', command: 'reboot', outcome: 'blocked', error: 'ADMIN_COMMANDS_DISABLED',
+    }));
   });
 
   it('replies Sent but pushes nothing when the CLI command rejects (timeout / not Companion)', async () => {

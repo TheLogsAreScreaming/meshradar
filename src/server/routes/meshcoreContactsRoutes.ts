@@ -9,7 +9,8 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { MeshCoreDiscoverFilter, type MeshCoreDiscoverMode } from '../meshcoreManager.js';
+import { MeshCoreDiscoverFilter, type MeshCoreDiscoverMode, type MeshCoreManager, type ImportContactTokenResult } from '../meshcoreManager.js';
+import { parseMeshCoreContactToken } from '../../utils/meshcoreContactToken.js';
 import {
   MAX_INTERVAL_MINUTES,
   MIN_INTERVAL_BETWEEN_REQUESTS_MS,
@@ -37,6 +38,7 @@ import meshcorePositionHistoryService from '../services/meshcorePositionHistoryS
 import { isBogusPosition } from '../../utils/nullIsland.js';
 import { managerFor, isValidPublicKey, auditMeshcoreEvent, parseHexPathChain, requireMeshcoreTx, failIfTxDisabled, maskContactPositionsForViewOnMap } from './meshcoreRouteShared.js';
 import { ok, fail } from '../utils/apiResponse.js';
+import { newNodeAlertGate } from '../services/newNodeAlertGate.js';
 import {
   getMeshCoreNeighboursFetchRegistry,
   isValidNeighboursRequestId,
@@ -45,6 +47,8 @@ import { MANUAL_NEIGHBOURS_MAX_PAGES } from '../services/meshcoreNeighboursPagin
 import { buildLocalContactRow, withoutLocalFlag, type MeshCoreContactResponse } from './meshcoreLocalContactRow.js';
 import { applySignFlipToMeshCoreRows } from '../services/signFlipCorrection.js';
 import { extendRequestTimeout } from '../middleware/requestTimeout.js';
+import { recordMeshcoreCliHistory, cliRequester, cliErrorOutcome } from '../services/meshcoreCliHistoryService.js';
+import { applyMeshCorePositionOverridesForViewer } from '../utils/meshcorePositionOverride.js';
 import { MESHCORE_TRACE_SOCKET_TIMEOUT_MS } from '../constants/meshcoreFirmwareTimeout.js';
 
 // Radio round trips on these routes legitimately run past the 30s default
@@ -76,6 +80,14 @@ const REGIONS_DISCOVER_TIMEOUT_MS = 180_000;
  */
 const PUSH_TO_DEVICE_TIMEOUT_MS = 300_000;
 
+/**
+ * Bulk remove (#5777): one serial write per contact,
+ * a few hundred ms each; ~350 contacts is well under 2 min. 5 min leaves margin;
+ * past it the 504 safety net answers and the run finishes in the background
+ * (a dropped socket would make the browser resend the POST).
+ */
+const BULK_REMOVE_TIMEOUT_MS = 300_000;
+
 
 const router = Router({ mergeParams: true });
 
@@ -85,8 +97,9 @@ const router = Router({ mergeParams: true });
  */
 router.get('/nodes', optionalAuth(), requirePermission('nodes', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
   try {
+    // #5842: an enabled location override wins over the advert position.
     const nodes = await applySignFlipToMeshCoreRows(await maskContactPositionsForViewOnMap(
-      await managerFor(req, res).getAllNodes(),
+      await applyMeshCorePositionOverridesForViewer(await managerFor(req, res).getAllNodes(), req.user, req.params.id),
       req.user ?? null,
       req.params.id,
     ), req.params.id); // #5363 display-only sign-flip correction
@@ -169,7 +182,7 @@ router.get('/contacts', optionalAuth(), requirePermission('nodes', 'read', { sou
     }
 
     const masked = await applySignFlipToMeshCoreRows(await maskContactPositionsForViewOnMap(
-      allContacts,
+      await applyMeshCorePositionOverridesForViewer(allContacts, req.user, req.params.id), // #5842
       req.user ?? null,
       req.params.id,
     ), req.params.id); // #5363
@@ -214,7 +227,11 @@ router.post('/contacts/refresh', meshcoreDeviceLimiter, requireAuth(), requirePe
     // same as GET /contacts so refreshing doesn't become a side-channel
     // around the read-path's position gate (#4559 review follow-up).
     const masked = await applySignFlipToMeshCoreRows(
-      await maskContactPositionsForViewOnMap(allContacts, req.user ?? null, req.params.id),
+      await maskContactPositionsForViewOnMap(
+        await applyMeshCorePositionOverridesForViewer(allContacts, req.user, req.params.id), // #5842
+        req.user ?? null,
+        req.params.id,
+      ),
       req.params.id,
     ); // #5363
 
@@ -298,6 +315,118 @@ router.post(
     } catch (error) {
       logger.error('[API] Error pushing contacts to device:', error);
       return fail(res, 500, 'PUSH_TO_DEVICE_FAILED', 'Failed to push contacts to the radio');
+    }
+  },
+);
+
+/**
+ * POST /api/sources/:id/meshcore/contacts/remove-non-favorites
+ *
+ * Remove every non-favourite contact from the RADIO's contact table (#5777),
+ * one at a time. A favourite on the radio (flags & 0x01) or in MeshRadar is
+ * kept. MeshRadar's own node rows and history are NOT touched.
+ * Declared before `/contacts/:publicKey/...` so it never reads as a key.
+ *
+ * Mesh impact: serial writes to the companion only, no RF.
+ */
+router.post(
+  '/contacts/remove-non-favorites',
+  extendRequestTimeout(BULK_REMOVE_TIMEOUT_MS),
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const result = await managerFor(req, res).removeNonFavoriteContacts();
+      auditMeshcoreEvent(req, 'meshcore_contacts_remove_non_favorites', 'configuration', {
+        sourceId: req.params.id,
+        status: result.status,
+        ...(result.status === 'done'
+          ? { removed: result.removed, kept: result.kept, failed: result.failed, total: result.total }
+          : {}),
+      });
+      switch (result.status) {
+        case 'done': {
+          const { status: _status, ...counts } = result;
+          return ok(res, counts);
+        }
+        case 'busy':
+          return fail(res, 409, 'BULK_REMOVE_RUNNING', 'A bulk remove is already running');
+        case 'unavailable':
+          return fail(res, 409, 'SOURCE_NOT_CONNECTED', 'Removing contacts needs a connected Companion radio');
+        default:
+          return fail(res, 502, 'BULK_REMOVE_FAILED', result.error);
+      }
+    } catch (error) {
+      logger.error('[API] Error removing non-favourite contacts:', error);
+      return fail(res, 500, 'BULK_REMOVE_FAILED', 'Failed to remove contacts from the radio');
+    }
+  },
+);
+
+/**
+ * GET /api/sources/:id/meshcore/nodes/purge-non-favourites/preview
+ *
+ * Count how many MeshCore nodes the purge would delete for this source
+ * (#6041) — every node that is NOT a device-starred favourite. Feeds the
+ * confirm dialog's "will delete N" line before the user commits. DB read
+ * only; nothing on the radio is touched.
+ *
+ * Declared before `/nodes/:publicKey/...` so "purge-non-favourites" never
+ * reads as a public key.
+ */
+router.get(
+  '/nodes/purge-non-favourites/preview',
+  requireAuth(),
+  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = req.params.id;
+      const count = await databaseService.meshcore.countNonFavoriteNodes(sourceId);
+      return ok(res, { count });
+    } catch (error) {
+      logger.error('[API] Error counting non-favourite MeshCore nodes:', error);
+      return fail(res, 500, 'PURGE_PREVIEW_FAILED', 'Failed to count non-favourite nodes');
+    }
+  },
+);
+
+/**
+ * POST /api/sources/:id/meshcore/nodes/purge-non-favourites
+ *
+ * Delete every non-favourite MeshCore node row for this source from
+ * MeshRadar's database (#6041), keeping only the device-starred favourites
+ * (isFavorite = true). Scoped by sourceId, so another source's nodes are
+ * untouched, and each removed node's rename history goes with it — the same
+ * cascade `deleteNode` runs for a single node. Returns `{ deleted }`.
+ *
+ * A purge that deleted rows also re-arms the new-node alert learning window
+ * (#6306). Mesh impact: a DB purge only, no RF and no serial write — so no
+ * requireMeshcoreTx() gate. The radio's own contact table is left alone
+ * (that is the separate /contacts/remove-non-favorites action).
+ */
+router.post(
+  '/nodes/purge-non-favourites',
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = req.params.id;
+      const deleted = await databaseService.meshcore.deleteNonFavoriteNodes(sourceId);
+      // #6306: every node heard again after a purge is "new", so restart the
+      // new-node learning window. It can only suppress alerts. The window is
+      // persisted, so a restart does not undo it. A single-node delete does not
+      // re-arm. A Companion has no gate, so the stored value is unused there.
+      if (deleted > 0) await newNodeAlertGate.rearm(sourceId);
+      auditMeshcoreEvent(req, 'meshcore_nodes_purge_non_favourites', 'configuration', {
+        sourceId,
+        deleted,
+      });
+      return ok(res, { deleted });
+    } catch (error) {
+      logger.error('[API] Error purging non-favourite MeshCore nodes:', error);
+      return fail(res, 500, 'PURGE_NON_FAVOURITES_FAILED', 'Failed to purge non-favourite nodes');
     }
   },
 );
@@ -480,6 +609,8 @@ router.post(
  * 200 → { success, hops: [{ index, snr }], lastSnr, path }
  * 409 → MESHCORE_TRACE_FAILED (no path / disconnected / not a Companion / device error)
  * 504 → MESHCORE_TRACE_TIMEOUT, with { reason: 'timeout', waitMs, suggestedTimeoutMs }
+ *
+ * Requires traceroute:write on the source (#5898; was nodes:write).
  */
 // The trace can wait up to 60 s for the radio, past the server's 30 s socket
 // timeout (server.ts). Closing the socket with no reply makes the browser
@@ -491,7 +622,9 @@ router.post(
   extendRequestTimeout(MESHCORE_TRACE_SOCKET_TIMEOUT_MS),
   meshcoreDeviceLimiter,
   requireAuth(),
-  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  // #5898: a trace is a traceroute send, so it takes traceroute:write like
+  // POST /api/traceroute. Migration 213 copied nodes:write holders across.
+  requirePermission('traceroute', 'write', { sourceIdFrom: 'params.id' }),
   requireMeshcoreTx(),
   async (req: Request, res: Response) => {
     try {
@@ -501,7 +634,7 @@ router.post(
       }
       // #5485: opt-in return leg; anything but literal true keeps one-way.
       const autoReturn = req.body?.autoReturn === true;
-      const result = await managerFor(req, res).traceContactPathDetailed(publicKey, { autoReturn });
+      const result = await managerFor(req, res).traceContactPathDetailed(publicKey, { autoReturn, origin: 'manual' });
       if (!result.ok) {
         if (result.reason === 'timeout') {
           const seconds = Math.round(result.waitMs / 1000);
@@ -755,6 +888,14 @@ router.delete(
       if (!ok) {
         ok = await manager.forgetLocalContact(publicKey);
       }
+      if (!ok && !isValidPublicKey(publicKey)) {
+        // A key that is not 64-hex cannot be a device contact. If no row or
+        // in-memory entry matched it either, it is a leftover (a corrupted
+        // room-post author prefix, #5774) that already has no stored row: the
+        // wanted end state holds, so answer success and let the UI refresh
+        // instead of a 409 the user cannot act on.
+        return res.json({ success: true, removed: false });
+      }
       if (!ok) {
         return res.status(409).json({
           success: false,
@@ -768,6 +909,56 @@ router.delete(
     }
   },
 );
+
+/**
+ * Map an add-to-radio outcome onto the response envelope (#5349). Shared by
+ * add-to-device and the contact-share token import (#6370), so both answer
+ * the full-table confirm / favourites / table-full cases the same way.
+ */
+function sendAddContactResult(res: Response, result: ImportContactTokenResult): Response {
+  switch (result.status) {
+    case 'added':
+      return ok(res, result);
+    case 'already_on_device':
+      return ok(res, result);
+    case 'confirm_full':
+      return fail(
+        res,
+        409,
+        'CONTACT_TABLE_FULL_CONFIRM',
+        result.maxContacts === null
+          ? "Couldn't read how many contacts the radio can hold. If its list is full, adding may replace the oldest non-favourite contact (or the radio will refuse)."
+          : `The radio's contact list is full (${result.count}/${result.maxContacts}). Adding may replace the oldest non-favourite contact (or the radio will refuse).`,
+        { count: result.count, maxContacts: result.maxContacts },
+      );
+    case 'favorites_unprotected':
+      return fail(
+        res,
+        409,
+        'FAVORITES_NOT_PROTECTED',
+        'Not added: some favourites are not yet protected on the radio, so a full contact list could evict them. Try again once the radio has synced.',
+        { unprotected: result.unprotected },
+      );
+    case 'table_full':
+      return fail(
+        res,
+        409,
+        'CONTACT_TABLE_FULL',
+        "The radio refused: its contact list is full and it is not set to replace old contacts (or every contact is a favourite). In Settings, Radio contact list, turn on replacing the oldest non-favourite contact, or remove non-favourite contacts.",
+        { count: result.count, maxContacts: result.maxContacts },
+      );
+    case 'unknown_type':
+      return fail(res, 422, 'UNKNOWN_NODE_TYPE', 'The node type is unknown, so it cannot be added yet. Wait for it to advertise.');
+    case 'not_found':
+      return fail(res, 404, 'CONTACT_NOT_FOUND', 'Unknown node');
+    case 'self':
+      return fail(res, 400, 'CANNOT_IMPORT_SELF', "This is the radio's own contact");
+    case 'unavailable':
+      return fail(res, 409, 'COMPANION_NOT_CONNECTED', 'Adding contacts needs a connected Companion radio');
+    default:
+      return fail(res, 502, 'ADD_CONTACT_FAILED', result.error);
+  }
+}
 
 /**
  * POST /api/sources/:id/meshcore/contacts/:publicKey/add-to-device
@@ -805,46 +996,7 @@ router.post(
         status: result.status,
         ...(result.status === 'added' ? { evicted: result.evicted } : {}),
       });
-      switch (result.status) {
-        case 'added':
-          return ok(res, result);
-        case 'already_on_device':
-          return ok(res, result);
-        case 'confirm_full':
-          return fail(
-            res,
-            409,
-            'CONTACT_TABLE_FULL_CONFIRM',
-            result.maxContacts === null
-              ? "Couldn't read how many contacts the radio can hold. If its list is full, adding may replace the oldest non-favourite contact (or the radio will refuse)."
-              : `The radio's contact list is full (${result.count}/${result.maxContacts}). Adding may replace the oldest non-favourite contact (or the radio will refuse).`,
-            { count: result.count, maxContacts: result.maxContacts },
-          );
-        case 'favorites_unprotected':
-          return fail(
-            res,
-            409,
-            'FAVORITES_NOT_PROTECTED',
-            'Not added: some favourites are not yet protected on the radio, so a full contact list could evict them. Try again once the radio has synced.',
-            { unprotected: result.unprotected },
-          );
-        case 'table_full':
-          return fail(
-            res,
-            409,
-            'CONTACT_TABLE_FULL',
-            "The radio refused: its contact list is full and it is not set to replace old contacts (or every contact is a favourite). Remove a contact first.",
-            { count: result.count, maxContacts: result.maxContacts },
-          );
-        case 'unknown_type':
-          return fail(res, 422, 'UNKNOWN_NODE_TYPE', 'The node type is unknown, so it cannot be added yet. Wait for it to advertise.');
-        case 'not_found':
-          return fail(res, 404, 'CONTACT_NOT_FOUND', 'Unknown node');
-        case 'unavailable':
-          return fail(res, 409, 'COMPANION_NOT_CONNECTED', 'Adding contacts needs a connected Companion radio');
-        default:
-          return fail(res, 502, 'ADD_CONTACT_FAILED', result.error);
-      }
+      return sendAddContactResult(res, result);
     } catch (error) {
       logger.error('[API] Error adding contact to device:', error);
       return fail(res, 500, 'ADD_CONTACT_FAILED', 'Failed to add contact to the radio');
@@ -885,6 +1037,55 @@ router.get(
     } catch (error) {
       logger.error('[API] Error exporting contact:', error);
       res.status(500).json({ success: false, error: 'Failed to export contact' });
+    }
+  },
+);
+
+/**
+ * POST /api/sources/:id/meshcore/contacts/import-token
+ *
+ * Import a contact from a MeshCore One contact-share token (#6370),
+ * `<PUBKEYHEX:type:name>`, into the companion radio's contact table and this
+ * source's node list. The token has no advert or signature, so the contact
+ * gets a flood out-path; one the radio already holds is left as it is.
+ * Same `nodes:write` scoping, limiter and full-table confirm as add-to-device.
+ *
+ * Body: { token: string, confirmFull?: boolean }
+ *
+ * Mesh impact: serial/TCP write to the companion only, no RF — so, like
+ * add-to-device, no requireMeshcoreTx() gate.
+ */
+router.post(
+  '/contacts/import-token',
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as { token?: unknown; confirmFull?: unknown };
+      const token = typeof body.token === 'string' ? parseMeshCoreContactToken(body.token) : null;
+      if (!token) {
+        return fail(
+          res,
+          400,
+          'INVALID_CONTACT_TOKEN',
+          'Expected a contact token <PUBLICKEY:type:name> with a 64-character hex key, type 1 (Companion), 2 (Repeater) or 3 (Room), and a name',
+        );
+      }
+      const confirmFull = body.confirmFull === true;
+      const result = await managerFor(req, res).importContactFromToken(token, { confirmFull });
+      auditMeshcoreEvent(req, 'meshcore_contact_import_token', 'configuration', {
+        sourceId: req.params.id,
+        publicKey: token.publicKey,
+        advType: token.type,
+        confirmFull,
+        status: result.status,
+        ...(result.status === 'added' ? { evicted: result.evicted } : {}),
+      });
+      return sendAddContactResult(res, result);
+    } catch (error) {
+      logger.error('[API] Error importing contact token:', error);
+      return fail(res, 500, 'ADD_CONTACT_FAILED', 'Failed to import the contact');
     }
   },
 );
@@ -1019,6 +1220,10 @@ router.get(
           enabled: Boolean(node?.telemetryEnabled),
           intervalMinutes: node?.telemetryIntervalMinutes ?? 60,
           lastRequestAt: node?.lastTelemetryRequestAt ?? null,
+          // Retry-burst / cooldown state (#6033).
+          lastSuccessAt: node?.lastTelemetrySuccessAt ?? null,
+          missCount: node?.telemetryMissCount ?? 0,
+          cooldownUntil: node?.telemetryCooldownUntil ?? null,
         },
       });
     } catch (error) {
@@ -1027,6 +1232,57 @@ router.get(
     }
   },
 );
+
+export type MeshCoreTelemetryPollOutcome =
+  | { kind: 'not_connected' }
+  | { kind: 'scheduler_unavailable' }
+  | { kind: 'rate_limited'; retryAfterSecs: number }
+  | { kind: 'polled'; written: number; sources: string[] };
+
+/**
+ * One manual remote-telemetry poll for a MeshCore node, outside the scheduler
+ * cadence (#3674). Shared by the UI poll route and the v1
+ * `actions/request-telemetry` handler (#6263), so both hit the same per-source
+ * 60 s mesh-TX gate (the scheduler's own primitive) and stamp `recordMeshTx`
+ * BEFORE the request goes out. Throws what the manager throws (TxDisabledError).
+ */
+export async function pollMeshCoreNodeTelemetry(opts: {
+  manager: MeshCoreManager;
+  sourceId: string;
+  publicKey: string;
+  type: 'status' | 'lpp';
+}): Promise<MeshCoreTelemetryPollOutcome> {
+  const { manager, sourceId, publicKey, type } = opts;
+  if (!manager.isConnected()) return { kind: 'not_connected' };
+
+  const scheduler = getMeshCoreRemoteTelemetryScheduler();
+  if (!scheduler) return { kind: 'scheduler_unavailable' };
+
+  // Per-source 60s mesh-TX gate: a manual poll can't flood the air or collide
+  // with a scheduled request already in flight on this source.
+  const lastTx = manager.getLastMeshTxAt();
+  const sinceLastTx = Date.now() - lastTx;
+  if (lastTx > 0 && sinceLastTx < MIN_INTERVAL_BETWEEN_REQUESTS_MS) {
+    return { kind: 'rate_limited', retryAfterSecs: Math.ceil((MIN_INTERVAL_BETWEEN_REQUESTS_MS - sinceLastTx) / 1000) };
+  }
+
+  // Load the persisted node (if any) so the scheduler can classify advType for
+  // guest-login decisions. An unknown node is treated as a companion.
+  const node = await databaseService.meshcore.getNodeByPublicKeyAndSource(publicKey, sourceId);
+
+  // Stamp before issuing so the gate applies regardless of result and the
+  // scheduler's fair-rotation clock advances too.
+  const now = Date.now();
+  manager.recordMeshTx(now);
+  await databaseService.meshcore.markTelemetryRequested(sourceId, publicKey, now);
+
+  const result = await scheduler.requestTelemetryForNode(
+    manager,
+    { publicKey, advType: node?.advType ?? null, name: node?.name ?? null },
+    { includeStatus: type === 'status', includeLpp: type === 'lpp' },
+  );
+  return { kind: 'polled', written: result.written, sources: result.sources };
+}
 
 /**
  * POST /api/sources/:id/meshcore/nodes/:publicKey/telemetry/poll
@@ -1063,52 +1319,27 @@ router.post(
         return res.status(400).json({ success: false, error: "type must be 'status' or 'lpp'" });
       }
 
-      const manager = managerFor(req, res);
-      if (!manager.isConnected()) {
+      const outcome = await pollMeshCoreNodeTelemetry({
+        manager: managerFor(req, res), sourceId, publicKey, type,
+      });
+      if (outcome.kind === 'not_connected') {
         return res.status(409).json({ success: false, error: 'MeshCore source is not connected' });
       }
-
-      const scheduler = getMeshCoreRemoteTelemetryScheduler();
-      if (!scheduler) {
+      if (outcome.kind === 'scheduler_unavailable') {
         return res.status(503).json({ success: false, error: 'Telemetry scheduler unavailable' });
       }
-
-      // Per-source 60s mesh-TX gate — the same primitive the scheduler
-      // uses, so a manual poll can't flood the air or collide with a
-      // scheduled request already in flight on this source.
-      const lastTx = manager.getLastMeshTxAt();
-      const sinceLastTx = Date.now() - lastTx;
-      if (lastTx > 0 && sinceLastTx < MIN_INTERVAL_BETWEEN_REQUESTS_MS) {
-        const retryAfterSecs = Math.ceil((MIN_INTERVAL_BETWEEN_REQUESTS_MS - sinceLastTx) / 1000);
-        res.set('Retry-After', String(retryAfterSecs));
+      if (outcome.kind === 'rate_limited') {
+        res.set('Retry-After', String(outcome.retryAfterSecs));
         return res.status(429).json({
           success: false,
-          error: `Too soon since last mesh transmission; retry in ${retryAfterSecs}s`,
-          retryAfterSecs,
+          error: `Too soon since last mesh transmission; retry in ${outcome.retryAfterSecs}s`,
+          retryAfterSecs: outcome.retryAfterSecs,
         });
       }
 
-      // Load the persisted node (if any) so the scheduler can classify
-      // advType for guest-login decisions. A node not yet in the DB is
-      // fine — requestTelemetryForNode treats an unknown advType as a
-      // companion (LPP-only, no guest login).
-      const node = await databaseService.meshcore.getNodeByPublicKeyAndSource(publicKey, sourceId);
-
-      // Stamp before issuing so the gate applies regardless of result and
-      // the scheduler's fair-rotation clock advances too.
-      const now = Date.now();
-      manager.recordMeshTx(now);
-      await databaseService.meshcore.markTelemetryRequested(sourceId, publicKey, now);
-
-      const result = await scheduler.requestTelemetryForNode(
-        manager,
-        { publicKey, advType: node?.advType ?? null },
-        { includeStatus: type === 'status', includeLpp: type === 'lpp' },
-      );
-
       res.json({
         success: true,
-        data: { type, written: result.written, sources: result.sources },
+        data: { type, written: outcome.written, sources: outcome.sources },
       });
     } catch (error) {
       if (failIfTxDisabled(res, error)) return;
@@ -1210,6 +1441,10 @@ router.patch(
           enabled: Boolean(node?.telemetryEnabled),
           intervalMinutes: node?.telemetryIntervalMinutes ?? 60,
           lastRequestAt: node?.lastTelemetryRequestAt ?? null,
+          // Retry-burst / cooldown state (#6033).
+          lastSuccessAt: node?.lastTelemetrySuccessAt ?? null,
+          missCount: node?.telemetryMissCount ?? 0,
+          cooldownUntil: node?.telemetryCooldownUntil ?? null,
         },
       });
     } catch (error) {
@@ -1628,7 +1863,7 @@ router.get(
  *
  * `intervalMinutes` is rejected below TIME_SYNC_MIN_INTERVAL_MINUTES (60)
  * rather than silently clamped, so an API caller learns the floor exists.
- * One sync is four packets on the air, so a mistyped small value would be
+ * One sync is two to five packets on the air, so a mistyped small value would be
  * genuinely harmful to the mesh.
  *
  * Gated by `configuration:write`, mirroring the neighbours-config PATCH.
@@ -1776,6 +2011,25 @@ router.post(
       await databaseService.meshcore.markTimeSyncRequested(sourceId, publicKey, now);
 
       const result = await manager.syncNodeTime(publicKey);
+      // #5892: a person pressed the button, so it goes in the CLI history.
+      // The scheduler calls syncNodeTime directly and is never recorded.
+      const contact = manager.getContact(publicKey);
+      void recordMeshcoreCliHistory({
+        sourceId,
+        targetKind: 'remote',
+        targetPublicKey: publicKey,
+        targetName: contact?.advName ?? contact?.name ?? null,
+        origin: 'user',
+        ...cliRequester(req),
+        command: 'clock sync',
+        ...(result.status === 'ok'
+          ? { outcome: 'ok' as const, reply: result.reply, elapsedMs: result.elapsedMs }
+          : result.status === 'rejected'
+            ? { outcome: 'failed' as const, reply: result.reply, error: 'CLOCK_PUSH_REJECTED' }
+            : result.status === 'no-credential'
+              ? { outcome: 'failed' as const, error: 'NO_SAVED_CREDENTIAL' }
+              : { outcome: cliErrorOutcome(result.error), error: result.error }),
+      });
       if (result.status === 'no-credential') {
         return res.status(409).json({
           success: false,
@@ -1891,6 +2145,196 @@ router.post(
     } catch (error) {
       logger.error('[API] Error setting MeshCore node favorite:', error);
       res.status(500).json({ success: false, error: 'Failed to set favorite' });
+    }
+  },
+);
+
+/**
+ * POST /api/sources/:id/meshcore/nodes/:publicKey/remote-cli
+ *
+ * Allow or stop a contact running CLI commands on this Companion (contact
+ * flag 0x10, fw 1.18.0+, #5867). Body: { allowed: boolean }. Allowing hands
+ * that peer every CLI verb on this radio, `reboot` and `set radio` included,
+ * so it takes `configuration:write`, like the local console. A local serial
+ * write: no RF, and receive-only mode does not block it.
+ */
+router.post(
+  '/nodes/:publicKey/remote-cli',
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    const { publicKey } = req.params;
+    if (!isValidPublicKey(publicKey)) {
+      return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key format (expected 64-character hex string)');
+    }
+    const { allowed } = req.body ?? {};
+    if (typeof allowed !== 'boolean') {
+      return fail(res, 400, 'INVALID_INPUT', 'allowed must be a boolean');
+    }
+    try {
+      const manager = managerFor(req, res);
+      const { flags } = await manager.setContactRemoteCli(publicKey, allowed);
+      auditMeshcoreEvent(req, 'meshcore_contact_remote_cli', 'configuration', {
+        sourceId: req.params.id,
+        publicKey,
+        allowed,
+      });
+      ok(res, { publicKey, allowed, flags });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.warn(`[API] remote-cli permission for ${publicKey.substring(0, 16)}… failed: ${msg}`);
+      if (/not connected/i.test(msg)) return fail(res, 409, 'SOURCE_NOT_CONNECTED', msg);
+      if (/needs|not in device contact list|not found/i.test(msg)) {
+        return fail(res, 409, 'REMOTE_CLI_UNAVAILABLE', msg);
+      }
+      fail(res, 502, 'REMOTE_CLI_FAILED', msg);
+    }
+  },
+);
+
+/**
+ * Location override for one MeshCore contact (#5842), parity with the
+ * Meshtastic `/api/nodes/:nodeId/position-override` routes.
+ *
+ * MeshRadar-only: the override lives in `meshcore_nodes` (migration 206)
+ * and nothing is sent to the radio, so a Companion and a Repeater source
+ * behave the same and the routes do not need a connection. Advert ingest
+ * keeps writing the advert `latitude`/`longitude`; read sides apply the
+ * override over them (`src/server/utils/meshcorePositionOverride.ts`).
+ *
+ * Editing takes the same per-source permission as the Meshtastic route,
+ * `nodes:write` on the source, behind `requireAuth()` like every MeshCore
+ * write route (so the anonymous account cannot edit it). Reading takes `nodes:read`; the coordinates
+ * additionally need `nodes:viewOnMap`, and a private override's coordinates
+ * need `nodes_private:read`, both on this source.
+ */
+router.get(
+  '/nodes/:publicKey/position-override',
+  optionalAuth(),
+  requirePermission('nodes', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id: string }).id;
+      const { publicKey } = req.params;
+      if (!isValidPublicKey(publicKey)) {
+        return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key format (expected 64-character hex string)');
+      }
+      const override = await databaseService.meshcore.getNodePositionOverride(sourceId, publicKey);
+      const data = {
+        publicKey,
+        enabled: override?.enabled ?? false,
+        isPrivate: override?.isPrivate ?? false,
+        latitude: override?.latitude,
+        longitude: override?.longitude,
+        altitude: override?.altitude,
+      };
+      const user = req.user ?? null;
+      const canViewOnMap = !!user && await hasPermission(user, 'nodes', 'viewOnMap', sourceId);
+      const canViewPrivate = !!user && await hasPermission(user, 'nodes_private', 'read', sourceId);
+      if (!canViewOnMap || (data.isPrivate && !canViewPrivate)) {
+        delete data.latitude;
+        delete data.longitude;
+        delete data.altitude;
+      }
+      return ok(res, data);
+    } catch (error) {
+      logger.error('[API] Error reading MeshCore position override:', error);
+      return fail(res, 500, 'INTERNAL_ERROR', 'Failed to get position override');
+    }
+  },
+);
+
+router.post(
+  '/nodes/:publicKey/position-override',
+  requireAuth(),
+  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id: string }).id;
+      const { publicKey } = req.params;
+      if (!isValidPublicKey(publicKey)) {
+        return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key format (expected 64-character hex string)');
+      }
+      const { enabled, latitude, longitude, altitude, isPrivate } = req.body ?? {};
+      if (typeof enabled !== 'boolean') {
+        return fail(res, 400, 'INVALID_PARAMETER_TYPE', 'enabled must be a boolean');
+      }
+      if (isPrivate !== undefined && typeof isPrivate !== 'boolean') {
+        return fail(res, 400, 'INVALID_PARAMETER_TYPE', 'isPrivate must be a boolean');
+      }
+      if (enabled) {
+        if (typeof latitude !== 'number' || !Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+          return fail(res, 400, 'INVALID_LATITUDE', 'Latitude must be a number between -90 and 90');
+        }
+        if (typeof longitude !== 'number' || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+          return fail(res, 400, 'INVALID_LONGITUDE', 'Longitude must be a number between -180 and 180');
+        }
+        if (altitude !== undefined && altitude !== null && (typeof altitude !== 'number' || !Number.isFinite(altitude))) {
+          return fail(res, 400, 'INVALID_ALTITUDE', 'Altitude must be a number');
+        }
+      }
+
+      // The node must be known to this source: a stored row, or a live contact.
+      // A live-only contact gets its identity row first, so the override does
+      // not land on a nameless stub (mirrors the favorite route).
+      const existing = await databaseService.meshcore.getNodeByPublicKeyAndSource(publicKey, sourceId);
+      if (!existing) {
+        const contact = managerFor(req, res).getContact(publicKey);
+        if (!contact) {
+          return fail(res, 404, 'NODE_NOT_FOUND', 'Node not found on this source');
+        }
+        await databaseService.meshcore.upsertNode(
+          {
+            publicKey,
+            name: contact.advName ?? contact.name ?? null,
+            advType: contact.advType ?? null,
+            lastHeard: contact.lastSeen ?? null,
+          },
+          sourceId,
+        );
+      }
+
+      await databaseService.meshcore.setNodePositionOverride(sourceId, publicKey, {
+        enabled,
+        latitude: enabled ? latitude : null,
+        longitude: enabled ? longitude : null,
+        altitude: enabled && typeof altitude === 'number' ? altitude : null,
+        isPrivate: enabled ? isPrivate === true : false,
+      });
+
+      return ok(res, {
+        publicKey,
+        sourceId,
+        enabled,
+        latitude: enabled ? latitude : null,
+        longitude: enabled ? longitude : null,
+        altitude: enabled && typeof altitude === 'number' ? altitude : null,
+        isPrivate: enabled ? isPrivate === true : false,
+      });
+    } catch (error) {
+      logger.error('[API] Error setting MeshCore position override:', error);
+      return fail(res, 500, 'INTERNAL_ERROR', 'Failed to set position override');
+    }
+  },
+);
+
+router.delete(
+  '/nodes/:publicKey/position-override',
+  requireAuth(),
+  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id: string }).id;
+      const { publicKey } = req.params;
+      if (!isValidPublicKey(publicKey)) {
+        return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key format (expected 64-character hex string)');
+      }
+      await databaseService.meshcore.clearNodePositionOverride(sourceId, publicKey);
+      return ok(res, { publicKey, sourceId, enabled: false });
+    } catch (error) {
+      logger.error('[API] Error clearing MeshCore position override:', error);
+      return fail(res, 500, 'INTERNAL_ERROR', 'Failed to clear position override');
     }
   },
 );

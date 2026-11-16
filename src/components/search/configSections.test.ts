@@ -65,6 +65,17 @@ describe('configSections', () => {
     expect(source).not.toContain('settings-sorting');
   });
 
+  it('files Solar Monitoring and Restart under Global Settings only (#6258)', () => {
+    const global = settingsNavItems(t, { ...baseOptions, mode: 'global' }).map((i) => i.id);
+    const source = settingsNavItems(t, { ...baseOptions, mode: 'source' }).map((i) => i.id);
+    expect(global).toContain('settings-solar');
+    expect(global).toContain('settings-system');
+    expect(source).not.toContain('settings-solar');
+    expect(source).not.toContain('settings-system');
+    const nonAdmin = settingsNavItems(t, { ...baseOptions, mode: 'global', isAdmin: false }).map((i) => i.id);
+    expect(nonAdmin).not.toContain('settings-system');
+  });
+
   describe('visibility gates mirror the tab', () => {
     it('hides admin-only sections from a non-admin', () => {
       const ids = settingsNavItems(t, { ...baseOptions, isAdmin: false }).map((i) => i.id);
@@ -73,9 +84,9 @@ describe('configSections', () => {
       expect(ids).toContain('settings-language');
     });
 
-    it('hides Database Maintenance on a non-SQLite backend', () => {
-      const ids = settingsNavItems(t, { ...baseOptions, databaseType: 'postgres' }).map((i) => i.id);
-      expect(ids).not.toContain('settings-maintenance');
+    it.each(['sqlite', 'postgres', 'mysql'] as const)('lists Database Maintenance on %s (#5870)', (databaseType) => {
+      const ids = settingsNavItems(t, { ...baseOptions, databaseType }).map((i) => i.id);
+      expect(ids).toContain('settings-maintenance');
     });
 
     it('lists Firmware Updates under Device Configuration, never under Settings (#5683 follow-up)', () => {
@@ -86,6 +97,14 @@ describe('configSections', () => {
       expect(configurationNavItems(t, { showFirmware: true }).map((i) => i.id)).toContain('config-firmware');
       expect(configurationNavItems(t, { showFirmware: false }).map((i) => i.id)).not.toContain('config-firmware');
       expect(configurationNavItems(t).map((i) => i.id)).not.toContain('config-firmware');
+    });
+
+    it('lists the Device Configuration danger zone last, matching the page (#5830)', () => {
+      for (const showFirmware of [true, false]) {
+        const ids = configurationNavItems(t, { showFirmware }).map((i) => i.id);
+        expect(ids[ids.length - 1]).toBe('config-danger');
+        expect(ids[0]).toBe('config-import-export');
+      }
     });
 
     it('lists PKI DM decryption under a radio source\'s Settings, for configuration:read', () => {
@@ -99,6 +118,17 @@ describe('configSections', () => {
         expect(settingsNavItems(t, { ...radio, sourceType }).map((i) => i.id), String(sourceType)).not.toContain('settings-pki-dm');
       }
       expect(settingsNavItems(t, { ...radio, mode: 'global' }).map((i) => i.id)).not.toContain('settings-pki-dm');
+    });
+
+    it('lists Reliable PKI under a Meshtastic radio source\'s Settings only (#5691)', () => {
+      const radio = { ...baseOptions, mode: 'source' as const, sourceType: 'meshtastic_tcp' };
+      expect(settingsNavItems(t, radio).map((i) => i.id)).toContain('settings-reliable-pki');
+      for (const sourceType of ['mqtt_bridge', 'mqtt_broker', 'meshcore', 'reticulum', null]) {
+        expect(settingsNavItems(t, { ...radio, sourceType }).map((i) => i.id), String(sourceType)).not.toContain('settings-reliable-pki');
+      }
+      // The global default lives inside Global → Security, not as its own section.
+      expect(settingsNavItems(t, { ...radio, mode: 'global' }).map((i) => i.id)).not.toContain('settings-reliable-pki');
+      expect(settingsNavItems(t, { ...radio, mode: 'global' }).map((i) => i.id)).toContain('settings-security');
     });
 
     it('lists the MQTT bridge setup under a bridge\'s Settings, for sources:read', () => {

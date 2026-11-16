@@ -57,7 +57,7 @@ When security issues are detected, nodes are flagged with warning indicators thr
 ```bash
 # docker-compose.yml or environment configuration
 environment:
-  - DUPLICATE_KEY_SCAN_INTERVAL_HOURS=24  # Adjust scan frequency (1-168 hours)
+  - DUPLICATE_KEY_SCAN_INTERVAL_HOURS=24  # Scan frequency in hours
 ```
 
 ### Combined Detection
@@ -196,15 +196,15 @@ Trigger a manual scan for duplicate keys:
 POST /api/nodes/scan-duplicate-keys
 ```
 
-**Authentication**: Requires `nodes:write` permission
+**Authentication**: Requires `nodes:write` permission. The scan covers the Meshtastic sources you can write to, and looks for duplicates within each source, never across sources.
 
 **Response**:
 ```json
 {
   "success": true,
-  "message": "Duplicate key scan completed",
-  "flaggedNodes": 8,
-  "duplicateGroups": 2
+  "duplicatesFound": 2,
+  "affectedNodes": [305419896, 2271560481],
+  "totalNodesScanned": 156
 }
 ```
 
@@ -218,8 +218,10 @@ POST /api/nodes/scan-duplicate-keys
 Retrieve all nodes currently flagged with security issues:
 
 ```bash
-GET /api/security/issues
+GET /api/security/issues?sourceId=<source id>
 ```
+
+**Authentication**: Requires `security:read` and `nodes:read` on the source. The `sourceId` query parameter is required. Each node also carries `nodeKey` (`mt:<number>` or `mc:<key>`) and `protocol`. The response adds `counts`, `thresholds` and, for MeshCore, `packetLogEnabled`. MeshCore times are in seconds.
 
 **Response**:
 ```json
@@ -242,6 +244,118 @@ GET /api/security/issues
   "topBroadcasters": []
 }
 ```
+
+## MeshCore Sources
+
+The Security tab also works on MeshCore sources. It shows the sections below for the selected source.
+
+### What MeshCore shows
+
+- **Dead contacts**: contacts not heard for N days. Set N per source with "dead after N days". The default is 7 days for Meshtastic and 14 days for MeshCore.
+- **Bulk delete**: you need `security:write` and `nodes:write` on the source. On a connected Companion, MeshMonitor removes the contacts from the radio and the database. On any other source, it removes them from the database only. A removed contact comes back on its next advert.
+- **Path-hash collisions**: repeaters and room servers that share a path hash at the source's hash width. The tab shows counts for 2-byte and 3-byte hashes.
+- **Advert signatures**: each contact shows Verified, Failed, or Not checked. Only Repeater and MQTT sources check signatures. Companion contacts always show Not checked.
+- **Name reused under a new key**: a name that now appears under a different key. This view is for display only. MeshMonitor takes no action.
+- **Own-key change**: a card appears when your own radio key changes. MeshMonitor sends one alert per change through the server-events notification preference. Click **Acknowledge** to clear the card.
+
+The dead-contact list and the findings need `nodes:read` on the source, for both Meshtastic and MeshCore.
+
+### Packet rates, clock offset, scanner, digest and export
+
+These work for Meshtastic and MeshCore with the same thresholds:
+
+| Check | Threshold | Notes |
+|---|---|---|
+| Excessive packets | more than **30 packets per hour** | Counted over the last hour at scan time. |
+| Clock offset | more than **30 minutes** | Set `TIME_OFFSET_THRESHOLD_MINUTES` to change it. A positive value means the node is behind. |
+
+**MeshCore packet rates need the packet log.** MeshCore counts distinct packets per key from the MeshCore packet monitor. Turn on **Packet Monitor** for the source, or the tab shows "Enable the MeshCore Packet Monitor to measure rates" and leaves rate flags as they are. MeshMonitor counts a packet once, however many observers or repeaters passed it on. It credits a packet to a key by:
+
+- the full key, for adverts and anonymous requests;
+- the one-byte sender hash, only when a single known contact on the source has that first byte (requests, responses and direct messages);
+- never for group messages, ACKs and path packets, which carry no sender.
+
+Your own radio is never flagged. Adverts are listed with the rate for information; advert cadence has its own check in Mesh Issues.
+
+**MeshCore clock offset** comes from the newest advert (the time inside the advert) or direct message (the sender time) for each node. A node with no real-time clock stamps a default date in the past, so it is years off. The tab shows these as **Clock not set**. Other nodes drop adverts older than one they hold, so such a node is hard to hear until you set its time. Room server posts are ignored, because they replay when you log in. With the packet log off, the scan also uses the clock samples MeshMonitor stores from live adverts (the same samples the Device Health clock alert uses), so the flag still works.
+
+**Scanner.** The 24-hour scan (plus one 5 minutes after start) now covers MeshCore sources, including MeshCore MQTT sources. It only reads the database and writes flags. It sends nothing and fires no events. **Run scan now** works on both. Flags stay until the next scan or until you clear them.
+
+**Digest.** The daily Apprise digest covers MeshCore. Its sections are Excessive packets, Clock offset, Advert signature failed, Name reused under new key, and Own key changed (pending acknowledge). Collisions are not in the digest, because they are a configuration matter. Save digest settings per source: the Apprise URL, report type, format and "suppress when empty" belong to the source, and the enable switch and send time are global. If a source has no value for those four, MeshMonitor uses the global one. A source with no Apprise URL is skipped, not reported as a failure. Sources that use the global URL share **one combined digest** per day, with a heading for each source, instead of one message per source. A source with its own URL still sends its own digest.
+
+**Send Now.** The **Send Now** button sends the digest for the source you view. The API call `POST /api/security/digest/send` needs a `sourceId` in the body and rejects a request without one (400), because it no longer sends for every source. It needs `security:write` and `nodes:read` on that source.
+
+**Export.** Export as CSV or JSON from either protocol. The file lists every node with a flag, including nodes flagged only for spam or clock offset. CSV cells are quoted and escaped. The Meshtastic columns keep their order, and "Excessive Packets" and "Packets per Hour" come last. MeshCore has its own columns.
+
+**Permissions.** `/issues`, `/export` and `/key-mismatches` need `nodes:read` on the source, as well as `security:read`. Scan and clear need `security:write` and `nodes:read` on the source.
+
+### Send notification (a draft, never sent for you)
+
+Rows for excessive packets and clock offset have a **Send notification** button, on Meshtastic and on MeshCore. It opens the node's direct message with a short English text in the box. You read it and press Send. MeshMonitor never sends it for you.
+
+- The text is 75 bytes or less.
+- MeshCore needs a **Companion** source and a **chat contact** target. Repeaters and Room Servers do not read DMs, so they get no button. The contact must be in the radio's table; if it is not, the button is disabled.
+- You need `messages:write` on the source.
+- When MeshMonitor knows no path to the node, a warning shows: "No known path: this DM will flood the mesh".
+
+**Airtime cost.** Estimates for one click (US: SF7 / 62.5 kHz; EU: SF8 / 62.5 kHz), with an 89-byte packet at 3 hops:
+
+| Case | US | EU |
+|---|---|---|
+| One DM on a known path (4 transmissions) | 1.43 s, plus the ACK 0.53 s | 3.74 s, plus the ACK 1.12 s |
+| No path, so it floods (about 50 repeaters) | about 18 s across the mesh | about 46 s across the mesh |
+| Worst case with no ACK (2 path retries and 1 flood) | about 22 s | about 57 s |
+
+One click is one DM. It does not grow with node count, has no timer and never repeats by itself. It uses the normal message rate limit and the normal DM retry rules.
+
+### What MeshCore does not have
+
+- Low-entropy key detection and duplicate key detection (a MeshCore node is its key).
+- Notification DMs to Repeaters or Room Servers.
+- Per-sender spam counts for group messages (they carry no sender).
+
+## Node name anti-spam
+
+Some people put invite links in their node names, such as `MyNode t.me/spam_channel`. Those names then show up in the node list, map popups, messages and notifications. MeshMonitor can strip the link before it stores the name.
+
+It is **off by default**. An admin turns it on in **Global Settings → Security → Node name anti-spam**.
+
+### What it does
+
+When a node name arrives, MeshMonitor replaces each link with a placeholder and keeps the rest of the name:
+
+| Name sent by the node | Name MeshMonitor stores |
+|---|---|
+| `MyNode t.me/spam_channel` | `MyNode [spammer]` |
+| `https://t.me/spam` | `[spammer]` |
+| `Bob t . me/spam` | `Bob [spammer]` |
+
+- It works for every source: Meshtastic over TCP, Meshtastic MQTT brokers and bridges, MeshCore companions and repeaters, and MeshCore MQTT.
+- It covers the long name and the short name of Meshtastic nodes and the advert name of MeshCore nodes.
+- It never changes your own node (the node each source is connected to).
+- Matching ignores common tricks: full-width letters (`ｔ.ｍｅ`), hidden zero-width characters, and spaced or bracketed dots (`t . me`, `t[.]me`).
+- Several links in a row become one placeholder, and extra spaces collapse.
+- The result stays within the Meshtastic long-name size (24 bytes on firmware 2.8, up to 39 on older firmware). If the placeholder makes the name too long, MeshMonitor shortens the rest of the name, never the placeholder.
+
+MeshMonitor does not keep the original name. If you turn the feature off, names stay cleaned until each node sends its name again (about every 3 hours on default Meshtastic firmware).
+
+### Rules
+
+- **Built-in rules** (on by default once the feature is on): any `http://` or `https://` link, plus `t.me/`, `telegram.me/`, `telegram.dog/`, `discord.gg/`, `wa.me/` and `chat.whatsapp.com/` links.
+- **Extra hosts or patterns**, one per line:
+  - A plain host such as `spam.example` matches `spam.example/anything`, with the same obfuscation handling as the built-ins.
+  - Anything else is a regular expression in [RE2 syntax](https://github.com/google/re2/wiki/Syntax), matched without regard to case. RE2 cannot hang on a bad pattern. Each pattern can be at most 256 characters, and you can store up to 50. MeshMonitor refuses to save an invalid pattern.
+- **Placeholder**: the text that replaces a link. The default is `[spammer]`, and it can be at most 24 bytes.
+
+### Cleaning names already stored
+
+New rules apply to names as they arrive. To clean names already in the database, click **Re-scan existing node names**. It runs the rules once over every stored Meshtastic and MeshCore node, on every source, and reports how many names changed. Older entries in a node's rename history are not changed.
+
+The section also shows how many names it has rewritten since the server started.
+
+### Airtime
+
+None. The feature only changes what MeshMonitor stores. It sends no packets, arms no timers and never retries anything.
 
 ## Best Practices
 
@@ -314,14 +428,14 @@ GET /api/security/issues
 
 **Solutions**:
 - Check server logs for `🔐` emoji messages
-- Verify the scanner started: Look for "Starting duplicate key scanner"
+- Verify the scanner started: Look for "Starting security scanner"
 - Check environment variable `DUPLICATE_KEY_SCAN_INTERVAL_HOURS`
 - Restart the server to reinitialize the scanner
 
 **Diagnostic Commands**:
 ```bash
-# Get nodes with security issues
-curl http://localhost:8080/api/security/issues
+# Get nodes with security issues (send your session cookie or API token)
+curl "http://localhost:8080/api/security/issues?sourceId=<source id>"
 
 # View scanner logs (Docker)
 docker logs meshmonitor 2>&1 | grep "🔐"
@@ -337,7 +451,7 @@ curl -X POST http://localhost:8080/api/nodes/scan-duplicate-keys
 - Public keys are stored in the database for comparison
 - Key hashes are generated but not stored
 - No private keys are ever transmitted or stored
-- Security flags are visible to all authenticated users
+- Security flags show to anyone who can see the node. The `/api/security/issues` list needs `security:read`
 
 ### Performance Impact
 
@@ -353,9 +467,19 @@ curl -X POST http://localhost:8080/api/nodes/scan-duplicate-keys
 - Requires nodes to broadcast their public keys
 - Scanner only runs while server is running
 
+## Packet Authenticity (Protection Level)
+
+The checks above are MeshMonitor's own. Firmware 2.8.0 adds a control on the node itself: a packet signature policy that decides whether the node accepts packets it cannot prove came from their sender. MeshMonitor sets it with the **Protection Level** picker (Compatible, Balanced or Strict) in the Security section of Device Configuration and of the Admin Commands tab. See [Protection Level](/features/device#protection-level-packet-authenticity) before you raise it: Strict drops most traffic from nodes older than 2.8.
+
+What each level does depends on the firmware: 2.8.0 and 2.8.1 behave one way, later firmware another. The [Protection Level table](/features/device#protection-level-packet-authenticity) lists both. On later firmware, Balanced and Strict ignore an unsigned name or role change from a node that has signed before, and MeshMonitor shows an **Unsigned update ignored** notice when that happens.
+
 ## Two-Factor Authentication (MFA)
 
 MeshMonitor supports TOTP-based two-factor authentication (MFA) for user accounts, adding an extra layer of security beyond username and password.
+
+::: tip
+Looking for passwordless sign-in? See [Passkeys](/features/passkeys). A passkey sign-in skips the TOTP code.
+:::
 
 ### Overview
 
@@ -363,8 +487,8 @@ When MFA is enabled on an account, logging in requires both a password and a tim
 
 ### Setting Up MFA
 
-1. Navigate to **Settings > Security**
-2. Click **Enable MFA**
+1. Open the user menu (your username in the header) and choose **Two-Factor Auth**
+2. Click **Enable Two-Factor Authentication**
 3. Scan the QR code with your authenticator app (or manually enter the secret key)
 4. Enter the 6-digit verification code from your app to confirm setup
 5. Save the backup codes displayed after successful setup

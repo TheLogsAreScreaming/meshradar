@@ -6,6 +6,7 @@
  */
 import { eq, asc, desc, and, or, inArray, sql, isNull, gte, gt, lt, isNotNull, max, min, type SQL } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase } from './base.js';
+import { likeContains } from './likeSearch.js';
 import { DatabaseType, DbPacketLog, DbPacketCountByNode, DbPacketCountByPortnum, DbDistinctRelayNode } from '../types.js';
 import { logger } from '../../utils/logger.js';
 import { getPortNumName, PortNum } from '../../server/constants/meshtastic.js';
@@ -43,6 +44,13 @@ export const HOP_ARRIVAL_MAX_ROWS = 20_000;
 export interface PacketVisibility {
   allowedChannels: number[];
   canReadMessages: boolean;
+  /**
+   * #5156: node numbers whose packets (sent by or addressed to them) the
+   * caller may not see, from the anonymous MQTT-consent filter.
+   */
+  excludeNodes?: number[];
+  /** #5156: the consent filter failed closed for this source: match nothing. */
+  excludeAll?: boolean;
 }
 
 
@@ -105,7 +113,11 @@ export class PacketLogRepository extends BaseRepository {
       ? sql`(${c('channel')} IS NULL OR ${c('channel')} IN (${sql.join(v.allowedChannels.map((n) => sql`${n}`), sql`, `)}))`
       : sql`${c('channel')} IS NULL`;
     const dmBranch = v.canReadMessages ? sql`${isDm}` : sql`1=0`;
-    return sql`(${encrypted} OR ${dmBranch} OR (NOT ${isDm} AND ${channels}))`;
+    const base = sql`(${encrypted} OR ${dmBranch} OR (NOT ${isDm} AND ${channels}))`;
+    if (v.excludeAll) return sql`1=0`;
+    if (!v.excludeNodes || v.excludeNodes.length === 0) return base;
+    const list = sql.join(v.excludeNodes.map((n) => sql`${n}`), sql`, `);
+    return sql`(${base} AND (${c('from_node')} IS NULL OR ${c('from_node')} NOT IN (${list})) AND (${c('to_node')} IS NULL OR ${c('to_node')} NOT IN (${list})))`;
   }
 
   /**
@@ -141,27 +153,10 @@ export class PacketLogRepository extends BaseRepository {
       conditions.push(sql`pl.relay_node = ${relay_node}`);
     }
     conditions.push(...this.transportConditions(sql`pl.transport_mechanism`, { transport_mechanism, transportClass }));
-    // Free-text search across the decoded content (#4958): the human-readable
-    // preview and the serialized-JSON metadata (both plain TEXT in every
-    // backend). Postgres LIKE is case-sensitive, so branch to ILIKE there;
-    // SQLite/MySQL LIKE are case-insensitive by default.
-    //
-    // The user's `%`/`_` must match literally, so they are escaped and an
-    // explicit ESCAPE char is declared (SQLite has no default escape char).
-    // The escape char is `~`, NOT `\`: a backslash escape clause (`ESCAPE '\'`)
-    // is fine for SQLite/Postgres but breaks MySQL, where `\` escapes the
-    // closing quote inside the string literal. `~` is a plain literal in all
-    // three backends.
+    // Free-text search across the decoded content (#4958): preview + serialized
+    // metadata. Escaping / ILIKE handling lives in likeSearch.ts.
     if (search !== undefined && search !== '') {
-      const escaped = search.replace(/[~%_]/g, (c: string) => `~${c}`);
-      const like = `%${escaped}%`;
-      // Branch the whole condition per backend rather than interpolating the
-      // operator keyword, so the generated SQL is unambiguous to read.
-      if (this.isPostgres()) {
-        conditions.push(sql`(pl.payload_preview ILIKE ${like} ESCAPE '~' OR pl.metadata ILIKE ${like} ESCAPE '~')`);
-      } else {
-        conditions.push(sql`(pl.payload_preview LIKE ${like} ESCAPE '~' OR pl.metadata LIKE ${like} ESCAPE '~')`);
-      }
+      conditions.push(likeContains([sql`pl.payload_preview`, sql`pl.metadata`], search, this.isPostgres()));
     }
 
     return { conditions };
@@ -472,7 +467,11 @@ export class PacketLogRepository extends BaseRepository {
    * relay_node is only the last byte of the node ID per the Meshtastic protobuf spec.
    * We match by (nodeNum & 0xFF) to find candidate node names.
    */
-  async getDistinctRelayNodes(sourceId?: string): Promise<DbDistinctRelayNode[]> {
+  /**
+   * `exclude` (#5156): node numbers the caller may not see; they are left out
+   * of each relay byte's candidate list. `'all'` leaves every list empty.
+   */
+  async getDistinctRelayNodes(sourceId?: string, exclude?: number[] | 'all'): Promise<DbDistinctRelayNode[]> {
     const longName = this.col('longName');
     const shortName = this.col('shortName');
     const nodeNum = this.col('nodeNum');
@@ -489,12 +488,13 @@ export class PacketLogRepository extends BaseRepository {
       for (const rv of relayValues) {
         // Only include nodes that could plausibly be relays:
         // direct neighbors (hopsAway <= 1) or unknown hop distance (NULL)
-        const matchRows = await this.executeQuery(
-          sql`SELECT ${longName}, ${shortName} FROM nodes WHERE (${nodeNum} & 255) = ${rv} AND (${hopsAway} IS NULL OR ${hopsAway} <= 1)`
+        const matchRows = exclude === 'all' ? [] : await this.executeQuery(
+          sql`SELECT ${nodeNum}, ${longName}, ${shortName} FROM nodes WHERE (${nodeNum} & 255) = ${rv} AND (${hopsAway} IS NULL OR ${hopsAway} <= 1)`
         );
+        const excluded = new Set(Array.isArray(exclude) ? exclude : []);
         results.push({
           relay_node: rv,
-          matching_nodes: (matchRows as any[]).map((r: any) => ({
+          matching_nodes: (matchRows as any[]).filter((r: { nodeNum?: unknown }) => !excluded.has(Number(r.nodeNum))).map((r: any) => ({
             longName: r.longName ?? null,
             shortName: r.shortName ?? null,
           })),

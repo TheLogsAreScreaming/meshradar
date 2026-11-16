@@ -20,8 +20,9 @@
  *    decrypts — rotating SESSION_SECRET leaves it `true` while every sync
  *    fails. The manual "Sync Now" path is what surfaces the real answer, so
  *    its no-credential error names rotation as a possible cause.
- *  - The interval floor is 60 minutes, not 1. One sync costs four packets on
- *    the air (login + reply, then the CLI command + reply), so the cheap-looking
+ *  - The interval floor is 60 minutes, not 1. One sync costs two packets on
+ *    a remembered admin session (#5785) and four when it must log in first
+ *    (worst case five when the session is stale), so the cheap-looking
  *    small numbers the other panels accept would be genuinely harmful here.
  *    The server rejects sub-floor values too — this is not a UI-only guard.
  *
@@ -29,7 +30,7 @@
  * telemetry/neighbours polls: it mutates the remote device's clock rather than
  * reading from it.
  */
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../../contexts/AuthContext';
 import { useCsrfFetch } from '../../hooks/useCsrfFetch';
@@ -100,6 +101,9 @@ export const MeshCoreNodeTimeSyncConfig: React.FC<MeshCoreNodeTimeSyncConfigProp
   const [syncMsg, setSyncMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
   const endpoint = `${baseUrl}/api/sources/${encodeURIComponent(sourceId)}/meshcore/nodes/${encodeURIComponent(publicKey)}/time-sync-config`;
+  // The endpoint names the node. A reply that lands after the user has moved
+  // to another node belongs to the old one, so it is dropped (#5797).
+  const currentEndpoint = useRef(endpoint);
   const syncEndpoint = `${baseUrl}/api/sources/${encodeURIComponent(sourceId)}/meshcore/nodes/${encodeURIComponent(publicKey)}/time-sync`;
 
   const applyResponse = (d: Record<string, unknown>): TimeSyncConfigState => ({
@@ -112,6 +116,7 @@ export const MeshCoreNodeTimeSyncConfig: React.FC<MeshCoreNodeTimeSyncConfigProp
   // Refetch whenever the selected node or source changes.
   useEffect(() => {
     let cancelled = false;
+    currentEndpoint.current = endpoint;
     setLoading(true);
     setError(null);
     setSaved(false);
@@ -141,7 +146,10 @@ export const MeshCoreNodeTimeSyncConfig: React.FC<MeshCoreNodeTimeSyncConfigProp
     };
   }, [endpoint, csrfFetch, t]);
 
-  const save = async (patch: { enabled?: boolean; intervalMinutes?: number }) => {
+  // `rollback` restores what the control showed before this save. It runs
+  // only when the save fails for the node still on screen.
+  const save = async (patch: { enabled?: boolean; intervalMinutes?: number }, rollback: () => void) => {
+    const isStale = () => currentEndpoint.current !== endpoint;
     setSaving(true);
     setSaved(false);
     setError(null);
@@ -152,14 +160,18 @@ export const MeshCoreNodeTimeSyncConfig: React.FC<MeshCoreNodeTimeSyncConfigProp
         body: JSON.stringify(patch),
       });
       const data = await response.json();
+      if (isStale()) return;
       if (data.success && data.data) {
         setCfg(applyResponse(data.data));
         setSaved(true);
         window.setTimeout(() => setSaved(false), 1800);
       } else {
+        rollback();
         setError(data.error || t('meshcore.time_sync_config.save_error', 'Failed to save'));
       }
     } catch (_err) {
+      if (isStale()) return;
+      rollback();
       setError(t('meshcore.time_sync_config.save_error', 'Failed to save'));
     } finally {
       setSaving(false);
@@ -167,8 +179,9 @@ export const MeshCoreNodeTimeSyncConfig: React.FC<MeshCoreNodeTimeSyncConfigProp
   };
 
   const handleToggle = (next: boolean) => {
+    const before = cfg.enabled;
     setCfg((prev) => ({ ...prev, enabled: next }));
-    void save({ enabled: next });
+    void save({ enabled: next }, () => setCfg((prev) => ({ ...prev, enabled: before })));
   };
 
   const showIntervalRangeError = () => {
@@ -187,7 +200,8 @@ export const MeshCoreNodeTimeSyncConfig: React.FC<MeshCoreNodeTimeSyncConfigProp
       return;
     }
     if (n === cfg.intervalMinutes) return;
-    void save({ intervalMinutes: n });
+    const before = cfg.intervalMinutes;
+    void save({ intervalMinutes: n }, () => setIntervalDraft(String(before)));
   };
 
   const syncNow = async () => {
@@ -252,7 +266,7 @@ export const MeshCoreNodeTimeSyncConfig: React.FC<MeshCoreNodeTimeSyncConfigProp
       <p className="hint" style={{ marginBottom: '0.75rem' }}>
         {t(
           'meshcore.time_sync_config.hint',
-          "Periodically push this server's clock to the repeater's RTC, which has no NTP or GPS of its own. Each sync costs four packets on the air (an admin login and its reply, then the time command and its reply), so the minimum interval is 1 hour and the default is 12. Spacing is shared with Telemetry and Neighbours Retrieval, and tracked separately from both.",
+          "Periodically push this server's clock to the repeater's RTC, which has no NTP or GPS of its own. Each sync costs two packets on the air (the time command and its reply) while the admin session is remembered, and four when it must log in first, so the minimum interval is 1 hour and the default is 12. Spacing is shared with Telemetry and Neighbours Retrieval, and tracked separately from both.",
         )}
       </p>
 

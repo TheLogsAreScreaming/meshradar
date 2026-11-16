@@ -6,6 +6,7 @@ import { PacketSignaturePolicyPicker } from './configuration/PacketSignaturePoli
 import { PacketSignaturePolicyConfirmDialog } from './configuration/PacketSignaturePolicyConfirmDialog';
 import { useQueryClient } from '@tanstack/react-query';
 import apiService, { type AdminCommandAck } from '../services/api';
+import { mqttRootErrorMessage } from './MQTT/mqttRootApiError';
 import { useToast } from './ToastContainer';
 import { useResolvedSourceId } from '../hooks/useResolvedSourceId';
 import { useTxStatus } from '../hooks/useTxStatus';
@@ -18,6 +19,7 @@ import type { Channel } from '../types/device';
 import { ImportConfigModal } from './configuration/ImportConfigModal';
 import { ExportConfigModal } from './configuration/ExportConfigModal';
 import SectionNav from './SectionNav';
+import sectionNavLayout from './SectionNav.module.css';
 import { adminCommandsNavItems } from './search/configSections';
 import { encodePositionFlags, decodePositionFlagNames } from '../utils/positionFlags';
 import { getHardwareModelName, getRoleName } from '../utils/nodeHelpers';
@@ -25,7 +27,9 @@ import { DeviceConfigurationSection } from './admin-commands/DeviceConfiguration
 import AutoFavoriteManagementSection from './admin-commands/AutoFavoriteManagementSection';
 import { ModuleConfigurationSection } from './admin-commands/ModuleConfigurationSection';
 import { DeviceActionsSection } from './admin-commands/DeviceActionsSection';
+import { MeshtasticRemoteCliConsole } from './admin-commands/MeshtasticRemoteCliConsole';
 import { useAdminCommandsState, buildMeshBeaconConfigPayload } from './admin-commands/useAdminCommandsState';
+import { buildAdminMqttSavePayload } from './admin-commands/mqttSavePayload';
 import {
   ADMIN_LOAD_SECTIONS,
   LOAD_CONFIG_TYPES,
@@ -40,11 +44,13 @@ import {
   PUBLIC_CHANNEL_PRECISION_MAX_BITS,
   PUBLIC_CHANNEL_PRECISION_MAX_METERS,
   exceedsPublicChannelPrecisionClamp,
+  hasPrivatePsk,
 } from '../utils/publicChannel';
 import { buildNodeOptions, filterNodes, sortNodeOptionsForRemoteAdmin, type NodeOption } from './admin-commands/nodeOptionsUtils';
 import { createEmptyChannelSlot, createChannelFromResponse, countLoadedChannels } from './admin-commands/channelLoadingUtils';
 import { UiIcon } from './icons';
 import { NumberInput } from './common/NumberInput';
+import { VerifyJobsPanel } from './admin-commands/VerifyJobsPanel';
 import { NumberInputScope } from './common/NumberInputScope';
 import { useNumberInputScope } from './common/numberInputScopeContext';
 
@@ -122,6 +128,9 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
   // setting; a number overrides it for commands sent from this tab, for the one
   // stubborn node rather than a global change.
   const [retryAttemptsOverride, setRetryAttemptsOverride] = useState<number | null>(null);
+  // Verified saves (#4487): remote config saves are read back until they stick.
+  const [verifySaves, setVerifySaves] = useState(false);
+  const [verifyJobsRefresh, setVerifyJobsRefresh] = useState(0);
   const [isExecuting, setIsExecuting] = useState(false);
   const [nodeOptions, setNodeOptions] = useState<NodeOption[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -195,6 +204,8 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
     hasRemoteHardware: boolean;
     /** Firmware 2.8+ build capability: XEdDSA signature verification compiled in (#3923). */
     hasXeddsa?: boolean;
+    /** #6157: DeviceMetadata.ble_address — the BLE MAC the node advertises. Present only when non-empty. */
+    bleAddress?: string;
   } | null>(null);
   // The node `deviceMetadata` was read from. It is not cleared when the
   // selection changes, so anything that gates on it must check this first.
@@ -404,7 +415,9 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       loadedPacketSignaturePolicy: null,
       firmwareVersion: null,
     });
-  }, [selectedNodeNum, setSecurityConfig]);
+    // Same for MQTT: the form on screen is the old node's config.
+    setMQTTConfig({ loadedForNodeNum: null });
+  }, [selectedNodeNum, setSecurityConfig, setMQTTConfig]);
 
   // Fetch and update passkey status for remote nodes
   const fetchPasskeyStatus = useCallback(async () => {
@@ -968,20 +981,30 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       throw new Error('TX_DISABLED_REMOTE_ADMIN_BLOCKED');
     }
 
+    // Security is refused server-side: its keys never read back.
+    const verify = verifySaves && isManagingRemoteNode
+      && /^set\w+Config$/.test(command) && command !== 'setSecurityConfig';
+
     setIsExecuting(true);
     try {
       // Remote commands come back as a 202 + operation id that ApiService
       // polls to completion (#4482), so this await can still take mesh time —
       // it just no longer holds an HTTP request open for it.
-      const result = await apiService.sendAdminCommand<{ success: boolean; message: string; ack?: AdminCommandAck }>({
+      const result = await apiService.sendAdminCommand<{ success: boolean; message: string; ack?: AdminCommandAck; verifyJobId?: string }>({
         command,
         nodeNum: selectedNodeNum,
         ...(sourceId ? { sourceId } : {}),
         // Omitted unless explicitly set, so the server falls back to the
         // adminRetryAttempts setting rather than this tab pinning a value.
         ...(retryAttemptsOverride != null ? { retryAttempts: retryAttemptsOverride } : {}),
+        ...(verify ? { verify: true } : {}),
         ...params
       });
+      if (result.verifyJobId) {
+        setVerifyJobsRefresh((n) => n + 1);
+        showToast(t('admin_commands.verify_started', 'Sent. Verifying in the background; see Verified saves.'), 'success');
+        return result;
+      }
       // The device actions (#5614, #5615) answer in the `{ success, data }`
       // envelope, so their message sits one level down.
       const message = result.message || (result as { data?: { message?: string } }).data?.message;
@@ -993,14 +1016,15 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
       if (isTxDisabledError(error)) {
         showToast(t('tx_disabled.send_blocked_toast'), 'warning');
       } else {
-        showToast(error.message || t('admin_commands.failed_execute_command'), 'error');
+        // A refused MQTT root comes back localised (#6338).
+        showToast(mqttRootErrorMessage(error, t) || error.message || t('admin_commands.failed_execute_command'), 'error');
       }
       console.error('Admin command error:', error);
       throw error;
     } finally {
       setIsExecuting(false);
     }
-  }, [selectedNodeNum, sourceId, remoteAdminBlocked, retryAttemptsOverride, showToast, t]);
+  }, [selectedNodeNum, sourceId, remoteAdminBlocked, retryAttemptsOverride, verifySaves, isManagingRemoteNode, showToast, t]);
 
   const handleReboot = useCallback(async () => {
     if (!confirm(t('admin_commands.reboot_confirmation', { seconds: rebootSeconds }))) {
@@ -1315,16 +1339,21 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
     }
   }, [configState.position, executeCommand]);
 
+  // Firmware replaces the whole MQTT struct with what we send, so the form must
+  // hold this node's config before a Save can go out. A save from defaults
+  // turns MQTT, client proxy and map reporting off on the node.
+  const mqttConfigLoadedForSelectedNode =
+    selectedNodeNum !== null && configState.mqtt.loadedForNodeNum === selectedNodeNum;
+
   const handleSetMQTTConfig = async () => {
-    const config: any = {
-      enabled: configState.mqtt.enabled,
-      address: configState.mqtt.address,
-      username: configState.mqtt.username,
-      password: configState.mqtt.password,
-      encryptionEnabled: configState.mqtt.encryptionEnabled,
-      jsonEnabled: configState.mqtt.jsonEnabled,
-      root: configState.mqtt.root
-    };
+    if (!mqttConfigLoadedForSelectedNode) {
+      showToast(
+        t('admin_commands.mqtt_save_needs_load', 'Load this node’s MQTT configuration first. Saving without it would replace the node’s MQTT settings with defaults.'),
+        'error',
+      );
+      return;
+    }
+    const config = buildAdminMqttSavePayload(configState.mqtt);
 
     try {
       await executeCommand('setMQTTConfig', { config });
@@ -1825,7 +1854,7 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
 
       if (isLocalNode) {
         // For local node, use the standard export endpoint
-        await apiService.exportChannel(channelId);
+        await apiService.exportChannel(channelId, sourceId);
         showToast(t('admin_commands.channel_exported_successfully', { channelId }), 'success');
       } else {
         // For remote node, get channel data and export it manually
@@ -2063,6 +2092,9 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
 
   return (
     <div className="tab-content">
+      {/* Picker + console share one flex row on a landscape phone (#6211): the
+          picker becomes a left rail so the content keeps the full usable height. */}
+      <div className={sectionNavLayout.shell}>
       <SectionNav
         searchable
         searchPlaceholder={t('config_search.filter_admin', 'Search admin sections...')}
@@ -2070,6 +2102,7 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
         noMatchesLabel={t('config_search.no_sections', 'No matching sections')}
         items={adminCommandsNavItems(t)}
       />
+      <div className={sectionNavLayout.body}>
 
       {remoteAdminBlocked && (
         <div
@@ -2121,6 +2154,33 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
             onValidityChange={(valid) => { if (!valid) setRetryAttemptsOverride(null); }}
           />
         </div>
+        {isManagingRemoteNode && (
+          <div className="setting-item">
+            <label
+              htmlFor="adminVerifySaves"
+              style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}
+            >
+              <input
+                id="adminVerifySaves"
+                type="checkbox"
+                checked={verifySaves}
+                disabled={isExecuting}
+                onChange={(e) => setVerifySaves(e.target.checked)}
+                style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+              />
+              <div style={{ flex: 1 }}>
+                <div>{t('admin_commands.verify_saves_label', 'Verify config saves')}</div>
+                <span className="setting-description">
+                  {t('admin_commands.verify_saves_description', 'Reads each config save back from the node until it sticks, in the background for up to 2 hours. Checks every 5 minutes; resends only when the node answers with the old value, at most 5 sends. Load the section first. Security settings cannot be verified.')}
+                </span>
+              </div>
+            </label>
+          </div>
+        )}
+        <VerifyJobsPanel
+          refreshKey={verifyJobsRefresh}
+          nodeName={(num) => nodeOptions.find((n) => n.nodeNum === num)?.longName ?? `!${num.toString(16).padStart(8, '0')}`}
+        />
         <div className="setting-item">
           <label>
             {t('admin_commands.select_node_description')}
@@ -2317,6 +2377,13 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
 
                   <span style={{ color: 'var(--color-text-subtle)', fontWeight: 500 }}>{t('admin_commands.position_flags', 'Position Flags')}:</span>
                   <span style={{ color: 'var(--color-text)' }}>{decodePositionFlagNames(deviceMetadata.positionFlags ?? 0)}</span>
+
+                  {typeof deviceMetadata.bleAddress === 'string' && deviceMetadata.bleAddress && (
+                    <>
+                      <span style={{ color: 'var(--color-text-subtle)', fontWeight: 500 }}>{t('admin_commands.ble_address', 'BLE Address')}:</span>
+                      <span style={{ color: 'var(--color-text)' }}>{deviceMetadata.bleAddress}</span>
+                    </>
+                  )}
                 </div>
               </div>
             )}
@@ -2859,7 +2926,7 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
                     </h4>
                     {channel && (
                       <div style={{ marginTop: '0.5rem', fontSize: '0.9rem', color: 'var(--color-text-muted)' }}>
-                        <div><UiIcon name={channel.psk && channel.psk !== 'AQ==' ? 'encrypted' : 'unencrypted'} /> {channel.psk && channel.psk !== 'AQ==' ? t('admin_commands.encrypted') : t('admin_commands.unencrypted')}</div>
+                        <div><UiIcon name={hasPrivatePsk(channel.psk) ? 'encrypted' : 'unencrypted'} /> {hasPrivatePsk(channel.psk) ? t('admin_commands.encrypted') : t('admin_commands.unencrypted')}</div>
                         <div>
                           {channel.uplinkEnabled && <><UiIcon name="sortAscending" /> {t('admin_commands.uplink')} </>}
                           {channel.downlinkEnabled && <><UiIcon name="sortDescending" /> {t('admin_commands.downlink')}</>}
@@ -3013,6 +3080,14 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
         mqttEncryptionEnabled={configState.mqtt.encryptionEnabled}
         mqttJsonEnabled={configState.mqtt.jsonEnabled}
         mqttRoot={configState.mqtt.root}
+        mqttTlsEnabled={configState.mqtt.tlsEnabled}
+        mqttProxyToClientEnabled={configState.mqtt.proxyToClientEnabled}
+        mqttMapReportingEnabled={configState.mqtt.mapReportingEnabled}
+        mqttMapPublishIntervalSecs={configState.mqtt.mapPublishIntervalSecs}
+        mqttMapPositionPrecision={configState.mqtt.mapPositionPrecision}
+        mqttMapShouldReportLocation={configState.mqtt.mapShouldReportLocation}
+        mqttLoadedForSelectedNode={mqttConfigLoadedForSelectedNode}
+        mqttSavedRoot={configState.mqtt.loadedRoot}
         onMQTTConfigChange={handleMQTTConfigChange}
         onSaveMQTTConfig={handleSetMQTTConfig}
         neighborInfoEnabled={configState.neighborInfo.enabled}
@@ -3799,6 +3874,18 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
         />
       </CollapsibleSection>
 
+      {/* Free-form remote-admin CLI console (#6154) */}
+      <div id="admin-cli-console" className="settings-section">
+        <h3>{t('admin_commands.cli_console.title', 'Remote CLI console')}</h3>
+        <MeshtasticRemoteCliConsole
+          sourceId={sourceId}
+          destNodeId={selectedNode?.nodeId}
+          destNodeName={selectedNode?.longName}
+          isLocalNode={selectedNode?.isLocal ?? false}
+          disabled={remoteAdminBlocked}
+        />
+      </div>
+
       {/* Import/Export Config Modals */}
       {showConfigImportModal && (
         <ImportConfigModal
@@ -3875,6 +3962,8 @@ const AdminCommandsTab: React.FC<AdminCommandsTabProps> = ({ nodes, currentNodeI
           isLoadingChannels={isLoadingChannels || isLoadingAllConfigs}
         />
       )}
+      </div>
+      </div>
     </div>
   );
 };

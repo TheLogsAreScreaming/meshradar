@@ -8,6 +8,7 @@ import { eq, lt, lte, gt, gte, and, asc, desc, inArray, notInArray, isNull, or, 
 import { ALL_SOURCES, BaseRepository, DrizzleDatabase, SourceScope, SourceSetScope } from './base.js';
 import { DatabaseType, DbTelemetry } from '../types.js';
 import { logger } from '../../utils/logger.js';
+import { computeRollingHopStats } from '../../server/utils/hopStats.js';
 
 // A node that reboots without GPS/NTP can broadcast telemetry with a hardware
 // clock that is months or years off. A clock set into the FUTURE is the case
@@ -676,6 +677,71 @@ export class TelemetryRepository extends BaseRepository {
 
     if (result.length === 0) return null;
     return this.normalizeBigInts(result[0]) as DbTelemetry;
+  }
+
+  /**
+   * The newest row per (node, telemetry type) on one source, from rows at or
+   * after `sinceTimestamp`, in ONE query (#5896). Replaces a per-node,
+   * per-type loop of `getLatestTelemetryForType` calls for the cross-source
+   * "Latest" snapshot. Rows dated in the future (bad node clock) are skipped,
+   * as in the averaged chart query. Two rows that tie on the newest timestamp
+   * collapse to one.
+   */
+  async getLatestTelemetryPerNodeAndTypeSince(sourceId: string, sinceTimestamp: number): Promise<DbTelemetry[]> {
+    const { telemetry } = this.tables;
+    const window = and(
+      eq(telemetry.sourceId, sourceId),
+      gte(telemetry.timestamp, sinceTimestamp),
+      lt(telemetry.timestamp, Date.now() + TELEMETRY_FUTURE_SKEW_MS),
+    );
+    const latest = this.db
+      .select({
+        nodeId: telemetry.nodeId,
+        telemetryType: telemetry.telemetryType,
+        maxTs: sql<number>`MAX(${telemetry.timestamp})`.as('maxTs'),
+      })
+      .from(telemetry)
+      .where(window)
+      .groupBy(telemetry.nodeId, telemetry.telemetryType)
+      .as('latest');
+    const rows = await this.db
+      .select({
+        nodeId: telemetry.nodeId,
+        nodeNum: telemetry.nodeNum,
+        telemetryType: telemetry.telemetryType,
+        timestamp: telemetry.timestamp,
+        value: telemetry.value,
+        unit: telemetry.unit,
+        createdAt: telemetry.createdAt,
+      })
+      .from(telemetry)
+      .innerJoin(
+        latest,
+        and(
+          eq(telemetry.nodeId, latest.nodeId),
+          eq(telemetry.telemetryType, latest.telemetryType),
+          eq(telemetry.timestamp, latest.maxTs),
+        ),
+      )
+      .where(eq(telemetry.sourceId, sourceId));
+
+    const seen = new Set<string>();
+    const out: DbTelemetry[] = [];
+    for (const r of rows as Array<Record<string, unknown>>) {
+      const key = `${r.nodeId}\u0000${r.telemetryType}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        nodeId: r.nodeId as string,
+        nodeNum: Number(r.nodeNum),
+        telemetryType: r.telemetryType as string,
+        timestamp: Number(r.timestamp),
+        value: Number(r.value),
+        unit: (r.unit as string | null) ?? undefined,
+        createdAt: Number(r.createdAt),
+      });
+    }
+    return out;
   }
 
   /**
@@ -1385,44 +1451,12 @@ export class TelemetryRepository extends BaseRepository {
       sourceId
     );
 
-    if (telemetry.length === 0) {
-      return [];
-    }
-
-    // Sort by timestamp ascending
-    telemetry.sort((a, b) => a.timestamp - b.timestamp);
-
-    // Generate output points at regular intervals from sinceTimestamp to now
-    const intervalMs = intervalMinutes * 60 * 1000;
-    const now = Date.now();
-    const results: Array<{ timestamp: number; minHops: number; maxHops: number; avgHops: number }> = [];
-
-    // Start from the first interval boundary after sinceTimestamp
-    let currentTime = Math.ceil(sinceTimestamp / intervalMs) * intervalMs;
-
-    while (currentTime <= now) {
-      // Calculate rolling 24-hour window: [currentTime - 24h, currentTime]
-      const windowStart = currentTime - twentyFourHours;
-      const windowEnd = currentTime;
-
-      // Get all data points within this 24-hour window
-      const windowData = telemetry.filter(
-        (t) => t.timestamp >= windowStart && t.timestamp <= windowEnd
-      );
-
-      if (windowData.length > 0) {
-        const values = windowData.map((t) => t.value);
-        const minHops = Math.min(...values);
-        const maxHops = Math.max(...values);
-        const avgHops = Math.round((values.reduce((sum, v) => sum + v, 0) / values.length) * 100) / 100;
-
-        results.push({ timestamp: currentTime, minHops, maxHops, avgHops });
-      }
-
-      currentTime += intervalMs;
-    }
-
-    return results;
+    return computeRollingHopStats(
+      telemetry.map((t) => ({ timestamp: t.timestamp, value: t.value })),
+      sinceTimestamp,
+      intervalMinutes,
+      Date.now()
+    );
   }
 
   /**
@@ -1499,7 +1533,8 @@ export class TelemetryRepository extends BaseRepository {
     sinceTimestamp: number | undefined,
     intervalMinutes: number,
     maxHours: number | undefined,
-    sourceId: SourceScope | undefined
+    sourceId: SourceScope | undefined,
+    types?: readonly string[]
   ): DbTelemetry[] {
     if (!this.sqliteDb) {
       throw new Error('getTelemetryByNodeAveragedSqlite is SQLite-only');
@@ -1516,6 +1551,11 @@ export class TelemetryRepository extends BaseRepository {
     }
     if (sinceTimestamp !== undefined) {
       baseConditions.push(gte(telemetry.timestamp, sinceTimestamp));
+    }
+    // Only these telemetry types (#5896). An empty list matches nothing.
+    if (types !== undefined) {
+      if (types.length === 0) return [];
+      baseConditions.push(inArray(telemetry.telemetryType, [...types]));
     }
     // Exclude future-dated rows so a node with a bad hardware clock can't
     // stretch the chart X-axis (issue #3362). Belt-and-suspenders with the
@@ -1624,7 +1664,8 @@ export class TelemetryRepository extends BaseRepository {
     sinceTimestamp: number | undefined,
     intervalMinutes: number,
     _maxHours: number | undefined,
-    sourceId: SourceScope | undefined
+    sourceId: SourceScope | undefined,
+    types?: readonly string[]
   ): Promise<DbTelemetry[]> {
     const { telemetry } = this.tables;
     const rawTypes = TelemetryRepository.RAW_VALUE_TYPES;
@@ -1635,6 +1676,11 @@ export class TelemetryRepository extends BaseRepository {
     if (sourceScope) baseConditions.push(sourceScope);
     if (sinceTimestamp !== undefined) {
       baseConditions.push(gte(telemetry.timestamp, sinceTimestamp));
+    }
+    // Only these telemetry types (#5896). An empty list matches nothing.
+    if (types !== undefined) {
+      if (types.length === 0) return [];
+      baseConditions.push(inArray(telemetry.telemetryType, [...types]));
     }
     // Exclude future-dated rows so a node with a bad hardware clock can't
     // stretch the chart X-axis (issue #3362). Belt-and-suspenders with the

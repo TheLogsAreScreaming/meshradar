@@ -43,6 +43,8 @@ const POSTGRES_CREATE = `
     "mfaEnabled" BOOLEAN NOT NULL DEFAULT false,
     "mfaSecret" TEXT,
     "mfaBackupCodes" TEXT,
+    "passwordLoginDisabled" BOOLEAN NOT NULL DEFAULT false,
+    "passkeyRecoveryCodes" TEXT,
     "createdAt" BIGINT NOT NULL,
     "updatedAt" BIGINT NOT NULL,
     "lastLoginAt" BIGINT
@@ -113,6 +115,8 @@ const MYSQL_CREATE = `
     mfaEnabled BOOLEAN NOT NULL DEFAULT false,
     mfaSecret TEXT,
     mfaBackupCodes TEXT,
+    passwordLoginDisabled BOOLEAN NOT NULL DEFAULT false,
+    passkeyRecoveryCodes TEXT,
     createdAt BIGINT NOT NULL,
     updatedAt BIGINT NOT NULL,
     lastLoginAt BIGINT
@@ -560,6 +564,24 @@ function runAuthTests(getBackend: () => TestBackend) {
     expect(remaining[0].action).toBe('recent_action');
   });
 
+  it('cleanupOldAuditLogs - deletes across several batches and keeps recent rows (#5870)', async () => {
+    const backend = getBackend();
+    if (!backend.available) { console.log(`⚠ Skipped: ${backend.skipReason}`); return; }
+
+    const now = Date.now();
+    const old = now - (100 * 24 * 60 * 60 * 1000);
+    for (let i = 0; i < 7; i++) {
+      await repo.createAuditLogEntry({ userId: null, action: `old_${i}`, resource: null, details: null, ipAddress: null, userAgent: null, timestamp: old + i });
+    }
+    await repo.createAuditLogEntry({ userId: null, action: 'recent_action', resource: null, details: null, ipAddress: null, userAgent: null, timestamp: now });
+
+    // Batch of 3: 3 + 3 + 1 rows.
+    expect(await repo.cleanupOldAuditLogs(90, 3)).toBe(7);
+    const remaining = await repo.getAuditLogEntries();
+    expect(remaining.map((r) => r.action)).toEqual(['recent_action']);
+    expect(await repo.cleanupOldAuditLogs(90, 3)).toBe(0);
+  });
+
   // ---- getAuditLogsFiltered ----
 
   it('getAuditLogsFiltered - returns all entries unfiltered', async () => {
@@ -779,6 +801,66 @@ function runAuthTests(getBackend: () => TestBackend) {
     expect(remaining).not.toBeNull();
     expect(await repo.getSession('expired_1')).toBeNull();
     expect(await repo.getSession('expired_2')).toBeNull();
+  });
+
+  it('deleteSessionsByUserId - removes all sessions for a user (#6074)', async () => {
+    const backend = getBackend();
+    if (!backend.available) { console.log(`⚠ Skipped: ${backend.skipReason}`); return; }
+
+    const now = Date.now();
+    await repo.setSession('u7_a', JSON.stringify({ userId: 7, cookie: {} }), now + 100000);
+    await repo.setSession('u7_b', JSON.stringify({ userId: 7, cookie: {} }), now + 100000);
+    await repo.setSession('u8_a', JSON.stringify({ userId: 8, cookie: {} }), now + 100000);
+
+    const deleted = await repo.deleteSessionsByUserId(7);
+    expect(deleted).toBe(2);
+
+    expect(await repo.getSession('u7_a')).toBeNull();
+    expect(await repo.getSession('u7_b')).toBeNull();
+    // Another user's session is untouched.
+    expect(await repo.getSession('u8_a')).not.toBeNull();
+  });
+
+  it('deleteSessionsByUserId - keeps the excepted session (#6077)', async () => {
+    const backend = getBackend();
+    if (!backend.available) { console.log(`⚠ Skipped: ${backend.skipReason}`); return; }
+
+    const now = Date.now();
+    await repo.setSession('keep_me', JSON.stringify({ userId: 9, cookie: {} }), now + 100000);
+    await repo.setSession('kill_me', JSON.stringify({ userId: 9, cookie: {} }), now + 100000);
+
+    const deleted = await repo.deleteSessionsByUserId(9, 'keep_me');
+    expect(deleted).toBe(1);
+
+    // Current session preserved, the other one gone.
+    expect(await repo.getSession('keep_me')).not.toBeNull();
+    expect(await repo.getSession('kill_me')).toBeNull();
+  });
+
+  // ============ MFA BACKUP CODES ============
+
+  it('consumeBackupCode - atomic CAS: a code cannot be spent twice (#6075)', async () => {
+    const backend = getBackend();
+    if (!backend.available) { console.log(`⚠ Skipped: ${backend.skipReason}`); return; }
+
+    const userId = await repo.createUser(makeUser('mfa_user'));
+    const original = JSON.stringify(['hashA', 'hashB']);
+    await repo.updateUser(userId, { mfaBackupCodes: original });
+
+    // Two concurrent requests both read the same `original` list and both
+    // compute the same remaining list (minus the consumed code).
+    const remaining = JSON.stringify(['hashB']);
+
+    const first = await repo.consumeBackupCode(userId, original, remaining);
+    const second = await repo.consumeBackupCode(userId, original, remaining);
+
+    // Only the first write (which matched the stored list) wins; the second
+    // loses because the stored list no longer equals `original`.
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+
+    const user = await repo.getUserById(userId);
+    expect(user!.mfaBackupCodes).toBe(remaining);
   });
 }
 

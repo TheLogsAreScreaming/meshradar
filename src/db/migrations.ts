@@ -216,8 +216,48 @@ import { migration as addMeshcoreLastAdvertHadPositionMigration, runMigration194
 import { migration as splitTranslationApiKeyMigration, runMigration195Postgres, runMigration195Mysql } from '../server/migrations/195_split_translation_api_key.js';
 import { migration as addNotificationMessageTemplatesMigration, runMigration196Postgres, runMigration196Mysql } from '../server/migrations/196_add_notification_message_templates.js';
 import { migration as widenSystemBackupTotalSizeMigration, runMigration197Postgres, runMigration197Mysql } from '../server/migrations/197_widen_system_backup_total_size.js';
+import { migration as createPkiExchangeStateMigration, runMigration198Postgres, runMigration198Mysql } from '../server/migrations/198_create_pki_exchange_state.js';
+import { migration as createMapMarkersMigration, runMigration199Postgres, runMigration199Mysql } from '../server/migrations/199_create_map_markers.js';
+import { migration as aircraftManualMarkMigration, runMigration200Postgres, runMigration200Mysql } from '../server/migrations/200_add_node_aircraft_manual_mark.js';
+import { migration as createMeshcoreHopSnrMigration, runMigration201Postgres, runMigration201Mysql } from '../server/migrations/201_create_meshcore_hop_snr.js';
+import { migration as addNotifyOnMentionMigration, runMigration202Postgres, runMigration202Mysql } from '../server/migrations/202_add_notify_on_mention.js';
+import { migration as addMeshcoreReactionColumnsMigration, runMigration203Postgres, runMigration203Mysql } from '../server/migrations/203_add_meshcore_reaction_columns.js';
+import { migration as createMeshcoreAdminSessionsMigration, runMigration204Postgres, runMigration204Mysql } from '../server/migrations/204_create_meshcore_admin_sessions.js';
+import { migration as userMapPreferencesMqttMessagesBySourceMigration, runMigration205Postgres, runMigration205Mysql } from '../server/migrations/205_user_map_preferences_mqtt_messages_by_source.js';
+import { migration as addMeshcorePositionOverrideMigration, runMigration206Postgres, runMigration206Mysql } from '../server/migrations/206_add_meshcore_position_override.js';
+import { migration as createUserPasskeysMigration, runMigration207Postgres, runMigration207Mysql } from '../server/migrations/207_create_user_passkeys.js';
+import { migration as addChannelDatabaseUseAeadMigration, runMigration208Postgres, runMigration208Mysql } from '../server/migrations/208_add_channel_database_use_aead.js';
+import { migration as createNodeNameHistoryMigration, runMigration209Postgres, runMigration209Mysql } from '../server/migrations/209_create_node_name_history.js';
+import { migration as messagesChannelIndexMigration, runMigration210Postgres, runMigration210Mysql } from '../server/migrations/210_messages_channel_index_and_pg_autovacuum.js';
+import { migration as createMqttBrokerPresetsMigration, runMigration211Postgres, runMigration211Mysql } from '../server/migrations/211_create_mqtt_broker_presets.js';
+import { migration as createMeshcoreCliHistoryMigration, runMigration212Postgres, runMigration212Mysql } from '../server/migrations/212_create_meshcore_cli_history.js';
+import { migration as backfillTracerouteWriteMigration, runMigration213Postgres, runMigration213Mysql } from '../server/migrations/213_backfill_traceroute_write_for_meshcore_trace.js';
+import { migration as aircraftFlightMatchRechecksMigration, runMigration214Postgres, runMigration214Mysql } from '../server/migrations/214_add_aircraft_flight_match_rechecks.js';
+import { migration as addMeshcoreAdvertSignatureVerifiedMigration, runMigration215Postgres, runMigration215Mysql } from '../server/migrations/215_add_meshcore_advert_signature_verified.js';
+import { migration as addWaypointGeofenceMigration, runMigration216Postgres, runMigration216Mysql } from '../server/migrations/216_add_waypoint_geofence.js';
+import { migration as addNodeChannelLockedMigration, runMigration217Postgres, runMigration217Mysql } from '../server/migrations/217_add_node_channel_locked.js';
+import { migration as addMeshcoreHeardRepeaterHopsMigration, runMigration218Postgres, runMigration218Mysql } from '../server/migrations/218_add_meshcore_heard_repeater_hops.js';
+import { migration as automationFireStateMigration, runMigration219Postgres, runMigration219Mysql } from '../server/migrations/219_automation_fire_state.js';
+import { migration as meshcoreTelemetryRetryStateMigration, runMigration220Postgres, runMigration220Mysql } from '../server/migrations/220_add_meshcore_telemetry_retry_state.js';
+import { migration as colorNodesBySourcePrefMigration, runMigration221Postgres, runMigration221Mysql } from '../server/migrations/221_user_map_preferences_color_nodes_by_source.js';
+import { migration as reticulumInterfaceLiveStatsMigration, runMigration222Postgres, runMigration222Mysql } from '../server/migrations/222_add_reticulum_interface_live_stats.js';
+import { migration as meshcoreSourcePkiKeysMigration, runMigration223Postgres, runMigration223Mysql } from '../server/migrations/223_add_meshcore_source_pki_keys.js';
+import { migration as meshcorePacketLogDerivedMigration, runMigration224Postgres, runMigration224Mysql } from '../server/migrations/224_meshcore_packet_log_derived_fields.js';
+import { migration as meshcoreTraceRunsMigration, runMigration225Postgres, runMigration225Mysql } from '../server/migrations/225_add_meshcore_trace_runs.js';
+import { migration as backupHistorySourceProtocolMigration, runMigration226Postgres, runMigration226Mysql } from '../server/migrations/226_backup_history_source_protocol.js';
+import { migration as meshcoreNodeSecurityFlagsMigration, runMigration227Postgres, runMigration227Mysql } from '../server/migrations/227_add_meshcore_node_security_flags.js';
+import { migration as addNotificationTextMaxMigration, runMigration229Postgres, runMigration229Mysql } from '../server/migrations/229_add_notification_text_max.js';
+import { migration as addMeshcoreMessageSenderNameOverrideMigration, runMigration231Postgres, runMigration231Mysql } from '../server/migrations/231_add_meshcore_message_sender_name_override.js';
+import { migration as addNotifyOnAutoTraceMigration, runMigration232Postgres, runMigration232Mysql } from '../server/migrations/232_add_notify_on_auto_trace.js';
+import { migration as createDirectRfContactsMigration, runMigration233Postgres, runMigration233Mysql } from '../server/migrations/233_create_direct_rf_contacts.js';
+import { migration as addNodeMqttConsentMigration, runMigration234Postgres, runMigration234Mysql } from '../server/migrations/234_add_node_mqtt_consent.js';
+import { migration as unifiedNotificationScopeMigration, runMigration235Postgres, runMigration235Mysql } from '../server/migrations/235_unified_notification_scope.js';
+import { migration as createMqttNativeIdentitiesMigration, runMigration236Postgres, runMigration236Mysql } from '../server/migrations/236_create_mqtt_native_identities.js';
+import { migration as meshcoreRoomLoginOkAtMigration, runMigration237Postgres, runMigration237Mysql } from '../server/migrations/237_add_meshcore_room_login_ok_at.js';
+import { migration as refileMeshcoreMqttSlotChannelsMigration, runMigration228Postgres, runMigration228Mysql } from '../server/migrations/228_refile_meshcore_mqtt_slot_channels.js';
+import { migration as meshcoreNeighborWatchMigration, runMigration230Postgres, runMigration230Mysql } from '../server/migrations/230_add_meshcore_neighbor_watch.js';
 
-// ============================================================================
+// =====================================================================
 // Registry
 // ============================================================================
 
@@ -3196,4 +3236,586 @@ registry.register({
   sqlite: (db) => widenSystemBackupTotalSizeMigration.up(db),
   postgres: (client) => runMigration197Postgres(client),
   mysql: (pool) => runMigration197Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 198: pki_exchange_state (#5691, Reliable PKI). PER-SOURCE.
+// Outcome of the last PKI exchange with each node, and the persisted hourly
+// timer for priming NodeInfo sends.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 198,
+  name: 'create_pki_exchange_state',
+  settingsKey: 'migration_198_create_pki_exchange_state',
+  sqlite: (db) => createPkiExchangeStateMigration.up(db),
+  postgres: (client) => runMigration198Postgres(client),
+  mysql: (pool) => runMigration198Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 199: map_markers (#5686, local map markers). PER-SOURCE.
+// Planning notes on the map; never transmitted.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 199,
+  name: 'create_map_markers',
+  settingsKey: 'migration_199_create_map_markers',
+  sqlite: (db) => createMapMarkersMigration.up(db),
+  postgres: (client) => runMigration199Postgres(client),
+  mysql: (pool) => runMigration199Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 200: manual aircraft mark on nodes (#5715). PER-SOURCE (nodes row).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 200,
+  name: 'add_node_aircraft_manual_mark',
+  settingsKey: 'migration_200_add_node_aircraft_manual_mark',
+  sqlite: (db) => aircraftManualMarkMigration.up(db),
+  postgres: (client) => runMigration200Postgres(client),
+  mysql: (pool) => runMigration200Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 201: meshcore_hop_snr (#5722). PER-SOURCE.
+// Per-hop SNR from MeshCore TRACE packets a companion radio heard.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 201,
+  name: 'create_meshcore_hop_snr',
+  settingsKey: 'migration_201_create_meshcore_hop_snr',
+  sqlite: (db) => createMeshcoreHopSnrMigration.up(db),
+  postgres: (client) => runMigration201Postgres(client),
+  mysql: (pool) => runMigration201Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 202: notify_on_mention. PER-SOURCE (user_notification_preferences row).
+// Opt-in alert when a MeshCore message names the source's own node as @[Name].
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 202,
+  name: 'add_notify_on_mention',
+  settingsKey: 'migration_202_add_notify_on_mention',
+  sqlite: (db) => addNotifyOnMentionMigration.up(db),
+  postgres: (client) => runMigration202Postgres(client),
+  mysql: (pool) => runMigration202Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 203: reaction columns on meshcore_messages (#5759). PER-SOURCE
+// (the table already carries sourceId). Seven nullable columns + one index.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 203,
+  name: 'add_meshcore_reaction_columns',
+  settingsKey: 'migration_203_add_meshcore_reaction_columns',
+  sqlite: (db) => addMeshcoreReactionColumnsMigration.up(db),
+  postgres: (client) => runMigration203Postgres(client),
+  mysql: (pool) => runMigration203Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 204: meshcore_admin_sessions (#5785). PER-SOURCE. Remembered
+// remote-admin logins so the console and scheduled jobs can resume without a
+// fresh login exchange.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 204,
+  name: 'create_meshcore_admin_sessions',
+  settingsKey: 'migration_204_create_meshcore_admin_sessions',
+  sqlite: (db) => createMeshcoreAdminSessionsMigration.up(db),
+  postgres: (client) => runMigration204Postgres(client),
+  mysql: (pool) => runMigration204Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 205: `user_map_preferences.show_mqtt_messages_by_source` (#5824).
+// Per-user JSON map { sourceId: boolean } for the "Show MQTT/Bridge Messages"
+// toggle, which used to be one browser-global localStorage key.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 205,
+  name: 'user_map_preferences_mqtt_messages_by_source',
+  settingsKey: 'migration_205_user_map_preferences_mqtt_messages_by_source',
+  sqlite: (db) => userMapPreferencesMqttMessagesBySourceMigration.up(db),
+  postgres: (client) => runMigration205Postgres(client),
+  mysql: (pool) => runMigration205Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 206: `meshcore_nodes` position override columns (#5842). PER-SOURCE.
+// A MeshRadar-only pinned location for a MeshCore contact, parallel to the
+// Meshtastic `nodes.positionOverride*` columns. Never written to the radio.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 206,
+  name: 'add_meshcore_position_override',
+  settingsKey: 'migration_206_add_meshcore_position_override',
+  sqlite: (db) => addMeshcorePositionOverrideMigration.up(db),
+  postgres: (client) => runMigration206Postgres(client),
+  mysql: (pool) => runMigration206Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 207: passkey storage (#5841, PR 1 of 4). GLOBAL (account data).
+// New `user_passkeys` table (FK users, cascade) plus
+// `users.password_login_disabled` / `users.passkey_recovery_codes`.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 207,
+  name: 'create_user_passkeys',
+  settingsKey: 'migration_207_create_user_passkeys',
+  sqlite: (db) => createUserPasskeysMigration.up(db),
+  postgres: (client) => runMigration207Postgres(client),
+  mysql: (pool) => runMigration207Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 208: `channel_database.useAead` (#5248 Phase 2). GLOBAL (decryption
+// keys). Marks a key as an AES-CCM channel for server-side decryption.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 208,
+  name: 'add_channel_database_use_aead',
+  settingsKey: 'migration_208_add_channel_database_use_aead',
+  sqlite: (db) => addChannelDatabaseUseAeadMigration.up(db),
+  postgres: (client) => runMigration208Postgres(client),
+  mysql: (pool) => runMigration208Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 209: `node_name_history` (#5862). PER-SOURCE. One row per rename a
+// source saw, for both Meshtastic and MeshCore nodes.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 209,
+  name: 'create_node_name_history',
+  settingsKey: 'migration_209_create_node_name_history',
+  sqlite: (db) => createNodeNameHistoryMigration.up(db),
+  postgres: (client) => runMigration209Postgres(client),
+  mysql: (pool) => runMigration209Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 210: messages(sourceId, channel, timestamp) index for the MQTT
+// channel list, plus PostgreSQL per-table autovacuum thresholds (#5870).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 210,
+  name: 'messages_channel_index_and_pg_autovacuum',
+  settingsKey: 'migration_210_messages_channel_index_and_pg_autovacuum',
+  sqlite: (db) => messagesChannelIndexMigration.up(db),
+  postgres: (client) => runMigration210Postgres(client),
+  mysql: (pool) => runMigration210Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 211: `mqtt_broker_presets` (#5794). GLOBAL. MQTT brokers an admin
+// saved for reuse across the Meshtastic MQTT forms.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 211,
+  name: 'create_mqtt_broker_presets',
+  settingsKey: 'migration_211_create_mqtt_broker_presets',
+  sqlite: (db) => createMqttBrokerPresetsMigration.up(db),
+  postgres: (client) => runMigration211Postgres(client),
+  mysql: (pool) => runMigration211Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 212: `meshcore_cli_history` (#5892). PER-SOURCE. One row per
+// MeshCore CLI command a person issued through MeshRadar (redacted).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 212,
+  name: 'create_meshcore_cli_history',
+  settingsKey: 'migration_212_create_meshcore_cli_history',
+  sqlite: (db) => createMeshcoreCliHistoryMigration.up(db),
+  postgres: (client) => runMigration212Postgres(client),
+  mysql: (pool) => runMigration212Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 213: backfill `traceroute:write` for `nodes:write` holders on
+// MeshCore sources (#5898). MeshCore trace-path moved from nodes:write to
+// traceroute:write; this keeps every current user's Trace Path button.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 213,
+  name: 'backfill_traceroute_write_for_meshcore_trace',
+  settingsKey: 'migration_213_backfill_traceroute_write_for_meshcore_trace',
+  sqlite: (db) => backfillTracerouteWriteMigration.up(db),
+  postgres: (client) => runMigration213Postgres(client),
+  mysql: (pool) => runMigration213Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 214: re-check columns on `aircraft_flight_matches` (#5876).
+// PER-SOURCE. Last-lookup position/time plus the persisted re-check and miss
+// counters, so a restart or settings save cannot reset the re-check cap.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 214,
+  name: 'add_aircraft_flight_match_rechecks',
+  settingsKey: 'migration_214_add_aircraft_flight_match_rechecks',
+  sqlite: (db) => aircraftFlightMatchRechecksMigration.up(db),
+  postgres: (client) => runMigration214Postgres(client),
+  mysql: (pool) => runMigration214Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 215: `meshcore_nodes.advertSignatureVerified` (#5909). PER-SOURCE.
+// Nullable boolean written by meshcore_mqtt ingest: did the latest advert's
+// signature verify? Gates MQTT nodes in cross-source hop resolution.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 215,
+  name: 'add_meshcore_advert_signature_verified',
+  settingsKey: 'migration_215_add_meshcore_advert_signature_verified',
+  sqlite: (db) => addMeshcoreAdvertSignatureVerifiedMigration.up(db),
+  postgres: (client) => runMigration215Postgres(client),
+  mysql: (pool) => runMigration215Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 216: waypoint geofence fields (#5922)
+// Firmware Waypoint fields 9-13 (radius, bounding box, enter/exit/favorites
+// alert flags), stored so waypoints from other clients round-trip.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 216,
+  name: 'add_waypoint_geofence',
+  settingsKey: 'migration_216_add_waypoint_geofence',
+  sqlite: (db) => addWaypointGeofenceMigration.up(db),
+  postgres: (client) => runMigration216Postgres(client),
+  mysql: (pool) => runMigration216Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 217: nodes.channelLocked (#5923). PER-SOURCE (a nodes column).
+// An admin-pinned channel that packet-driven upserts leave alone. Existing
+// rows start unlocked.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 217,
+  name: 'add_node_channel_locked',
+  settingsKey: 'migration_217_add_node_channel_locked',
+  sqlite: (db) => addNodeChannelLockedMigration.up(db),
+  postgres: (client) => runMigration217Postgres(client),
+  mysql: (pool) => runMigration217Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 218: meshcore_heard_repeaters.hops (#6000). PER-SOURCE (a column
+// on a per-source table). A repeater's index in the echoed copy's relay chain;
+// nullable, old rows stay null.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 218,
+  name: 'add_meshcore_heard_repeater_hops',
+  settingsKey: 'migration_218_add_meshcore_heard_repeater_hops',
+  sqlite: (db) => addMeshcoreHeardRepeaterHopsMigration.up(db),
+  postgres: (client) => runMigration218Postgres(client),
+  mysql: (pool) => runMigration218Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 219: automation_fire_state. GLOBAL (automations are global, no
+// sourceId). Persists the Automation Engine's cooldown and rate-limit state so
+// a restart or a disable/re-enable does not re-arm a rule. New empty table.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 219,
+  name: 'automation_fire_state',
+  settingsKey: 'migration_219_automation_fire_state',
+  sqlite: (db) => automationFireStateMigration.up(db),
+  postgres: (client) => runMigration219Postgres(client),
+  mysql: (pool) => runMigration219Mysql(pool),
+});
+
+// Migration 220: meshcore_nodes retry-burst / cooldown state (#6033).
+// PER-SOURCE (columns on the per-source meshcore_nodes table). Lets a missed
+// scheduled telemetry pull become a short retry burst then a cooldown, with
+// the state persisted so a save/restart never re-arms or clears it.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 220,
+  name: 'add_meshcore_telemetry_retry_state',
+  settingsKey: 'migration_220_add_meshcore_telemetry_retry_state',
+  sqlite: (db) => meshcoreTelemetryRetryStateMigration.up(db),
+  postgres: (client) => runMigration220Postgres(client),
+  mysql: (pool) => runMigration220Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 221: user_map_preferences.color_nodes_by_source (#6125).
+// PER-USER opt-in toggle. When on, the Dashboard Unified map draws a per-source
+// coloured ring around each node marker (reusing getSourceColor). Default
+// FALSE keeps today's behaviour.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 221,
+  name: 'user_map_preferences_color_nodes_by_source',
+  settingsKey: 'migration_221_user_map_preferences_color_nodes_by_source',
+  sqlite: (db) => colorNodesBySourcePrefMigration.up(db),
+  postgres: (client) => runMigration221Postgres(client),
+  mysql: (pool) => runMigration221Mysql(pool),
+});
+
+// Migration 222: add live RNode interface-gauge columns (airtime, channel
+// load, noise floor, interference, CPU load, battery) to `reticulum_interfaces`
+// (#6120). Null for non-RNode interfaces. PER-SOURCE (columns on the per-source
+// reticulum_interfaces table). Display-only; the bridge now relays these fields.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 222,
+  name: 'add_reticulum_interface_live_stats',
+  settingsKey: 'migration_222_add_reticulum_interface_live_stats',
+  sqlite: (db) => reticulumInterfaceLiveStatsMigration.up(db),
+  postgres: (client) => runMigration222Postgres(client),
+  mysql: (pool) => runMigration222Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 223: per-source encrypted Ed25519 identity private key for MeshCore
+// Companion sources (#6195). One row per source, auto-captured on connect; used
+// server-side to decrypt our own echoed DMs for exact #6194 heard-by matching.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 223,
+  name: 'add_meshcore_source_pki_keys',
+  settingsKey: 'migration_223_add_meshcore_source_pki_keys',
+  sqlite: (db) => meshcoreSourcePkiKeysMigration.up(db),
+  postgres: (client) => runMigration223Postgres(client),
+  mysql: (pool) => runMigration223Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 224: derived sender fields (srcHash, senderPubKey, advertName) on
+// meshcore_packet_log plus sender/contact indexes (#6262 P4).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 224,
+  name: 'meshcore_packet_log_derived_fields',
+  settingsKey: 'migration_224_meshcore_packet_log_derived_fields',
+  sqlite: (db) => meshcorePacketLogDerivedMigration.up(db),
+  postgres: (client) => runMigration224Postgres(client),
+  mysql: (pool) => runMigration224Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 225: meshcore_trace_runs, an attempt log of the MeshCore traces a
+// source sent, including timeouts and failures (#6276 P14 WP4).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 225,
+  name: 'add_meshcore_trace_runs',
+  settingsKey: 'migration_225_add_meshcore_trace_runs',
+  sqlite: (db) => meshcoreTraceRunsMigration.up(db),
+  postgres: (client) => runMigration225Postgres(client),
+  mysql: (pool) => runMigration225Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 226: backup_history.sourceId + protocol, legacy backfill and the
+// per-source backup schedule seed (#6285 P8b).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 226,
+  name: 'backup_history_source_protocol',
+  settingsKey: 'migration_226_backup_history_source_protocol',
+  sqlite: (db) => backupHistorySourceProtocolMigration.up(db),
+  postgres: (client) => runMigration226Postgres(client),
+  mysql: (pool) => runMigration226Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 227: persisted security flags (packet rate, clock offset) on
+// meshcore_nodes (#6281 P7b).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 227,
+  name: 'add_meshcore_node_security_flags',
+  settingsKey: 'migration_227_add_meshcore_node_security_flags',
+  sqlite: (db) => meshcoreNodeSecurityFlagsMigration.up(db),
+  postgres: (client) => runMigration227Postgres(client),
+  mysql: (pool) => runMigration227Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 228: re-file MeshCore MQTT slot-decrypted channel rows under their
+// keyed index and fan out per-channel notification state (#6308).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 228,
+  name: 'refile_meshcore_mqtt_slot_channels',
+  settingsKey: 'migration_228_refile_meshcore_mqtt_slot_channels',
+  sqlite: (db) => refileMeshcoreMqttSlotChannelsMigration.up(db),
+  postgres: (client) => runMigration228Postgres(client),
+  mysql: (pool) => runMigration228Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 229: configurable message-notification text length (#6278).
+// PER-USER, PER-SOURCE. Two nullable integer columns on
+// user_notification_preferences; NULL = the default of 100.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 229,
+  name: 'add_notification_text_max',
+  settingsKey: 'migration_229_add_notification_text_max',
+  sqlite: (db) => addNotificationTextMaxMigration.up(db),
+  postgres: (client) => runMigration229Postgres(client),
+  mysql: (pool) => runMigration229Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 230: confirmed new-neighbour ledger (meshcore_neighbor_watch) and
+// meshcore_nodes.neighborWatchBaselinedAt (#6274).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 230,
+  name: 'add_meshcore_neighbor_watch',
+  settingsKey: 'migration_230_add_meshcore_neighbor_watch',
+  sqlite: (db) => meshcoreNeighborWatchMigration.up(db),
+  postgres: (client) => runMigration230Postgres(client),
+  mysql: (pool) => runMigration230Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 231: `meshcore_messages.senderNameOverride` (#6282). PER-SOURCE.
+// The allowlisted sender name an API caller sent an own channel message under
+// (raw CMD_SEND_RAW_PACKET). NULL for every other row. A resend of a row with
+// this set is rebuilt as a raw packet, never sent under the real node name.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 231,
+  name: 'add_meshcore_message_sender_name_override',
+  settingsKey: 'migration_231_add_meshcore_message_sender_name_override',
+  sqlite: (db) => addMeshcoreMessageSenderNameOverrideMigration.up(db),
+  postgres: (client) => runMigration231Postgres(client),
+  mysql: (pool) => runMigration231Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 232: notify_on_auto_trace. PER-SOURCE (user_notification_preferences
+// row). Opt-in alert for automatic MeshCore traces / path discoveries (M3).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 232,
+  name: 'add_notify_on_auto_trace',
+  settingsKey: 'migration_232_add_notify_on_auto_trace',
+  sqlite: (db) => addNotifyOnAutoTraceMigration.up(db),
+  postgres: (client) => runMigration232Postgres(client),
+  mysql: (pool) => runMigration232Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 233: `direct_rf_contacts` (#6210). PER-SOURCE. Daily rollup of
+// the nodes each source's own radio heard at zero hops over RF (not MQTT).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 233,
+  name: 'create_direct_rf_contacts',
+  settingsKey: 'migration_233_create_direct_rf_contacts',
+  sqlite: (db) => createDirectRfContactsMigration.up(db),
+  postgres: (client) => runMigration233Postgres(client),
+  mysql: (pool) => runMigration233Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 234: MQTT consent columns on `nodes` (#5156). PER-SOURCE (nodes
+// is keyed by nodeNum + sourceId). Feeds the opt-in anonymous-viewer filter.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 234,
+  name: 'add_node_mqtt_consent',
+  settingsKey: 'migration_234_add_node_mqtt_consent',
+  sqlite: (db) => addNodeMqttConsentMigration.up(db),
+  postgres: (client) => runMigration234Postgres(client),
+  mysql: (pool) => runMigration234Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 235: mesh-wide notification settings (#5729). Adds the mesh-wide
+// row's push source list, and collapses push subscriptions to one row per
+// (user, browser endpoint). Per-source preference rows stay as overrides.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 235,
+  name: 'unified_notification_scope',
+  settingsKey: 'migration_235_unified_notification_scope',
+  sqlite: (db) => unifiedNotificationScopeMigration.up(db),
+  postgres: (client) => runMigration235Postgres(client),
+  mysql: (pool) => runMigration235Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 236: `mqtt_native_identities` (#4305). PER-SOURCE. The generated
+// Meshtastic identity (node num + X25519 keypair, private key sealed) of an
+// MQTT source that sends with no radio, plus its persisted send state.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 236,
+  name: 'create_mqtt_native_identities',
+  settingsKey: 'migration_236_create_mqtt_native_identities',
+  sqlite: (db) => createMqttNativeIdentitiesMigration.up(db),
+  postgres: (client) => runMigration236Postgres(client),
+  mysql: (pool) => runMigration236Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 237: `meshcore_nodes.lastRoomLoginOkAt` (#6408). Epoch ms of the
+// last SUCCESSFUL room login from this source. Non-NULL means "joined", which
+// lets Room Sync re-join with a blank-password ACL login. Stores no secret.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 237,
+  name: 'add_meshcore_room_login_ok_at',
+  settingsKey: 'migration_237_add_meshcore_room_login_ok_at',
+  sqlite: (db) => meshcoreRoomLoginOkAtMigration.up(db),
+  postgres: (client) => runMigration237Postgres(client),
+  mysql: (pool) => runMigration237Mysql(pool),
 });

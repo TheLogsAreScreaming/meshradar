@@ -1,0 +1,237 @@
+/**
+ * MeshCore hop SNR read route (#5722) on the real route harness: gated by the
+ * per-source `traceroute:read` grant; another source's grant does not help.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import express from 'express';
+import { createRouteTestApp, type RouteTestHarness } from '../test-helpers/routeTestApp.js';
+import traceRoutes from './meshcoreTraceRoutes.js';
+import type { MeshCoreHopSnrRow } from '../../db/repositories/meshcoreHopSnr.js';
+
+const K1 = 'a'.repeat(64);
+const K2 = 'b'.repeat(64);
+const K3 = 'c'.repeat(64);
+
+const row = (sourceId: string, over: Partial<MeshCoreHopSnrRow> = {}): MeshCoreHopSnrRow => ({
+  sourceId, traceTag: 1, authCode: 0, hopIndex: 0, hopCount: 2, hashBytes: 1,
+  senderPublicKey: K1, senderHash: 'aa', senderCandidates: 1,
+  receiverPublicKey: K2, receiverHash: 'bb', receiverCandidates: 1,
+  snrQuarterDb: 20, initiated: false, timestamp: Date.now() - 60_000, ...over,
+});
+
+describe('MeshCore hop SNR route (#5722)', () => {
+  let harness: RouteTestHarness;
+  const url = (sourceId: string, q = '') => `/api/sources/${sourceId}/meshcore/hop-snr${q}`;
+
+  beforeEach(async () => {
+    harness = await createRouteTestApp({
+      mount: (app: express.Express) => app.use('/api/sources/:id/meshcore', traceRoutes),
+    });
+    await harness.db.meshcoreHopSnr.insertHops(harness.sourceA, [
+      row(harness.sourceA),
+      row(harness.sourceA, { snrQuarterDb: -8, timestamp: Date.now() - 30_000 }),
+      row(harness.sourceA, { senderPublicKey: K2, senderHash: 'bb', receiverPublicKey: K1, receiverHash: 'aa', snrQuarterDb: 4 }),
+    ]);
+    await harness.db.meshcoreHopSnr.insertHops(harness.sourceB, [row(harness.sourceB, { snrQuarterDb: 100 })]);
+  });
+
+  afterEach(async () => {
+    await harness.db.meshcoreHopSnr.deleteBySourceId(harness.sourceA);
+    await harness.db.meshcoreHopSnr.deleteBySourceId(harness.sourceB);
+    await harness.cleanup();
+  });
+
+  it('needs traceroute:read on THIS source', async () => {
+    await harness.grant(harness.limited.id, 'traceroute', 'read', harness.sourceB);
+    const agent = await harness.loginAs(harness.limited);
+    expect((await agent.get(url(harness.sourceA))).status).toBe(403);
+    await harness.grant(harness.limited.id, 'traceroute', 'read', harness.sourceA);
+    const res = await agent.get(url(harness.sourceA));
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    // Two directional links on source A; source B's row never leaks in.
+    expect(res.body.data.links).toHaveLength(2);
+    expect(res.body.data.links.some((l: { maxSnr: number }) => l.maxSnr === 25)).toBe(false);
+  });
+
+  it('returns directional links with stats and points', async () => {
+    const admin = await harness.loginAs(harness.admin);
+    const res = await admin.get(url(harness.sourceA, `?publicKey=${K1}`));
+    const k1HeardByK2 = res.body.data.links.find((l: { sender: { publicKey: string } }) => l.sender.publicKey === K1);
+    expect(k1HeardByK2).toMatchObject({
+      receiver: { publicKey: K2, candidates: 1 }, count: 2, lastSnr: -2, minSnr: -2, maxSnr: 5, avgSnr: 1.5,
+    });
+    expect(k1HeardByK2.points).toHaveLength(2);
+    const reverse = res.body.data.links.find((l: { sender: { publicKey: string } }) => l.sender.publicKey === K2);
+    expect(reverse).toMatchObject({ receiver: { publicKey: K1 }, count: 1, lastSnr: 1 });
+  });
+
+  it('validates publicKey and hours', async () => {
+    const admin = await harness.loginAs(harness.admin);
+    expect((await admin.get(url(harness.sourceA, '?publicKey=zz'))).body.code).toBe('INVALID_PUBLIC_KEY');
+    expect((await admin.get(url(harness.sourceA, '?hours=0'))).body.code).toBe('INVALID_HOURS');
+    expect((await admin.get(url(harness.sourceA, '?hours=99999'))).body.code).toBe('INVALID_HOURS');
+    expect((await admin.get(url(harness.sourceA, '?hours=1'))).status).toBe(200);
+  });
+
+  describe('GET /hop-snr/latest-trace (WP4 #6260)', () => {
+    const latest = (sourceId: string, q = '') => `/api/sources/${sourceId}/meshcore/hop-snr/latest-trace${q}`;
+
+    it('needs traceroute:read on THIS source and a valid key', async () => {
+      await harness.grant(harness.limited.id, 'traceroute', 'read', harness.sourceB);
+      const agent = await harness.loginAs(harness.limited);
+      expect((await agent.get(latest(harness.sourceA, `?publicKey=${K1}`))).status).toBe(403);
+      await harness.grant(harness.limited.id, 'traceroute', 'read', harness.sourceA);
+      expect((await agent.get(latest(harness.sourceA, `?publicKey=${K1}`))).status).toBe(200);
+      for (const q of ['', '?publicKey=zz', `?publicKey=${'a'.repeat(63)}`]) {
+        const res = await agent.get(latest(harness.sourceA, q));
+        expect(res.status, q).toBe(400);
+        expect(res.body).toMatchObject({ success: false, code: 'INVALID_PUBLIC_KEY' });
+      }
+    });
+
+    it('returns null when no trace we sent involves the contact', async () => {
+      const admin = await harness.loginAs(harness.admin);
+      const res = await admin.get(latest(harness.sourceA, `?publicKey=${K1}`));
+      expect(res.body).toEqual({ success: true, data: { trace: null } });
+    });
+
+    it('returns the newest sent trace as ordered hops with dB SNR, scoped to the source', async () => {
+      const ts = Date.now() - 1000;
+      await harness.db.meshcoreHopSnr.insertHops(harness.sourceA, [
+        row(harness.sourceA, { traceTag: 7, hopIndex: 1, initiated: true, timestamp: ts, senderPublicKey: K2, senderHash: 'bb', receiverPublicKey: K3, receiverHash: 'cc', snrQuarterDb: -8 }),
+        row(harness.sourceA, { traceTag: 7, hopIndex: 0, initiated: true, timestamp: ts, snrQuarterDb: 22 }),
+      ]);
+      await harness.db.meshcoreHopSnr.insertHops(harness.sourceB, [
+        row(harness.sourceB, { traceTag: 8, initiated: true, timestamp: ts + 500 }),
+      ]);
+      const admin = await harness.loginAs(harness.admin);
+      const res = await admin.get(latest(harness.sourceA, `?publicKey=${K2.toUpperCase()}`));
+      expect(res.status).toBe(200);
+      const { trace } = res.body.data;
+      expect(trace).toMatchObject({ traceTag: 7, timestamp: ts, hashBytes: 1 });
+      expect(trace.hops.map((h: { hopIndex: number; snr: number }) => [h.hopIndex, h.snr])).toEqual([[0, 5.5], [1, -2]]);
+      expect(trace.hops[0]).toMatchObject({ senderPublicKey: K1, receiverPublicKey: K2, receiverHash: 'bb' });
+    });
+  });
+
+  it('caps points per link at 120 by default and honours ?points (#5765)', async () => {
+    const now = Date.now();
+    await harness.db.meshcoreHopSnr.insertHops(harness.sourceA, Array.from({ length: 150 }, (_, i) =>
+      row(harness.sourceA, { senderPublicKey: K3, senderHash: 'cc', snrQuarterDb: i, timestamp: now - (150 - i) * 1000 })));
+    const admin = await harness.loginAs(harness.admin);
+    const find = (body: { data: { links: Array<{ sender: { publicKey: string }; count: number; points: Array<[number, number]> }> } }) =>
+      body.data.links.find((l) => l.sender.publicKey === K3)!;
+
+    const byDefault = find((await admin.get(url(harness.sourceA, `?publicKey=${K2}`))).body);
+    expect(byDefault.count).toBe(150);
+    expect(byDefault.points).toHaveLength(120);
+
+    const wide = find((await admin.get(url(harness.sourceA, `?publicKey=${K2}&points=2000`))).body);
+    expect(wide.points).toHaveLength(150);
+
+    // A smaller cap keeps the NEWEST samples, oldest first.
+    const narrow = find((await admin.get(url(harness.sourceA, `?publicKey=${K2}&points=5`))).body);
+    expect(narrow.count).toBe(150);
+    expect(narrow.points.map((p) => p[1])).toEqual([145, 146, 147, 148, 149].map((q) => q / 4));
+  });
+
+  it('rejects a points value that is junk or out of range (#5765)', async () => {
+    const admin = await harness.loginAs(harness.admin);
+    for (const bad of ['0', '-1', '2001', 'abc', '1.5', '']) {
+      const res = await admin.get(url(harness.sourceA, `?points=${bad}`));
+      expect(res.status, `points=${bad}`).toBe(400);
+      expect(res.body).toMatchObject({ success: false, code: 'INVALID_POINTS' });
+    }
+    expect((await admin.get(url(harness.sourceA, '?points=1'))).status).toBe(200);
+    expect((await admin.get(url(harness.sourceA, '?points=2000'))).status).toBe(200);
+  });
+
+  it('the points param does not widen the permission gate (#5765)', async () => {
+    await harness.grant(harness.limited.id, 'traceroute', 'read', harness.sourceB);
+    const agent = await harness.loginAs(harness.limited);
+    expect((await agent.get(url(harness.sourceA, '?points=1000'))).status).toBe(403);
+    expect((await agent.get(url(harness.sourceB, '?points=1000'))).status).toBe(200);
+  });
+
+  it('anonymous follows the anonymous account grants', async () => {
+    await harness.revokeAll(harness.anonymous.id);
+    const anon = await harness.loginAs(null);
+    expect((await anon.get(url(harness.sourceA))).status).toBe(403);
+    await harness.grant(harness.anonymous.id, 'traceroute', 'read', harness.sourceA);
+    expect((await anon.get(url(harness.sourceA))).status).toBe(200);
+  });
+
+  describe('DELETE /hop-snr, one link (#5970)', () => {
+    // Source A holds K1 -> K2 twice and K2 -> K1 once.
+    const del = (sourceId: string, q = `?from=${K1}&to=${K2}`) => url(sourceId, q);
+    const keysOf = async (sourceId: string) =>
+      (await harness.db.meshcoreHopSnr.getRecent(sourceId, 0)).map((r) => [r.senderPublicKey, r.receiverPublicKey]);
+
+    it('needs traceroute:write; read alone gets 403 and deletes nothing', async () => {
+      await harness.grant(harness.limited.id, 'traceroute', 'read', harness.sourceA);
+      const agent = await harness.loginAs(harness.limited);
+      expect((await agent.delete(del(harness.sourceA))).status).toBe(403);
+      expect(await keysOf(harness.sourceA)).toHaveLength(3);
+      await harness.revokeAll(harness.limited.id);
+      await harness.grant(harness.limited.id, 'traceroute', 'write', harness.sourceA);
+      const res = await agent.delete(del(harness.sourceA));
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ success: true, data: { deleted: 2 } });
+    });
+
+    it('a write grant on source B cannot clear source A, and B keeps its rows when A is cleared', async () => {
+      await harness.grant(harness.limited.id, 'traceroute', 'write', harness.sourceB);
+      const agent = await harness.loginAs(harness.limited);
+      expect((await agent.delete(del(harness.sourceA))).status).toBe(403);
+      expect(await keysOf(harness.sourceA)).toHaveLength(3);
+
+      const admin = await harness.loginAs(harness.admin);
+      expect((await admin.delete(del(harness.sourceA))).body.data.deleted).toBe(2);
+      expect(await keysOf(harness.sourceB)).toEqual([[K1, K2]]);
+    });
+
+    it('clears only that direction of that link, at any age; the other links stay', async () => {
+      const old = Date.now() - 200 * 24 * 60 * 60_000;
+      await harness.db.meshcoreHopSnr.insertHops(harness.sourceA, [
+        row(harness.sourceA, { receiverPublicKey: K3, receiverHash: 'cc' }),
+        row(harness.sourceA, { timestamp: old }),
+        row(harness.sourceA, { senderPublicKey: null, senderHash: 'dd', senderCandidates: 0, receiverPublicKey: K2 }),
+      ]);
+      const admin = await harness.loginAs(harness.admin);
+      const res = await admin.delete(del(harness.sourceA, `?from=${K1.toUpperCase()}&to=${K2}`));
+      expect(res.body.data.deleted).toBe(3);
+      expect((await keysOf(harness.sourceA)).sort()).toEqual([[K1, K3], [K2, K1], [null, K2]].sort());
+      const links = (await admin.get(url(harness.sourceA, `?publicKey=${K1}`))).body.data.links;
+      expect(links.map((l: { sender: { publicKey: string }; receiver: { publicKey: string } }) =>
+        [l.sender.publicKey, l.receiver.publicKey]).sort()).toEqual([[K1, K3], [K2, K1]].sort());
+
+      // A hash end, URL-encoded the way the card sends it.
+      const hashRes = await admin.delete(del(harness.sourceA, `?from=${encodeURIComponent('h:dd')}&to=${K2}`));
+      expect(hashRes.body.data.deleted).toBe(1);
+      expect(await keysOf(harness.sourceA)).toHaveLength(2);
+    });
+
+    it('needs a signed-in user, even when the anonymous account holds the grant', async () => {
+      await harness.revokeAll(harness.anonymous.id);
+      await harness.grant(harness.anonymous.id, 'traceroute', 'write', harness.sourceA);
+      const anon = await harness.loginAs(null);
+      expect((await anon.delete(del(harness.sourceA))).status).toBe(401);
+      expect(await keysOf(harness.sourceA)).toHaveLength(3);
+    });
+
+    it('rejects missing, malformed, repeated or keyless ends with 400', async () => {
+      const admin = await harness.loginAs(harness.admin);
+      for (const q of [
+        '', `?publicKey=${K1}`, `?from=${K1}`, `?to=${K2}`, `?from=zz&to=${K2}`, `?from=${K1}0&to=${K2}`,
+        `?from=${K1}&to=h:abc`, `?from=${K1}&to=h:`, `?from=${K1}&to=${K2}&to=${K3}`,
+        '?from=unknown&to=h:bb', '?from=h:aa&to=h:bb',
+      ]) {
+        const res = await admin.delete(del(harness.sourceA, q));
+        expect(res.status, q).toBe(400);
+        expect(res.body).toMatchObject({ success: false, code: 'INVALID_LINK' });
+      }
+      expect(await keysOf(harness.sourceA)).toHaveLength(3);
+    });
+  });
+});

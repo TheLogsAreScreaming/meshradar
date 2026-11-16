@@ -19,6 +19,11 @@ export const MESH_ISSUE_TYPES = {
   A3_INFRA_POWER: 'A3_infra_power',
   A4_MOBILE_INFRA: 'A4_mobile_infra',
   A5_COSPLAY_ROUTER: 'A5_cosplay_router',
+  // Node health (#6279): protocol-neutral, infra nodes only.
+  A6_STALE_NODE: 'A6_stale_node',
+  A7_NO_POSITION: 'A7_no_position',
+  A8_LOW_BATTERY: 'A8_low_battery',
+  A9_BAD_POSITION: 'A9_bad_position',
   // Tier B (RF adjacency graph, #4964 Phase 2 WP1). Values stay <= 64 chars —
   // `mesh_issues.issueType` is `varchar(64)` on MySQL.
   B1_ROUTER_CLUSTER: 'B1_router_cluster',
@@ -48,7 +53,7 @@ export const MESH_ISSUE_RULE_IDS: readonly MeshIssueType[] = Object.values(MESH_
 /** What a rule emits. No persistence fields — the repository owns those. */
 export interface MeshIssueFinding {
   issueType: MeshIssueType;
-  /** `node:${nodeNum}` or `area:${latBin}:${lonBin}` — see schema/meshIssues.ts. */
+  /** `node:${nodeNum}`, `mc:${publicKey}` or `area:${latBin}:${lonBin}` — see schema/meshIssues.ts. */
   subjectKey: string;
   nodeNum: number | null;
   severity: MeshIssueSeverity;
@@ -60,6 +65,13 @@ export interface MeshIssueFinding {
   /** Human-readable action, official-guidance-compliant (never "promote to ROUTER"). */
   recommendation: string;
 }
+
+/** Which protocol family a pooled node (and so a rule) belongs to (#6263 S5). */
+export type MeshIssueProtocol = 'meshtastic' | 'meshcore';
+
+/** `mc:${publicKey}` — canonical subjectKey for a MeshCore-attributed finding
+ *  (#6263). `nodeNum` is null on those rows; the key is lowercased. */
+export const meshcoreSubjectKey = (publicKey: string): string => `mc:${publicKey.toLowerCase()}`;
 
 /** `node:${nodeNum}` — canonical subjectKey for a node-attributed finding. */
 export const nodeSubjectKey = (nodeNum: number): string => `node:${nodeNum}`;

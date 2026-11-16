@@ -13,14 +13,18 @@
  */
 import { logger } from '../../../utils/logger.js';
 import type { DbMessage } from '../../../services/database.js';
+import type { HopEmojiOverrides } from '../../../utils/hopEmoji.js';
 import type { AutomationsRepository, AutomationRecord } from '../../../db/repositories/automations.js';
 import type { AutomationHomeAnchorsRepository } from '../../../db/repositories/automationHomeAnchors.js';
+import type { AutomationFireStateRepository } from '../../../db/repositories/automationFireState.js';
 import { isMqttSourceType } from '../../../db/repositories/sources.js';
 import {
   validateAutomationGraph,
   categoryOf,
   parseCooldownScope,
   parseRateLimit,
+  effectiveTelemetryCooldown,
+  NEIGHBOR_CONFIRM_HOURS_DEFAULT,
   type AutomationGraph,
   type AutomationNode,
   type TriggerType,
@@ -34,6 +38,7 @@ import {
   buildNodeContext,
   buildMeshCoreNodeContext,
   buildTelemetryContext,
+  type MeshCoreTelemetrySubject,
   buildMeshBeaconContext,
   buildSystemContext,
   buildGeofenceContext,
@@ -42,24 +47,28 @@ import {
   buildNodeStaleContext,
   buildNodeOnlineContext,
   buildNodeRebootedContext,
+  buildNeighborAddedContext,
+  buildClockOutOfSyncContext,
   buildNodePowerChangedContext,
   buildBecameLikelyAircraftContext,
   buildBatteryTrendContext,
   buildScheduleContext,
   messageMatchesFilter,
   meshCoreMessageMatchesFilter,
+  messageFilterIncludesMeshCoreReactions,
   reticulumMessageMatchesFilter,
   describeMessageFilterMiss,
   describeMeshCoreFilterMiss,
   describeReticulumFilterMiss,
-  parseMeshCoreChannelIdx,
+  meshCoreMessageChannelIdx,
   type TriggerContext,
   type SystemEvent,
 } from './triggerContext.js';
 import type { MeshCoreMessage } from '../../meshcoreManager.js';
 import type { ReticulumMessageRow } from '../../../db/repositories/reticulum.js';
-import type { MeshCoreNodeEventFacts, NodeAircraftData, NodeUpdateOrigin } from '../dataEventEmitter.js';
+import type { MeshCoreNodeEventFacts, NeighborSightingData, NodeAircraftData, NodeUpdateOrigin } from '../dataEventEmitter.js';
 import { scheduleCron, validateCron } from '../../utils/cronScheduler.js';
+import { readScheduleWindow } from '../../../types/scheduleWindow.js';
 import { haversineKm, geofenceFires, pointInShape, geofenceCenter, normalizeGeofenceParams, normalizeGeofenceAnchor, shapeFromWaypoint, type GeofenceMode, type GeofenceShape } from './geo.js';
 import { evaluateGraph, type EvaluatorHooks } from './graphEvaluator.js';
 import { automationTraceBus } from './automationTraceBus.js';
@@ -74,6 +83,7 @@ import {
   cooldownKeyFor,
   createStepOutputs,
 } from './engineContext.js';
+import { CLOCK_OUT_OF_SYNC_DEFAULT_SECONDS, parseClockThresholdSeconds, isClockOutOfSyncEdge } from '../../../utils/clockOutOfSync.js';
 
 interface LoadedAutomation {
   id: string;
@@ -244,14 +254,17 @@ function compactEventFields(fields: Record<string, unknown>): Record<string, unk
   return out;
 }
 
+/** Longest delay a Node timer accepts (2^31 - 1 ms, about 24.8 days). */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 /** Pluggable cron backing for `trigger.schedule` — real croner in prod, a fake in tests. */
 export interface CronScheduler {
-  schedule(expression: string, callback: () => void): { stop: () => void };
+  schedule(expression: string, callback: () => void, options?: { timezone?: string }): { stop: () => void };
   validate(expression: string): boolean;
 }
 
 const REAL_CRON_SCHEDULER: CronScheduler = {
-  schedule: (expr, cb) => scheduleCron(expr, cb),
+  schedule: (expr, cb, options) => scheduleCron(expr, cb, options),
   validate: validateCron,
 };
 
@@ -263,6 +276,11 @@ export interface EngineServiceOptions {
   data: NodeDataProvider;
   /** Persists left-home anchors. Optional in unit tests that don't cover leftHome. */
   homeAnchorsRepo?: AutomationHomeAnchorsRepository | null;
+  /**
+   * Persists cooldown + rate-limit state so a restart or a disable/re-enable
+   * does not re-arm a rule. Optional: without it that state lives in memory only.
+   */
+  fireStateRepo?: AutomationFireStateRepository | null;
   /**
    * Optional: estimate a home lat/lon from stored position history (median +
    * inlier mean). Used on first establish / reset so a glitched first packet
@@ -286,6 +304,13 @@ export class AutomationEngineService {
   private readonly deps: ActionDeps;
   private readonly data: NodeDataProvider;
   private readonly homeAnchorsRepo: AutomationHomeAnchorsRepository | null;
+  private readonly fireStateRepo: AutomationFireStateRepository | null;
+  /**
+   * Fire-state writes run one after another on this chain, so a later write for
+   * a key never lands before an earlier one. Callers never await it (a fire must
+   * not wait on the database); load() and {@link flushFireState} do.
+   */
+  private fireStateChain: Promise<void> = Promise.resolve();
   private readonly estimateHomeFromHistory: EngineServiceOptions['estimateHomeFromHistory'];
   private readonly now: () => number;
   private readonly maxActions: number;
@@ -310,6 +335,10 @@ export class AutomationEngineService {
   private leftHomeAlarmed = new Map<string, Map<number, boolean>>();
   /** automationId → live cron job, for `trigger.schedule` automations. */
   private cronJobs = new Map<string, { stop: () => void }>();
+  /** automationId → timer that turns a timed rule off at its end (#5515). */
+  private endTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Rules whose end-of-window disable is in flight, so a reload does not start a second one. */
+  private ending = new Set<string>();
   /** automationId → "sourceId:nodeKey" → staleness baseline (#4558 Phase A). */
   private staleState = new Map<string, Map<string, StaleEntry>>();
   /** The periodic staleness ticker, or null when not running (#4558 Phase A). */
@@ -331,6 +360,7 @@ export class AutomationEngineService {
     });
     this.data = opts.data;
     this.homeAnchorsRepo = opts.homeAnchorsRepo ?? null;
+    this.fireStateRepo = opts.fireStateRepo ?? null;
     this.estimateHomeFromHistory = opts.estimateHomeFromHistory;
     this.now = opts.now ?? (() => Date.now());
     this.maxActions = opts.maxActions ?? 50;
@@ -368,8 +398,13 @@ export class AutomationEngineService {
     // No `as any` needed: params is Record<string, unknown> and parseRateLimit
     // takes unknown (same reasoning as the parseCooldownScope line above).
     const rateLimit = parseRateLimit(triggerNode.params?.rateLimit);
+    // Telemetry triggers get a per-node floor (once per node per hour) whatever
+    // the saved cooldown says — see TELEMETRY_TRIGGER_MIN_COOLDOWN_SECONDS.
+    const cooldown = triggerType === 'trigger.telemetry'
+      ? effectiveTelemetryCooldown(cooldownSeconds, cooldownScope)
+      : { cooldownSeconds, cooldownScope };
     return {
-      id: row.id, name: row.name, graph: result.graph, triggerNode, triggerType, cooldownSeconds, cooldownScope, rateLimit,
+      id: row.id, name: row.name, graph: result.graph, triggerNode, triggerType, ...cooldown, rateLimit,
     };
   }
 
@@ -382,16 +417,20 @@ export class AutomationEngineService {
       if (!index.has(entry.triggerType)) index.set(entry.triggerType, []);
       index.get(entry.triggerType)!.push(entry);
     }
+    // Restore persisted cooldown / rate-limit state BEFORE the new index goes
+    // live, so a rule that comes back (restart, re-enable) is gated by its last
+    // fire rather than firing at once. Restoring only reads; it never fires.
+    await this.restoreFireState(index);
     this.index = index;
     this.liveIds = new Set([...index.values()].flatMap((list) => list.map((a) => a.id)));
-    // Drop cooldown state for automations that are no longer loaded (deleted or
-    // disabled). They are unreachable — runTrigger/onSchedule/checkGeofences only
-    // iterate `this.index` — so this is unobservable while they stay out of the
-    // index. One observable edge, accepted: disabling and re-enabling a rule inside
-    // its own cooldown window now lets it fire immediately instead of waiting out
-    // the remainder. Erring toward firing is the safe direction, and without this a
-    // deleted node-scoped automation would strand up to COOLDOWN_KEYS_MAX entries
-    // forever.
+    // Drop in-memory cooldown state for automations that are no longer loaded
+    // (deleted or disabled). They are unreachable — runTrigger/onSchedule/
+    // checkGeofences only iterate `this.index` — and without this a deleted
+    // node-scoped automation would strand up to COOLDOWN_KEYS_MAX entries. With a
+    // fireStateRepo the state is also on disk, so a disabled rule that is
+    // re-enabled gets its last fire back from restoreFireState() and still waits
+    // out its cooldown; a deleted rule's rows are removed. Without a repo (unit
+    // tests), re-enabling inside the window lets the rule fire at once.
     const liveIds = new Set<string>();
     for (const list of index.values()) for (const a of list) liveIds.add(a.id);
     for (const id of this.lastFired.keys()) if (!liveIds.has(id)) this.lastFired.delete(id);
@@ -431,23 +470,79 @@ export class AutomationEngineService {
   private rescheduleCron(): void {
     for (const job of this.cronJobs.values()) job.stop();
     this.cronJobs.clear();
+    for (const timer of this.endTimers.values()) clearTimeout(timer);
+    this.endTimers.clear();
+    const now = this.now();
     for (const a of this.index.get('trigger.schedule') ?? []) {
-      const cron = String((a.triggerNode.params as Record<string, unknown>)?.cron ?? '').trim();
+      const params = a.triggerNode.params as Record<string, unknown> | undefined;
+      const cron = String(params?.cron ?? '').trim();
       if (!cron || !this.cron.validate(cron)) {
         logger.warn(`[AutomationEngine] automation "${a.name}" has an invalid/missing cron ("${cron}"); not scheduled`);
         continue;
       }
+      // Start/end window (#5515). The dates live in the rule's config, so a
+      // restart or a save reads the same window and never counts as a fire.
+      const window = readScheduleWindow(params);
+      if (window.errors.length > 0) {
+        logger.warn(`[AutomationEngine] automation "${a.name}" has an invalid schedule window (${window.errors.join('; ')}); not scheduled`);
+        continue;
+      }
+      if (window.endMs !== null && window.endMs <= now) {
+        // Already over: enabled past its end, or the server was down when it ended.
+        this.endTimedAutomation(a.id);
+        continue;
+      }
       const job = this.cron.schedule(cron, () => {
         this.onSchedule(a.id).catch((e) => logger.error(`[AutomationEngine] schedule trigger error: ${e?.message}`));
-      });
+      }, window.timeZone ? { timezone: window.timeZone } : undefined);
       this.cronJobs.set(a.id, job);
+      if (window.endMs !== null) this.armEndTimer(a.id, window.endMs);
     }
+  }
+
+  /**
+   * Turn a timed rule off when its end passes, without waiting for its next
+   * cron tick (a daily rule would otherwise show as running for a day). A
+   * timer cannot wait longer than ~24.8 days, so a far end re-arms itself.
+   */
+  private armEndTimer(automationId: string, endMs: number): void {
+    const delay = Math.max(0, endMs - this.now());
+    const timer = setTimeout(() => {
+      this.endTimers.delete(automationId);
+      if (this.now() >= endMs) this.endTimedAutomation(automationId);
+      else this.armEndTimer(automationId, endMs);
+    }, Math.min(delay, MAX_TIMER_DELAY_MS));
+    if (typeof timer.unref === 'function') timer.unref();
+    this.endTimers.set(automationId, timer);
+  }
+
+  /**
+   * A timed rule reached its end (#5515): disable it, so the list shows it as
+   * off and it cannot fire again until someone changes the dates and enables
+   * it. Runs off the current call stack because it reloads the engine, and
+   * this is reached from inside load().
+   */
+  private endTimedAutomation(automationId: string): void {
+    if (this.ending.has(automationId)) return;
+    this.ending.add(automationId);
+    void Promise.resolve()
+      .then(async () => {
+        const row = await this.automationsRepo.getAutomation(automationId);
+        if (!row || !row.enabled) return;
+        await this.automationsRepo.setEnabled(row.id, false);
+        logger.info(`[AutomationEngine] automation "${row.name}" reached its end time and turned itself off`);
+        await this.load();
+      })
+      .catch((e) => logger.error(`[AutomationEngine] could not end timed automation ${automationId}: ${e?.message}`))
+      .finally(() => this.ending.delete(automationId));
   }
 
   /** Stop all cron jobs + the staleness/battery-trend tickers (clean shutdown / test teardown). */
   stop(): void {
     for (const job of this.cronJobs.values()) job.stop();
     this.cronJobs.clear();
+    for (const timer of this.endTimers.values()) clearTimeout(timer);
+    this.endTimers.clear();
     if (this.staleTimer) {
       clearInterval(this.staleTimer);
       this.staleTimer = null;
@@ -495,6 +590,14 @@ export class AutomationEngineService {
     const a = (this.index.get('trigger.schedule') ?? []).find((x) => x.id === automationId);
     if (!a) return 0;
     const now = this.now();
+    // Start/end window (#5515): a tick before the start is not a fire and
+    // writes no run-log row; a tick at or after the end turns the rule off.
+    const window = readScheduleWindow(a.triggerNode.params as Record<string, unknown> | undefined);
+    if (window.startMs !== null && now < window.startMs) return 0;
+    if (window.endMs !== null && now >= window.endMs) {
+      this.endTimedAutomation(a.id);
+      return 0;
+    }
     const ctx = buildScheduleContext(null, now);
     const traced = automationTraceBus.activeCount() > 0 && automationTraceBus.isTracing(a.id, now);
     const gate = this.cooldownGate(a, ctx, now);
@@ -527,8 +630,9 @@ export class AutomationEngineService {
    * guard (#3914) has nothing to drop.
    *
    * Does NOT disturb the cron cadence: croner computes each next fire from the
-   * wall clock, and this method never touches the cron jobs nor persists any
-   * last-fire timestamp (the cooldown map is in-memory). Loads the row directly
+   * wall clock, and this method never touches the cron jobs. Its fire is stamped
+   * against the cooldown / rate-limit state like any other (and persisted with
+   * it, when a fireStateRepo is set). Loads the row directly
    * rather than the enabled index, so it works for disabled automations too.
    */
   async runNow(automationId: string): Promise<RunNowResult> {
@@ -536,6 +640,9 @@ export class AutomationEngineService {
     if (!row) return { ran: false, reason: 'not_found' };
     const a = this.buildEntry(row);
     if (!a) return { ran: false, reason: 'invalid' };
+    // A rule that is not loaded (disabled) has no state in memory after a
+    // restart; read its stored state so a manual fire still honours it.
+    if (!this.liveIds.has(a.id)) await this.restoreOne(a);
     const now = this.now();
     const ctx = buildScheduleContext(null, now);
     const gate = this.cooldownGate(a, ctx, now);
@@ -642,6 +749,7 @@ export class AutomationEngineService {
     let inner = this.lastFired.get(a.id);
     if (!inner) { inner = new Map(); this.lastFired.set(a.id, inner); }
     inner.set(key, now);
+    this.persistFireState(`cooldown for "${a.name}"`, (repo) => repo.upsertCooldown(a.id, key, now));
     if (inner.size > COOLDOWN_KEYS_MAX) this.pruneCooldownKeys(a, inner, now);
   }
 
@@ -655,6 +763,10 @@ export class AutomationEngineService {
     // subjects may fire once early rather than growing without bound.
     const byAge = [...inner.entries()].sort((x, y) => x[1] - y[1]);
     for (let i = 0; i < byAge.length - COOLDOWN_KEYS_TRIM_TO; i++) inner.delete(byAge[i][0]);
+    // Trim the stored rows to match: everything dropped above is older than the
+    // oldest key kept, so one ranged delete covers it.
+    const oldestKept = Math.min(...inner.values());
+    this.persistFireState(`cooldown trim for "${a.name}"`, (repo) => repo.deleteCooldownsBefore(a.id, oldestKept));
     logger.debug(`[AutomationEngine] "${a.name}" cooldown keys trimmed to ${inner.size} (scope=${a.cooldownScope})`);
   }
 
@@ -686,6 +798,140 @@ export class AutomationEngineService {
     const events = this.rateLimitEvents.get(a.id) ?? [];
     events.push(now);
     this.rateLimitEvents.set(a.id, events);
+    const snapshot = [...events];
+    this.persistFireState(`rate limit for "${a.name}"`, (repo) => repo.upsertRateEvents(a.id, snapshot));
+  }
+
+  /**
+   * Queue one fire-state write. Never awaited by the fire path; writes run in
+   * order on {@link fireStateChain}, and a failure is logged, not thrown (the
+   * in-memory guard still holds for this process).
+   */
+  private persistFireState(what: string, op: (repo: AutomationFireStateRepository) => Promise<void>): void {
+    const repo = this.fireStateRepo;
+    if (!repo) return;
+    this.fireStateChain = this.fireStateChain
+      .then(() => op(repo))
+      .catch((e) => logger.warn(`[AutomationEngine] could not save ${what}: ${e instanceof Error ? e.message : String(e)}`));
+  }
+
+  /** Wait for every queued fire-state write to land (tests, shutdown). */
+  async flushFireState(): Promise<void> {
+    await this.fireStateChain;
+  }
+
+  /**
+   * Bring persisted cooldown / rate-limit state into memory for the automations
+   * about to go live, and prune rows that can no longer suppress anything.
+   * Called by load(), so it runs on startup and after every save, enable,
+   * disable and delete.
+   *
+   *  - Rows for a deleted automation are removed.
+   *  - Cooldown rows older than the rule's current cooldown, and rate events
+   *    outside its current window, are removed (also for disabled rules).
+   *  - For a live rule, a stored cooldown merges with memory by taking the newer
+   *    time; stored rate events fill in only when memory has none. Restoring
+   *    never moves a fire time forward, so it can only suppress, never fire.
+   *  - A stored time in the future (clock stepped back) is clamped to now, so it
+   *    holds for one window rather than until the clock catches up.
+   *
+   * A changed cooldownScope changes the key shape ('' / node / source:node), so
+   * keys from the old scope stop matching: the rule starts fresh under the new
+   * scope, exactly as it did when this state lived only in memory. The old keys
+   * age out and are pruned here.
+   */
+  /** Take the newer of the in-memory and stored last fire for one cooldown key. */
+  private mergeCooldown(automationId: string, scopeKey: string, firedAt: number): void {
+    let inner = this.lastFired.get(automationId);
+    if (!inner) { inner = new Map(); this.lastFired.set(automationId, inner); }
+    const mem = inner.get(scopeKey);
+    if (mem == null || firedAt > mem) inner.set(scopeKey, firedAt);
+  }
+
+  /**
+   * Restore one automation's stored state into memory (no pruning). Used by
+   * runNow for a rule that load() did not restore because it is not live.
+   */
+  private async restoreOne(a: LoadedAutomation): Promise<void> {
+    const repo = this.fireStateRepo;
+    if (!repo) return;
+    try {
+      await this.fireStateChain;
+      const now = this.now();
+      for (const row of await repo.listByAutomation(a.id)) {
+        if (row.kind === 'cooldown') {
+          if (a.cooldownSeconds > 0) this.mergeCooldown(a.id, row.scopeKey, Math.min(row.firedAt, now));
+        } else if (a.rateLimit && !this.rateLimitEvents.has(a.id)) {
+          const windowMs = a.rateLimit.windowSeconds * 1000;
+          const events = (row.events ?? []).map((ts) => Math.min(ts, now)).filter((ts) => now - ts < windowMs).sort((x, y) => x - y);
+          if (events.length > 0) this.rateLimitEvents.set(a.id, events);
+        }
+      }
+    } catch (e) {
+      logger.warn(`[AutomationEngine] could not restore cooldown / rate-limit state for "${a.name}": ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  private async restoreFireState(index: Map<TriggerType, LoadedAutomation[]>): Promise<void> {
+    const repo = this.fireStateRepo;
+    if (!repo) return;
+    try {
+      // Let queued writes land first so the read below is current.
+      await this.fireStateChain;
+      const [rows, all] = await Promise.all([repo.listAll(), this.automationsRepo.listAutomations()]);
+      if (rows.length === 0) return;
+      const live = new Map<string, LoadedAutomation>();
+      for (const list of index.values()) for (const a of list) live.set(a.id, a);
+      const records = new Map(all.map((r) => [r.id, r]));
+      const entries = new Map<string, LoadedAutomation | null>();
+      const entryFor = (id: string): LoadedAutomation | null => {
+        if (live.has(id)) return live.get(id)!;
+        if (!entries.has(id)) entries.set(id, this.buildEntry(records.get(id)!));
+        return entries.get(id)!;
+      };
+      const now = this.now();
+      const orphans = new Set<string>();
+      const expiredCooldowns = new Map<string, number>();
+      const clearCooldowns = new Set<string>();
+      const clearRate = new Set<string>();
+      const rewriteRate = new Map<string, number[]>();
+      for (const row of rows) {
+        const id = row.automationId;
+        if (!records.has(id)) { orphans.add(id); continue; }
+        const a = entryFor(id);
+        // An unparseable config tells us nothing about the window; keep its rows.
+        if (!a) continue;
+        if (row.kind === 'cooldown') {
+          if (a.cooldownSeconds <= 0) { clearCooldowns.add(id); continue; }
+          const windowMs = a.cooldownSeconds * 1000;
+          const firedAt = Math.min(row.firedAt, now);
+          if (now - firedAt >= windowMs) {
+            // firedAt <= now - windowMs  ⇔  firedAt < now - windowMs + 1
+            expiredCooldowns.set(id, now - windowMs + 1);
+            continue;
+          }
+          if (live.has(id)) this.mergeCooldown(id, row.scopeKey, firedAt);
+        } else {
+          if (!a.rateLimit) { clearRate.add(id); continue; }
+          const windowMs = a.rateLimit.windowSeconds * 1000;
+          const stored = row.events ?? [];
+          const events = stored.map((ts) => Math.min(ts, now)).filter((ts) => now - ts < windowMs).sort((x, y) => x - y);
+          if (events.length === 0) { clearRate.add(id); continue; }
+          if (events.length !== stored.length) rewriteRate.set(id, events);
+          if (live.has(id) && !this.rateLimitEvents.has(id)) this.rateLimitEvents.set(id, [...events]);
+        }
+      }
+      for (const id of orphans) this.persistFireState(`cleanup for deleted automation ${id}`, (r) => r.deleteByAutomation(id));
+      for (const [id, cutoff] of expiredCooldowns) {
+        this.persistFireState(`expired cooldowns for ${id}`, (r) => r.deleteCooldownsBefore(id, cutoff));
+      }
+      for (const id of clearCooldowns) this.persistFireState(`cooldowns for ${id}`, (r) => r.deleteKind(id, 'cooldown'));
+      for (const id of clearRate) this.persistFireState(`rate limit for ${id}`, (r) => r.deleteKind(id, 'rate'));
+      for (const [id, events] of rewriteRate) this.persistFireState(`rate limit for ${id}`, (r) => r.upsertRateEvents(id, events));
+    } catch (e) {
+      // Fail toward the old behaviour (in-memory only) rather than not loading.
+      logger.warn(`[AutomationEngine] could not restore cooldown / rate-limit state: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   /** Prior inside/outside geofence state for (automation, node), or undefined on first sighting. */
@@ -808,13 +1054,20 @@ export class AutomationEngineService {
     try {
       const result = await evaluateGraph(a.graph, evalCtx, this.hooks(), { maxActions: this.maxActions });
       const anyFailed = result.actions.some((x) => !x.ok);
-      await this.automationsRepo.createRun({
-        automationId: a.id,
-        sourceId: ctx.sourceId,
-        status: anyFailed ? 'failed' : 'completed',
-        triggerEvent: JSON.stringify(ctx.fields),
-        log: JSON.stringify(result.steps),
-      });
+      // #5723: a tick where every action that ran had nothing to do (all
+      // scheduled trace paths "not due") writes no run-log row. A manual Run
+      // Now is always logged.
+      const idleTick = !opts.manual && !anyFailed && result.actions.length > 0
+        && (evalCtx.idleActions ?? 0) === result.actions.length;
+      if (!idleTick) {
+        await this.automationsRepo.createRun({
+          automationId: a.id,
+          sourceId: ctx.sourceId,
+          status: anyFailed ? 'failed' : 'completed',
+          triggerEvent: JSON.stringify(ctx.fields),
+          log: JSON.stringify(result.steps),
+        });
+      }
       return {
         status: anyFailed ? 'failed' : 'completed',
         conditionResults: result.conditionResults,
@@ -933,7 +1186,9 @@ export class AutomationEngineService {
     // without the accessor (older/unit-test providers) yields false = today's
     // behaviour.
     let viaMqttSource = false;
+    let hopEmojis: HopEmojiOverrides | undefined;
     if (hasMessageAutomations) {
+      if (this.data.getHopEmojiOverrides) hopEmojis = await this.data.getHopEmojiOverrides(sourceId);
       if (this.data.getChannelName) {
         channelName = await this.data.getChannelName(sourceId, Number(msg.channel));
       }
@@ -945,7 +1200,7 @@ export class AutomationEngineService {
         viaMqttSource = isMqttSourceType(await this.data.getSourceType(sourceId));
       }
     }
-    const ctx = buildMessageContext(msg, sourceId, this.now(), { channelName, fromName, viaMqttSource });
+    const ctx = buildMessageContext(msg, sourceId, this.now(), { channelName, fromName, viaMqttSource, hopEmojis });
     return this.runTrigger(
       ctx,
       (a) => (!isSelf || this.includesSelfOrigin(a)) && messageMatchesFilter(msg, a.triggerNode.params ?? {}, channelName),
@@ -965,19 +1220,37 @@ export class AutomationEngineService {
     // `selfOrigin` (#5551) marks a repeater-decrypted channel message whose
     // sender is one of our own nodes — channel traffic has no sender key to
     // match, so the ingest path flags it instead.
-    const isSelf = msg.selfOrigin === true || await this.isSelfMeshCore(sourceId, msg.fromPublicKey);
+    const channelIdx = meshCoreMessageChannelIdx(msg);
+    const isReaction = !!msg.reactionEmoji;
+    // A reaction is also ours when stored as 'local', or when its channel
+    // reactor name is a local MeshCore node name on any source (#5763).
+    // An own send stored before the local node's key was known carries the
+    // 'local' placeholder as its sender (meshcoreManager sendMessage).
+    const isSelf = msg.selfOrigin === true
+      || msg.fromPublicKey === 'local'
+      || await this.isSelfMeshCore(sourceId, msg.fromPublicKey)
+      || (isReaction && channelIdx !== undefined && !!msg.fromName
+        && !!this.data.isOwnMeshCoreName && await this.data.isOwnMeshCoreName(msg.fromName));
     // Same reconciliation as onMessage: resolve the channel name when any message
     // automation is loaded (subsumes #3974's channelName/`channels` filter gate),
     // feeding both the universal channelName/senderLabel tokens and the matcher's
     // single-/multi-channel matching. `channel-<idx>` is parsed straight from the
     // sender key so we can resolve BEFORE building the context (to pass it in).
     const hasMessageAutomations = (this.index.get('trigger.message') ?? []).length > 0;
-    const channelIdx = parseMeshCoreChannelIdx(msg.fromPublicKey);
     let channelName: string | null | undefined;
     if (hasMessageAutomations && this.data.getChannelName && typeof channelIdx === 'number') {
       channelName = await this.data.getChannelName(sourceId, channelIdx);
     }
-    const ctx = buildMeshCoreMessageContext(msg, sourceId, this.now(), { channelName });
+    const hopEmojis = hasMessageAutomations && this.data.getHopEmojiOverrides
+      ? await this.data.getHopEmojiOverrides(sourceId)
+      : undefined;
+    // Look the reaction target up only when a loaded rule opted in (no DB read otherwise).
+    const wantsReactions = isReaction
+      && (this.index.get('trigger.message') ?? []).some((a) => messageFilterIncludesMeshCoreReactions(a.triggerNode.params ?? {}));
+    const reactionTarget = wantsReactions && msg.reactionTargetId && this.data.getMeshCoreMessage
+      ? await this.data.getMeshCoreMessage(sourceId, msg.reactionTargetId)
+      : null;
+    const ctx = buildMeshCoreMessageContext(msg, sourceId, this.now(), { channelName, reactionTarget, hopEmojis });
     return this.runTrigger(
       ctx,
       (a) => (!isSelf || this.includesSelfOrigin(a)) && meshCoreMessageMatchesFilter(msg, a.triggerNode.params ?? {}, channelName),
@@ -997,7 +1270,15 @@ export class AutomationEngineService {
    * doc comment.
    */
   async onReticulumMessage(msg: ReticulumMessageRow, sourceId: string | null): Promise<number> {
-    const ctx = buildReticulumMessageContext(msg, sourceId, this.now());
+    // Sender display name (announced in the destination row), so fromName /
+    // senderLabel address the sender by name — same DB-free hot path gate as
+    // onMessage: only look it up when a message automation is actually loaded.
+    let displayName: string | null | undefined;
+    const hasMessageAutomations = (this.index.get('trigger.message') ?? []).length > 0;
+    if (hasMessageAutomations && this.data.getReticulumDisplayName) {
+      displayName = await this.data.getReticulumDisplayName(sourceId, msg.fromHash);
+    }
+    const ctx = buildReticulumMessageContext(msg, sourceId, this.now(), { displayName });
     return this.runTrigger(
       ctx,
       (a) => reticulumMessageMatchesFilter(msg, a.triggerNode.params ?? {}),
@@ -1042,9 +1323,29 @@ export class AutomationEngineService {
     value: number,
     unit: string | undefined,
     sourceId: string | null,
+    opts: {
+      answersOwnRequest?: boolean;
+      localStats?: boolean;
+      /** MeshCore readings (#6397): the contact the reading came from. */
+      meshcore?: MeshCoreTelemetrySubject;
+    } = {},
   ): Promise<number> {
-    if (await this.isSelfMeshtastic(sourceId, nodeNum)) return 0; // #3914: ignore our own telemetry
-    const ctx = buildTelemetryContext(nodeNum, telemetryType, value, unit, sourceId, this.now());
+    // Loop guard: a reading that answers a telemetry request WE sent never
+    // fires. Otherwise "telemetry → request telemetry from that node" repeats
+    // every round trip; the reply comes from a remote node, so #3914 below
+    // can't catch it.
+    if (opts.answersOwnRequest) return 0;
+    // Every live reading lands here; skip the self-origin lookups when no
+    // telemetry automation is loaded (the common case).
+    if (!this.index.get('trigger.telemetry')?.length) return 0;
+    // #3914: ignore our own telemetry — except LocalStats readings (noiseFloor,
+    // uptime, packet counters). Only our own node produces those, so the guard
+    // would drop every one. No action can make the radio emit LocalStats, so
+    // exempting them opens no loop.
+    if (opts.meshcore) {
+      if (await this.isSelfMeshCore(sourceId, opts.meshcore.publicKey)) return 0;
+    } else if (!opts.localStats && await this.isSelfMeshtastic(sourceId, nodeNum)) return 0;
+    const ctx = buildTelemetryContext(nodeNum, telemetryType, value, unit, sourceId, this.now(), opts.meshcore);
     return this.runTrigger(
       ctx,
       (a) => {
@@ -1083,6 +1384,69 @@ export class AutomationEngineService {
   ): Promise<number> {
     const ctx = buildNodeRebootedContext(nodeNum, publicKey, previousUptimeSeconds, uptimeSeconds, sourceId, this.now());
     return this.runTrigger(ctx);
+  }
+
+  /**
+   * A pending MeshCore neighbour was seen again in a repeater's neighbour table
+   * (`trigger.neighborAdded`, #6274). The neighbour watch already did the
+   * bookkeeping and stored both timestamps, so each rule decides for itself, with
+   * no per-automation state, whether this sighting is the one that crosses its
+   * `confirmHours`: `prevLastHeardAt - firstSeenAt < H <= lastHeardAt - firstSeenAt`.
+   * That is exactly once per rule per pending episode and survives a restart.
+   *
+   * Self-origin guard (#3914): drop only when the NEIGHBOUR is our own key. A
+   * reporter that is our own repeater is the point of this trigger.
+   */
+  async onNeighborSighting(d: NeighborSightingData, sourceId: string | null): Promise<number> {
+    if (!d.neighborPublicKey) return 0;
+    if (await this.isSelfMeshCore(sourceId, d.neighborPublicKey)) return 0;
+    const ctx = buildNeighborAddedContext(d, sourceId, this.now());
+    const hoursOf = (a: { triggerNode: { params?: Record<string, unknown> } }): number => {
+      const raw = a.triggerNode.params?.confirmHours;
+      const h = raw == null || raw === '' ? NEIGHBOR_CONFIRM_HOURS_DEFAULT : Number(raw);
+      return Number.isFinite(h) ? h : NEIGHBOR_CONFIRM_HOURS_DEFAULT;
+    };
+    return this.runTrigger(
+      ctx,
+      (a) => {
+        const ms = hoursOf(a) * 3_600_000;
+        return d.prevLastHeardAt - d.firstSeenAt < ms && ms <= d.lastHeardAt - d.firstSeenAt;
+      },
+      (a) => `neighbour not yet (or no longer crossing) ${hoursOf(a)} h`,
+    );
+  }
+
+  /**
+   * A passive MeshCore clock sample (`trigger.clockOutOfSync`, #6273). The
+   * sample and the two stored samples before it arrive with the event, so each
+   * rule only applies its own threshold. It fires when this sample and the one
+   * before are past the threshold and the one before that was not: two
+   * consecutive bad samples, once per episode. The history lives in the
+   * telemetry table, so a restart or a settings save can neither re-fire a
+   * rule nor reset it. Sends nothing.
+   *
+   * No self-origin guard (#3914): no automation action can change a node's clock.
+   */
+  async onClockOffset(
+    publicKey: string,
+    offsetSeconds: number,
+    previousOffsets: readonly number[],
+    sampleSource: 'advert' | 'device',
+    sourceId: string | null,
+  ): Promise<number> {
+    const autos = this.index.get('trigger.clockOutOfSync');
+    if (!autos || autos.length === 0) return 0;
+    const now = this.now();
+    let fired = 0;
+    for (const a of autos) {
+      const raw = (a.triggerNode.params as Record<string, unknown> | undefined)?.thresholdSeconds;
+      const threshold = raw == null || raw === '' ? CLOCK_OUT_OF_SYNC_DEFAULT_SECONDS : parseClockThresholdSeconds(raw);
+      if (threshold == null) continue;
+      if (!isClockOutOfSyncEdge(offsetSeconds, previousOffsets, threshold)) continue;
+      const ctx = buildClockOutOfSyncContext(publicKey, offsetSeconds, sampleSource, threshold, sourceId, now);
+      fired += await this.fireStaleTransition(a, ctx, now);
+    }
+    return fired;
   }
 
   /**

@@ -5,6 +5,8 @@ import 'leaflet/dist/leaflet.css';
 import { DEFAULT_TILESET_ID } from '../config/tilesets';
 import { createNodeIcon, getHopColor } from '../utils/mapIcons';
 import { getHardwareModelName, getRoleName } from '../utils/nodeHelpers';
+import { meshcoreRoleLabel, isMeshCoreInfrastructureAdvType } from './MeshCore/meshcoreRole';
+import { markerRoleProps } from '../utils/nodeTypeCategory';
 import GeoJsonOverlay from './GeoJsonOverlay';
 import type { GeoJsonLayer } from '../server/services/geojsonService.js';
 import { getOverlayColors, getSchemeForTileset } from '../config/overlayColors';
@@ -55,11 +57,26 @@ interface EmbedNode {
   role?: number;
   viaMqtt?: boolean;
   channel?: number;
+  /** #5999: a MeshCore node. `nodeNum` is 0; `nodeId` (`mc:…`) identifies it. */
+  isMeshCore?: boolean;
+  /** #5999: MeshCore role (1 companion, 2 repeater, 3 room server, 4 sensor). */
+  advType?: number;
+}
+
+/**
+ * The key a node's marker is drawn by. A MeshCore node has no `nodeNum`, so it
+ * keys on its `mc:` id, which can never equal a Meshtastic node number.
+ */
+function embedNodeKey(node: EmbedNode): string {
+  return node.isMeshCore && node.nodeId ? node.nodeId : String(node.nodeNum);
 }
 
 interface EmbedNeighborSegment {
   nodeNum: number;
   neighborNodeNum: number;
+  /** MeshCore edge: `mc:` ids; the numeric fields are 0. */
+  nodeKey?: string;
+  neighborKey?: string;
   snr: number | null;
   nodeLatitude: number;
   nodeLongitude: number;
@@ -80,6 +97,9 @@ interface EmbedTracerouteSegment {
   toName: string;
   snr: number | null;
   timestamp: number;
+  /** MeshCore segment: `mc:` ids of the ends; `fromNum`/`toNum` are 0. */
+  fromKey?: string;
+  toKey?: string;
   // Additive fields (#4047 P6 WP1) — the server now emits these on every
   // response, but they're typed optional here so a stale/cached response
   // from a not-yet-upgraded server (old shape) is tolerated defensively,
@@ -243,23 +263,31 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
 
   // Build icon map
   const iconMap = useMemo(() => {
-    const map = new Map<number, L.DivIcon>();
+    const map = new Map<string, L.DivIcon>();
     for (const node of filteredNodes) {
       const hops = node.hopsAway ?? 999;
-      const isRouter = (node.role ?? 0) === 2;
+      // A MeshCore repeater or room server draws as infrastructure, as a
+      // Meshtastic router does. Meshtastic roles go through the shared helper
+      // (#6008) and pass their category, so the embed draws the same glyphs and
+      // corner badges as the app's maps.
+      const meshtasticRole = node.isMeshCore ? null : markerRoleProps({ role: node.role });
+      const isRouter = meshtasticRole
+        ? meshtasticRole.isRouter
+        : isMeshCoreInfrastructureAdvType(node.advType);
       const icon = createNodeIcon({
         hops,
         isSelected: false,
         isRouter,
+        roleCategory: meshtasticRole?.roleCategory,
         shortName: node.user?.shortName,
         showLabel: false,
         pinStyle: 'meshmonitor',
       });
-      map.set(node.nodeNum, icon);
+      map.set(embedNodeKey(node), icon);
     }
     return map;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filteredNodes.map(n => `${n.nodeNum}-${n.hopsAway}-${n.role}-${n.user?.shortName}`).join(',')]);
+  }, [filteredNodes.map(n => `${embedNodeKey(n)}-${n.hopsAway}-${n.role}-${n.advType}-${n.user?.shortName}`).join(',')]);
 
   // Traceroute palette (#4047 P6 §3.1) — the embed bundle has no
   // SettingsProvider, so the SNR palette is derived directly from the
@@ -282,7 +310,7 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
     () => tracerouteSegments.map((s) => {
       const leg = s.leg ?? 'forward';
       return {
-        key: `${leg}:${s.fromNum}-${s.toNum}`,
+        key: `${leg}:${s.fromKey ?? s.fromNum}-${s.toKey ?? s.toNum}`,
         from: [s.fromLat, s.fromLng] as [number, number],
         to: [s.toLat, s.toLng] as [number, number],
         fromNodeNum: s.fromNum,
@@ -302,7 +330,7 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
     const map = new Map<string, EmbedTracerouteSegment>();
     for (const s of tracerouteSegments) {
       const leg = s.leg ?? 'forward';
-      map.set(`${leg}:${s.fromNum}-${s.toNum}`, s);
+      map.set(`${leg}:${s.fromKey ?? s.fromNum}-${s.toKey ?? s.toNum}`, s);
     }
     return map;
   }, [tracerouteSegments]);
@@ -457,20 +485,23 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
 
         {/* Node markers */}
         {filteredNodes.map((node) => {
-          const icon = iconMap.get(node.nodeNum);
+          const markerKey = embedNodeKey(node);
+          const icon = iconMap.get(markerKey);
           const hops = node.hopsAway ?? 999;
-          const hwModelName = getHardwareModelName(node.user?.hwModel);
-          const roleName = getRoleName(node.role);
+          const hwModelName = node.isMeshCore ? null : getHardwareModelName(node.user?.hwModel);
+          const roleName = node.isMeshCore
+            ? (node.advType ? meshcoreRoleLabel(node.advType) : null)
+            : getRoleName(node.role);
 
           return (
             <Marker
-              key={node.nodeNum}
+              key={markerKey}
               position={[node.position!.latitude!, node.position!.longitude!]}
               icon={icon}
             >
               {config.showTooltips && (
                 <Tooltip direction="top" offset={[0, -20]} permanent={false}>
-                  <span>{node.user?.longName || node.user?.shortName || `!${node.nodeNum.toString(16)}`}</span>
+                  <span>{node.user?.longName || node.user?.shortName || (node.isMeshCore ? node.nodeId : `!${node.nodeNum.toString(16)}`)}</span>
                 </Tooltip>
               )}
               {config.showPopups && (
@@ -479,7 +510,7 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
                     {/* Header */}
                     <div className="embed-popup-header" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                       <div className="embed-popup-title">
-                        {node.user?.longName || `Node ${node.nodeNum}`}
+                        {node.user?.longName || (node.isMeshCore ? node.nodeId : `Node ${node.nodeNum}`)}
                       </div>
                       {node.user?.shortName && (
                         <div className="embed-popup-subtitle">{node.user.shortName}</div>

@@ -17,6 +17,7 @@ import { logger } from '../utils/logger';
 import { useToast } from './ToastContainer';
 import { getDeviceRoleName } from '../utils/deviceRole';
 import { getHardwareModelName } from '../utils/hardwareModel';
+import { formatBootloaderVersion } from '../utils/bootloaderVersion';
 import { getPacketDistributionStats } from '../services/packetApi';
 import { PacketDistributionStats } from '../types/packet';
 import PacketStatsChart, { ChartDataEntry, DISTRIBUTION_COLORS } from './PacketStatsChart';
@@ -485,6 +486,12 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
           {deviceInfo?.deviceMetadata?.rebootCount !== undefined && (
             <p><strong>{t('info.reboot_count')}</strong> {deviceInfo.deviceMetadata.rebootCount}</p>
           )}
+          {typeof deviceInfo?.deviceMetadata?.bleAddress === 'string' && deviceInfo.deviceMetadata.bleAddress && (
+            <p><strong>{t('info.ble_address')}</strong> {deviceInfo.deviceMetadata.bleAddress}</p>
+          )}
+          {formatBootloaderVersion(deviceInfo?.deviceMetadata?.bootloaderVersion) && (
+            <p><strong>{t('info.bootloader_version')}</strong> {formatBootloaderVersion(deviceInfo.deviceMetadata.bootloaderVersion)}</p>
+          )}
         </div>
 
         {deviceConfig && (
@@ -614,7 +621,7 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
             reach. Lives in Info because it describes the local network rather
             than acting on it. */}
         <div className="info-section">
-          <NetworkSurveyPanel sourceId={activeSourceId} />
+          <NetworkSurveyPanel sourceId={activeSourceId} timeFormat={timeFormat} dateFormat={dateFormat} />
         </div>
 
         <div className="info-section">

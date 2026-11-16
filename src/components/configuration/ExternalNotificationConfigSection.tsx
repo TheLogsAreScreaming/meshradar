@@ -1,13 +1,17 @@
-import React, { useState, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
 import ModuleAvailabilityNotice from './ModuleAvailabilityNotice';
+import { ConfigSection } from '../shared/config/ConfigSection';
 
 interface ExternalNotificationConfigSectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
   // Main settings
   enabled: boolean;
   setEnabled: (value: boolean) => void;
@@ -43,10 +47,12 @@ interface ExternalNotificationConfigSectionProps {
   setOutputBuzzer: (value: number) => void;
   // UI state
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
 }
 
 const ExternalNotificationConfigSection: React.FC<ExternalNotificationConfigSectionProps> = ({
+  canWrite = true,
   enabled,
   setEnabled,
   outputMs,
@@ -83,70 +89,39 @@ const ExternalNotificationConfigSection: React.FC<ExternalNotificationConfigSect
   const { t } = useTranslation();
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // What the node holds; moves on a successful save (#5797)
+  const values = {
     enabled, outputMs, output, active, alertMessage, alertMessageVibra, alertMessageBuzzer,
     alertBell, alertBellVibra, alertBellBuzzer, usePwm, nagTimeout,
     useI2sAsBuzzer, outputVibra, outputBuzzer
-  });
-
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      enabled !== initial.enabled ||
-      outputMs !== initial.outputMs ||
-      output !== initial.output ||
-      active !== initial.active ||
-      alertMessage !== initial.alertMessage ||
-      alertMessageVibra !== initial.alertMessageVibra ||
-      alertMessageBuzzer !== initial.alertMessageBuzzer ||
-      alertBell !== initial.alertBell ||
-      alertBellVibra !== initial.alertBellVibra ||
-      alertBellBuzzer !== initial.alertBellBuzzer ||
-      usePwm !== initial.usePwm ||
-      nagTimeout !== initial.nagTimeout ||
-      useI2sAsBuzzer !== initial.useI2sAsBuzzer ||
-      outputVibra !== initial.outputVibra ||
-      outputBuzzer !== initial.outputBuzzer
-    );
-  }, [enabled, outputMs, output, active, alertMessage, alertMessageVibra, alertMessageBuzzer,
-      alertBell, alertBellVibra, alertBellBuzzer, usePwm, nagTimeout,
-      useI2sAsBuzzer, outputVibra, outputBuzzer]);
+  };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values);
 
   // Reset to initial values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setEnabled(initial.enabled);
-    setOutputMs(initial.outputMs);
-    setOutput(initial.output);
-    setActive(initial.active);
-    setAlertMessage(initial.alertMessage);
-    setAlertMessageVibra(initial.alertMessageVibra);
-    setAlertMessageBuzzer(initial.alertMessageBuzzer);
-    setAlertBell(initial.alertBell);
-    setAlertBellVibra(initial.alertBellVibra);
-    setAlertBellBuzzer(initial.alertBellBuzzer);
-    setUsePwm(initial.usePwm);
-    setNagTimeout(initial.nagTimeout);
-    setUseI2sAsBuzzer(initial.useI2sAsBuzzer);
-    setOutputVibra(initial.outputVibra);
-    setOutputBuzzer(initial.outputBuzzer);
-  }, [setEnabled, setOutputMs, setOutput, setActive, setAlertMessage, setAlertMessageVibra,
+    setEnabled(baseline.enabled);
+    setOutputMs(baseline.outputMs);
+    setOutput(baseline.output);
+    setActive(baseline.active);
+    setAlertMessage(baseline.alertMessage);
+    setAlertMessageVibra(baseline.alertMessageVibra);
+    setAlertMessageBuzzer(baseline.alertMessageBuzzer);
+    setAlertBell(baseline.alertBell);
+    setAlertBellVibra(baseline.alertBellVibra);
+    setAlertBellBuzzer(baseline.alertBellBuzzer);
+    setUsePwm(baseline.usePwm);
+    setNagTimeout(baseline.nagTimeout);
+    setUseI2sAsBuzzer(baseline.useI2sAsBuzzer);
+    setOutputVibra(baseline.outputVibra);
+    setOutputBuzzer(baseline.outputBuzzer);
+  }, [baseline, setEnabled, setOutputMs, setOutput, setActive, setAlertMessage, setAlertMessageVibra,
       setAlertMessageBuzzer, setAlertBell, setAlertBellVibra, setAlertBellBuzzer,
       setUsePwm, setNagTimeout, setUseI2sAsBuzzer, setOutputVibra, setOutputBuzzer]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      enabled, outputMs, output, active, alertMessage, alertMessageVibra, alertMessageBuzzer,
-      alertBell, alertBellVibra, alertBellBuzzer, usePwm, nagTimeout,
-      useI2sAsBuzzer, outputVibra, outputBuzzer
-    };
-  }, [onSave, enabled, outputMs, output, active, alertMessage, alertMessageVibra, alertMessageBuzzer,
-      alertBell, alertBellVibra, alertBellBuzzer, usePwm, nagTimeout,
-      useI2sAsBuzzer, outputVibra, outputBuzzer]);
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Register with SaveBar
   const numberScope = useNumberInputScope();
@@ -162,24 +137,7 @@ const ExternalNotificationConfigSection: React.FC<ExternalNotificationConfigSect
 
   return (
     <NumberInputScope scope={numberScope}>
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('extnotif_config.title')}
-        <a
-          href="https://meshtastic.org/docs/configuration/module/external-notification/"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('extnotif_config.view_docs')}
-        >
-          ?
-        </a>
-      </h3>
-      <ModuleAvailabilityNotice />
+    <ConfigSection canWrite={canWrite} title={t('extnotif_config.title')} docsUrl="https://meshtastic.org/docs/configuration/module/external-notification/" notice={<ModuleAvailabilityNotice />}>
 
       {/* Enable Module */}
       <div className="setting-item">
@@ -486,7 +444,7 @@ const ExternalNotificationConfigSection: React.FC<ExternalNotificationConfigSect
           )}
         </>
       )}
-    </div>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

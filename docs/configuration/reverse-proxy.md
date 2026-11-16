@@ -28,6 +28,8 @@ COOKIE_SECURE=true                                  # Enable secure cookies for 
 ALLOWED_ORIGINS=https://meshmonitor.example.com    # Allow CORS from your domain
 ```
 
+On a bare-metal install, `BIND_ADDRESS=127.0.0.1` makes MeshMonitor listen on loopback only, so the proxy is the only way in. Leave it unset in Docker: the container's port mapping needs the default (all interfaces).
+
 **Without `NODE_ENV=production`, you will get:**
 - Map tiles won't load (gray/blank tiles) for satellite, dark mode, light mode, and topographic maps
 - Browser console shows CSP errors about refused connections to tile servers
@@ -400,6 +402,20 @@ spec:
             port:
               number: 8080
 ```
+
+## Compression and Caching
+
+MeshMonitor compresses its own responses (brotli or gzip, per what the browser
+accepts), so you don't need `gzip on;` in NGINX or `encode gzip` in Caddy. Leaving
+proxy compression on does no harm: the proxy sees `Content-Encoding` on the
+response and passes it through unchanged.
+
+MeshMonitor also sets `Cache-Control` itself. Files under `/assets/` have
+content hashes in their names and are cached for a year (`immutable`); the HTML
+page, `sw.js`, `registerSW.js`, the manifest and `/locales/*.json` use
+`no-cache`, so browsers check for a new copy on every load. Don't override
+these headers in the proxy: a long cache on the HTML page or `sw.js` keeps
+browsers on an old release after an upgrade.
 
 ## Security Considerations
 

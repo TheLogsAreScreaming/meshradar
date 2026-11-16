@@ -1,8 +1,11 @@
-import React, { useState, useRef, useMemo, useCallback } from 'react';
+import React, { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import ModuleAvailabilityNotice from './ModuleAvailabilityNotice';
+import { ConfigSection } from '../shared/config/ConfigSection';
+import { PasswordField } from '../shared/config/PasswordField';
 
 // Address mode options from protobufs
 const ADDRESS_MODE_OPTIONS = [
@@ -14,6 +17,8 @@ const ADDRESS_MODE_OPTIONS = [
 const UDP_BROADCAST_FLAG = 0x0001;
 
 interface NetworkConfigSectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
   wifiEnabled: boolean;
   setWifiEnabled: (value: boolean) => void;
   wifiSsid: string;
@@ -43,10 +48,15 @@ interface NetworkConfigSectionProps {
   isBridged?: boolean;
   // UI state
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
+  /** Bumped when the page reloads config from the node (#5797). */
+  configVersion?: number;
 }
 
 const NetworkConfigSection: React.FC<NetworkConfigSectionProps> = ({
+  canWrite = true,
+  configVersion,
   wifiEnabled,
   setWifiEnabled,
   wifiSsid,
@@ -74,59 +84,34 @@ const NetworkConfigSection: React.FC<NetworkConfigSectionProps> = ({
   onSave
 }) => {
   const { t } = useTranslation();
-  const [showPassword, setShowPassword] = useState(false);
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // What the node holds; moves on a successful save or a reload (#5797)
+  const values = {
     wifiEnabled, wifiSsid, wifiPsk, ntpServer, rsyslogServer, addressMode, enabledProtocols,
     ipv4Address, ipv4Gateway, ipv4Subnet, ipv4Dns
-  });
-
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      wifiEnabled !== initial.wifiEnabled ||
-      wifiSsid !== initial.wifiSsid ||
-      wifiPsk !== initial.wifiPsk ||
-      ntpServer !== initial.ntpServer ||
-      rsyslogServer !== initial.rsyslogServer ||
-      addressMode !== initial.addressMode ||
-      enabledProtocols !== initial.enabledProtocols ||
-      ipv4Address !== initial.ipv4Address ||
-      ipv4Gateway !== initial.ipv4Gateway ||
-      ipv4Subnet !== initial.ipv4Subnet ||
-      ipv4Dns !== initial.ipv4Dns
-    );
-  }, [wifiEnabled, wifiSsid, wifiPsk, ntpServer, rsyslogServer, addressMode, enabledProtocols,
-      ipv4Address, ipv4Gateway, ipv4Subnet, ipv4Dns]);
+  };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values, { reseedKey: configVersion });
 
   // Reset to initial values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setWifiEnabled(initial.wifiEnabled);
-    setWifiSsid(initial.wifiSsid);
-    setWifiPsk(initial.wifiPsk);
-    setNtpServer(initial.ntpServer);
-    setRsyslogServer(initial.rsyslogServer);
-    setAddressMode(initial.addressMode);
-    setEnabledProtocols(initial.enabledProtocols);
-    setIpv4Address(initial.ipv4Address);
-    setIpv4Gateway(initial.ipv4Gateway);
-    setIpv4Subnet(initial.ipv4Subnet);
-    setIpv4Dns(initial.ipv4Dns);
-  }, [setWifiEnabled, setWifiSsid, setWifiPsk, setNtpServer, setRsyslogServer, setAddressMode, setEnabledProtocols,
+    setWifiEnabled(baseline.wifiEnabled);
+    setWifiSsid(baseline.wifiSsid);
+    setWifiPsk(baseline.wifiPsk);
+    setNtpServer(baseline.ntpServer);
+    setRsyslogServer(baseline.rsyslogServer);
+    setAddressMode(baseline.addressMode);
+    setEnabledProtocols(baseline.enabledProtocols);
+    setIpv4Address(baseline.ipv4Address);
+    setIpv4Gateway(baseline.ipv4Gateway);
+    setIpv4Subnet(baseline.ipv4Subnet);
+    setIpv4Dns(baseline.ipv4Dns);
+  }, [baseline, setWifiEnabled, setWifiSsid, setWifiPsk, setNtpServer, setRsyslogServer, setAddressMode, setEnabledProtocols,
       setIpv4Address, setIpv4Gateway, setIpv4Subnet, setIpv4Dns]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      wifiEnabled, wifiSsid, wifiPsk, ntpServer, rsyslogServer, addressMode, enabledProtocols,
-      ipv4Address, ipv4Gateway, ipv4Subnet, ipv4Dns
-    };
-  }, [onSave, wifiEnabled, wifiSsid, wifiPsk, ntpServer, rsyslogServer, addressMode, enabledProtocols,
-      ipv4Address, ipv4Gateway, ipv4Subnet, ipv4Dns]);
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Register with SaveBar
   useSaveBar({
@@ -139,24 +124,7 @@ const NetworkConfigSection: React.FC<NetworkConfigSectionProps> = ({
   });
 
   return (
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('network_config.title')}
-        <a
-          href="https://meshmonitor.org/features/device#network-configuration"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('network_config.view_docs')}
-        >
-          <UiIcon name="help" />
-        </a>
-      </h3>
-      <ModuleAvailabilityNotice />
+    <ConfigSection canWrite={canWrite} title={t('network_config.title')} docsUrl="https://meshmonitor.org/features/device#network-configuration" notice={<ModuleAvailabilityNotice />}>
 
       {isBridged && (
         <div
@@ -227,32 +195,15 @@ const NetworkConfigSection: React.FC<NetworkConfigSectionProps> = ({
               {t('network_config.wifi_psk')}
               <span className="setting-description">{t('network_config.wifi_psk_description')}</span>
             </label>
-            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-              <input
-                id="wifiPsk"
-                type={showPassword ? 'text' : 'password'}
-                value={wifiPsk}
-                onChange={(e) => setWifiPsk(e.target.value)}
-                placeholder="••••••••"
-                maxLength={63}
-                className="setting-input"
-                style={{ width: '300px' }}
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword(!showPassword)}
-                style={{
-                  background: 'transparent',
-                  border: '1px solid var(--color-surface-active)',
-                  color: 'var(--color-text-subtle)',
-                  padding: '0.5rem',
-                  borderRadius: '4px',
-                  cursor: 'pointer'
-                }}
-              >
-                <UiIcon name={showPassword ? 'visibilityOff' : 'unencrypted'} />
-              </button>
-            </div>
+            <PasswordField
+              id="wifiPsk"
+              value={wifiPsk}
+              onChange={(e) => setWifiPsk(e.target.value)}
+              placeholder="••••••••"
+              maxLength={63}
+              className="setting-input"
+              style={{ width: '300px' }}
+            />
           </div>
 
           {/* Address Mode */}
@@ -413,7 +364,7 @@ const NetworkConfigSection: React.FC<NetworkConfigSectionProps> = ({
           className="setting-checkbox"
         />
       </div>
-    </div>
+    </ConfigSection>
   );
 };
 

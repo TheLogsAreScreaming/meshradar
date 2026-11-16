@@ -10,7 +10,14 @@
  */
 import databaseService from '../../services/database.js';
 import { ALL_SOURCES } from '../../db/repositories/base.js';
-import { channelKeyFingerprint, pskToHex, type ChannelKeyRow } from '../services/meshcoreFrameIngest.js';
+import {
+  channelKeyFingerprint,
+  pskToHex,
+  MESHCORE_KEYED_CHANNEL_BASE,
+  isKeyedChannelIndex,
+  MESHCORE_UNRESOLVED_KEY_FINGERPRINT,
+  type ChannelKeyRow,
+} from '../services/meshcoreFrameIngest.js';
 import { resolveMeshcoreKeyAccess, type KeyAccessUser } from './meshcoreKeyAccess.js';
 
 /** One keyed channel on a source. */
@@ -19,6 +26,13 @@ export interface KeyedChannelEntry {
   id: number;
   name: string;
   keyFingerprint: string;
+  /** True when the key is a MeshCore virtual channel (#5552, a
+   *  `channel_database` row), not another source's device slot. The channels
+   *  view shows a `(Virtual)` marker and hides the send bar for these (#6159). */
+  virtual: boolean;
+  /** True for an unresolved legacy MQTT slot (#6308): `id` is a device slot
+   *  number, not a keyed index, and only admins can see it. */
+  legacy: boolean;
 }
 
 function parseChannelKey(key: string): number | null {
@@ -52,14 +66,20 @@ export async function listKeyedChannels(
   }
 
   // A virtual channel's own name (#5552) wins over a same-secret device slot:
-  // it is the name an admin gave the key on purpose.
+  // it is the name an admin gave the key on purpose. The same pass records the
+  // fingerprints that belong to a virtual channel, so the keyed entry can be
+  // marked `virtual` (#6159).
+  const virtualFps = new Set<string>();
   try {
     for (const vc of await databaseService.channelDatabase.getAllAsync('meshcore')) {
       const secretHex = pskToHex(vc.psk);
-      if (secretHex && vc.name) nameByFp.set(channelKeyFingerprint(secretHex), vc.name);
+      if (!secretHex) continue;
+      const fp = channelKeyFingerprint(secretHex);
+      virtualFps.add(fp);
+      if (vc.name) nameByFp.set(fp, vc.name);
     }
   } catch {
-    // Names fall back to the device rows.
+    // Names fall back to the device rows; virtual marking is best-effort.
   }
 
   const byId = new Map<number, KeyedChannelEntry>();
@@ -71,6 +91,8 @@ export async function listKeyedChannels(
       id,
       name: recorded || nameByFp.get(s.keyFingerprint) || '',
       keyFingerprint: s.keyFingerprint,
+      virtual: virtualFps.has(s.keyFingerprint),
+      legacy: s.keyFingerprint === MESHCORE_UNRESOLVED_KEY_FINGERPRINT,
     });
   }
   return [...byId.values()].sort((a, b) => a.id - b.id);
@@ -80,9 +102,19 @@ export async function listKeyedChannels(
 export async function keyedChannelNames(sourceId: string): Promise<Map<number, string>> {
   const out = new Map<number, string>();
   for (const e of await listKeyedChannels(sourceId)) {
-    if (e.name) out.set(e.id, e.name);
+    if (e.name && !e.legacy) out.set(e.id, e.name);
   }
   return out;
+}
+
+/**
+ * Display name of one keyed channel index on a MeshCore source, or null when
+ * the index is not keyed or no key names it. One lookup shared by the ingest
+ * read routes and the automation engine (#6308).
+ */
+export async function keyedChannelNameFor(sourceId: string, idx: number): Promise<string | null> {
+  if (!isKeyedChannelIndex(idx)) return null;
+  return (await keyedChannelNames(sourceId)).get(idx) ?? null;
 }
 
 /**
@@ -104,4 +136,26 @@ export async function listKeyedChannelsForViewer(
   if (access === 'all') return entries;
   const allowed = new Set(access);
   return entries.filter((e) => allowed.has(e.keyFingerprint));
+}
+
+/**
+ * Display name for a MeshCore channel index in a notification (#6307).
+ *
+ * A keyed index (>= MESHCORE_KEYED_CHANNEL_BASE) takes its name from the key's
+ * channel row, never from the Meshtastic `channel_database` offset path. Any
+ * other index uses the source's own slot row, then "Channel N". Never throws.
+ */
+export async function resolveMeshCoreChannelName(idx: number, sourceId: string): Promise<string> {
+  try {
+    if (idx >= MESHCORE_KEYED_CHANNEL_BASE) {
+      const name = (await keyedChannelNames(sourceId)).get(idx);
+      if (name) return name;
+    } else {
+      const slot = await databaseService.channels.getChannelById(idx, sourceId);
+      if (slot?.name) return slot.name;
+    }
+  } catch {
+    // fall through to the numeric label
+  }
+  return `Channel ${idx}`;
 }

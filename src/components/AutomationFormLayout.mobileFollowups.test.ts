@@ -33,7 +33,7 @@ describe('trigger form fields stay inside their card', () => {
     expect(layoutCss).not.toMatch(/@media/);
   });
 
-  it.each(['TimerTriggersSection.tsx', 'GeofenceTriggersSection.tsx'])(
+  it.each(['timer-triggers/TimerTriggerEditor.tsx', 'GeofenceTriggersSection.tsx'])(
     '%s: every flex: 1 field beside a label has the floor, in a wrapping row',
     (file) => {
       const tsx = read(file);
@@ -60,7 +60,7 @@ describe('trigger form fields stay inside their card', () => {
   );
 
   it.each([
-    ['TimerTriggersSection.tsx', 'timer_triggers.name_placeholder'],
+    ['timer-triggers/TimerTriggerEditor.tsx', 'timer_triggers.name_placeholder'],
     ['GeofenceTriggersSection.tsx', 'geofence_triggers.name_placeholder'],
   ])('%s Name input carries the floor', (file, key) => {
     const tsx = read(file);
@@ -76,7 +76,8 @@ describe('auto responder pattern placeholder fits', () => {
     expect(layoutCss).toMatch(
       /@container\s*\(max-width:[^)]*\)\s*\{\s*\.patternField\s*\{[^}]*flex-basis:\s*100%/,
     );
-    const tsx = read('AutoResponderSection.tsx');
+    // #5808: the pattern row lives in the TriggerCard editor now.
+    const tsx = read('auto-responder/TriggerEditor.tsx');
     expect(tsx).toContain('className={`${layout.wrapRow} ${layout.patternRow}`}');
     expect(tsx).toContain('className={`${layout.growField} ${layout.patternField}`}');
     // An inline `flex: '1'` would pin flex-basis to 0 and defeat the query.

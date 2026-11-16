@@ -91,6 +91,7 @@ export class NodeCacheService {
       altitudeOverride: node.altitudeOverride ?? undefined,
       positionOverrideIsPrivate: node.positionOverrideIsPrivate ?? undefined,
       hideFromMap: node.hideFromMap ?? undefined,
+      channelLocked: node.channelLocked ?? undefined,
       notes: node.notes ?? undefined,
       // #3684: missing from this projection until now — a PG/MySQL install's
       // sync-method cache never saw these, though the underlying row has them.
@@ -110,6 +111,10 @@ export class NodeCacheService {
       aircraftFixedAt: node.aircraftFixedAt ?? undefined,
       aircraftFixedLatitude: node.aircraftFixedLatitude ?? undefined,
       aircraftFixedLongitude: node.aircraftFixedLongitude ?? undefined,
+      // #5715: manual aircraft mark.
+      aircraftManualMark: node.aircraftManualMark ?? undefined,
+      aircraftManualMarkAt: node.aircraftManualMarkAt ?? undefined,
+      aircraftManualMarkBy: node.aircraftManualMarkBy ?? undefined,
       sourceId: node.sourceId ?? sourceId,
       createdAt: node.createdAt,
       updatedAt: node.updatedAt,

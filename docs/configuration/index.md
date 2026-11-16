@@ -64,6 +64,7 @@ node(s) in **Dashboard → Sources**.
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `MESHTASTIC_NODE_IP` | Optional. Seeds a Meshtastic TCP source on first boot | `192.168.1.100` |
+| `MESHCORE_TCP_HOST` / `MESHCORE_SERIAL_PORT` | Optional. Seeds a MeshCore source on first boot ([details](#meshcore-default-source)) | `192.168.1.60` / `/dev/ttyACM0` |
 
 ### Optional Variables
 
@@ -74,7 +75,7 @@ node(s) in **Dashboard → Sources**.
 | `NODE_ENV` | Environment mode (`development` or `production`) | `development` |
 | `DATABASE_PATH` | SQLite database file path | `/data/meshmonitor.db` |
 | `TRACEROUTE_HISTORY_LIMIT` | Traceroute history rows to keep per node pair | `50` |
-| `BASE_URL` | Base path if serving from subfolder (e.g., `/meshmonitor`) | `/` (root) |
+| `BASE_URL` | Base path if serving from subfolder (e.g., `/meshmonitor`). Trailing slashes are stripped, so `/meshmonitor//` works like `/meshmonitor`. | `/` (root) |
 | `TZ` | Timezone for log timestamps and scheduled tasks | `America/New_York` |
 | `PUID` / `PGID` | Docker: uid/gid of the unprivileged `node` user every process runs as. See [Docker Security](/configuration/production#docker-security) | `1000` / `1000` |
 
@@ -86,8 +87,14 @@ node(s) in **Dashboard → Sources**.
 
 ::: tip 4.16.1 — set it, or leave it out
 Set `MESHTASTIC_NODE_IP` and a "Default" Meshtastic TCP source is created and
-connected on first boot. Leave it unset and **no source is created at all** —
-the Sources page starts empty and nothing is dialled.
+connected on first boot. Leave it unset and the "Default" source is still
+created, but **disabled**, pointing at the placeholder host `meshtastic.local`.
+Nothing is dialled until you edit it with your node's address and enable it, or
+delete it and add your own sources.
+
+If you set the [MeshCore first-boot vars](#meshcore-default-source) and leave
+`MESHTASTIC_NODE_IP` unset, the disabled placeholder is skipped: the only source
+is your MeshCore node.
 
 Earlier versions used `192.168.1.100` as a stand-in when the variable was
 missing, created an enabled source pointing at it, and reconnected to that
@@ -99,7 +106,7 @@ told it about one.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MESHTASTIC_NODE_IP` | IP address used to seed the first TCP source on first boot. Unset → no source is created | _unset_ |
+| `MESHTASTIC_NODE_IP` | IP address used to seed the first TCP source on first boot. Unset → the Default source is created disabled (host `meshtastic.local`), or skipped when the MeshCore vars below are set | _unset_ |
 | `MESHTASTIC_TCP_PORT` | TCP port used to seed the first TCP source on first boot | `4403` |
 | `MESHTASTIC_STALE_CONNECTION_TIMEOUT` | Connection timeout in milliseconds before reconnecting if no data received | `300000` (5 minutes) |
 | `MESHTASTIC_CONNECT_TIMEOUT_MS` | Initial TCP connection timeout in milliseconds | `10000` (10 seconds) |
@@ -109,9 +116,47 @@ told it about one.
 
 ### Virtual Node
 
-> **Breaking change in 4.0:** The `ENABLE_VIRTUAL_NODE`, `VIRTUAL_NODE_PORT`, and `VIRTUAL_NODE_ALLOW_ADMIN_COMMANDS` environment variables have been **removed**. Virtual Node is now configured **per source** through the Dashboard UI — each `meshtastic_tcp` source owns its own VN endpoint.
+Virtual Node is a **per source** setting: each `meshtastic_tcp` source owns its own VN endpoint, and you manage it in **Dashboard → Edit Source → Virtual Node**.
+
+For headless installs, two env vars can turn it on for the **Default** source when that source is first created:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ENABLE_VIRTUAL_NODE` | `true` / `1` / `yes` adds a Virtual Node to the Default source on first boot. Needs `MESHTASTIC_NODE_IP` | _unset_ (off) |
+| `VIRTUAL_NODE_PORT` | Port for that Virtual Node, `1`–`65535`. Does nothing without `ENABLE_VIRTUAL_NODE`. An invalid value logs a warning and both vars are ignored | `4404` |
+
+::: warning First boot only
+These vars apply **once**, when the Default source is created. After that the source's saved config owns the Virtual Node settings, and later restarts never change them, even if you change or remove the vars. Change it in the UI from then on.
+:::
+
+Admin commands stay **off**: there is no env var for them (`VIRTUAL_NODE_ALLOW_ADMIN_COMMANDS` was removed in 4.0 and is not coming back). The Virtual Node port has no login, so anyone who can reach it could reconfigure your node. Turn that on in the UI only if you trust every client that can reach the port.
 
 See the [Virtual Node Server guide](/configuration/virtual-node) for details.
+
+### MeshCore Default Source
+
+For a headless MeshCore install, these vars create a **"Default MeshCore"** source on first boot. They are independent of `MESHTASTIC_NODE_IP`: set either, both, or neither.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MESHCORE_TCP_HOST` | Host of a MeshCore Companion reachable over TCP. Creates a TCP source | _unset_ |
+| `MESHCORE_TCP_PORT` | Its TCP port. WiFi/Ethernet Companion builds listen on `5000` | `5000` |
+| `MESHCORE_SERIAL_PORT` | Serial path of a USB-attached device, e.g. `/dev/ttyACM0`. Creates a serial source. Map the device into the container with `devices:` | _unset_ |
+| `MESHCORE_BAUD_RATE` | Serial baud rate | `115200` |
+| `MESHCORE_DEVICE_TYPE` | `companion` or `repeater`. A Repeater needs `MESHCORE_SERIAL_PORT` (no Repeater over TCP). Anything else logs a warning and uses `companion` | `companion` |
+| `MESHCORE_ENABLE_VIRTUAL_NODE` | `true` / `1` / `yes` adds a MeshCore Virtual Node to that source. Companion only | _unset_ (off) |
+| `MESHCORE_VIRTUAL_NODE_PORT` | Port for that Virtual Node, `1`–`65535`. Does nothing without `MESHCORE_ENABLE_VIRTUAL_NODE` | `5000` |
+
+- Set `MESHCORE_TCP_HOST` **or** `MESHCORE_SERIAL_PORT`. If you set both, MeshMonitor logs a warning and uses TCP. Set neither and no MeshCore source is created.
+- The source is created enabled, with **Auto-connect** on and the same settings the Add Source form would save (Heartbeat 30 s for a Companion, off for a Repeater). It sends nothing over the radio that the same source added in the UI would not.
+- The Virtual Node keeps **Allow admin commands**, **Allow PKI export** and **Allow PKI import** off. There are no env vars for them. If its port equals the Meshtastic Virtual Node port, MeshMonitor logs a warning and skips the MeshCore Virtual Node.
+- With the MeshCore vars set and `MESHTASTIC_NODE_IP` unset, the disabled Meshtastic placeholder is not created.
+
+::: warning First boot only
+Like `MESHTASTIC_NODE_IP`, these vars apply **once**, when MeshMonitor first creates its sources. An install that already has sources never grows a MeshCore source because you added the vars later, and later restarts never change the source, even if you change or remove the vars. Add or edit MeshCore sources in **Dashboard → Sources** from then on. (As with `MESHTASTIC_NODE_IP`, if you delete *every* source and restart with the vars still set, MeshMonitor treats the empty Sources list as a first boot and creates them again.)
+:::
+
+See [MeshCore → Headless installs](/features/meshcore#headless-installs-first-boot-env-vars).
 
 ### Security & Reverse Proxy Variables
 
@@ -125,6 +170,8 @@ See the [Virtual Node Server guide](/configuration/virtual-node) for details.
 | `SESSION_ROLLING` | Reset session expiry on each request (keeps active users logged in) | `true` |
 | `ALLOWED_ORIGINS` | **REQUIRED for HTTPS/reverse proxy**: Comma-separated list of allowed CORS origins | `http://localhost:8080, http://localhost:3001` |
 | `IFRAME_ALLOWED_ORIGINS` | Comma-separated list of origins allowed to embed MeshMonitor in an `<iframe>` (e.g. a Node-RED dashboard). Use `*` to allow any origin. When unset, iframe embedding is blocked. | *(unset - iframe blocked)* |
+| `WEBAUTHN_RP_ID` | Hostname that [passkeys](/features/passkeys) bind to (bare hostname, no scheme or port). Optional. | request hostname |
+| `WEBAUTHN_ORIGINS` | Comma-separated origins allowed to use [passkeys](/features/passkeys), for example `https://mesh.example.com`. Optional. | `<scheme>://<host>` of the request |
 
 ::: tip Embedding MeshMonitor in an iframe
 By default MeshMonitor sends `X-Frame-Options: DENY`, which blocks browsers from rendering it inside an `<iframe>`. To embed MeshMonitor in another page (for example a Node-RED dashboard, Home Assistant panel, or internal portal), set `IFRAME_ALLOWED_ORIGINS` to the origin(s) that will host the frame:
@@ -157,6 +204,7 @@ If you're running multiple MeshMonitor instances on the same host (different por
 | `DISABLE_ANONYMOUS` | Disable anonymous access - require login for all features | `false` |
 | `DISABLE_LOCAL_AUTH` | Disable local username/password authentication (OIDC only) | `false` |
 | `ADMIN_USERNAME` | Override default admin username on first run | `admin` |
+| `ADMIN_PASSWORD` | Password for the first admin, used **only** when that account is created on first boot. Never resets an existing admin's password. Must be at least 8 characters; an empty or shorter value logs a warning and falls back to `changeme`. Not printed in the log | `changeme` |
 
 ### Rate Limiting Variables
 

@@ -39,6 +39,7 @@ export * from './ignoredNodes.js';
 export * from './meshcoreNodes.js';
 export * from './meshcoreMessages.js';
 export * from './meshcoreNeighbors.js';
+export * from './meshcoreNeighborWatch.js';
 export * from './meshcorePacketLog.js';
 export * from './meshcorePositionHistory.js';
 export * from './meshcoreHeardRepeaters.js';
@@ -49,12 +50,26 @@ export * from './messageEvents.js';
 // Meshtastic Heard-By table (#4816 Phase 4 WP1)
 export * from './meshtasticHeardRepeaters.js';
 
+// Reliable PKI per-node exchange state (#5691)
+export * from './pkiExchangeState.js';
+export * from './mapMarkers.js';
+export * from './meshcoreHopSnr.js';
+export * from './meshcoreTraceRuns.js';
+// Node rename history (#5862)
+export * from './nodeNameHistory.js';
+export * from './mqttBrokerPresets.js';
+// MeshCore CLI command history (#5892)
+export * from './meshcoreCliHistory.js';
+export * from './meshcoreAdminSessions.js';
+
 // Coverage Report RF receptions (#5277 Phase 1 WP1)
 export * from './coverageReceptions.js';
 
 // Coverage Report saved surveys (global — no sourceId) (#5277 Phase 4b WP1)
 export * from './coverageSurveys.js';
 export * from './crossSourceLinks.js';
+// Direct RF Contacts daily rollup, per-source (#6210)
+export * from './directRfContacts.js';
 
 // Translation cache (global) + per-source message links (#5520)
 export * from './translations.js';
@@ -75,6 +90,7 @@ export * from './embedProfiles.js';
 export * from './automations.js';
 export * from './automationVariables.js';
 export * from './automationHomeAnchors.js';
+export * from './automationFireState.js';
 
 // MeshCore saved-regions catalog (global — no sourceId) (#3770)
 export * from './savedRegions.js';
@@ -101,9 +117,15 @@ export * from './autoFavoriteTargets.js';
 // Per-source PKI private keys for server-side DM decryption (issue #3441)
 export * from './sourcePkiKeys.js';
 
+// Per-source MQTT-native send identities (issue #4305)
+export * from './mqttNativeIdentities.js';
+
 // Per-source MeshCore Analyzer Observer signing keys (epic #4457)
 export * from './meshcoreObserverKeys.js';
 export * from './meshcoreObserverCredentials.js';
+
+// Per-source MeshCore Companion device identity private keys (issue #6195)
+export * from './meshcoreSourcePkiKeys.js';
 
 // Dead Drop / Mailbox — async per-source message store
 export * from './deadDrop.js';

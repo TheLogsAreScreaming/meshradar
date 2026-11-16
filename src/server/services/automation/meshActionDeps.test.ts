@@ -21,6 +21,8 @@ vi.mock('../waypointService.js', () => ({
 }));
 
 import { createMeshActionDeps } from './meshActionDeps.js';
+import { MeshCoreReactionError } from '../../errors/meshcoreReactionError.js';
+import { TxDisabledError } from '../../errors/txDisabledError.js';
 
 /** Every Meshtastic send from the Automation Engine is tagged (#5414). */
 const AUTOMATION = { origin: 'automation' };
@@ -65,6 +67,35 @@ describe('createMeshActionDeps sendMessage — MeshCore scope (#3833)', () => {
 
 // Regression tests for #4018: a MeshCore DM destination is a pubkey string, and
 // must reach the manager as `toPublicKey`, not be silently dropped.
+describe('createMeshActionDeps sendMessage — MeshCore split (#6316)', () => {
+  beforeEach(() => { getManager.mockReset(); });
+
+  it('routes a MeshCore channel send through sendAutomatedText with split off by default', async () => {
+    const sendAutomatedText = vi.fn().mockResolvedValue({ ok: true, totalParts: 1, truncated: true });
+    const sendMessage = vi.fn();
+    getManager.mockReturnValue({ sendMessage, sendAutomatedText });
+    const deps = createMeshActionDeps();
+    const r = await deps.sendMessage({ sourceId: 'mc', text: 'hi', channel: 2, scopeOverride: 'paris' });
+    expect(sendAutomatedText).toHaveBeenCalledWith('hi', expect.objectContaining({ channelIdxs: [2], scopeOverride: 'paris', split: false }));
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(r).toEqual({ ok: true, parts: 1, truncated: true });
+  });
+
+  it('passes split on and a DM key', async () => {
+    const sendAutomatedText = vi.fn().mockResolvedValue({ ok: true, totalParts: 3, truncated: false });
+    getManager.mockReturnValue({ sendMessage: vi.fn(), sendAutomatedText });
+    const deps = createMeshActionDeps();
+    await deps.sendMessage({ sourceId: 'mc', text: 'hi', channel: 0, destination: 'abcd', splitLongMessages: true });
+    expect(sendAutomatedText).toHaveBeenCalledWith('hi', expect.objectContaining({ toPublicKey: 'abcd', split: true }));
+  });
+
+  it('throws when no part could be sent', async () => {
+    getManager.mockReturnValue({ sendMessage: vi.fn(), sendAutomatedText: vi.fn().mockResolvedValue({ ok: false, totalParts: 1, truncated: false }) });
+    const deps = createMeshActionDeps();
+    await expect(deps.sendMessage({ sourceId: 'mc', text: 'hi', channel: 0 })).rejects.toThrow(/failed to send/);
+  });
+});
+
 describe('createMeshActionDeps sendMessage — MeshCore DM destination (#4018)', () => {
   beforeEach(() => { getManager.mockReset(); });
 
@@ -275,7 +306,7 @@ describe('createMeshActionDeps requestData — node operations (#3835)', () => {
     expect(m.requestRemoteTelemetry).toHaveBeenCalledWith('aabbcc');
 
     await deps.requestData({ sourceId: 'mc', op: 'traceroute', target: 'aabbcc', channel: 0 });
-    expect(m.traceContactPath).toHaveBeenCalledWith('aabbcc');
+    expect(m.traceContactPath).toHaveBeenCalledWith('aabbcc', { origin: 'automation' });
 
     await deps.requestData({ sourceId: 'mc', op: 'neighbors', target: 'aabbcc', channel: 0 });
     expect(m.requestNeighbors).toHaveBeenCalledWith('aabbcc');
@@ -523,5 +554,227 @@ describe('createMeshActionDeps broadcastWaypoint (#5482)', () => {
     };
     await expect(createMeshActionDeps().broadcastWaypoint(args)).resolves.toEqual({ waypointId: 3, sent: true, packetId: 9 });
     expect(mockUpsertAndBroadcast).toHaveBeenCalledWith(args);
+  });
+});
+
+describe('createMeshActionDeps sendTapback — MeshCore reactions (#5762)', () => {
+  beforeEach(() => { getManager.mockReset(); });
+
+  it('calls sendReaction(messageId, emoji) on a MeshCore manager', async () => {
+    const sendReaction = vi.fn().mockResolvedValue({ id: 'r1' });
+    getManager.mockReturnValue({ sourceType: 'meshcore', sendReaction });
+    const out = await createMeshActionDeps().sendTapback({ sourceId: 'mc', emoji: '👍', meshcoreMessageId: 'm1' });
+    expect(sendReaction).toHaveBeenCalledWith('m1', '👍');
+    expect(out).toEqual({ id: 'r1' });
+  });
+
+  it('turns a skip-code refusal into a recorded skip', async () => {
+    const sendReaction = vi.fn().mockRejectedValue(new MeshCoreReactionError('DUPLICATE_REACTION', 'dup'));
+    getManager.mockReturnValue({ sourceType: 'meshcore', sendReaction });
+    await expect(createMeshActionDeps().sendTapback({ sourceId: 'mc', emoji: '👍', meshcoreMessageId: 'm1' }))
+      .resolves.toEqual({ skipped: true, reason: 'meshcore reaction: DUPLICATE_REACTION' });
+  });
+
+  it.each(['SEND_FAILED', 'SOURCE_NOT_CONNECTED'] as const)('rethrows %s as a failed step', async (code) => {
+    const sendReaction = vi.fn().mockRejectedValue(new MeshCoreReactionError(code, 'boom'));
+    getManager.mockReturnValue({ sourceType: 'meshcore', sendReaction });
+    await expect(createMeshActionDeps().sendTapback({ sourceId: 'mc', emoji: '👍', meshcoreMessageId: 'm1' }))
+      .rejects.toThrow(code);
+  });
+
+  it('lets TxDisabledError propagate', async () => {
+    const sendReaction = vi.fn().mockRejectedValue(new TxDisabledError());
+    getManager.mockReturnValue({ sourceType: 'meshcore', sendReaction });
+    await expect(createMeshActionDeps().sendTapback({ sourceId: 'mc', emoji: '👍', meshcoreMessageId: 'm1' }))
+      .rejects.toBeInstanceOf(TxDisabledError);
+  });
+});
+
+// #6143: a Reticulum manager's sendMessage takes ONE object ({ to, content, … }),
+// not the positional form. ReticulumManager ALSO has a `sendMessage` method, so
+// this branch must win over the MeshCore duck-typed branch.
+describe('createMeshActionDeps sendMessage — Reticulum (#6143)', () => {
+  beforeEach(() => { getManager.mockReset(); });
+
+  it('calls sendMessage with the object form { to, content } for a Reticulum DM', async () => {
+    const sendMessage = vi.fn().mockResolvedValue({ id: 'ret_x', state: 'outbound' });
+    getManager.mockReturnValue({ sourceType: 'reticulum', sendMessage });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'ret', text: 'pong', channel: 0, destination: 'a1b2c3d4e5f6' });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith({ to: 'a1b2c3d4e5f6', content: 'pong' });
+  });
+
+  it('threads replyToHash into the object when replying to the triggering message', async () => {
+    const sendMessage = vi.fn().mockResolvedValue({ id: 'ret_x', state: 'outbound' });
+    getManager.mockReturnValue({ sourceType: 'reticulum', sendMessage });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'ret', text: 'pong', channel: 0, destination: 'a1b2c3d4e5f6', replyToHash: 'lxmf-9' });
+
+    expect(sendMessage).toHaveBeenCalledWith({ to: 'a1b2c3d4e5f6', content: 'pong', replyToHash: 'lxmf-9' });
+  });
+
+  it('throws (failed step) when a Reticulum send has no destination address', async () => {
+    const sendMessage = vi.fn();
+    getManager.mockReturnValue({ sourceType: 'reticulum', sendMessage });
+    const deps = createMeshActionDeps();
+
+    await expect(deps.sendMessage({ sourceId: 'ret', text: 'pong', channel: 0 }))
+      .rejects.toThrow(/destination/i);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('propagates a send rejection as a failed step (not connected / rejected)', async () => {
+    const sendMessage = vi.fn().mockRejectedValue(new Error('ReticulumManager(ret): not connected'));
+    getManager.mockReturnValue({ sourceType: 'reticulum', sendMessage });
+    const deps = createMeshActionDeps();
+
+    await expect(deps.sendMessage({ sourceId: 'ret', text: 'pong', channel: 0, destination: 'a1b2c3' }))
+      .rejects.toThrow(/not connected/);
+  });
+});
+
+// A Meshtastic text payload holds about 200 bytes (#6202). The engine must cut
+// the body like every other automation sender does, and leave MeshCore alone.
+describe('createMeshActionDeps sendMessage — Meshtastic 200-byte cut (#6202)', () => {
+  beforeEach(() => { getManager.mockReset(); });
+
+  const bytes = (s: string) => Buffer.byteLength(s, 'utf8');
+
+  it('cuts a long body to 200 bytes ending in ... on the direct Meshtastic path', async () => {
+    const sendTextMessage = vi.fn().mockResolvedValue(1);
+    getManager.mockReturnValue({ sendTextMessage });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mt', text: 'x'.repeat(1257), channel: 0 });
+
+    const sent = sendTextMessage.mock.calls[0][0] as string;
+    expect(bytes(sent)).toBe(200);
+    expect(sent.endsWith('...')).toBe(true);
+  });
+
+  it('cuts on a character boundary, never inside a multi-byte character', async () => {
+    const sendTextMessage = vi.fn().mockResolvedValue(1);
+    getManager.mockReturnValue({ sendTextMessage });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mt', text: '\u{1F600}'.repeat(100), channel: 0 }); // 400 bytes of 4-byte emoji
+
+    const sent = sendTextMessage.mock.calls[0][0] as string;
+    expect(bytes(sent)).toBeLessThanOrEqual(200);
+    expect(sent.endsWith('...')).toBe(true);
+    expect(Array.from(sent.slice(0, -3)).every((ch) => ch === '\u{1F600}')).toBe(true);
+  });
+
+  it('cuts the queued DM path too', async () => {
+    const sendTextMessage = vi.fn().mockResolvedValue(1);
+    const enqueue = vi.fn().mockReturnValue('q1');
+    getManager.mockReturnValue({ sendTextMessage, messageQueue: { enqueue } });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mt', text: 'y'.repeat(500), channel: 0, destination: 123, maxAttempts: 3 });
+
+    expect(bytes(enqueue.mock.calls[0][0] as string)).toBe(200);
+    expect(sendTextMessage).not.toHaveBeenCalled();
+  });
+
+  it('cuts the queued DM path on a character boundary too', async () => {
+    const enqueue = vi.fn().mockReturnValue('q1');
+    getManager.mockReturnValue({ sendTextMessage: vi.fn(), messageQueue: { enqueue } });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mt', text: '\u{1F600}'.repeat(100), channel: 0, destination: 123, maxAttempts: 3 });
+
+    const sent = enqueue.mock.calls[0][0] as string;
+    expect(bytes(sent)).toBeLessThanOrEqual(200);
+    expect(sent.endsWith('...')).toBe(true);
+    expect(Array.from(sent.slice(0, -3)).every((ch) => ch === '\u{1F600}')).toBe(true);
+  });
+
+  it('leaves a queued DM body that fits untouched', async () => {
+    const enqueue = vi.fn().mockReturnValue('q1');
+    getManager.mockReturnValue({ sendTextMessage: vi.fn(), messageQueue: { enqueue } });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mt', text: 'z'.repeat(200), channel: 0, destination: 123, maxAttempts: 3 });
+
+    expect(enqueue.mock.calls[0][0]).toBe('z'.repeat(200));
+  });
+
+  it('leaves a body that fits untouched', async () => {
+    const sendTextMessage = vi.fn().mockResolvedValue(1);
+    getManager.mockReturnValue({ sendTextMessage });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mt', text: 'z'.repeat(200), channel: 0 });
+
+    expect(sendTextMessage.mock.calls[0][0]).toBe('z'.repeat(200));
+  });
+
+  it('does not cut a MeshCore send', async () => {
+    const sendMessage = vi.fn().mockResolvedValue(true);
+    getManager.mockReturnValue({ sendMessage });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mc', text: 'w'.repeat(500), channel: 0 });
+
+    expect(sendMessage.mock.calls[0][0]).toBe('w'.repeat(500));
+  });
+});
+
+// #6330: the engine's split option now covers Meshtastic too, through the
+// manager's shared sendAutomatedText.
+describe('createMeshActionDeps sendMessage — Meshtastic split (#6330)', () => {
+  beforeEach(() => { getManager.mockReset(); });
+
+  it('sends a channel split direct through sendAutomatedText', async () => {
+    const sendTextMessage = vi.fn();
+    const sendAutomatedText = vi.fn().mockResolvedValue({ ok: true, totalParts: 2, truncated: false });
+    getManager.mockReturnValue({ sendTextMessage, sendAutomatedText });
+    const deps = createMeshActionDeps();
+
+    const res = await deps.sendMessage({ sourceId: 'mt', text: 'z'.repeat(300), channel: 2, splitLongMessages: true, hopLimitOverride: 1 });
+
+    expect(sendTextMessage).not.toHaveBeenCalled();
+    expect(sendAutomatedText).toHaveBeenCalledWith('z'.repeat(300), expect.objectContaining({
+      channels: [2], split: true, direct: true, hopLimitOverride: 1,
+    }));
+    expect(res).toEqual({ ok: true, parts: 2, truncated: false });
+  });
+
+  it('keeps a queued DM on the queue (maxAttempts) when splitting', async () => {
+    const sendAutomatedText = vi.fn().mockResolvedValue({ ok: true, totalParts: 3, truncated: true });
+    getManager.mockReturnValue({ sendTextMessage: vi.fn(), sendAutomatedText });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mt', text: 'q'.repeat(700), channel: 0, destination: 123, maxAttempts: 3, splitLongMessages: true });
+
+    const opts = sendAutomatedText.mock.calls[0][1];
+    expect(opts).toMatchObject({ destination: 123, maxAttempts: 3, split: true });
+    expect(opts.direct).toBeUndefined();
+  });
+
+  it('throws when no part went out', async () => {
+    const sendAutomatedText = vi.fn().mockResolvedValue({ ok: false, totalParts: 2, truncated: false });
+    getManager.mockReturnValue({ sendTextMessage: vi.fn(), sendAutomatedText });
+    const deps = createMeshActionDeps();
+
+    await expect(deps.sendMessage({ sourceId: 'mt', text: 'z'.repeat(300), channel: 0, splitLongMessages: true }))
+      .rejects.toThrow(/failed to send the Meshtastic message/);
+  });
+
+  it('split off keeps the old single truncated send', async () => {
+    const sendTextMessage = vi.fn().mockResolvedValue(1);
+    const sendAutomatedText = vi.fn();
+    getManager.mockReturnValue({ sendTextMessage, sendAutomatedText });
+    const deps = createMeshActionDeps();
+
+    await deps.sendMessage({ sourceId: 'mt', text: 'x'.repeat(300), channel: 0 });
+
+    expect(sendAutomatedText).not.toHaveBeenCalled();
+    expect(Buffer.byteLength(sendTextMessage.mock.calls[0][0] as string, 'utf8')).toBe(200);
   });
 });

@@ -22,10 +22,15 @@ import contactsRoutes from './meshcoreContactsRoutes.js';
 import configRoutes from './meshcoreConfigRoutes.js';
 import messagingRoutes from './meshcoreMessagingRoutes.js';
 import adminRoutes from './meshcoreAdminRoutes.js';
+import remoteSettingsRoutes from './meshcoreRemoteSettingsRoutes.js';
 import automationRoutes from './meshcoreAutomationRoutes.js';
 import packetRoutes from './meshcorePacketRoutes.js';
 import ingestReadRoutes from './meshcoreIngestReadRoutes.js';
 import filterRoutes from './meshcoreFilterRoutes.js';
+import traceRoutes from './meshcoreTraceRoutes.js';
+import estimatedPositionRoutes from './meshcoreEstimatedPositionRoutes.js';
+import hopCandidatesRoutes from './meshcoreHopCandidatesRoutes.js';
+import { perSourceCliHistoryRouter } from './meshcoreCliHistoryRoutes.js';
 
 const router = Router({ mergeParams: true });
 
@@ -40,6 +45,14 @@ router.use(ingestReadRoutes);
 // Ignore / Block lists (#5408): data, not device surface — valid for an
 // ingest source too.
 router.use(filterRoutes);
+// Per-hop trace SNR history (#5722): stored data, read-only.
+router.use(traceRoutes);
+// Estimated positions (#6260): computed on read, never stored.
+router.use(estimatedPositionRoutes);
+// Cross-source hop names (#5909): stored data, read-only, off by default.
+router.use(hopCandidatesRoutes);
+// CLI command history (#5892): stored data, readable while disconnected.
+router.use(perSourceCliHistoryRouter);
 
 // DEVICE routes from here down. This guard refuses an ingest source, and
 // everything below it is connection lifecycle, local-node status, contacts,
@@ -50,6 +63,7 @@ router.use(contactsRoutes);
 router.use(configRoutes);
 router.use(messagingRoutes);
 router.use(adminRoutes);
+router.use(remoteSettingsRoutes);
 router.use(automationRoutes);
 
 export default router;

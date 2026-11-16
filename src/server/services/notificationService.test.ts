@@ -155,6 +155,15 @@ describe('notificationService.getServiceStatus', () => {
     expect(status.anyAvailable).toBe(true); // apprise still available
   });
 
+  it('returns anyAvailable=true when only desktop is available', () => {
+    mockPush.isAvailable.mockReturnValue(false);
+    mockApprise.isAvailable.mockReturnValue(false);
+    mockDesktop.isAvailable.mockReturnValue(true);
+    const status = notificationService.getServiceStatus();
+    expect(status.desktop).toBe(true);
+    expect(status.anyAvailable).toBe(true);
+  });
+
   it('returns anyAvailable=false when both unavailable', () => {
     mockPush.isAvailable.mockReturnValue(false);
     mockApprise.isAvailable.mockReturnValue(false);
@@ -242,6 +251,18 @@ describe('notificationService.notifyNewMeshCoreNode', () => {
     const body = mockPush.broadcastToPreferenceUsers.mock.calls[0][1].body;
     expect(body).toBe('Nameless detected by MTDL Base');
   });
+
+  it('appends the dropped-node count to the body and to the merged body (#6306)', async () => {
+    await notificationService.notifyNewMeshCoreNode('pubkey123', 'Hill', 'Repeater', 'src2', 'MTDL Base', 4);
+    const payload = mockPush.broadcastToPreferenceUsers.mock.calls[0][1];
+    expect(payload.body).toBe('Hill detected by MTDL Base - Repeater (+4 more new nodes since the last alert)');
+    expect(payload.dedup.merged(['A', 'B']).body).toBe('Hill detected by A, B - Repeater (+4 more new nodes since the last alert)');
+  });
+
+  it('adds no suffix for a zero or missing count (#6306)', async () => {
+    await notificationService.notifyNewMeshCoreNode('pubkey123', 'Hill', undefined, 'src2', 'MTDL Base', 0);
+    expect(mockPush.broadcastToPreferenceUsers.mock.calls[0][1].body).toBe('Hill detected by MTDL Base');
+  });
 });
 
 // ─── notifyTraceroute ─────────────────────────────────────────────────────────
@@ -275,6 +296,18 @@ describe('notificationService.notifyTraceroute', () => {
       undefined,
       'src1'
     );
+  });
+
+  it('an automatic trace goes to the opt-in notifyOnAutoTrace preference (M3)', async () => {
+    await notificationService.notifyTraceroute('!aaa', '!bbb', 'Direct', 'src1', 'Source One', { automatic: true });
+    for (const svc of [mockPush, mockApprise]) {
+      expect(svc.broadcastToPreferenceUsers).toHaveBeenCalledWith(
+        'notifyOnAutoTrace', expect.anything(), undefined, 'src1',
+      );
+      expect(svc.broadcastToPreferenceUsers).not.toHaveBeenCalledWith(
+        'notifyOnTraceroute', expect.anything(), expect.anything(), expect.anything(),
+      );
+    }
   });
 
   it('does not throw on broadcast error', async () => {

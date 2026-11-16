@@ -12,7 +12,7 @@
  *
  * Talks to /api/sources/:id/meshcore/* via useMeshCore.
  */
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useTxStatus } from '../../hooks/useTxStatus';
 import { useMeshCore, ConnectionStatus } from './hooks/useMeshCore';
@@ -30,6 +30,7 @@ import { MeshCoreSubToolbar } from './MeshCoreSubToolbar';
 import { resolveMeshCoreView, useMeshCoreViewAccess, type MeshCoreView } from './meshCoreViewAccess';
 import { readSidebarPinned, useSidebarPin } from '../nav/useSidebarPin';
 import { MeshCoreNodesView } from './MeshCoreNodesView';
+import { takePendingMeshCoreContact } from '../../utils/meshcoreContactFocus';
 import { MeshCoreChannelsView } from './MeshCoreChannelsView';
 import { MeshCoreDirectMessagesView } from './MeshCoreDirectMessagesView';
 import { MeshCoreInfoView } from './MeshCoreInfoView';
@@ -40,13 +41,16 @@ import { MeshCoreSettingsView } from './MeshCoreSettingsView';
 import { MeshCoreRoomsView } from './MeshCoreRoomsView';
 import { MeshCoreAutomationsView } from './MeshCoreAutomationsView';
 import NotificationsTab from '../NotificationsTab';
+import { SecurityTab } from '../SecurityTab';
 import { useAuth } from '../../contexts/AuthContext';
 import { SaveBarProvider, SaveBarGroup } from '../../contexts/SaveBarContext';
-import { useOptionalChannelMuteSettings } from '../../contexts/SettingsContext';
+import { useOptionalMuteSettings } from '../../contexts/SettingsContext';
 import { SaveBar } from '../SaveBar';
 import { SourceNavLayout } from '../nav/SourceNavLayout';
 import './MeshCoreTab.css';
 import './MeshCorePage.css';
+import { usePushNotificationNavigation } from '../../hooks/usePushNotificationNavigation';
+import { resolveMeshCoreNotificationTarget } from './meshcoreNotificationNav';
 // The automation views (auto-ack, auto-announce, auto-responder, timer
 // triggers) lean on the shared settings stylesheet — .setting-item,
 // .setting-input, .automation-section-header. Without this import the
@@ -67,7 +71,7 @@ interface MeshCorePageProps {
   enabled?: boolean;
   /** When provided, the parent renders the connection chip in its own header
    *  and the inline status bar suppresses its duplicate "Connected to X" text. */
-  onStatusChange?: (status: ConnectionStatus | null) => void;
+  onStatusChange?: (status: ConnectionStatus | null, loaded: boolean, connecting: boolean) => void;
 }
 
 export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, enabled, onStatusChange }) => {
@@ -75,7 +79,7 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
   const { authStatus } = useAuth();
   const isAdmin = authStatus?.user?.isAdmin ?? false;
   const meshCore = useMeshCore({ baseUrl, sourceId, enabled });
-  const { status, nodes, contacts, messages, loading, hasLoadedOnce, error, actions } = meshCore;
+  const { status, nodes, contacts, messages, reactionResolutions, loading, hasLoadedOnce, error, actions } = meshCore;
 
   // MeshCore strict receive-only mode (#4547 Phase 2 WP1). Phase 1 made
   // GET /api/device/tx-status MeshCore-aware, so `isTxDisabled` for a
@@ -92,7 +96,11 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
   // blank pane, whichever way it was asked for: a nav click, the status bar's
   // Connect button, or a jump to Node Details. Derived, so the asked-for tab
   // appears once the grants have loaded.
-  const [requestedView, setView] = useState<MeshCoreView>('nodes');
+  // `#configuration` opens straight on Configuration: the source form's
+  // Analyzer Observer note links here (#5831).
+  const [requestedView, setView] = useState<MeshCoreView>(() =>
+    typeof window !== 'undefined' && window.location.hash === '#configuration' ? 'configuration' : 'nodes',
+  );
   const visibleViews = useMeshCoreViewAccess();
   const view = resolveMeshCoreView(requestedView, visibleViews);
   const canOpenSettings = visibleViews.includes('settings');
@@ -111,6 +119,14 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
     if (toggleNavPin()) setToolbarExpanded(true);
   }, [toggleNavPin]);
   const [pendingDmContact, setPendingDmContact] = useState<string | null>(null);
+  // Security tab "Send notification" (#6281): a draft for the pending DM
+  // contact. Consumed once by the message stream, which seeds its compose
+  // draft; never sent for the user.
+  const [pendingDmDraft, setPendingDmDraft] = useState<string | null>(null);
+  // #5964: Node Details → Show on Map. Same hand-off shape as
+  // `pendingDmContact`: set the key, switch to the Nodes view (list + map),
+  // and drop the key once the view changes away again.
+  const [pendingMapNode, setPendingMapNode] = useState<string | null>(null);
 
   // Wire the durable per-user read-state transport once per mounted source
   // (#4607). The store is deliberately fetch-free so it can stay a plain
@@ -124,14 +140,6 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
   // only display is suppressed. One place, so all three views agree.
   const ignoredNodesQuery = useMeshCoreIgnoredNodes(sourceId, { enabled: enabled ?? true });
   const hiddenKeys = useHiddenMeshCoreKeys(ignoredNodesQuery.data);
-  const visibleNodes = useMemo(
-    () => (hiddenKeys.size === 0 ? nodes : nodes.filter((n) => !hiddenKeys.has(n.publicKey.toLowerCase()))),
-    [nodes, hiddenKeys],
-  );
-  const visibleContacts = useMemo(
-    () => (hiddenKeys.size === 0 ? contacts : contacts.filter((c) => !hiddenKeys.has(c.publicKey.toLowerCase()))),
-    [contacts, hiddenKeys],
-  );
   const { mutateAsync: setIgnoredNodeAsync } = useSetMeshCoreIgnoredNode(sourceId);
   const { mutateAsync: removeIgnoredNodeAsync } = useRemoveMeshCoreIgnoredNode(sourceId);
   const handleSetIgnoredNode = useCallback(
@@ -144,8 +152,9 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
     [removeIgnoredNodeAsync],
   );
 
-  // Muted channels never light the sidebar Channels dot (#5487).
-  const channelMute = useOptionalChannelMuteSettings();
+  // Muted channels never light the sidebar Channels dot (#5487); muted DM peers and
+  // rooms light no dot either (#6261).
+  const channelMute = useOptionalMuteSettings();
   const unread = useMeshCoreUnread({
     baseUrl,
     sourceId,
@@ -154,6 +163,7 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
     selfKey: status?.localNode?.publicKey,
     enabled: enabled ?? true,
     isChannelMuted: channelMute?.isChannelMuted,
+    isDMMuted: channelMute?.isDMMuted,
   });
 
   const navigateToDm = useCallback((publicKey: string) => {
@@ -161,13 +171,64 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
     setView('dms');
   }, []);
 
-  useEffect(() => {
-    onStatusChange?.(status);
-  }, [status, onStatusChange]);
+  // `nodeKey` is `mc:<64-hex>`; open that contact's DM with the draft pre-filled.
+  const openDmWithDraft = useCallback((nodeKey: string, draft: string) => {
+    setPendingDmContact(nodeKey.startsWith('mc:') ? nodeKey.slice(3) : nodeKey);
+    setPendingDmDraft(draft);
+    setView('dms');
+  }, []);
+
+  const showNodeOnMap = useCallback((publicKey: string) => {
+    setPendingMapNode(publicKey);
+    setView('nodes');
+  }, []);
 
   useEffect(() => {
-    if (view !== 'dms') setPendingDmContact(null);
+    // `loaded`: the first snapshot settled. A source with no manager never
+    // gets a status, so the header needs this to stop saying "Connecting"
+    // (#4173 N6). `connecting`: a connect is in flight — the same test the
+    // status bar's "Connecting…" button label uses.
+    onStatusChange?.(status, hasLoadedOnce, loading && !status?.connected);
+  }, [status, hasLoadedOnce, loading, onStatusChange]);
+
+  useEffect(() => {
+    if (view !== 'dms') {
+      setPendingDmContact(null);
+      setPendingDmDraft(null);
+    }
+    if (view !== 'nodes') setPendingMapNode(null);
+    if (view !== 'channels') setPendingChannelIdx(null);
+    if (view !== 'rooms') setPendingRoom(null);
   }, [view]);
+
+  // Deep link from outside the page (Mesh Issues, #6263): select the contact
+  // through the same hand-off Show on Map uses. Declared after the view
+  // effect above so its pending key is not cleared on the first commit.
+  useEffect(() => {
+    const key = takePendingMeshCoreContact();
+    if (key) showNodeOnMap(key);
+  }, [sourceId, showNodeOnMap]);
+
+  // Notification click-through (#6253): open the channel, room or DM the
+  // notification was about. Payloads for another source are left alone.
+  const { pendingNavigation, clearPendingNavigation } = usePushNotificationNavigation();
+  const [pendingChannelIdx, setPendingChannelIdx] = useState<number | null>(null);
+  const [pendingRoom, setPendingRoom] = useState<string | null>(null);
+  useEffect(() => {
+    if (!pendingNavigation) return;
+    if (pendingNavigation.sourceId && pendingNavigation.sourceId !== sourceId) return;
+    const target = resolveMeshCoreNotificationTarget(pendingNavigation, contacts);
+    if (target.kind === 'channel') {
+      setPendingChannelIdx(target.channelIdx);
+      setView('channels');
+    } else if (target.kind === 'room') {
+      setPendingRoom(target.publicKey);
+      setView('rooms');
+    } else if (target.kind === 'dm') {
+      navigateToDm(target.publicKey);
+    }
+    clearPendingNavigation();
+  }, [pendingNavigation, sourceId, contacts, navigateToDm, clearPendingNavigation]);
 
   return (
     <div className="meshcore-page">
@@ -204,15 +265,18 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
             pinned={navPinned}
             onTogglePin={handleToggleNavPin}
             showInfo
-            unread={{ channels: unread.channels, dms: unread.dms }}
+            unread={{ channels: unread.channels, dms: unread.dms, rooms: unread.rooms }}
           />
         )}
       >
         {view === 'nodes' && (
           <MeshCoreNodesView
-            nodes={visibleNodes}
-            contacts={visibleContacts}
+            nodes={nodes}
+            contacts={contacts}
+            ignoredKeys={hiddenKeys}
             onImportContact={actions.importContact}
+            // Contact-share tokens (#6370) need a Companion's contact list.
+            onImportContactToken={status?.deviceType === DEVICE_TYPE_COMPANION ? actions.importContactToken : undefined}
             onNavigateToDm={navigateToDm}
             onToggleFavorite={actions.setNodeFavorite}
             onDiscoverNodes={actions.discoverNodes}
@@ -220,11 +284,13 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
             mapIsLoading={!hasLoadedOnce}
             receiveOnly={receiveOnly}
             isRepeaterSource={status?.deviceType === DEVICE_TYPE_REPEATER}
+            focusPublicKey={pendingMapNode}
           />
         )}
         {view === 'channels' && (
           <MeshCoreChannelsView
             messages={messages}
+            reactionResolutions={reactionResolutions}
             contacts={contacts}
             status={status}
             actions={actions}
@@ -232,6 +298,7 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
             sourceId={sourceId}
             onNodeNameClick={navigateToDm}
             receiveOnly={receiveOnly}
+            initialChannelIdx={pendingChannelIdx}
           />
         )}
         {view === 'rooms' && (
@@ -244,11 +311,13 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
             sourceId={sourceId}
             onNodeNameClick={navigateToDm}
             receiveOnly={receiveOnly}
+            initialRoom={pendingRoom}
           />
         )}
         {view === 'dms' && (
           <MeshCoreDirectMessagesView
             messages={messages}
+            reactionResolutions={reactionResolutions}
             contacts={contacts}
             nodes={nodes}
             status={status}
@@ -256,34 +325,43 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
             baseUrl={baseUrl}
             sourceId={sourceId}
             initialSelectedContact={pendingDmContact}
+            initialDraft={pendingDmDraft}
+            onInitialDraftConsumed={() => setPendingDmDraft(null)}
             receiveOnly={receiveOnly}
             ignoredNodes={ignoredNodesQuery.data}
             onSetIgnoredNode={handleSetIgnoredNode}
             onRemoveIgnoredNode={handleRemoveIgnoredNode}
+            onShowOnMap={showNodeOnMap}
           />
         )}
         {view === 'telemetry' && (
-          <MeshCoreTelemetryView baseUrl={baseUrl} />
+          <MeshCoreTelemetryView baseUrl={baseUrl} currentNodeId={status?.localNode?.publicKey ?? null} />
         )}
         {view === 'packets' && (
           <MeshCorePacketMonitorView
             baseUrl={baseUrl}
             sourceId={sourceId}
             isRepeaterSource={status?.deviceType === DEVICE_TYPE_REPEATER}
+            contacts={contacts}
+            onNodeClick={navigateToDm}
           />
         )}
         {view === 'info' && (
           <MeshCoreInfoView baseUrl={baseUrl} sourceId={sourceId} status={status} onSyncTime={actions.syncDeviceTime} />
         )}
         {view === 'configuration' && (
-          <MeshCoreConfigurationView
-            status={status}
-            actions={actions}
-            baseUrl={baseUrl}
-            sourceId={sourceId}
-            receiveOnly={receiveOnly}
-            loading={loading}
-          />
+          // The Analyzer Observer's broker list saves through the SaveBar (#5831).
+          <SaveBarProvider>
+            <MeshCoreConfigurationView
+              status={status}
+              actions={actions}
+              baseUrl={baseUrl}
+              sourceId={sourceId}
+              receiveOnly={receiveOnly}
+              loading={loading}
+            />
+            <SaveBar />
+          </SaveBarProvider>
         )}
         {view === 'automations' && (
           <SaveBarProvider>
@@ -292,6 +370,7 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
                 baseUrl={baseUrl}
                 sourceId={sourceId}
                 receiveOnly={receiveOnly}
+                isCompanionSource={status?.deviceType === DEVICE_TYPE_COMPANION}
               />
             </SaveBarGroup>
             <SaveBar />
@@ -299,8 +378,17 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
         )}
         {view === 'notifications' && (
           <div className="meshcore-notifications-view">
-            <NotificationsTab isAdmin={isAdmin} />
+            <NotificationsTab isAdmin={isAdmin} meshcoreDeviceType={status?.deviceType} />
           </div>
+        )}
+        {view === 'security' && (
+          <SecurityTab
+            sourceId={sourceId}
+            sourceType="meshcore"
+            deviceType={status?.deviceType}
+            onOpenNode={navigateToDm}
+            onOpenDmWithDraft={openDmWithDraft}
+          />
         )}
         {view === 'settings' && (
           <SaveBarProvider>
@@ -311,6 +399,7 @@ export const MeshCorePage: React.FC<MeshCorePageProps> = ({ baseUrl, sourceId, e
                 actions={actions}
                 baseUrl={baseUrl}
                 sourceId={sourceId}
+                contacts={contacts}
                 receiveOnly={receiveOnly}
                 canOpenDeviceConfiguration={canOpenDeviceConfiguration}
                 onOpenDeviceConfiguration={openDeviceConfiguration}

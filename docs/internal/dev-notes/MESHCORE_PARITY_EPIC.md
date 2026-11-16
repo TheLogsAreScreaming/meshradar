@@ -1,0 +1,305 @@
+# MeshCore Parity Epic (#6226 follow-ups)
+
+## Goal
+
+Close the feasible Meshtastic ↔ MeshCore gaps found by the #6226 audit. Each
+issue ships as its own PR (or several, for large ones), merged after CI is
+green and review feedback is handled. MeshCore features cover Companion and
+Repeater sources where both ingest paths allow it.
+
+Audit summary: https://github.com/Yeraze/meshmonitor/issues/6226#issuecomment-6711718051
+
+## Decisions (maintainer, 2026-11-07)
+
+- **Run mode:** one phase per issue, one PR each, merge when green. RF-free
+  phases first.
+- **#6253 notifications:** reuse the Meshtastic rules as-is (per-channel
+  enable/mute, keyword lists, templates, existing dedup). No MeshCore-only cap.
+- **#6255 repeater advert intervals:** `advert.interval` 60–240 min,
+  `flood.advert.interval` 6–168 h. Enforced on the server and in the input,
+  with a warning next to each input.
+- **#6263 v1 API TX for MeshCore:** same limits as Meshtastic (`messageLimiter`,
+  v1 rate limits) plus existing MeshCore send caps.
+- **Firmware verification:** confirm CLI verbs / companion commands against
+  supported firmware before building #6255 and #6257 controls.
+- **One implementation for all sources (maintainer, 2026-11-07):** every
+  parity feature uses a single configurable component/hook/service shared by
+  the Meshtastic tab and the MeshCore view (props/config for protocol
+  differences), not a MeshCore copy. Each phase spec must name the shared
+  piece first; a MeshCore-only component needs a stated reason (no protocol
+  equivalent). Precedents: `NodeDimmingSettings`, `SignFlipCorrectionSettings`,
+  `NotificationsTab`.
+- **Dev deploys:** check SQLite integrity and apply the RF lockdown
+  (autoConnect off on radios, MQTT broker/bridge rows `enabled=0`) first, or
+  use a throwaway volume for screenshots.
+
+## Phases
+
+Each phase's scope is the checklist in its issue.
+
+- [x] **P1 #6258 Settings:** telemetry retention editors, purge telemetry and
+  clean outliers, node dimming and hide-incomplete, global restart/shutdown
+  and Solar Monitoring reachable without a Meshtastic source.
+- [x] **P2 #6261 Messaging:** Room unread, DM/Room mute, mark-all-read,
+  translation, composer emoji picker.
+- [x] **P3 #6259 Nodes and DM lists:** sort, columns, filters, group by role,
+  export, DM list filters and richer rows.
+- [x] **P4 #6262 Packet Monitor + contact graphs:** paging, search and filters,
+  distribution charts, Unified filters, Smart Hops / Link Quality / Signal Trend.
+- [x] **P5 #6260 Map parity:** shared MeshCoreMap layers, trace on map, Map
+  Analysis positions/traces/solar, estimated positions. May split.
+- [x] **P6 #6263 Dashboard / API / reports:** dashboard widgets, Mesh Issues,
+  Prometheus, v1 API read + TX, embed maps.
+- [x] **P7 #6254 Security view:** dead contacts, hash collisions, advert
+  signatures, own-key change (P7a shipped). P7b (rates, clock flag, scanner,
+  digest, export, DM) shipped as P15 (#6281).
+- [ ] **P8 #6257 Companion extras:** BLE PIN, factory reset, multi-ACKs,
+  device-config backups, channel QR share.
+- [x] **P9 #6255 Repeater settings + danger zone.**
+- [x] **P10 #6256 Remote structured config.**
+- [x] **P11 #6253 Notifications.**
+- [x] **P12 #6279 Mesh Issues node-health rules (A6-A9).**
+- [x] **P13 #6306 Repeater new-node alerts** (shared learning-window + hourly-cap gate).
+- [x] **P17 #6307 Notifications tab for `meshcore_mqtt`** (+ shared debounced broker-link alerts).
+- [x] **P18 #6308 File slot-decrypted MQTT channel rows under a keyed index** (closes a read leak; migration 228).
+
+## Phase log
+
+(Decisions and deviations recorded as each phase ships.)
+
+### P1 #6258 (spec: `MESHCORE_PARITY_P1_SPEC.md`)
+Maintainer answers, 2026-11-07:
+- Meshtastic per-source "Purge telemetry" and "Erase nodes" sent no source id and wiped every source. Scope both to the page's source in this phase (like traceroutes, #5089).
+- MeshCore "incomplete" = no advertised name OR unknown device type; favourites and local node exempt.
+- MeshCore dimming applies to map markers only (Meshtastic parity), not list rows.
+- Age window 0 (show all) = no dimming (Meshtastic parity).
+- MeshCore telemetry editors write per-source overrides; Meshtastic keeps the global default.
+- `meshcore_packet_log_*` per source is out of scope (Meshtastic's packet log is global too).
+
+Shipped: 3 work packages (global moves + purge scoping; dimming + hide-incomplete; MeshCore telemetry settings + danger actions). Deviations: confirm copy for Meshtastic source-page purges now names the source (review finding). Noted, not fixed: on MeshCore Settings the label and its help text render on one line (pre-existing `.setting-description` inline style on that page; every existing field does it).
+
+### P2 #6261 (spec: `MESHCORE_PARITY_P2_SPEC.md`)
+Orchestrator decisions (recommended options, aligned with the one-implementation rule):
+room unread uses receipt time; room mute lives in `mutedDMs`; MeshCore channels/DMs/rooms
+get list-header mark-all; MeshCore composer stays single-line; MeshCore adopts the shared
+composer look. Read models stay separate (Meshtastic per-message rows vs MeshCore
+watermarks; the schema forbids merging) — the controls and mute state are shared.
+Found: translation orphan sweep would delete every MeshCore link — fixed first in WP3.
+Shipped: 4 work packages. Shared now: `MuteMenu`/`MutedIndicator` (replaced 3 copies), `MarkAllReadButton` (Meshtastic sidebar, ChannelsTab, DashboardSidebar, MeshCore channels/DMs/rooms), `MessageComposeInput` (MeshCore uses it via `draftStore`/`maxBytes`/`blockSendOverLimit`/`allowNewlines` props), translation pipeline (server dispatch in `translatableMessages.ts`). Deviations: MessagesTab DM mute menu now shows the full option list when muted (shared order). Browser check limited to offline views (MeshCore channel/DM/room views need a live manager); composer, counter and mute bell verified rendered.
+
+### P3 #6259 (spec: `MESHCORE_PARITY_P3_SPEC.md`)
+Maintainer answers, 2026-11-07: toolbar sort is persisted for BOTH protocols (Settings
+preferred sort is the default until a toolbar pick); MeshCore battery shows voltage only;
+DM preview only for live-window threads (no server change). Orchestrator (one-implementation
+rule): one shared Group-by-role preference; favorites filter added to both protocols.
+#6185 (public-key sort) already implemented — this phase closes it.
+Shipped: 4 work packages. Shared now: `nodeSort.sortByKey`/`orderFavoritesFirst`, `nodeExport` generic columns + `exportNodeList`, `nodeAdvancedFilter.passesNodeFilters` + configurable `AdvancedNodeFilterPopup`, `usePersistedListSort`, `usePersistedNodeFilters`, `useNodeRoleGrouping`, `components/nodes/{NodeSortControls,ExportMenuButton,NodeStatChips,RoleDistributionSummary,RoleGroupHeader}`, `BatteryItem`, `dmListFilter`, `DmFilterSelect`, `formatMessagePreview`. MeshCore adapter: `utils/meshcoreNodeRows.ts`. Deviations: UIContext owns the persisted Meshtastic sort (one source of truth); MeshCore DM sort labels keep `meshcore.sort_*` wording.
+
+### P4 #6262 (spec: `MESHCORE_PARITY_P4_SPEC.md`)
+Maintainer answers, 2026-11-08: Signal Trend for MeshCore uses our DM reception (snr/rssi of DMs from
+the contact) plus polled noise floor; free-text search excludes channel plaintext (per-viewer
+decryption stays gated). Orchestrator: no backfill of the new derived columns (retention ≤30 d);
+meshcore_mqtt distribution counts receptions. Contact graphs are a read-side adapter (no new
+telemetry writers). Migration 224 adds derived packet-log columns + indexes.
+Shipped: migration 224 + derived sender fields; cursor paging, search, payload/route filters and a
+distribution endpoint for the MeshCore packet log; shared `usePagedPackets` / `useInfiniteVirtualRows`
+hooks drive both protocols' monitors; unified monitor merges distribution protocol-tagged; MeshCore
+contact panel gets "Link history" via the shared Meshtastic graph components. Browser-checked on a
+throwaway volume (popout monitor renders, routes return paged envelopes, no console errors).
+
+### P5 #6260 (spec: `MESHCORE_PARITY_P5_SPEC.md`)
+Maintainer answers, 2026-11-08: estimated positions computed on read (no table/scheduler); hop shading
+from `path_len`; Traceroute Explorer split to a follow-up issue; stationary nodes get one current fix
+in heatmap/coverage; playback for any selected contact with ≥2 fixes; solar overrides keyed on the
+synthetic nodeNum; local markers reuse `waypoints`. Read-only phase, no migration.
+Shipped (WP1–WP5): Map Analysis positions/coverage/hop shading/solar for MeshCore (two-phase cursor,
+`nodeKey` identity); shared MapInstanceBridge / useMap3DToggle / useLocalMarkerAuthoring /
+RouteFlowMap / EstimatedPositionRadiiLayer; MeshCoreMap local markers, cross-source links,
+clustering, 3D, playback, estimated positions; Trace Path map card; MeshCore trace links on the
+Map Analysis traceroute layer (2D+3D). Browser check on a seeded throwaway volume: all new routes
+return correct data; Map Analysis draws MeshCore nodes + heatmap. The MeshCore Nodes map draws the
+live device contact list, so its markers need a connected companion (pre-existing behaviour).
+Follow-up: #6276 (Traceroute Explorer).
+
+### P6 #6263 (spec: `MESHCORE_PARITY_P6_SPEC.md`)
+Maintainer answers, 2026-11-08: v1 TX limits = Meshtastic's (no new caps; docs warn on POST /messages airtime); v1 MeshCore
+rows `nodeId mc:<pk>` + additive `protocol` on every row; v1 MeshCore trace fire-and-forget; new `request-telemetry` action
+for both protocols gated on `messages:write`; Mesh Issues A4 + A3-resets + C2 (flood advert < 6 h / zero-hop < 60 min) on
+MeshCore, four protocol-neutral rules → follow-up; separate payload-type Prometheus metric; per-node MeshCore metrics on
+`nodes:read`; embeds reuse existing toggles.
+Shipped (WP1–WP8): v1 reads for MeshCore (`nodes`, `channels`, `packets`, `traceroutes`, `network`, `messages`)
+with an additive `protocol` field and `mc:<pk>` node ids; v1 TX on MeshCore (`POST /messages` under Meshtastic's
+limits, fire-and-forget `actions/traceroute`, new `actions/request-telemetry` for both protocols with the 60 s
+gate as 429 + Retry-After); per-source metrics collectors, MeshCore gauges, `meshmonitor_packets_by_payload_type_last_hour`
+and per-node `mc:` series on `nodes:read`; Dashboard widgets and Live Mesh Activity on MeshCore; Mesh Issues A4/A3/C2
+on MeshCore; embed neighbour links and trace segments under the existing toggles (both ends must be visible, so a
+private-override node is never a line end); user docs in `REST_API.md`, `embed-maps.md`, `packet-monitor.md`, `meshcore.md`.
+
+### P7 #6254 (spec: `MESHCORE_PARITY_P7_SPEC.md`)
+Maintainer answers, 2026-11-08: split into P7a (dead contacts + bulk delete, collisions, advert signatures, name under
+new key, own-key change alert; no migration, no RF) and P7b (rates, clock-offset flag, MeshCore in scanner / digest /
+export / DM). Per-source `securityDeadNodeDays` (Meshtastic 7, MeshCore 14). Bulk delete needs security:write AND
+per-source nodes:write; Companion deletes radio + DB. Own-key alert once per change via `notifyOnServerEvents`. Name
+reuse display-only. Repeater adverts always signature-checked; unchecked = null.
+
+Shipped (P7a): the Security tab is protocol-aware. MeshCore sources show dead contacts (per-source `securityDeadNodeDays`,
+default 14 days; Meshtastic 7) with bulk delete (needs security:write and per-source nodes:write; a connected Companion
+deletes from the radio and DB, others from the DB only), path-hash collisions at the source's hash width, advert
+signature status (Verified / Failed / Not checked; only Repeater and MQTT check), name reused under a new key (display
+only), and an own-key change card with one alert per change and an Acknowledge action. Dead-nodes and findings routes now
+need `nodes:read` on the source for both protocols. No migration, no RF. P7b (rates, clock-offset flag, scanner, digest,
+export, DM) follows in #6281. User docs: `docs/features/security.md`, `meshcore.md`.
+
+Shipped (P7b / P15, #6281; spec: `MESHCORE_PARITY_P15_SPEC.md`): MeshCore uses the same 30 packets/hour and 30 minute
+thresholds as Meshtastic from one constant file (`constants/securityThresholds.ts`). Rates count distinct packet
+hashes from the MeshCore packet log (off = rate flags untouched, hint in the tab); the clock offset comes from the newest
+advert or DM sender time, and a never-set clock is shown as "Clock not set". Migration 227 adds the flag columns to
+`meshcore_nodes` (only the scanner and the clear route write them). One scanner, one issues collector
+(`securityIssuesService`), one digest formatter (sections), one export and one notification-text builder serve both
+protocols. Digest settings now save per source with a global fallback; an unconfigured source is skipped, not failed.
+`/issues`, `/export`, `/key-mismatches` need `nodes:read` on the source; the shared export now lists spam- and
+clock-only nodes. "Send notification" is draft-only on Companion sources and chat contacts (and now also on Meshtastic
+excessive-packet and clock rows), text <= 75 bytes, flood warning when no path is known, disabled when the contact is
+not on the radio (the firmware looks the recipient up in its table).
+
+### P8 #6257 (spec: `MESHCORE_PARITY_P8_SPEC.md`)
+Maintainer answers, 2026-11-08: leak fix (device backups exported every source's channel secrets) shipped first as
+PR #6284; P8a = BLE PIN, multi-ACKs (0/1 only, airtime warning), factory reset (admin + typed name, fw ≥ 7, TCP allowed
+with warning, expected identity change audited not alerted), channel share/import URL (`configuration:write`,
+`region_scope` included); P8b = per-source protocol-aware device-config backups (migration 226).
+Shipped (P8a): BLE PIN (raw cmd 37), multi-ACKs 0/1 with SelfInfo readback (fw ≥ 7; v1.7.3 ignores byte 5),
+factory reset (cmd 51, fw ≥ 7, admin + typed name, expected identity change audited not alerted), channel share/import
+via `meshcore://channel/add` with shared Export/Import modals and the config-capable device gate. Fixed: the raw
+other-params writer preserves the auto-add bits. Leak fix shipped separately (#6284). P8b (per-source config backups,
+migration 226) follows.
+
+### P9 #6255 (spec: `MESHCORE_PARITY_P9_SPEC.md`)
+Maintainer answers, 2026-11-08: Off (0) allowed for both advert intervals with a reachability warning (clamps otherwise
+60–240 min / 6–168 h); power-off and key restore admin + typed name on both protocols, restore auto-reboots with a pinned
+expected key; forwarding knobs use firmware ranges with inline warnings (af < 1, flood.max ≤ 2, repeat off); guest
+password never sent to the browser; `set prv.key` added to the danger guard; existing repeater secret debug-log leak fixed;
+Companion gets power-off too.
+Shipped (P9): shared repeater settings schema + CLI reply parser (`utils/meshcoreRepeaterSettings.ts`), LoRa airtime
+estimate (`utils/loraAirtime.ts`), transport-agnostic settings service (local serial now; P10 adds the remote transport),
+GET/PATCH repeater-settings (diff + readback), Repeater coords / reboot / clock sync / key export+restore, power-off for
+Repeater (fw 1.15+) and Companion (protocol 14+), admin + typed name for power-off and restore on both protocols, pinned
+expected identity change, `set prv.key` in the danger guard, extra CLI reply terminators, and the repeater secret
+debug-log leak fixed.
+
+
+### P10 #6256 (spec: `MESHCORE_PARITY_P10_SPEC.md`)
+Maintainer answers, 2026-11-09: the same `RepeaterSettingsForm` + settings service over a remote CLI transport; reads per
+group (identity / adverts / access) with a cost line, nothing on mount, flood warning when the path is unknown; caps one
+operation per (source, target), 40 remote commands / 10 min per source, ≥ 1 s gap, `recordMeshTx` per command, stop at the
+first timeout (rest `NOT_SENT`), no retries or auto re-login; admin password console-only, radio read-only remotely, TX
+power writable with a warning; `remote_admin:write` for read and save; Room Server hides forwarding knobs; readback only
+the sent keys; export/import from read values without secrets (also on the local form); one redacted CLI-history row per
+set; requires a remembered admin session.
+Shipped (P10): remote CLI transport + read/PATCH routes with the limits above, schema groups / device types / remote
+access, `name` / `txPower` / `radio` keys, `readback:'sent'`, stop-at-first-timeout with `NOT_SENT`, the same form in
+remote mode inside the remote console, and settings export/import on both forms. Deviations: TX power is a hard 1–30 dBm
+range (plus the warning); an empty reply also stops a remote run; no "Discover path" link next to the flood warning
+(the warning says to learn the path first).
+
+### P11 #6253 (spec: `MESHCORE_PARITY_P11_SPEC.md`)
+Maintainer answers, 2026-11-09: room posts follow the DM toggle and DM mute; accept DM pushes starting for existing
+MeshCore subscribers (release note); a mute beats a mention; the Disconnect button notifies, shutdown/edits stay silent;
+the per-DM mute fix applies to Meshtastic too; Repeater "New nodes" hidden with a hint (follow-up); click-through in P11;
+key-access gate on every MeshCore notification (closes the mention leak of keyed channel text).
+Shipped (P11): protocol-neutral `dispatchMessageNotification` (Meshtastic adapter unchanged except the DM-mute fix),
+key-access gate on every notification path (closes the mention leak), desktop counts as an available service, MeshCore
+message notifier (channel / DM / room post, content dedup keys, one ordered mention→message chain per source), MeshCore
+server connect/disconnect and trace/path-discovery notifications, a notification capability map for the tab
+(Companion vs Repeater, channel list from `/api/channels/all`), shared audio settings + `useMessageSound`, and
+click-through on the MeshCore page. Follow-ups: Repeater advert new-node alerts; a Notifications tab for `meshcore_mqtt`.
+
+### P12 #6279 (spec: `MESHCORE_PARITY_P12_SPEC.md`)
+Maintainer decisions, 2026-11-09: all recommended options. Infra nodes only; stale 24 h Meshtastic / 96 h MeshCore
+(tunable) and no flag after 30 days; low battery 20 % / 3300 mV (tunable); a position override suppresses A7; A8 skips
+nodes whose A3 battery clause fires; A9 accepted as mostly quiet with discard on; A6-A9 in Tier A. No RF, no notifications.
+Shipped (P12): one shared implementation of A6 stale, A7 no position, A8 low battery and A9 bad position on `PooledNode`
+for both protocols (`rulesNodeHealth.ts`, pure helpers in `nodeHealth.ts`), new `PooledNode` fields (reported position
+class, override, advert-had-position, local), an always-mV `batteryMv` series (MeshCore `mc_battery_mv` and
+`mc_status_battery_volts` x1000), four threshold settings, `tierASkips` (silent-source A6 and no-battery A8) and one
+`buildTierAContext` for both run paths. Deviations: A6 `aliveSources` joins the route's source-id redaction (it would
+have leaked hidden ids); the Meshtastic telemetry query keeps its four DB types. Verified: a Repeater-source's local
+battery rows are filed under the real public key, but that source has no own node row, so they only count when an advert
+creates one.
+
+### P13 #6306 (spec: `MESHCORE_PARITY_P13_SPEC.md`)
+Maintainer answers, 2026-11-09: 48 h learning window and 10 alerts per hour per source as module constants, built as a
+shared protocol-neutral gate (`newNodeAlertGate`) wired to Repeater sources only (explicit exception to "no MeshCore-only
+cap"); state persisted per source; overflow adds "(+N more)" to the next alert; legacy Repeater prefs accepted with a release
+note; "new" is per source; a full node purge re-arms the window, offline gaps do not.
+Shipped (P13): `upsertNode` reports `{ inserted }`, `ingestAdvertFrame` returns `{ advert, inserted, signatureVerified }`,
+`alertNewNode` split from `notifyNewNodeDiscovered` (the Repeater path never runs Auto Welcome), bounded dedup sets,
+`maybeAlertRepeaterNewNode`, purge re-arm, Repeater toggle plus learning note in the Notifications tab. Automation events
+for Repeater adverts stay off (#5553). Follow-ups: the same gate on Meshtastic MQTT; new-node alerts for `meshcore_mqtt`.
+
+### P17 #6307 (spec: `MESHCORE_PARITY_P17_SPEC.md`)
+Maintainer answers, 2026-11-09: one shared debounced broker-link notifier for `meshcore_mqtt` and Meshtastic `mqtt_bridge`;
+120 s grace, auth/eviction stops alert at once, no broker URL in payloads; picker = slot channels with messages on the source
+plus keyed channels the viewer can read; slot-index ambiguity accepted (#6308); inactive-node and low-battery alerts included;
+no MeshCore-only cap, the tab warns next to the picker.
+Shipped (P17): `meshcore_mqtt` capability row plus `unsupportedHint`/`connectionEvents` on every row, `GET /ingest/channels`
+and `getChannelIndicesWithMessages`, shared `NotificationsTab` mounted on the ingest page (capability-driven copy, no-DM
+defaults notice also fixes the Repeater), `resolveMeshCoreChannelName` (fixes keyed-channel titles for every MeshCore source),
+scoped `/api/nodes` lists ingest nodes for the monitored-node picker, `brokerLinkNotifier` wired into `meshcoreMqttManager`
+and `mqttBridgeManager` (dispose is silent). Follow-ups: #6308 slot re-filing; Reticulum Notifications tab; new-node alerts for feeds.
+
+### P18 #6308 (spec: `MESHCORE_PARITY_P18_SPEC.md`)
+Maintainer answers, 2026-11-10: unrecoverable legacy rows keep `channel-N` with the `unresolved` fingerprint (admin-only);
+the shared gate always grants the Public channel fingerprint to signed-in users on every MeshCore source (source
+`messages:read` still required; Packet Monitor anonymous rule unchanged); notification prefs for slot N fan out to the
+re-filed keyed channels plus every secret now at slot N on a MeshCore source, originals kept, mutes merged.
+Shipped (P18): `keyedFilingFor` (one filing rule for Repeater, Companion OTA and MQTT), MQTT rows stamped with
+`keyFingerprint`/`keySourceId`/`keyChannelIdx` (the read leak: slot rows had no fingerprint, so `messages:read` on the feed
+bypassed the key gate), `/ingest/messages` returns `channelIdx`/`channelName`/`legacy`, `/ingest/channels` drops the slot
+branch (`getChannelIndicesWithMessages` removed), `/api/channels/all` skips legacy ids, automation name filters resolve
+keyed indices (`keyedChannelNameFor`, also fixes the Repeater), migration 228 (recovers the key from the content-derived
+message id, SQLite/PG/MySQL, fans out prefs and read markers). Release notes: numeric channel filters in automations are
+not rewritten (use name filters); `channel_N` grants on MQTT feeds no longer gate anything; the feed now key-gates channel
+messages. Follow-ups: merge the MQTT and device GRP_TXT store pipelines; #5379 remap does not move notification prefs.
+
+### P16 #6285 (P8b) (spec: `MESHCORE_PARITY_P16_SPEC.md`)
+Maintainer answers, 2026-11-09: migration takes the next free number (226, after P14 took 225); download and create need
+`configuration:write` on the source; stop writing the Meshtastic private key; admins may restore an unowned legacy file of
+the same protocol after an extra confirmation; MeshCore radio restored verbatim and last with a current -> backup
+warning, TX power clamped; fixed whitelist of MeshMonitor settings; source delete keeps files as admin-only orphans;
+slot 0 always skipped.
+Shipped (P16): `backup_history.sourceId` + `protocol` (migration 226, legacy backfill to the only Meshtastic source,
+primary schedule seeded to per-source keys); source-scoped repository and file service (files 0600, dir 0700, `wx`
+collision suffix, per-source purge); new `stored` device-source gate mode; shared `deviceConfigBackupService` pipeline with
+Meshtastic and MeshCore adapters (lock, protocol check, legacy confirm, audit by ids); per-source scheduler with a
+persisted local day guard (a save or restart never fires a backup); `set_other_params_raw` bridge command, manager
+`readBackupSnapshot` / `setOtherParamsRaw` / `restoreChannels`; `BackupManagementSection` with protocol / sourceId /
+connected / canWrite props, a restore summary dialog and a MeshCore Backups section. Fixed: cross-source backup download
+and restore by filename, world-readable backup files, Meshtastic backups including the node private key.
+Deviations: TX power above the radio maximum is clamped and reported under `skipped`;
+the Meshtastic section is not disabled while the radio is offline (the server answers 409).
+
+### #6282 senderName override for API channel sends (spec: `ISSUE_6282_SPEC.md`)
+Maintainer decisions, 2026-11-10: per-source opt-in (default off), up to 16 allowed names edited with `configuration:write`,
+callers also need today's send grants; names 1-31 bytes NFC with no `:`, control, bidi, zero-width or leading `#`; full scope
+support mirroring `sendFloodScoped` (incl. `CMD_GET_DEFAULT_FLOOD_SCOPE`); 409 when client repeat is on; firmware gate >= 13
+plus runtime Err 1 -> `FIRMWARE_UNSUPPORTED`.
+Shipped: `buildRawGroupTextFrame` (raw `CMD_SEND_RAW_PACKET` frame), `meshcoreChannelTextCap(name, {raw})` (155 - name - 2),
+native `send_raw_packet` (RF, receive-only gated) and `get_default_flood_scope`, `device_query` now returns `repeat` and
+`path_hash_mode`, `MeshCoreManager.sendChannelMessageAs` (no `applyFloodScope`), own-echo suppression (10 min), heard-by match
+on the exact payload, process-wide recent-override-name registry (30 min) so sibling sources flag `selfOrigin` and skip
+auto-replies, raw resend (refused when the name left the list), migration 231 (`meshcore_messages.senderNameOverride`),
+`GET/PUT /config/sender-names`, `senderName` on both send routes, audit rows (no text), UI card and "Sent as" label.
+Follow-ups: automations / Auto-Responder / scheduled sends setting a name; a composer field; Virtual Node raw packets.
+
+### #6273 clock out of sync (spec: `ISSUE_6273_SPEC.md`)
+Maintainer answers, 2026-11-10: default threshold 300 s (range 120-86400), two consecutive out-of-sync samples, once per
+episode; Device Health rate limit 10 an hour; device sources only (no `meshcore_mqtt` sampling); no Sync-clock action;
+Meshtastic wiring is a follow-up.
+Shipped: `detectClockOffset` (`meshcoreDeviceHealth.ts`) stores `mc_rtc_drift_secs` samples from verified adverts (replay
+check on sender time, one an hour per node) and emits `node:clockOffset`; Companion reads the sender time
+stashed from the raw advert at the firmware push, Repeater needs `signatureVerified`, the local poller feeds its own
+device clock (no throttle; the poller stores the row). `trigger.clockOutOfSync` is protocol neutral
+(`utils/clockOutOfSync.ts`: edge rule, text, threshold range); history lives in telemetry so a restart or save cannot
+re-fire it. Device Health alert appended last. The Security scan reads the latest stored sample as an `advert` offset,
+so the clock flag works with the packet log off. Follow-ups: Meshtastic samples (packet `rxTime` vs sender time);
+`meshcore_mqtt` sampling from the broker envelope time; #6274 neighbour alert.

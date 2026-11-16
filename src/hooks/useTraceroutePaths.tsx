@@ -10,10 +10,9 @@
  * selectedNodeTraceroute useMemo blocks in App.tsx.
  */
 
-import React, { useMemo, useState } from 'react';
+import React, { Suspense, useMemo } from 'react';
 import { Popup } from 'react-leaflet';
 import { DraggablePopup } from '../components/DraggablePopup';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { calculateDistance, formatDistance } from '../utils/distance';
 import { getSegmentSnrOpacity, weightByUsage, tracerouteSegmentWeight, type SnrColorScale } from '../utils/mapHelpers';
 import {
@@ -21,15 +20,18 @@ import {
   resolveSegmentPosition,
   buildLiveNodePositionMap,
   decomposeTraceroute,
+  findSelectedNodeTraceroute,
   hasReturnPath,
   isUnknownSnr,
   isValidRouteNode,
   averageNonSentinelSnr,
+  TRACEROUTE_LOW_ZOOM,
   type TracerouteRenderSegment,
 } from '../utils/tracerouteSegments';
 import { TraceroutePathsLayer } from '../components/map/layers/TraceroutePathsLayer';
 import { darkOverlayColors } from '../config/overlayColors';
 import { logger } from '../utils/logger';
+import { lazyWithPreload } from '../utils/lazyWithPreload';
 import type { DistanceUnit } from '../contexts/SettingsContext';
 import {
   hopTransportClass,
@@ -40,106 +42,9 @@ import {
   type TransportFilterFlags,
 } from '../utils/tracerouteTransport';
 
-/** Small component for route segment SNR chart with time-of-day / chronological toggle */
-function SegmentSnrChart({ chartData }: {
-  chartData: Array<{ timeDecimal: number; timeLabel: string; snr: number; fullTimestamp: number }>;
-}) {
-  const [mode, setMode] = useState<'timeOfDay' | 'chronological'>('timeOfDay');
-
-  const chronoData = useMemo(() =>
-    [...chartData].sort((a, b) => a.fullTimestamp - b.fullTimestamp).map(d => {
-      const date = new Date(d.fullTimestamp);
-      const month = (date.getMonth() + 1).toString().padStart(2, '0');
-      const day = date.getDate().toString().padStart(2, '0');
-      const hours = date.getHours().toString().padStart(2, '0');
-      const minutes = date.getMinutes().toString().padStart(2, '0');
-      return { ...d, chronoLabel: `${month}/${day} ${hours}:${minutes}`, chronoTime: d.fullTimestamp };
-    }), [chartData]);
-
-  return (
-    <div className="snr-timeline-chart">
-      <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
-        <button
-          className={`node-popup-tab ${mode === 'timeOfDay' ? 'active' : ''}`}
-          style={{ fontSize: '10px', padding: '2px 8px', border: '1px solid var(--color-surface-active)', borderRadius: '4px', cursor: 'pointer', background: mode === 'timeOfDay' ? 'var(--color-accent)' : 'var(--color-surface)', color: mode === 'timeOfDay' ? 'var(--color-bg)' : 'var(--color-text-muted)' }}
-          onClick={e => { e.stopPropagation(); setMode('timeOfDay'); }}
-        >
-          Time of Day
-        </button>
-        <button
-          className={`node-popup-tab ${mode === 'chronological' ? 'active' : ''}`}
-          style={{ fontSize: '10px', padding: '2px 8px', border: '1px solid var(--color-surface-active)', borderRadius: '4px', cursor: 'pointer', background: mode === 'chronological' ? 'var(--color-accent)' : 'var(--color-surface)', color: mode === 'chronological' ? 'var(--color-bg)' : 'var(--color-text-muted)' }}
-          onClick={e => { e.stopPropagation(); setMode('chronological'); }}
-        >
-          Over Time
-        </button>
-      </div>
-      <ResponsiveContainer width="100%" height={150}>
-        {mode === 'timeOfDay' ? (
-          <LineChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--color-surface-active)" />
-            <XAxis
-              dataKey="timeDecimal"
-              type="number"
-              domain={[0, 24]}
-              ticks={[0, 6, 12, 18, 24]}
-              tickFormatter={value => {
-                const hours = Math.floor(value);
-                const minutes = Math.round((value - hours) * 60);
-                return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
-              }}
-              tick={{ fill: 'var(--color-text-muted)', fontSize: 10 }}
-              stroke="var(--color-surface-active)"
-            />
-            <YAxis
-              tick={{ fill: 'var(--color-text-muted)', fontSize: 10 }}
-              stroke="var(--color-surface-active)"
-              label={{ value: 'SNR (dB)', angle: -90, position: 'insideLeft', style: { fill: 'var(--color-text-muted)', fontSize: 10 } }}
-            />
-            <Tooltip
-              contentStyle={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-surface-active)', borderRadius: '4px', fontSize: '12px' }}
-              labelStyle={{ color: 'var(--color-text)' }}
-              labelFormatter={value => {
-                const item = chartData.find(d => d.timeDecimal === value);
-                return item ? item.timeLabel : String(value);
-              }}
-            />
-            <Line type="monotone" dataKey="snr" stroke="var(--color-accent-alt)" strokeWidth={2} dot={{ fill: 'var(--color-accent-alt)', r: 3 }} />
-          </LineChart>
-        ) : (
-          <LineChart data={chronoData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--color-surface-active)" />
-            <XAxis
-              dataKey="chronoTime"
-              type="number"
-              domain={['dataMin', 'dataMax']}
-              tickFormatter={value => {
-                const date = new Date(value);
-                return `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}`;
-              }}
-              tick={{ fill: 'var(--color-text-muted)', fontSize: 10 }}
-              stroke="var(--color-surface-active)"
-            />
-            <YAxis
-              tick={{ fill: 'var(--color-text-muted)', fontSize: 10 }}
-              stroke="var(--color-surface-active)"
-              label={{ value: 'SNR (dB)', angle: -90, position: 'insideLeft', style: { fill: 'var(--color-text-muted)', fontSize: 10 } }}
-            />
-            <Tooltip
-              contentStyle={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-surface-active)', borderRadius: '4px', fontSize: '12px' }}
-              labelStyle={{ color: 'var(--color-text)' }}
-              labelFormatter={value => {
-                const item = chronoData.find(d => d.chronoTime === value);
-                return item ? item.chronoLabel : String(value);
-              }}
-            />
-            <Line type="monotone" dataKey="snr" stroke="var(--color-accent-alt)" strokeWidth={2} dot={{ fill: 'var(--color-accent-alt)', r: 3 }} />
-          </LineChart>
-        )}
-      </ResponsiveContainer>
-    </div>
-  );
-}
+// The segment popup's SNR chart is the only recharts use here; load it (and
+// recharts) when a popup with a chart opens, not with every map.
+const SegmentSnrChart = lazyWithPreload(() => import('../components/SegmentSnrChart'));
 
 /**
  * Minimal node data needed for traceroute rendering
@@ -538,7 +443,7 @@ export function useTraceroutePaths({
     }
 
     // Zoom-adaptive filtering: at low zoom levels, only show stronger segments
-    if (mapZoom !== undefined && mapZoom < 8) {
+    if (mapZoom !== undefined && mapZoom < TRACEROUTE_LOW_ZOOM) {
       // Regional view: only show segments with good or medium SNR (filter out poor/unknown)
       filteredSegments = filteredSegments.filter(segment => {
         const segKey = nodePairKey(segment.nodeNums[0], segment.nodeNums[1]);
@@ -596,6 +501,9 @@ export function useTraceroutePaths({
     // Popup content (recharts SegmentSnrChart moves in verbatim) — a single
     // render-prop reading hop identity straight off the segment.
     const renderBasePopup = (seg: TracerouteRenderSegment): React.ReactNode => {
+      // Meshtastic adapters always set the node numbers; MeshCore segments
+      // (key-based) never reach this popup.
+      if (seg.fromNodeNum === undefined || seg.toNodeNum === undefined) return null;
       const nodeNum1 = seg.fromNodeNum;
       const nodeNum2 = seg.toNodeNum;
       const segmentKey = nodePairKey(nodeNum1, nodeNum2);
@@ -781,7 +689,7 @@ export function useTraceroutePaths({
                       <span className="stat-value">{snrStats.count}</span>
                     </div>
                     {chartData && (
-                      <SegmentSnrChart chartData={chartData} />
+                      <Suspense fallback={null}><SegmentSnrChart chartData={chartData} /></Suspense>
                     )}
                   </>
                 )}
@@ -819,9 +727,7 @@ export function useTraceroutePaths({
     // Skip rendering traceroute if the selected node is the current/local node
     if (!showRoute || !selectedNodeId || selectedNodeId === currentNodeId) return null;
 
-    const selectedTrace = traceroutesDigest.find(
-      tr => tr.toNodeId === selectedNodeId || tr.fromNodeId === selectedNodeId
-    );
+    const selectedTrace = findSelectedNodeTraceroute(traceroutesDigest, selectedNodeId);
 
     if (!selectedTrace) return null;
 
@@ -897,8 +803,8 @@ export function useTraceroutePaths({
         // fromNodeNum/toNodeNum (segments are in traversal order).
         const nums: number[] = [];
         legSegments.forEach((s, i) => {
-          if (i === 0) nums.push(s.fromNodeNum);
-          nums.push(s.toNodeNum);
+          if (i === 0 && s.fromNodeNum !== undefined) nums.push(s.fromNodeNum);
+          if (s.toNodeNum !== undefined) nums.push(s.toNodeNum);
         });
         return nums.map(nameForNode).join(' → ');
       };
@@ -977,9 +883,7 @@ export function useTraceroutePaths({
     // Only compute when showRoute is enabled and there's a selected node
     if (!showRoute || !selectedNodeId || selectedNodeId === currentNodeId) return null;
 
-    const selectedTrace = traceroutesDigest.find(
-      tr => tr.toNodeId === selectedNodeId || tr.fromNodeId === selectedNodeId
-    );
+    const selectedTrace = findSelectedNodeTraceroute(traceroutesDigest, selectedNodeId);
 
     if (!selectedTrace) return null;
 
@@ -1023,12 +927,11 @@ export function useTraceroutePaths({
   // (typeof-based #1862 snapshot checks) — the same resolution the rendered
   // segments use — so zoom-to-fit frames exactly what is drawn.
   const tracerouteBounds = useMemo((): [[number, number], [number, number]] | null => {
-    if (!tracerouteNodeNums || tracerouteNodeNums.size === 0) return null;
+    if (!selectedNodeId || !tracerouteNodeNums || tracerouteNodeNums.size === 0) return null;
 
-    // Parse snapshot positions from the selected traceroute (#1862, shared util)
-    const selectedTrace = traceroutesDigest.find(
-      tr => tr.toNodeId === selectedNodeId || tr.fromNodeId === selectedNodeId
-    );
+    // Parse snapshot positions from the selected traceroute (#1862, shared util).
+    // Same pick as the two memos above (#5821), so the bounds frame the drawn row.
+    const selectedTrace = findSelectedNodeTraceroute(traceroutesDigest, selectedNodeId);
     if (!selectedTrace) return null;
 
     // Zoom-to-fit only kicks in for a *complete* (both-leg) traceroute. This

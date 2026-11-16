@@ -5,7 +5,7 @@
  * Includes: users, permissions, sessions, audit_log, api_tokens
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, lt, desc, and, isNull, gte, lte, ne, count, sql } from 'drizzle-orm';
+import { eq, lt, desc, and, isNull, gte, lte, ne, count, sql, inArray } from 'drizzle-orm';
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import {
@@ -39,6 +39,10 @@ export interface DbUser {
   mfaEnabled: boolean;
   mfaSecret: string | null;
   mfaBackupCodes: string | null;
+  /** #5841: password login off; the user signs in with a passkey only. */
+  passwordLoginDisabled: boolean;
+  /** #5841: JSON array of bcrypt hashes. NEVER sent to the frontend. */
+  passkeyRecoveryCodes: string | null;
   createdAt: number;
   updatedAt?: number; // PostgreSQL only
   lastLoginAt: number | null;
@@ -78,6 +82,8 @@ export interface UpdateUserInput {
   mfaEnabled?: boolean;
   mfaSecret?: string | null;
   mfaBackupCodes?: string | null;
+  passwordLoginDisabled?: boolean;
+  passkeyRecoveryCodes?: string | null;
   updatedAt?: number;
   lastLoginAt?: number | null;
 }
@@ -308,6 +314,81 @@ export class AuthRepository extends BaseRepository {
     await this.db.delete(users).where(eq(users.id, id));
     notifyAccessChange({ kind: 'user', userId: id });
     return true;
+  }
+
+  // ============ PASSKEY-ONLY ACCOUNTS (#5841) ============
+
+  /**
+   * The passkey-only switch and the stored recovery-code hashes for one user,
+   * or null when the user does not exist.
+   */
+  async getPasskeyOnlyState(
+    userId: number,
+  ): Promise<{ passwordLoginDisabled: boolean; passkeyRecoveryCodes: string | null } | null> {
+    const { users } = this.tables;
+    const rows = await this.db
+      .select({
+        passwordLoginDisabled: users.passwordLoginDisabled,
+        passkeyRecoveryCodes: users.passkeyRecoveryCodes,
+      })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+    if (rows.length === 0) return null;
+    return {
+      // MySQL can hand back 0/1.
+      passwordLoginDisabled: Boolean(rows[0].passwordLoginDisabled),
+      passkeyRecoveryCodes: rows[0].passkeyRecoveryCodes ?? null,
+    };
+  }
+
+  /** Turn password login off (true) or back on (false) for one user. */
+  async setPasskeyOnly(userId: number, disabled: boolean): Promise<void> {
+    await this.updateUser(userId, { passwordLoginDisabled: disabled });
+  }
+
+  /** Store the recovery-code hashes (JSON array) for one user, or clear them with null. */
+  async setPasskeyRecoveryCodes(userId: number, codes: string | null): Promise<void> {
+    await this.updateUser(userId, { passkeyRecoveryCodes: codes });
+  }
+
+  /** Turn password login back on and drop the recovery codes, in one write. */
+  async clearPasskeyOnly(userId: number): Promise<void> {
+    await this.updateUser(userId, { passwordLoginDisabled: false, passkeyRecoveryCodes: null });
+  }
+
+  /**
+   * Spend a recovery code: turn password login back on and clear the codes,
+   * but only while the stored codes are still `expectedCodes`. Two requests
+   * racing with the same code both match the old list; only the first write
+   * wins, so a code works once. False when another write got there first.
+   */
+  async consumePasskeyRecovery(userId: number, expectedCodes: string): Promise<boolean> {
+    const { users } = this.tables;
+    const set: Record<string, unknown> = { passwordLoginDisabled: false, passkeyRecoveryCodes: null };
+    if (!this.isSQLite()) set.updatedAt = Date.now();
+    const result = await this.db
+      .update(users)
+      .set(set)
+      .where(and(eq(users.id, userId), eq(users.passkeyRecoveryCodes, expectedCodes)));
+    return this.getAffectedRows(result) > 0;
+  }
+
+  /**
+   * Spend an MFA backup code atomically. Writes `remainingCodes` but only while
+   * the stored list is still `expectedCodes`. Two requests racing with the same
+   * code both read the old list; only the first write matches it and wins, so a
+   * one-time code works once. False when another write got there first (#6075).
+   */
+  async consumeBackupCode(userId: number, expectedCodes: string, remainingCodes: string): Promise<boolean> {
+    const { users } = this.tables;
+    const set: Record<string, unknown> = { mfaBackupCodes: remainingCodes };
+    if (!this.isSQLite()) set.updatedAt = Date.now();
+    const result = await this.db
+      .update(users)
+      .set(set)
+      .where(and(eq(users.id, userId), eq(users.mfaBackupCodes, expectedCodes)));
+    return this.getAffectedRows(result) > 0;
   }
 
   /**
@@ -900,21 +981,29 @@ export class AuthRepository extends BaseRepository {
   }
 
   /**
-   * Cleanup old audit log entries
+   * Delete audit log entries older than `days` (#5870). Batched by id so the
+   * first run on a never-pruned table (millions of rows) is many short
+   * statements, not one long lock or one round-trip per row.
    */
-  async cleanupOldAuditLogs(days: number = 90): Promise<number> {
+  async cleanupOldAuditLogs(days: number = 90, batchSize: number = 5000): Promise<number> {
     const cutoff = this.now() - (days * 24 * 60 * 60 * 1000);
     const { auditLog } = this.tables;
 
-    const toDelete = await this.db
-      .select({ id: auditLog.id })
-      .from(auditLog)
-      .where(lt(auditLog.timestamp, cutoff));
-
-    for (const entry of toDelete) {
-      await this.db.delete(auditLog).where(eq(auditLog.id, entry.id));
+    let deleted = 0;
+    for (;;) {
+      const batch = await this.db
+        .select({ id: auditLog.id })
+        .from(auditLog)
+        .where(lt(auditLog.timestamp, cutoff))
+        .orderBy(auditLog.id)
+        .limit(batchSize);
+      if (batch.length === 0) break;
+      const ids = batch.map((r: { id: number }) => Number(r.id));
+      await this.db.delete(auditLog).where(inArray(auditLog.id, ids));
+      deleted += ids.length;
+      if (batch.length < batchSize) break;
     }
-    return toDelete.length;
+    return deleted;
   }
 
   // ============ SESSIONS ============
@@ -965,6 +1054,39 @@ export class AuthRepository extends BaseRepository {
     for (const session of toDelete) {
       await this.db.delete(sessions).where(eq(sessions.sid, session.sid));
     }
+    return toDelete.length;
+  }
+
+  /**
+   * Delete every session belonging to a user, optionally keeping one (the
+   * caller's current session). Used to terminate active sessions after a
+   * password reset or change (#6074 / #6077) so a stolen cookie stops working.
+   *
+   * The owning user is stored inside the serialized session JSON, not a column,
+   * so we scan rows and match in JS — portable across all three backends and
+   * cheap given the small session count.
+   */
+  async deleteSessionsByUserId(userId: number, exceptSid?: string): Promise<number> {
+    const { sessions } = this.tables;
+    const rows = await this.db
+      .select({ sid: sessions.sid, sess: sessions.sess })
+      .from(sessions);
+
+    const toDelete: string[] = [];
+    for (const row of rows) {
+      if (exceptSid && row.sid === exceptSid) continue;
+      try {
+        const parsed = JSON.parse(row.sess) as { userId?: unknown };
+        if (parsed && Number(parsed.userId) === Number(userId)) {
+          toDelete.push(row.sid);
+        }
+      } catch {
+        // Unparseable session row — leave it for the expiry sweep.
+      }
+    }
+
+    if (toDelete.length === 0) return 0;
+    await this.db.delete(sessions).where(inArray(sessions.sid, toDelete));
     return toDelete.length;
   }
 

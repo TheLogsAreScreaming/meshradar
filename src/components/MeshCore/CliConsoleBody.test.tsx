@@ -21,6 +21,9 @@ describe('CliConsoleBody — DANGER_COMMAND_PATTERN', () => {
     ['clkreboot'],
     ['factory reset'],
     ['set factory mode'],
+    ['poweroff'],
+    ['shutdown'],
+    [`set prv.key ${'ab'.repeat(64)}`],
   ])('flags danger command %s', (cmd) => {
     expect(DANGER_COMMAND_PATTERN.test(cmd)).toBe(true);
   });
@@ -33,6 +36,7 @@ describe('CliConsoleBody — DANGER_COMMAND_PATTERN', () => {
     ['set reboot.interval 30'],
     ['ver'],
     ['stats'],
+    ['get prv.key'],
   ])('does not flag non-danger command %s', (cmd) => {
     expect(DANGER_COMMAND_PATTERN.test(cmd)).toBe(false);
   });
@@ -64,5 +68,41 @@ describe('CliConsoleBody — command input focus (#3752)', () => {
     await waitFor(() => expect(document.activeElement).toBe(input));
     // And the field was cleared, ready for the next command.
     expect(input.value).toBe('');
+  });
+});
+
+describe('CliConsoleBody — timeoutHint (#5785)', () => {
+  const send = (cmd: string) => {
+    const input = screen.getByPlaceholderText(/Type a command/) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: cmd } });
+    fireEvent.click(screen.getByText('Send'));
+  };
+  const HINT = 'No reply. If the node rebooted or dropped the session, log in again.';
+
+  it('appends the hint after a CLI_TIMEOUT error, after the error line', async () => {
+    const runCommand = vi.fn().mockResolvedValue({ ok: false, error: 'timed out', code: 'CLI_TIMEOUT' });
+    render(<CliConsoleBody targetId="t-hint-1" targetName="R" runCommand={runCommand} actionCatalog={[]} timeoutHint={HINT} />);
+    send('ver');
+    const hint = await screen.findByText(HINT);
+    const error = screen.getByText(/timed out/);
+    // The hint follows the error in the transcript.
+    expect(error.compareDocumentPosition(hint) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('does not append it for other errors, or without the prop', async () => {
+    const runCommand = vi.fn().mockResolvedValue({ ok: false, error: 'send failed', code: 'OTHER' });
+    const { unmount } = render(
+      <CliConsoleBody targetId="t-hint-2" targetName="R" runCommand={runCommand} actionCatalog={[]} timeoutHint={HINT} />,
+    );
+    send('ver');
+    await screen.findByText(/send failed/);
+    expect(screen.queryByText(HINT)).toBeNull();
+    unmount();
+
+    const timeout = vi.fn().mockResolvedValue({ ok: false, error: 'timed out', code: 'CLI_TIMEOUT' });
+    render(<CliConsoleBody targetId="t-hint-3" targetName="R" runCommand={timeout} actionCatalog={[]} />);
+    send('ver');
+    await screen.findByText(/timed out/);
+    expect(screen.queryByText(HINT)).toBeNull();
   });
 });

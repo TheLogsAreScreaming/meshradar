@@ -5,19 +5,23 @@
  * Handles the Messages/DM tab with node list and conversation view.
  */
 
-import React, { useRef, useCallback, useState, useMemo, useEffect } from 'react';
+import React, { Suspense, useRef, useCallback, useState, useMemo, useEffect } from 'react';
 import '../styles/messages.css';
 import { useResizable } from '../hooks/useResizable';
-import { useAutoResizeTextarea } from '../hooks/useAutoResizeTextarea';
 import { useTranslation, Trans } from 'react-i18next';
 import { DeviceInfo, Channel } from '../types/device';
 import { MeshMessage } from '../types/message';
 import { ResourceType } from '../types/permission';
+import { MuteMenu } from './notifications/MuteMenu';
+import { MarkAllReadButton } from './messages/MarkAllReadButton';
+import { DmFilterSelect } from './messages/DmFilterSelect';
+import { NodeStatChips } from './nodes/NodeStatChips';
+import { passesDmFilter } from '../utils/dmListFilter';
+import { formatMessagePreview } from '../utils/messagePreview';
 import { TimeFormat, DateFormat, useNotificationMuteSettings } from '../contexts/SettingsContext';
 import {
   formatDateTime,
   formatRelativeTime,
-  formatMessageTime,
   getMessageDateSeparator,
   shouldShowDateSeparator,
 } from '../utils/datetime';
@@ -32,15 +36,10 @@ import { useTraceroutePairHistory } from '../hooks/useTraceroutePairHistory';
 import { getMessageSortTime } from '../utils/messageSort';
 import KeyMismatchWarning from './security/KeyMismatchWarning';
 import { NodeIdentityChangeNotice } from './NodeIdentityChangeNotice';
-import { getUtf8ByteLength, formatByteCount } from '../utils/text';
-import { isReplyTo, isTapbackMessage, isTapbackOf } from '../utils/messageReplies';
-import { SenderAvatar, SenderNameButton, StatusEmojiIndicator } from './SenderAvatar';
+import { isTapbackMessage } from '../utils/messageReplies';
+import { SenderNameButton, StatusEmojiIndicator } from './SenderAvatar';
 import { isDeviceDbWarningMitigatable } from '../utils/deviceDbWarning';
-import { applyHomoglyphOptimization } from '../utils/homoglyph';
 import { calculateDistance, formatDistance, getDistanceToNode } from '../utils/distance';
-import { renderMessageWithLinks } from '../utils/linkRenderer';
-import MentionAutocomplete from './mentions/MentionAutocomplete';
-import { useMentionAutocomplete } from '../hooks/useMentionAutocomplete';
 import { mentionCandidatesFromNodes } from '../utils/mentionCandidates';
 import { getMessageContentMatchNodeIds } from '../utils/messageContentFilter';
 import { isNodeComplete, isInfrastructureNode, hasValidPosition, parseNodeId, formatSenderLabel } from '../utils/nodeHelpers';
@@ -51,18 +50,16 @@ import { useSettings } from '../contexts/SettingsContext';
 import { nodeColorStyle } from '../utils/nodeColor';
 import { useDeviceNodes, useTelemetryNodes, setNodeFieldInCache } from '../hooks/useServerData';
 import { useQueryClient } from '@tanstack/react-query';
-import HopCountDisplay from './HopCountDisplay';
-import LinkPreview from './LinkPreview';
+import { sourcePollQueryKey } from '../hooks/pollQueryKey';
 import NodeDetailsBlock from './NodeDetailsBlock';
-import TelemetryGraphs from './TelemetryGraphs';
-import SmartHopsGraphs from './SmartHopsGraphs';
-import LinkQualityGraph from './LinkQualityGraph';
-import PacketStatsChart, { ChartDataEntry, DISTRIBUTION_COLORS } from './PacketStatsChart';
+import AircraftMarkMenuItems from './AircraftMarkMenuItems';
+import { type ChartDataEntry, DISTRIBUTION_COLORS } from './packetStatsChartData';
+import { lazyWithPreload } from '../utils/lazyWithPreload';
 import { getPacketDistributionStats } from '../services/packetApi';
 import { PacketDistributionStats } from '../types/packet';
 
-import { MessageEmojiButton } from './MessageEmojiButton';
-import { MessageStatusIndicator } from './MessageStatusIndicator';
+import MessageComposeInput from './MessageComposeInput';
+import { useComposeDraftStore } from '../contexts/composeDraftStore';
 import MessageDetailsModal from './diagnostics/MessageDetailsModal';
 import type { MessageDirection } from '../utils/deliveryDiagnostics/types';
 import TelemetryRequestModal, { TelemetryType } from './TelemetryRequestModal';
@@ -71,14 +68,45 @@ import { useToast } from './ToastContainer';
 import apiService, { type TracerouteParticipationEntry } from '../services/api';
 import { useCsrfFetch } from '../hooks/useCsrfFetch';
 import { useSource } from '../contexts/SourceContext';
+import { sourceTypeMeshProtocol } from '../utils/meshProtocol';
 import { computeMessagesReadOnlyState } from './messagesReadOnlyState';
 import { UiIcon } from './icons';
-import UnreadDivider from './messages/UnreadDivider';
 import { resolveUnreadAnchorId, shouldSuppressDivider } from '../utils/unreadAnchor';
 import { TranslateModal } from './translation/TranslateModal';
-import { TranslatedMessage } from './translation/TranslatedMessage';
 import { useViewTranslations } from '../hooks/useViewTranslations';
 import { useUnreadDividerAnchors } from '../contexts/MessagingContext';
+import { DmMessageRow, type MessageRowActions, type MessageRowNames } from './messages/DmMessageRow';
+import {
+  buildResponseIndex,
+  repliedMessageFor,
+  tapbacksFor,
+  useNodeNamesToken,
+} from './messages/messageRowSupport';
+import type { TranslatedMessageState } from './translation/TranslatedMessage';
+
+/** The latest handlers behind the stable row callbacks (see `rowActions`). */
+interface RowLatest {
+  getNodeName: (nodeId: string) => string;
+  getNodeShortName: (nodeId: string) => string;
+  getSenderLabel: (nodeId: string) => string;
+  handleSenderClick: (nodeId: string, event?: React.MouseEvent | React.KeyboardEvent) => void;
+  handleRelayClick: (msg: MeshMessage) => Promise<void>;
+  handleResendMessage: (msg: MeshMessage) => Promise<void>;
+  handleDeleteMessage: (msg: MeshMessage) => Promise<void>;
+  handleSendTapback: (emoji: string, msg: MeshMessage) => void;
+  setReplyingTo: (msg: MeshMessage | null) => void;
+  setEmojiPickerMessage: (msg: MeshMessage | null) => void;
+  translateMessage: (msgId: string, text: string, targetLang?: string) => Promise<void>;
+  dismissTranslation: (msgId: string) => void;
+  setDetailsState: (state: { message: MeshMessage; direction: MessageDirection } | null) => void;
+}
+
+// The DM pane's graphs are the tab's only recharts users: they load as lazy
+// chunks once a node is selected, not with the message list.
+const TelemetryGraphs = lazyWithPreload(() => import('./TelemetryGraphs'));
+const SmartHopsGraphs = lazyWithPreload(() => import('./SmartHopsGraphs'));
+const LinkQualityGraph = lazyWithPreload(() => import('./LinkQualityGraph'));
+const PacketStatsChart = lazyWithPreload(() => import('./PacketStatsChart'));
 
 // Types for node with message metadata
 interface NodeWithMessages extends DeviceInfo {
@@ -182,9 +210,8 @@ export interface MessagesTabProps {
   clearComposeFocus?: () => void;
   setSelectedDMNode: (nodeId: string) => void;
 
-  // Message input
-  newMessage: string;
-  setNewMessage: (message: string) => void;
+  // Message input. The draft text itself is NOT a prop: MessageComposeInput
+  // reads it from the compose-draft store, so typing re-renders only the box.
   replyingTo: MeshMessage | null;
   setReplyingTo: (message: MeshMessage | null) => void;
 
@@ -305,8 +332,6 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   setSelectedDMNode,
   pendingComposeFocus = null,
   clearComposeFocus,
-  newMessage,
-  setNewMessage,
   replyingTo,
   setReplyingTo,
   unreadCountsData,
@@ -411,6 +436,17 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   // leaks between conversations. Cleared on reload (not persisted).
   const [unmessageableOverrides, setUnmessageableOverrides] = useState<Set<string>>(new Set());
 
+  // #6116: freeze the mobile "Select a conversation" <select> option list while
+  // the native picker is open/focused. On iOS Safari, re-rendering or reordering
+  // a native <select>'s <option> children while the picker is open resets its
+  // scroll to the top. A poll re-renders the labels (live SNR/battery/unread) and
+  // — with the #6115 unread-first rule — can reorder them, so an unread
+  // conversation made the open picker jump. Snapshot the options on focus, render
+  // the frozen list until blur, then settle to the live order.
+  const [frozenDropdownOptions, setFrozenDropdownOptions] = useState<
+    Array<{ key: string; value: string; label: string }> | null
+  >(null);
+
   // Handle scroll to detect if user has scrolled up
   const handleScroll = useCallback(() => {
     const container = dmMessagesContainerRef.current;
@@ -491,11 +527,9 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
     return () => clearTimeout(timer);
   }, [focusMessageId, onFocusMessageHandled]);
 
-  // Memoize byte count to avoid redundant homoglyph optimization on each render
-  const byteCountDisplay = useMemo(() => {
-    const message = homoglyphEnabled ? applyHomoglyphOptimization(newMessage) : newMessage;
-    return formatByteCount(getUtf8ByteLength(message));
-  }, [newMessage, homoglyphEnabled]);
+  // One-off reads/writes of the compose draft (bell, translate). Doesn't
+  // subscribe: only MessageComposeInput re-renders on a keystroke.
+  const composeDraftStore = useComposeDraftStore();
 
   // Telemetry request modal state
   const [showTelemetryRequestModal, setShowTelemetryRequestModal] = useState(false);
@@ -534,7 +568,10 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   const [adminScanLoading, setAdminScanLoading] = useState<string | null>(null);
   const { showToast } = useToast();
   const csrfFetch = useCsrfFetch();
-  const { sourceId } = useSource();
+  const { sourceId, sourceType } = useSource();
+  // Protocol stripe on each bubble (#5744). No source type (legacy
+  // single-source view) reads as Meshtastic.
+  const meshProtocol = sourceTypeMeshProtocol(sourceType);
   // Oldest-unread timestamp for the open DM, pinned at entry (#4607) — drives
   // the red "New messages" divider below.
   const { dm: pinnedFirstUnreadDM } = useUnreadDividerAnchors();
@@ -605,19 +642,11 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   // Refs
   const dmMessageInputRef = useRef<HTMLTextAreaElement>(null);
 
-  useAutoResizeTextarea(dmMessageInputRef, newMessage);
-
   // #5276: `@` mention autocomplete, same behaviour as the channel composer.
   const mentionCandidates = useMemo(
     () => mentionCandidatesFromNodes(nodes, currentNodeId),
     [nodes, currentNodeId]
   );
-  const mentions = useMentionAutocomplete({
-    value: newMessage,
-    onChange: setNewMessage,
-    textareaRef: dmMessageInputRef,
-    candidates: mentionCandidates,
-  });
 
   // Honor a "Send Direct Message" focus request from the node list (#4325).
   //
@@ -670,18 +699,48 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
     [nodes]
   );
 
+  // The memoized message rows (DmMessageRow) get their name lookups and
+  // callbacks through these, so a poll that changes no name and no handler
+  // leaves every row's props equal. Each call reads the latest function from
+  // `rowLatestRef`, which the render body fills in below.
+  const rowLatestRef = useRef<RowLatest | null>(null);
+  const namesToken = useNodeNamesToken(nodes);
+  const rowNames = useMemo<MessageRowNames>(() => ({
+    token: namesToken,
+    name: (nodeId) => rowLatestRef.current!.getNodeName(nodeId),
+    short: (nodeId) => rowLatestRef.current!.getNodeShortName(nodeId),
+    label: (nodeId) => rowLatestRef.current!.getSenderLabel(nodeId),
+  }), [namesToken]);
+  const rowActions = useMemo<MessageRowActions>(() => ({
+    senderClick: (nodeId, event) => rowLatestRef.current!.handleSenderClick(nodeId, event),
+    relayClick: (msg) => { void rowLatestRef.current!.handleRelayClick(msg); },
+    resend: (msg) => { void rowLatestRef.current!.handleResendMessage(msg); },
+    reply: (msg) => {
+      rowLatestRef.current!.setReplyingTo(msg);
+      dmMessageInputRef.current?.focus();
+    },
+    emoji: (msg) => rowLatestRef.current!.setEmojiPickerMessage(msg),
+    translate: (msgId, text, lang) => { void rowLatestRef.current!.translateMessage(msgId, text, lang); },
+    dismissTranslation: (msgId) => rowLatestRef.current!.dismissTranslation(msgId),
+    remove: (msg) => { void rowLatestRef.current!.handleDeleteMessage(msg); },
+    tapback: (emoji, msg) => rowLatestRef.current!.handleSendTapback(emoji, msg),
+    showDetails: (msg) => rowLatestRef.current!.setDetailsState({ message: msg, direction: 'sent' }),
+  }), []);
+
   // Mention tokens resolve to the node's CURRENT name at render time (#5276).
+  // Keyed on the names token rather than the node list, so it stays the same
+  // object across polls that rename no one (it is a row prop).
   const mentionRenderOptions = useMemo(() => ({
     resolveNodeName: (nodeId: string) => {
-      const name = getNodeName(nodeId);
+      const name = rowNames.name(nodeId);
       return name && name !== nodeId ? name : undefined;
     },
     // Pass the real event: handleSenderClick measures event.currentTarget to
     // place the node popup next to what was clicked.
     onMentionClick: (nodeId: string, event: React.MouseEvent | React.KeyboardEvent) =>
-      handleSenderClick(nodeId, event as React.MouseEvent),
+      rowActions.senderClick(nodeId, event),
     selfNodeId: currentNodeId,
-  }), [getNodeName, handleSenderClick, currentNodeId]);
+  }), [rowNames, rowActions, currentNodeId]);
 
   // Status message per sender, for the avatar badge (#5645).
   const statusByNodeId = useMemo(() => {
@@ -986,6 +1045,23 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
   const { translationSettings, translatedMessages, translateMessage, dismissTranslation } =
     useViewTranslations(sourceId, storedTranslationIds);
 
+  // Latest handlers and name lookups for the stable `rowNames` / `rowActions`.
+  rowLatestRef.current = {
+    getNodeName,
+    getNodeShortName,
+    getSenderLabel,
+    handleSenderClick,
+    handleRelayClick,
+    handleResendMessage,
+    handleDeleteMessage,
+    handleSendTapback,
+    setReplyingTo,
+    setEmojiPickerMessage,
+    translateMessage,
+    dismissTranslation,
+    setDetailsState,
+  };
+
   // Permission check
   if (!hasPermission('messages', 'read')) {
     return (
@@ -1022,7 +1098,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
           : null;
 
       const lastMessageText = lastMessage
-        ? (lastMessage.text || '').substring(0, 50) + (lastMessage.text && lastMessage.text.length > 50 ? '...' : '')
+        ? formatMessagePreview(lastMessage.text)
         : '';
 
       return {
@@ -1065,31 +1141,37 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
       if (stickyNodes.has(node.nodeNum)) return true;
 
       // Apply filter conditions
-      switch (dmFilter) {
-        case 'unread':
-          return node.unreadCount > 0;
-        case 'recent': {
-          const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-          return node.lastMessageTime > oneDayAgo;
-        }
-        case 'favorites':
-          return node.isFavorite === true;
-        case 'withPosition':
-          return hasValidPosition(node);
-        case 'noInfra':
-          return !isInfrastructureNode(node);
-        case 'hops':
-        case 'all':
-        default:
-          return true;
-      }
+      return passesDmFilter(
+        {
+          unread: node.unreadCount > 0,
+          lastMessageTime: node.lastMessageTime,
+          isFavorite: node.isFavorite === true,
+          hasPosition: hasValidPosition(node),
+          isInfrastructure: isInfrastructureNode(node),
+        },
+        dmFilter
+      );
     })
     .sort((a, b) => {
-      // Sticky nodes always come first
+      // Sticky nodes always come first. Sticky is a deliberate user pin, so it
+      // outranks the unread-first rule below (#6115 decision: sticky > unread).
       const aSticky = stickyNodes.has(a.nodeNum);
       const bSticky = stickyNodes.has(b.nodeNum);
       if (aSticky && !bSticky) return -1;
       if (!aSticky && bSticky) return 1;
+
+      // #6115: conversations with unread DMs sort to the top — ahead of
+      // favorites and of every filter's ordering — newest message first. A new
+      // DM from a non-favorite node must not sit below favorites or get buried
+      // by a hops-based filter.
+      const aUnread = a.unreadCount > 0;
+      const bUnread = b.unreadCount > 0;
+      if (aUnread && !bUnread) return -1;
+      if (!aUnread && bUnread) return 1;
+      if (aUnread && bUnread) {
+        const unreadMsgDiff = (b.lastMessageTime || 0) - (a.lastMessageTime || 0);
+        if (unreadMsgDiff !== 0) return unreadMsgDiff;
+      }
 
       // For hops-based filters, sort by hops ascending
       if (['hops', 'favorites', 'withPosition', 'noInfra'].includes(dmFilter)) {
@@ -1126,6 +1208,46 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
       (node.user?.id ? messageContentMatchNodeIds.has(node.user.id) : false)
     );
   });
+
+  // Options for the mobile "Select a conversation" <select>, built from the
+  // same sorted list as the desktop node list so both agree on order (#6115).
+  // Labels are flattened to strings so a frozen snapshot (#6116) can be compared
+  // and re-rendered identically without touching the DOM.
+  const mobileDropdownOptions = sortedNodesWithMessages
+    .filter(node => {
+      if (!showIncompleteNodes && !isNodeComplete(node)) return false;
+      if (!messagesNodeFilter) return true;
+      const searchTerm = messagesNodeFilter.toLowerCase();
+      return (
+        node.user?.longName?.toLowerCase().includes(searchTerm) ||
+        node.user?.shortName?.toLowerCase().includes(searchTerm) ||
+        node.user?.id?.toLowerCase().includes(searchTerm) ||
+        // Issue #3922: also match conversations by message content.
+        (node.user?.id ? messageContentMatchNodeIds.has(node.user.id) : false)
+      );
+    })
+    .map(node => {
+      const displayName = node.user?.longName || `Node ${node.nodeNum}`;
+      const shortName = node.user?.shortName || '-';
+      const snr = node.snr != null ? ` ${node.snr.toFixed(1)}dB` : '';
+      const battery =
+        node.deviceMetrics?.batteryLevel !== undefined && node.deviceMetrics.batteryLevel !== null
+          ? node.deviceMetrics.batteryLevel === 101
+            ? ` ${t('node_popup.power_plugged', 'Plugged In')}`
+            : ` ${node.deviceMetrics.batteryLevel}%`
+          : '';
+      const unread = node.unreadCount > 0 ? ` (${node.unreadCount})` : '';
+      const favPrefix = node.isFavorite ? `[${t('meshcore.favorite.is_favorite', 'Favorite')}] ` : '';
+      return {
+        key: node.user?.id || String(node.nodeNum),
+        value: node.user?.id || '',
+        label: `${favPrefix}${displayName} (${shortName})${snr}${battery}${unread}`,
+      };
+    });
+
+  // #6116: while the native picker is focused/open, render the frozen snapshot
+  // captured on focus; otherwise render the live (and possibly reordered) list.
+  const renderedDropdownOptions = frozenDropdownOptions ?? mobileDropdownOptions;
 
   // Get DM messages for selected node
   const selectedDMMessages = selectedDMNode
@@ -1201,13 +1323,12 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
           {!isMessagesNodeListCollapsed && (
             <div className="sidebar-header-content">
               <h3>{t('messages.nodes_header')}</h3>
-              <button
+              <MarkAllReadButton
                 className="mark-all-read-btn"
-                onClick={() => markMessagesAsRead(undefined, undefined, undefined, true)}
+                onMarkAll={() => markMessagesAsRead(undefined, undefined, undefined, true)}
                 title={t('messages.mark_all_read_title')}
-              >
-                {t('messages.mark_all_read_button')}
-              </button>
+                label={t('messages.mark_all_read_button')}
+              />
             </div>
           )}
           {!isMessagesNodeListCollapsed && (
@@ -1233,20 +1354,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                 )}
               </div>
               <div className="sort-controls">
-                <select
-                  value={dmFilter}
-                  onChange={e => setDmFilter(e.target.value as 'all' | 'unread' | 'recent' | 'hops' | 'favorites' | 'withPosition' | 'noInfra')}
-                  className="sort-dropdown"
-                  title={t('messages.filter_conversations_title')}
-                >
-                  <option value="all">{t('messages.all_conversations')}</option>
-                  <option value="unread">{t('messages.unread_only')}</option>
-                  <option value="recent">{t('messages.recent_24h')}</option>
-                  <option value="hops">{t('messages.by_hops')}</option>
-                  <option value="favorites">{t('messages.favorites_only')}</option>
-                  <option value="withPosition">{t('messages.with_position')}</option>
-                  <option value="noInfra">{t('messages.exclude_infrastructure')}</option>
-                </select>
+                <DmFilterSelect value={dmFilter} onChange={setDmFilter} />
               </div>
             </div>
           )}
@@ -1402,24 +1510,15 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                       </div>
 
                       <div className="node-stats">
-                        {node.hopsAway === 0 && node.snr != null && (
-                          <span className="stat" title={t('nodes.snr')}>
-                            <UiIcon name="wifi" size={14} /> {node.snr.toFixed(1)}dB
-                          </span>
-                        )}
-                        {node.hopsAway === 0 && node.rssi != null && (
-                          <span className="stat" title={t('nodes.rssi')}>
-                            <UiIcon name="radioSignal" size={14} /> {node.rssi}dBm
-                          </span>
-                        )}
-                        {(node.hopsAway != null || node.lastMessageHops != null) && (() => {
-                          const effectiveHops = getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
-                          return effectiveHops < 999 ? (
-                            <span className="stat" title={t('nodes.hops_away')}>
-                              <UiIcon name="link" size={14} /> {effectiveHops} {t('nodes.hop', { count: effectiveHops })}
-                            </span>
-                          ) : null;
-                        })()}
+                        <NodeStatChips
+                          snr={node.hopsAway === 0 ? node.snr : null}
+                          rssi={node.hopsAway === 0 ? node.rssi : null}
+                          hops={
+                            node.hopsAway != null || node.lastMessageHops != null
+                              ? getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum)
+                              : null
+                          }
+                        />
                         <DistanceDisplay
                           homeNode={homeNode}
                           targetNode={node}
@@ -1449,6 +1548,8 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
           <select
             className="node-dropdown-select"
             value={selectedDMNode || ''}
+            onFocus={() => setFrozenDropdownOptions(mobileDropdownOptions)}
+            onBlur={() => setFrozenDropdownOptions(null)}
             onChange={e => {
               const nodeId = e.target.value;
               setSelectedDMNode(nodeId);
@@ -1457,40 +1558,11 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
             }}
           >
             <option value="">{t('messages.select_conversation')}</option>
-            {sortedNodesWithMessages
-              .filter(node => {
-                if (!showIncompleteNodes && !isNodeComplete(node)) return false;
-                if (!messagesNodeFilter) return true;
-                const searchTerm = messagesNodeFilter.toLowerCase();
-                return (
-                  node.user?.longName?.toLowerCase().includes(searchTerm) ||
-                  node.user?.shortName?.toLowerCase().includes(searchTerm) ||
-                  node.user?.id?.toLowerCase().includes(searchTerm) ||
-                  // Issue #3922: also match conversations by message content.
-                  (node.user?.id ? messageContentMatchNodeIds.has(node.user.id) : false)
-                );
-              })
-              .map(node => {
-                const displayName = node.user?.longName || `Node ${node.nodeNum}`;
-                const shortName = node.user?.shortName || '-';
-                const snr = node.snr != null ? ` ${node.snr.toFixed(1)}dB` : '';
-                const battery =
-                  node.deviceMetrics?.batteryLevel !== undefined && node.deviceMetrics.batteryLevel !== null
-                    ? node.deviceMetrics.batteryLevel === 101
-                      ? ` ${t('node_popup.power_plugged', 'Plugged In')}`
-                      : ` ${node.deviceMetrics.batteryLevel}%`
-                    : '';
-                const unread = node.unreadCount > 0 ? ` (${node.unreadCount})` : '';
-
-                return (
-                  <option key={node.user?.id || node.nodeNum} value={node.user?.id || ''}>
-                    {node.isFavorite ? `[${t('meshcore.favorite.is_favorite', 'Favorite')}] ` : ''}
-                    {displayName} ({shortName}){snr}
-                    {battery}
-                    {unread}
-                  </option>
-                );
-              })}
+            {renderedDropdownOptions.map(opt => (
+              <option key={opt.key} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
           </select>
         </div>
 
@@ -1532,47 +1604,14 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                       <div className="actions-menu-overlay" onClick={() => setShowActionsMenu(false)} />
                       <div className="actions-menu-dropdown">
                         {/* Notification Mute Actions */}
-                        {isDMMuted(selectedDMNode) ? (
-                          <button
-                            className="actions-menu-item"
-                            onClick={async () => {
-                              await unmuteDM(selectedDMNode);
-                              setShowActionsMenu(false);
-                            }}
-                          >
-                            <UiIcon name="unmute" /> {t('notifications.unmute', 'Unmute notifications')}
-                          </button>
-                        ) : (
-                          <>
-                            <button
-                              className="actions-menu-item"
-                              onClick={async () => {
-                                await muteDM(selectedDMNode, null);
-                                setShowActionsMenu(false);
-                              }}
-                            >
-                              <UiIcon name="muted" /> {t('notifications.mute_indefinite', 'Mute notifications indefinitely')}
-                            </button>
-                            <button
-                              className="actions-menu-item"
-                              onClick={async () => {
-                                await muteDM(selectedDMNode, Date.now() + 60 * 60 * 1000);
-                                setShowActionsMenu(false);
-                              }}
-                            >
-                              <UiIcon name="time" /> {t('notifications.mute_1h', 'Mute for 1 hour')}
-                            </button>
-                            <button
-                              className="actions-menu-item"
-                              onClick={async () => {
-                                await muteDM(selectedDMNode, Date.now() + 7 * 24 * 60 * 60 * 1000);
-                                setShowActionsMenu(false);
-                              }}
-                            >
-                              <UiIcon name="calendar" /> {t('notifications.mute_1w', 'Mute for 1 week')}
-                            </button>
-                          </>
-                        )}
+                        <MuteMenu
+                          variant="items"
+                          muted={isDMMuted(selectedDMNode)}
+                          onMute={(until) => muteDM(selectedDMNode, until)}
+                          onUnmute={() => unmuteDM(selectedDMNode)}
+                          itemClassName="actions-menu-item"
+                          onDone={() => setShowActionsMenu(false)}
+                        />
                         <div className="actions-menu-divider" />
                         {/* Traceroute Actions — the active Traceroute and
                             request flows transmit to the mesh, so they're
@@ -1725,6 +1764,13 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                               <UiIcon name={selectedNode.isIgnored ? 'unencrypted' : 'blocked'} /> {selectedNode.isIgnored ? t('messages.unignore_node') : t('messages.ignore_node')}
                             </button>
                           </>
+                        )}
+
+                        {/* Aircraft classification override (#5715) — DB only,
+                            gated inside on nodes:write for this source and
+                            hidden on MeshCore/Reticulum sources. */}
+                        {selectedNode && (
+                          <AircraftMarkMenuItems node={selectedNode} onDone={() => setShowActionsMenu(false)} />
                         )}
 
                         {/* Map & Position */}
@@ -2004,236 +2050,68 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                 </div>
               )}
               {selectedDMMessages.length > 0 ? (
-                selectedDMMessages.map((msg, index) => {
-                  const isTraceroute = msg.portnum === 70;
-                  const isMine = isMyMessage(msg);
-                  const isReaction = isTapbackMessage(msg);
+                (() => {
+                  // One pass for tapbacks and quoted parents (was a filter +
+                  // find per row). Rules: utils/messageReplies via
+                  // messageRowSupport.
+                  const responseIndex = buildResponseIndex(selectedDMMessages);
+                  const today = new Date().toDateString();
+                  const canWrite = hasPermission('messages', 'write');
+                  return selectedDMMessages.map((msg, index) => {
+                    // Reactions show under their parent, not as rows.
+                    if (isTapbackMessage(msg)) return null;
+                    const isMine = isMyMessage(msg);
 
-                  // #4880: color an incoming ("theirs") bubble + sender dot by
-                  // the sender node under the active Node List Style. Own
-                  // messages keep the standard "mine" styling. Returns {} for
-                  // monochrome / unknown sender, leaving the theme look intact.
-                  const senderNode = isMine ? undefined : nodes.find(n => n.user?.id === msg.from);
-                  const senderColor = senderNode
-                    ? nodeColorStyle(nodeListStyle, {
-                        nodeNum: senderNode.nodeNum,
-                        hopsAway: senderNode.hopsAway,
-                        isFavorite: senderNode.isFavorite,
-                      })
-                    : {};
+                    // #4880: color an incoming ("theirs") bubble + sender dot by
+                    // the sender node under the active Node List Style. Own
+                    // messages keep the standard "mine" styling. Returns {} for
+                    // monochrome / unknown sender, leaving the theme look intact.
+                    const senderNode = isMine ? undefined : nodes.find(n => n.user?.id === msg.from);
+                    const senderColor = senderNode
+                      ? nodeColorStyle(nodeListStyle, {
+                          nodeNum: senderNode.nodeNum,
+                          hopsAway: senderNode.hopsAway,
+                          isFavorite: senderNode.isFavorite,
+                        })
+                      : {};
 
-                  if (isReaction) return null;
+                    const currentDate = new Date(msg.timestamp);
+                    const prevMsg = index > 0 ? selectedDMMessages[index - 1] : null;
+                    const prevDate = prevMsg ? new Date(prevMsg.timestamp) : null;
+                    const dateSeparator = shouldShowDateSeparator(prevDate, currentDate)
+                      ? getMessageDateSeparator(currentDate, dateFormat)
+                      : null;
+                    const translation: TranslatedMessageState | undefined = translatedMessages[msg.id];
 
-                  // Reply / tapback rules live in utils/messageReplies — the
-                  // Auto-Acknowledge response cap counts with the same ones.
-                  const reactions = selectedDMMessages.filter(m => isTapbackOf(m, msg));
-
-                  const repliedMessage = selectedDMMessages.find(m => isReplyTo(msg, m)) ?? null;
-
-                  const currentDate = new Date(msg.timestamp);
-                  const prevMsg = index > 0 ? selectedDMMessages[index - 1] : null;
-                  const prevDate = prevMsg ? new Date(prevMsg.timestamp) : null;
-                  const showSeparator = shouldShowDateSeparator(prevDate, currentDate);
-
-                  if (isTraceroute) {
                     return (
-                      <React.Fragment key={msg.id}>
-                        {showSeparator && (
-                          <div className="date-separator">
-                            <span className="date-separator-text">
-                              {getMessageDateSeparator(currentDate, dateFormat)}
-                            </span>
-                          </div>
-                        )}
-                        {unreadAnchorId === msg.id && <UnreadDivider />}
-                        <div className="message-item traceroute">
-                          <div className="message-header">
-                            <span className="message-from">{getSenderLabel(msg.from)}</span>
-                            <span className="message-time">
-                              {formatMessageTime(currentDate, timeFormat, dateFormat)}
-                              <HopCountDisplay
-                                hopStart={msg.hopStart}
-                                hopLimit={msg.hopLimit}
-                                rxSnr={msg.rxSnr}
-                                rxRssi={msg.rxRssi}
-                                relayNode={msg.relayNode}
-                                viaMqtt={msg.viaMqtt}
-                                viaStoreForward={msg.viaStoreForward}
-                                xeddsaSigned={msg.xeddsaSigned}
-                                onClick={() => handleRelayClick(msg)}
-                              />
-                            </span>
-                            <span className="traceroute-badge">{t('messages.traceroute_badge')}</span>
-                          </div>
-                          <div className="message-text" style={{ whiteSpace: 'pre-line', fontFamily: 'monospace' }}>
-                            {renderMessageWithLinks(msg.text)}
-                          </div>
-                        </div>
-                      </React.Fragment>
+                      <DmMessageRow
+                        key={msg.id}
+                        msg={msg}
+                        isMine={isMine}
+                        dateSeparator={dateSeparator}
+                        showUnreadDivider={unreadAnchorId === msg.id}
+                        reactions={tapbacksFor(responseIndex, msg)}
+                        repliedMessage={repliedMessageFor(responseIndex, msg)}
+                        senderStatus={statusByNodeId.get(msg.from)}
+                        senderBackground={senderColor.background}
+                        senderTextColor={senderColor.text}
+                        currentNodeId={currentNodeId}
+                        canWrite={canWrite}
+                        txDisabled={txDisabled}
+                        txDisabledTooltip={txDisabledTooltip}
+                        canTranslate={translationSettings.canTranslate}
+                        translation={translation}
+                        timeFormat={timeFormat}
+                        dateFormat={dateFormat}
+                        today={today}
+                        meshProtocol={meshProtocol}
+                        mentionOptions={mentionRenderOptions}
+                        names={rowNames}
+                        actions={rowActions}
+                      />
                     );
-                  }
-
-                  return (
-                    <React.Fragment key={msg.id}>
-                      {showSeparator && (
-                        <div className="date-separator">
-                          <span className="date-separator-text">
-                            {getMessageDateSeparator(currentDate, dateFormat)}
-                          </span>
-                        </div>
-                      )}
-                      {/* Red "New messages" line, directly above the oldest
-                          message unseen at entry (#4607). */}
-                      {unreadAnchorId === msg.id && <UnreadDivider />}
-                      <div 
-                        className={`message-bubble-container ${isMine ? 'mine' : 'theirs'}`}
-                        data-message-id={msg.id}
-                      >
-                        {!isMine && (
-                          <SenderAvatar
-                            shortName={getNodeShortName(msg.from)}
-                            status={statusByNodeId.get(msg.from)}
-                            title={t('channels.sender_click_title', { name: getNodeName(msg.from) })}
-                            onActivate={e => handleSenderClick(msg.from, e)}
-                            style={senderColor.background ? { background: senderColor.background, color: senderColor.text } : undefined}
-                          />
-                        )}
-                        <div className="message-content">
-                          {msg.replyId && (
-                            <div className="replied-message">
-                              <div className="reply-arrow">↳</div>
-                              <div className="reply-content">
-                                {repliedMessage ? (
-                                  <>
-                                    <div className="reply-from">{getNodeShortName(repliedMessage.from)}</div>
-                                    <div className="reply-text">{repliedMessage.text || t('messages.empty_message')}</div>
-                                  </>
-                                ) : (
-                                  <div className="reply-text" style={{ fontStyle: 'italic', opacity: 0.6 }}>
-                                    {t('messages.message_unavailable')}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          )}
-                          {hasPermission('messages', 'write') && (
-                            <div className="message-actions">
-                              {isMine ? (
-                                <button
-                                  className="resend-button"
-                                  onClick={() => handleResendMessage(msg)}
-                                  disabled={txDisabled}
-                                  title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : t('messages.resend_button_title')}
-                                  aria-label={t('messages.resend_button_title')}
-                                >
-                                  ↻
-                                </button>
-                              ) : (
-                                <button
-                                  className="reply-button"
-                                  onClick={() => {
-                                    setReplyingTo(msg);
-                                    dmMessageInputRef.current?.focus();
-                                  }}
-                                  title={t('messages.reply_button_title')}
-                                  aria-label={t('messages.reply_button_title')}
-                                >
-                                  <UiIcon name="reply" size={15} />
-                                </button>
-                              )}
-                              <button
-                                className="emoji-picker-button"
-                                onClick={() => setEmojiPickerMessage(msg)}
-                                disabled={txDisabled}
-                                title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : t('messages.emoji_button_title')}
-                                aria-label={t('messages.emoji_button_title')}
-                              >
-                                <UiIcon name="reaction" size={15} />
-                              </button>
-                              {translationSettings.canTranslate && msg.text && (
-                                <button
-                                  className="translate-button"
-                                  onClick={() => translateMessage(msg.id, msg.text)}
-                                  title={t('messages.translate', 'Translate')}
-                                  aria-label={t('messages.translate', 'Translate')}
-                                >
-                                  <UiIcon name="translate" size={15} />
-                                </button>
-                              )}
-                              <button
-                                className="delete-button"
-                                onClick={() => handleDeleteMessage(msg)}
-                                title={t('messages.delete_button_title')}
-                                aria-label={t('messages.delete_button_title')}
-                              >
-                                <UiIcon name="delete" size={15} />
-                              </button>
-                            </div>
-                          )}
-                          <div
-                            className={`message-bubble ${isMine ? 'mine' : 'theirs'}${senderColor.background ? ' message-bubble--colored' : ''}`}
-                            style={senderColor.background ? { background: senderColor.background, color: senderColor.text } : undefined}
-                          >
-                            <div className="message-text-row">
-                              <div className="message-text" style={{ whiteSpace: 'pre-line' }}>
-                                {renderMessageWithLinks(msg.text, mentionRenderOptions)}
-                              </div>
-                              <div className="message-meta">
-                                <span className="message-time">
-                                  {formatMessageTime(currentDate, timeFormat, dateFormat)}
-                                  <HopCountDisplay
-                                    hopStart={msg.hopStart}
-                                    hopLimit={msg.hopLimit}
-                                    rxSnr={msg.rxSnr}
-                                    rxRssi={msg.rxRssi}
-                                    relayNode={msg.relayNode}
-                                    viaMqtt={msg.viaMqtt}
-                                    viaStoreForward={msg.viaStoreForward}
-                                    xeddsaSigned={msg.xeddsaSigned}
-                                    onClick={() => handleRelayClick(msg)}
-                                  />
-                                </span>
-                              </div>
-                            </div>
-                            <LinkPreview text={msg.text} />
-                            {translatedMessages[msg.id] && (
-                              <TranslatedMessage
-                                state={translatedMessages[msg.id]}
-                                onDismiss={() => dismissTranslation(msg.id)}
-                                onRetry={translationSettings.canTranslate ? () => translateMessage(msg.id, msg.text) : undefined}
-                                onChangeTargetLang={translationSettings.canTranslate ? (newLang) => translateMessage(msg.id, msg.text, newLang) : undefined}
-                              />
-                            )}
-                            {reactions.length > 0 && (
-                              <div className="message-reactions">
-                                {/* Reaction chips stay clickable even when txDisabled — see the
-                                    matching comment in ChannelsTab.tsx (epic #4294 Phase 2, §3.2/§3.3):
-                                    they double as the read affordance for "who reacted", and a
-                                    re-tap while TX is off is caught by the handleSendTapback
-                                    failure-branch toast in App.tsx rather than pre-emptively blocked. */}
-                                {reactions.map(reaction => (
-                                  <span
-                                    key={reaction.id}
-                                    className={`reaction ${isMyMessage(reaction) ? 'mine' : 'theirs'}`}
-                                    title={t('messages.reaction_tooltip', { name: getNodeShortName(reaction.from) })}
-                                    onClick={() => handleSendTapback(reaction.text, msg)}
-                                  >
-                                    {reaction.text}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                        {isMine && (
-                          <div className="message-status">
-                            <MessageStatusIndicator message={msg} onShowDetails={() => setDetailsState({ message: msg, direction: 'sent' })} />
-                          </div>
-                        )}
-                      </div>
-                    </React.Fragment>
-                  );
-                })
+                  });
+                })()
               ) : (
                 <p className="no-messages">{t('messages.no_dm_yet')}</p>
               )}
@@ -2272,95 +2150,43 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                 )}
                 {hasPermission('messages', 'write') && (
                   <div className="message-input-container">
-                    <div className="input-with-counter" style={{ position: 'relative' }}>
-                      <MentionAutocomplete
-                        id="dm-mention-list"
-                        candidates={mentions.suggestions}
-                        activeIndex={mentions.activeIndex}
-                        onHover={mentions.setActiveIndex}
-                        onSelect={mentions.select}
-                      />
-                      <textarea
-                        ref={attachDmInput}
-                        value={newMessage}
-                        onChange={e => {
-                          setNewMessage(e.target.value);
-                          mentions.handleChange(e.target.value, e.target.selectionStart);
-                        }}
-                        onSelect={e => mentions.syncFromCaret(
-                          e.currentTarget.value,
-                          e.currentTarget.selectionStart
-                        )}
-                        onBlur={mentions.close}
-                        role="combobox"
-                        aria-expanded={mentions.isOpen}
-                        aria-controls={mentions.isOpen ? 'dm-mention-list' : undefined}
-                        aria-activedescendant={mentions.activeDescendantId('dm-mention-list')}
-                        aria-autocomplete="list"
-                        onFocus={scrollInputIntoView}
-                        placeholder={t('messages.dm_placeholder', { name: getNodeName(selectedDMNode) })}
-                        className="message-input"
-                        rows={1}
-                        disabled={txDisabled}
-                        title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : undefined}
-                        onKeyDown={e => {
-                          // An open suggestion list claims Enter/Tab/arrows first.
-                          if (mentions.handleKeyDown(e)) return;
-                          if (
-                            txDisabled ||
-                            !(
-                              e.key === 'Enter' &&
-                              !e.shiftKey &&
-                              !e.ctrlKey &&
-                              !e.metaKey &&
-                              !e.altKey &&
-                              !e.nativeEvent.isComposing
-                            )
-                          ) {
-                            return;
-                          }
-                          e.preventDefault();
-                          void handleSendDirectMessage(selectedDMNode);
-                        }}
-                      />
-                      <div className={byteCountDisplay.className}>
-                        {byteCountDisplay.text}
-                      </div>
-                    </div>
-                    <MessageEmojiButton
+                    <MessageComposeInput
+                      listId="dm-mention-list"
                       textareaRef={dmMessageInputRef}
-                      value={newMessage}
-                      onChange={setNewMessage}
-                    />
-                    <button
-                      onClick={() => { void onSendBell?.(selectedDMNode, newMessage); setNewMessage(''); }}
+                      inputRef={attachDmInput}
+                      mentionCandidates={mentionCandidates}
+                      homoglyphEnabled={homoglyphEnabled}
+                      placeholder={t('messages.dm_placeholder', { name: getNodeName(selectedDMNode) })}
                       disabled={txDisabled}
-                      className="send-btn channel-action-btn"
-                      title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : 'Send alert bell'}
-                      aria-label="Send alert bell"
-                    >
-                      <UiIcon name="notifications" size={16} />
-                    </button>
-                    {translationSettings.canTranslate && (
-                      <button
-                        onClick={() => setTranslateModalOpen(true)}
-                        disabled={txDisabled}
-                        className="send-btn channel-action-btn"
-                        title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : t('messages.translate', 'Translate message')}
-                        aria-label={t('messages.translate', 'Translate message')}
-                      >
-                        <UiIcon name="translate" size={16} />
-                      </button>
-                    )}
-                    <button
-                      onClick={() => handleSendDirectMessage(selectedDMNode)}
-                      disabled={!newMessage.trim() || txDisabled}
-                      className="send-btn"
-                      title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : undefined}
-                      aria-label={t('common.send')}
-                    >
-                      <UiIcon name="send" size={16} />
-                    </button>
+                      disabledTitle={txDisabledTooltip ?? t('tx_disabled.control_tooltip')}
+                      onFocus={scrollInputIntoView}
+                      onSend={() => { void handleSendDirectMessage(selectedDMNode); }}
+                      sendAriaLabel={t('common.send')}
+                      actions={
+                        <>
+                          <button
+                            onClick={() => { void onSendBell?.(selectedDMNode, composeDraftStore.get()); composeDraftStore.set(''); }}
+                            disabled={txDisabled}
+                            className="send-btn channel-action-btn"
+                            title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : 'Send alert bell'}
+                            aria-label="Send alert bell"
+                          >
+                            <UiIcon name="notifications" size={16} />
+                          </button>
+                          {translationSettings.canTranslate && (
+                            <button
+                              onClick={() => setTranslateModalOpen(true)}
+                              disabled={txDisabled}
+                              className="send-btn channel-action-btn"
+                              title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : t('messages.translate', 'Translate message')}
+                              aria-label={t('messages.translate', 'Translate message')}
+                            >
+                              <UiIcon name="translate" size={16} />
+                            </button>
+                          )}
+                        </>
+                      }
+                    />
                   </div>
                 )}
               </div>
@@ -2921,6 +2747,14 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                   await apiService.setNodeNotes(selectedNode.user.id, notes, sourceId);
                   showToast(t('node_details.notes_saved', 'Notes saved'), 'success');
                 }}
+                canEditChannel={hasPermission('nodes', 'write') && !!sourceId}
+                onSaveChannel={async (channel, locked) => {
+                  if (!selectedNode.user?.id) throw new Error('Node has no ID');
+                  if (!sourceId) throw new Error('No source selected');
+                  await apiService.setNodeChannel(selectedNode.user.id, channel, locked, sourceId);
+                  await queryClient.invalidateQueries({ queryKey: sourcePollQueryKey(sourceId) });
+                  showToast(t('node_details.channel_saved', 'Channel saved'), 'success');
+                }}
               />
             )}
 
@@ -3000,6 +2834,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                 </div>
               )}
 
+              <Suspense fallback={null}>
               <TelemetryGraphs
                 nodeId={selectedDMNode}
                 temperatureUnit={temperatureUnit}
@@ -3025,6 +2860,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                   chartId="node-packet-type"
                 />
               )}
+              </Suspense>
             </div>
             {/* End of dm-send-section */}
           </div>
@@ -3089,10 +2925,10 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
         <TranslateModal
           isOpen={translateModalOpen}
           onClose={() => setTranslateModalOpen(false)}
-          initialText={newMessage}
+          initialText={composeDraftStore.get()}
           defaultTargetLanguage={translationSettings.defaultOutgoingLanguage}
           defaultSourceLanguage={translationSettings.defaultLanguage}
-          onApply={(translatedText) => setNewMessage(translatedText)}
+          onApply={(translatedText) => composeDraftStore.set(translatedText)}
         />
       )}
     </div>

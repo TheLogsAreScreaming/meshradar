@@ -14,6 +14,10 @@
  *    view — you can see where the signal actually landed.
  *  - Reactions (emoji tapbacks) are hidden from the main feed and rendered as
  *    small bubbles on their parent message, matching MessagesTab behavior.
+ *  - MeshCore reactions become read-only chips on their target message. Row
+ *    refs from the server resolve across every loaded page; a reaction whose
+ *    target is not loaded is hidden, and one with no target shows as a dim
+ *    line (#5763).
  *  - Reply threading shows a quoted preview of the parent when `replyId` is
  *    set, resolved from the already-loaded page cache.
  *  - Source filter: optional dropdown that narrows to messages heard by a
@@ -21,7 +25,7 @@
  *    receptions, so this is a pure view filter).
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -34,14 +38,31 @@ import { foldUnifiedMessagePages } from '../utils/unifiedMessageAccumulator';
 import LinkPreview from '../components/LinkPreview';
 import '../styles/unified.css';
 import { UiIcon } from '../components/icons';
-import { resolveReplyPreview } from '../utils/replyPreview';
+import { resolveReplyPreview, type ReplyPreviewState } from '../utils/replyPreview';
 import { getSourceColor } from '../utils/sourceColors';
-import { isAnyMeshCoreSourceType } from '../utils/nodeTypeCategory';
+import { MESH_PROTOCOL_LABEL, sourceTypeMeshProtocol } from '../utils/meshProtocol';
+import protocolStripe from '../components/messages/ProtocolStripe.module.css';
+import { ALL_CHANNELS_PARAM } from '../utils/unifiedChannelFilter';
 import { hopDisplay } from './unifiedHops';
+import { groupUnifiedMeshCoreReactions } from './unifiedMeshCoreReactions';
+import {
+  readStoredUnifiedChannel,
+  resolveInitialUnifiedChannel,
+  writeStoredUnifiedChannel,
+} from './unifiedChannelPreference';
+import {
+  MeshCoreReactionChips,
+  MeshCoreUnmatchedReaction,
+} from '../components/MeshCore/MeshCoreReactionChips';
 import HopBadge from '../components/unified/HopBadge';
+import { MeshCoreClockOffset } from '../components/MeshCore/MeshCoreClockOffset';
+import { meshcoreClockOffsetMs } from '../utils/meshcoreMessageTime';
+import { messageRowPropsEqual } from '../components/messages/messageRowSupport';
+import type { ReactionChip } from '../components/MeshCore/meshcoreReactionGroups';
 import MessageExportDialog from '../components/MessageExportDialog/MessageExportDialog';
+import type { TranslateFn } from '../types/translate';
 
-type TFn = (key: string, options?: Record<string, unknown>) => string;
+type TFn = TranslateFn;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -80,6 +101,15 @@ interface UnifiedMessage {
   timestamp: number; // canonical device time (earliest heard) — for display
   createdAt: number; // earliest server DB arrival time — for ordering / pagination cursor (#3122)
   receptions: Reception[];
+  /** Non-reaction MeshCore entries: ids other entries' reaction refs point at. */
+  meshcoreRowRefs?: string[];
+  /** MeshCore reaction entries: `text` is the emoji. */
+  reactionEmoji?: string;
+  /** Refs of the targeted rows; empty means unmatched. */
+  reactionTargetRefs?: string[];
+  /** MeshCore DM / channel entry: wire sender second, for the clock offset (#5973).
+   *  Its `timestamp` is then the earliest receipt time. */
+  senderTimestamp?: number | null;
 }
 
 interface UnifiedChannel {
@@ -97,6 +127,169 @@ interface ChannelCollisionRow {
 }
 
 // ── Constants ────────────────────────────────────────────────────────────
+
+/**
+ * Channel shown on a row of the "All Channels" view (#5361). The server names
+ * every row; the fallback covers a slot with no name on any source.
+ */
+function channelTag(msg: { channel: number; channelName?: string }): string {
+  return msg.channelName || `Channel ${msg.channel}`;
+}
+
+const NO_UNIFIED_MESSAGES: UnifiedMessage[] = [];
+const NO_CHIPS: ReactionChip[] = [];
+
+interface UnifiedMessageRowProps {
+  msg: UnifiedMessage;
+  /** Day divider above the row, or null for none. */
+  dateLabel: string | null;
+  showChannelTag: boolean;
+  /** Source ids in view, in order: decides each source tag's colour. */
+  sourceOrder: string[];
+  reactions: UnifiedMessage[];
+  replyPreview: ReplyPreviewState<UnifiedMessage>;
+  chips: ReactionChip[];
+  onOpen: (msg: UnifiedMessage) => void;
+}
+
+/**
+ * One feed row, memoized: a poll that adds one message renders one row.
+ * Props compare by value (`messageRowPropsEqual`), since each poll rebuilds
+ * the per-row lookups.
+ */
+const UnifiedMessageRow = memo(function UnifiedMessageRow({
+  msg,
+  dateLabel,
+  showChannelTag,
+  sourceOrder,
+  reactions,
+  replyPreview,
+  chips,
+  onOpen,
+}: UnifiedMessageRowProps) {
+  const { t } = useTranslation();
+  // Left border = mesh protocol (#5744). Every reception of one packet
+  // is on the same protocol, so the first one decides. Source identity
+  // stays on the per-source tags below.
+  const protocol = sourceTypeMeshProtocol(msg.receptions[0]?.sourceType);
+  const receptionCount = msg.receptions.length;
+  const divider = dateLabel !== null && (
+    <div className="unified-date-divider">
+      <span>{dateLabel}</span>
+    </div>
+  );
+
+  if (msg.reactionEmoji) {
+    return (
+      <div>
+        {divider}
+        <MeshCoreUnmatchedReaction name={senderLabel(msg)} emoji={msg.reactionEmoji} />
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {divider}
+      <div
+        className={`unified-msg-card unified-msg-card--clickable ${protocolStripe.stripe}`}
+        data-protocol={protocol}
+        title={t('unified.messages.protocol_title', {
+          defaultValue: '{{protocol}} message',
+          protocol: MESH_PROTOCOL_LABEL[protocol],
+        })}
+        onClick={() => onOpen(msg)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onOpen(msg);
+          }
+        }}
+      >
+        <div className="unified-msg-card__meta">
+          {showChannelTag && (
+            <span
+              className="unified-msg-card__channel-tag"
+              title={t('unified.messages.channel_label', { channel: channelTag(msg) })}
+            >
+              #{channelTag(msg)}
+            </span>
+          )}
+          {msg.receptions.map((r) => (
+            <span
+              key={r.sourceId}
+              className="unified-msg-card__source-tag"
+              style={{
+                background: `color-mix(in srgb, ${getSourceColor(r.sourceId, sourceOrder)} 15%, transparent)`,
+                color: getSourceColor(r.sourceId, sourceOrder),
+                border: `1px solid color-mix(in srgb, ${getSourceColor(r.sourceId, sourceOrder)} 35%, transparent)`,
+              }}
+              title={t('unified.messages.heard_by_source', { name: r.sourceName })}
+            >
+              {r.sourceName}
+              <HopBadge reception={r} sourceName={r.sourceName} />
+            </span>
+          ))}
+          {receptionCount > 1 && (
+            <span className="unified-msg-card__reception-count">
+              {t('unified.messages.heard_by_count', { count: receptionCount })}
+            </span>
+          )}
+          <span className="unified-msg-card__sender">{senderLabel(msg)}</span>
+          <span className="unified-msg-card__time">
+            {formatTime(msg.timestamp)}
+            {msg.senderTimestamp !== undefined && (
+              <MeshCoreClockOffset offsetMs={meshcoreClockOffsetMs(msg.createdAt, msg.senderTimestamp)} />
+            )}
+          </span>
+        </div>
+
+        {replyPreview.kind !== 'none' && (
+          <div className="unified-reply-preview">
+            <span className="unified-reply-preview__arrow">↳</span>
+            {replyPreview.kind === 'resolved' ? (
+              <>
+                <span className="unified-reply-preview__from">
+                  {shortSenderLabel(replyPreview.parent)}
+                </span>
+                <span className="unified-reply-preview__text">
+                  {replyPreview.parent.text || t('unified.no_text')}
+                </span>
+              </>
+            ) : (
+              // #4245: the parent packet was never received or has since
+              // been purged. Still show the reply box so the message is
+              // recognizable as a reply, rather than silently dropping
+              // replyId and rendering it as an ordinary message.
+              <span className="unified-reply-preview__text unified-reply-preview__text--unknown">
+                {t('unified.messages.unknown_parent', 'Unknown message')}
+              </span>
+            )}
+          </div>
+        )}
+
+        <div className="unified-msg-card__text">
+          {msg.text ? renderMessageWithLinks(msg.text) : <em style={{ opacity: 0.4 }}>{t('unified.no_text')}</em>}
+        </div>
+        {msg.text && <LinkPreview text={msg.text} />}
+
+        {reactions.length > 0 && (
+          <div className="unified-reactions">
+            {reactions.map((r) => (
+              <span key={r.dedupKey} className="unified-reaction" title={senderLabel(r)}>
+                {r.text}
+                <span className="unified-reaction__from">{shortSenderLabel(r)}</span>
+              </span>
+            ))}
+          </div>
+        )}
+        <MeshCoreReactionChips chips={chips} />
+      </div>
+    </div>
+  );
+}, messageRowPropsEqual);
 
 const PAGE_SIZE = 100;
 const POLL_INTERVAL_MS = 10_000;
@@ -167,12 +360,17 @@ export default function UnifiedMessagesPage() {
     staleTime: 60_000,
   });
 
-  // Auto-select the first channel when the list loads if nothing is picked yet.
+  // Pick a channel when the list loads if nothing is picked yet: the one the
+  // user last chose in this browser (#5792), else Primary / LongFast, else the
+  // first channel. Only a manual pick is remembered, not this automatic one.
   useEffect(() => {
     if (!selectedChannel && channels.length > 0) {
-      // Prefer a channel literally named "Primary" or "LongFast" if present.
-      const preferred = channels.find((c) => /^(primary|longfast)$/i.test(c.name));
-      setSelectedChannel(preferred?.name ?? channels[0].name);
+      setSelectedChannel(
+        resolveInitialUnifiedChannel(
+          channels.map((c) => c.name),
+          readStoredUnifiedChannel(),
+        ),
+      );
     }
   }, [channels, selectedChannel]);
 
@@ -212,7 +410,7 @@ export default function UnifiedMessagesPage() {
   // Names of channels colliding with the viewed channel — the "other side" of
   // each collision (the entry messages may be landing under, or vice versa).
   const overshadowNames = useMemo(() => {
-    if (!selectedChannel) return [] as string[];
+    if (!selectedChannel || selectedChannel === ALL_CHANNELS_PARAM) return [] as string[];
     const sel = selectedChannel.trim().toLowerCase();
     const names = new Set<string>();
     for (const c of channelCollisions) {
@@ -237,6 +435,8 @@ export default function UnifiedMessagesPage() {
     queryKey: ['unified', 'messages', selectedChannel],
     queryFn: async ({ pageParam }) => {
       const params = new URLSearchParams();
+      // "All Channels" sends its own value: with no `channel` the server
+      // takes the legacy path, which includes DMs and does not page.
       if (selectedChannel) params.set('channel', selectedChannel);
       params.set('limit', String(PAGE_SIZE));
       if (pageParam !== undefined && pageParam !== null) {
@@ -278,6 +478,9 @@ export default function UnifiedMessagesPage() {
     return foldUnifiedMessagePages(accumulatorRef.current, data?.pages);
   }, [data?.pages, selectedChannel]);
 
+  // MeshCore reactions fold into chips on their target (#5763).
+  const mcReactions = useMemo(() => groupUnifiedMeshCoreReactions(allMessages), [allMessages]);
+
   // ── All distinct sources heard across the loaded set ──────────────────
   const sourcesInView = useMemo(() => {
     const map = new Map<string, string>();
@@ -300,9 +503,10 @@ export default function UnifiedMessagesPage() {
 
   // ── Apply source filter ───────────────────────────────────────────────
   const filteredMessages = useMemo(() => {
-    if (!sourceFilter) return allMessages;
-    return allMessages.filter((m) => m.receptions.some((r) => r.sourceId === sourceFilter));
-  }, [allMessages, sourceFilter]);
+    const rows = mcReactions.rows;
+    if (!sourceFilter) return rows;
+    return rows.filter((m) => m.receptions.some((r) => r.sourceId === sourceFilter));
+  }, [mcReactions, sourceFilter]);
 
   // Build a quick index by packet id for reply preview + reaction grouping.
   // Meshtastic firmware sets `reply_id` to the parent's meshpacket id, not its
@@ -431,9 +635,11 @@ export default function UnifiedMessagesPage() {
         <div className="unified-header__title">
           <h1>{t('unified.messages.title')}</h1>
           <p>
-            {selectedChannel
-              ? t('unified.messages.subtitle_channel', { channel: selectedChannel })
-              : t('unified.messages.subtitle_none')}
+            {selectedChannel === ALL_CHANNELS_PARAM
+              ? t('unified.messages.subtitle_all_channels')
+              : selectedChannel
+                ? t('unified.messages.subtitle_channel', { channel: selectedChannel })
+                : t('unified.messages.subtitle_none')}
           </p>
         </div>
 
@@ -441,11 +647,19 @@ export default function UnifiedMessagesPage() {
           <select
             className="unified-select"
             value={selectedChannel}
-            onChange={(e) => setSelectedChannel(e.target.value)}
+            onChange={(e) => {
+              setSelectedChannel(e.target.value);
+              writeStoredUnifiedChannel(e.target.value);
+            }}
             disabled={loadingChannels || channels.length === 0}
             aria-label={t('unified.messages.channel_aria')}
           >
             {channels.length === 0 && <option value="">{t('unified.messages.no_channels')}</option>}
+            {channels.length > 0 && (
+              <option value={ALL_CHANNELS_PARAM}>
+                {t('unified.messages.all_channels')}
+              </option>
+            )}
             {channels.map((c) => (
               <option key={c.name} value={c.name}>
                 {t('unified.messages.channel_option', { name: c.name, count: c.sources.length })}
@@ -508,7 +722,11 @@ export default function UnifiedMessagesPage() {
         )}
         {canReadAnyMessages && !loadingMessages && feedMessages.length === 0 && !messagesError && (
           <div className="unified-empty">
-            {selectedChannel ? t('unified.messages.empty_channel') : t('unified.messages.choose_channel')}
+            {selectedChannel === ALL_CHANNELS_PARAM
+              ? t('unified.messages.empty_all_channels')
+              : selectedChannel
+                ? t('unified.messages.empty_channel')
+                : t('unified.messages.choose_channel')}
           </div>
         )}
 
@@ -526,114 +744,29 @@ export default function UnifiedMessagesPage() {
           </div>
         )}
 
-        {feedMessages.map((msg) => {
-          const dateLabel = formatDateDivider(msg.timestamp, t);
-          const showDivider = dateLabel !== lastDateLabel;
-          if (showDivider) lastDateLabel = dateLabel;
-
-          const primarySourceId = msg.receptions[0]?.sourceId ?? '';
-          const color = sourceColor(primarySourceId);
-          const receptionCount = msg.receptions.length;
-
-          const reactions = msg.packetId != null ? reactionsByParent.get(msg.packetId) ?? [] : [];
-
-          // Reply preview: look up parent by packet id (firmware's reply_id
-          // points at the parent's meshpacket id, not its requestId).
-          const replyPreview = resolveReplyPreview(msg.replyId, byPacketId);
-
-          return (
-            <div key={msg.dedupKey}>
-              {showDivider && (
-                <div className="unified-date-divider">
-                  <span>{dateLabel}</span>
-                </div>
-              )}
-              <div
-                className="unified-msg-card unified-msg-card--clickable"
-                style={{ borderLeftColor: color }}
-                onClick={() => openStats(msg)}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    openStats(msg);
-                  }
-                }}
-              >
-                <div className="unified-msg-card__meta">
-                  {msg.receptions.map((r) => (
-                    <span
-                      key={r.sourceId}
-                      className="unified-msg-card__source-tag"
-                      style={{
-                        background: `color-mix(in srgb, ${sourceColor(r.sourceId)} 15%, transparent)`,
-                        color: sourceColor(r.sourceId),
-                        border: `1px solid color-mix(in srgb, ${sourceColor(r.sourceId)} 35%, transparent)`,
-                      }}
-                      title={t('unified.messages.heard_by_source', { name: r.sourceName })}
-                    >
-                      {r.sourceName}
-                      {isAnyMeshCoreSourceType(r.sourceType) && (
-                        <span className="unified-msg-card__proto-badge">
-                          {t('unified.messages.meshcore_badge', 'MeshCore')}
-                        </span>
-                      )}
-                      <HopBadge reception={r} sourceName={r.sourceName} />
-                    </span>
-                  ))}
-                  {receptionCount > 1 && (
-                    <span className="unified-msg-card__reception-count">
-                      {t('unified.messages.heard_by_count', { count: receptionCount })}
-                    </span>
-                  )}
-                  <span className="unified-msg-card__sender">{senderLabel(msg)}</span>
-                  <span className="unified-msg-card__time">{formatTime(msg.timestamp)}</span>
-                </div>
-
-                {replyPreview.kind !== 'none' && (
-                  <div className="unified-reply-preview">
-                    <span className="unified-reply-preview__arrow">↳</span>
-                    {replyPreview.kind === 'resolved' ? (
-                      <>
-                        <span className="unified-reply-preview__from">
-                          {shortSenderLabel(replyPreview.parent)}
-                        </span>
-                        <span className="unified-reply-preview__text">
-                          {replyPreview.parent.text || t('unified.no_text')}
-                        </span>
-                      </>
-                    ) : (
-                      // #4245: the parent packet was never received or has since
-                      // been purged. Still show the reply box so the message is
-                      // recognizable as a reply, rather than silently dropping
-                      // replyId and rendering it as an ordinary message.
-                      <span className="unified-reply-preview__text unified-reply-preview__text--unknown">
-                        {t('unified.messages.unknown_parent', 'Unknown message')}
-                      </span>
-                    )}
-                  </div>
-                )}
-
-                <div className="unified-msg-card__text">
-                  {msg.text ? renderMessageWithLinks(msg.text) : <em style={{ opacity: 0.4 }}>{t('unified.no_text')}</em>}
-                </div>
-                {msg.text && <LinkPreview text={msg.text} />}
-
-                {reactions.length > 0 && (
-                  <div className="unified-reactions">
-                    {reactions.map((r) => (
-                      <span key={r.dedupKey} className="unified-reaction" title={senderLabel(r)}>
-                        {r.text}
-                        <span className="unified-reaction__from">{shortSenderLabel(r)}</span>
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          );
-        })}
+        {(() => {
+          const sourceOrder = sourcesInView.map((s) => s.id);
+          return feedMessages.map((msg) => {
+            const dateLabel = formatDateDivider(msg.timestamp, t);
+            const showDivider = dateLabel !== lastDateLabel;
+            if (showDivider) lastDateLabel = dateLabel;
+            return (
+              <UnifiedMessageRow
+                key={msg.dedupKey}
+                msg={msg}
+                dateLabel={showDivider ? dateLabel : null}
+                showChannelTag={selectedChannel === ALL_CHANNELS_PARAM}
+                sourceOrder={sourceOrder}
+                reactions={msg.packetId != null ? reactionsByParent.get(msg.packetId) ?? NO_UNIFIED_MESSAGES : NO_UNIFIED_MESSAGES}
+                // Reply preview: look up parent by packet id (firmware's reply_id
+                // points at the parent's meshpacket id, not its requestId).
+                replyPreview={resolveReplyPreview(msg.replyId, byPacketId)}
+                chips={mcReactions.chipsByTarget.get(msg.dedupKey) ?? NO_CHIPS}
+                onOpen={openStats}
+              />
+            );
+          });
+        })()}
       </div>
       </div>
 
@@ -704,7 +837,7 @@ export default function UnifiedMessagesPage() {
         isOpen={exportOpen}
         onClose={() => setExportOpen(false)}
         channels={channels}
-        initialChannel={selectedChannel || undefined}
+        initialChannel={selectedChannel === ALL_CHANNELS_PARAM ? undefined : (selectedChannel || undefined)}
       />
     </div>
   );

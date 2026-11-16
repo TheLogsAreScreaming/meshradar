@@ -46,6 +46,7 @@ import {
   purgeLegacyNodeDisplayLocal,
 } from '../utils/nodeDisplayStorage';
 import type { MapStyle } from '../server/services/mapStyleService.js';
+import { isMeshCoreMqttFedSourceType } from '../utils/meshcoreSourceTypes.js';
 
 // #4412 Phase 3 (WP2): one-time purge of the legacy un-namespaced Node
 // Display localStorage keys, so a stale global value from before the
@@ -1289,7 +1290,7 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children, ba
   // a non-Meshtastic source; this check stays as a second guard for a view
   // whose source type the server could not resolve.
   const muteScopeIsMeshtastic = sourceType !== 'meshcore'
-    && sourceType !== 'meshcore_mqtt'
+    && !isMeshCoreMqttFedSourceType(sourceType)
     && sourceType !== 'reticulum';
 
   const fetchNotificationPrefs = useCallback(async (): Promise<Record<string, unknown>> => {
@@ -2578,6 +2579,27 @@ export const useOptionalChannelMuteSettings = () => {
     isChannelMuted: context.isChannelMuted,
     muteChannel: context.muteChannel,
     unmuteChannel: context.unmuteChannel,
+  };
+};
+
+/**
+ * Channel + DM mute state for a view that may render outside a SettingsProvider.
+ * Null there. MeshCore DMs and rooms key by canonical public key in `mutedDMs`
+ * (#6261); channels keep using the numeric-index API.
+ */
+// eslint-disable-next-line react-refresh/only-export-components -- #6261 same shape as useOptionalChannelMuteSettings above
+export const useOptionalMuteSettings = () => {
+  const context = useContext(SettingsContext);
+  if (context === undefined) return null;
+  return {
+    enableAudioNotifications: context.enableAudioNotifications,
+    setEnableAudioNotifications: context.setEnableAudioNotifications,
+    isChannelMuted: context.isChannelMuted,
+    muteChannel: context.muteChannel,
+    unmuteChannel: context.unmuteChannel,
+    isDMMuted: context.isDMMuted,
+    muteDM: context.muteDM,
+    unmuteDM: context.unmuteDM,
   };
 };
 

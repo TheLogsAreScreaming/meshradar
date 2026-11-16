@@ -5,15 +5,16 @@
  * → THEN actions) → an optional FINALLY combine step (ANY/ALL/NONE). Compiles to
  * the graph model in compile.ts.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { TRIGGERS, CONDITIONS, ACTIONS, BLOCK_BY_TYPE, fieldsFor, fieldVisible, fieldPlaceholder, type BlockDef, type FieldDef } from './catalog';
 import { compile, blockNodeId, formOutputNames, type WorkflowForm, type FormBlock, type Rule, type BlockLocation } from './compile';
 import type { StepTokenScope } from './tokenHints';
-import { STEP_OUTPUT_NAME_PATTERN, stepOutputScopes } from '../../types/automation';
+import { STEP_OUTPUT_NAME_PATTERN, stepOutputScopes, emptySendFinding } from '../../types/automation';
 import SubstitutionsHelpDrawer from './SubstitutionsHelp';
 import GeofenceFieldInput from './GeofenceFieldInput';
 import NodeMultiFieldInput, { type NodeMultiOption } from './NodeMultiFieldInput';
+import TracePathsFieldInput from './TracePathsFieldInput';
 import AutomationIdFieldInput, { type AutomationOption } from './AutomationIdFieldInput';
 import TokenTextField from './TokenTextField';
 import { NumberInput } from '../common/NumberInput';
@@ -44,24 +45,33 @@ const isSendableSource = (s: SourceOption): boolean =>
   s.enabled !== false && !String(s.type ?? '').startsWith('mqtt');
 
 /** Short protocol badge for a source type / channel protocol. */
-const protoBadge = (proto?: string): 'MC' | 'MT' | null => {
+const protoBadge = (proto?: string): 'MC' | 'MT' | 'RET' | null => {
   const t = String(proto ?? '');
   if (t === 'meshcore') return 'MC';
+  if (t === 'reticulum') return 'RET';
   if (t.startsWith('meshtastic')) return 'MT';
   return null;
 };
 
+/** Extra CSS class for a protocol badge, so Reticulum (RET) reads as its own
+ *  protocol with a distinct (tokenised) colour (#6143). */
+const protoBadgeClass = (badge: 'MC' | 'MT' | 'RET' | null): string =>
+  badge === 'RET' ? 'ae-chip ae-chip--ret' : 'ae-chip';
+
 /**
- * Does a source match a field's `protocolFilter`? MeshCore is the explicit side
- * (`type === 'meshcore'`); everything else — native Meshtastic AND MQTT
- * bridge/broker sources — is Meshtastic-protocol. So `'meshtastic'` means "not
- * MeshCore" rather than a `startsWith('meshtastic')` check, which would wrongly
- * drop MQTT sources.
+ * Does a source match a field's `protocolFilter`? MeshCore (`type === 'meshcore'`)
+ * and Reticulum (`type === 'reticulum'`) are each their own protocol; everything
+ * else — native Meshtastic AND MQTT bridge/broker sources — is Meshtastic-protocol.
+ * So `'meshtastic'` means "not MeshCore and not Reticulum" rather than a
+ * `startsWith('meshtastic')` check, which would wrongly drop MQTT sources — and a
+ * Meshtastic-only field never offers a Reticulum source (#6143).
  */
 const sourceMatchesProtocol = (s: SourceOption, filter?: 'meshtastic' | 'meshcore'): boolean => {
   if (!filter) return true;
-  const isMeshCore = String(s.type ?? '') === 'meshcore';
-  return filter === 'meshcore' ? isMeshCore : !isMeshCore;
+  const type = String(s.type ?? '');
+  const isMeshCore = type === 'meshcore';
+  const isReticulum = type === 'reticulum';
+  return filter === 'meshcore' ? isMeshCore : (!isMeshCore && !isReticulum);
 };
 
 /** Channel counterpart of {@link sourceMatchesProtocol}, keyed off `UnifiedChannelOption.protocol`. */
@@ -244,8 +254,23 @@ function numberParamValue(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/** The browser's IANA zone, e.g. America/New_York. */
+function browserTimeZone(): string {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; }
+}
+
+/** IANA zone names for the time-zone picker; empty on a browser that cannot list them. */
+function timeZoneNames(): string[] {
+  const supported = (Intl as unknown as { supportedValuesOf?: (key: string) => string[] }).supportedValuesOf;
+  try { return typeof supported === 'function' ? supported('timeZone') : []; } catch { return []; }
+}
+
+/** A param the builder treats as unset text: absent, or blank after trimming. */
+const isBlankText = (v: unknown): boolean => v == null || (typeof v === 'string' && v.trim() === '');
+
 export function FieldInput({ field, value, onChange, variables, sources, channels, scripts, regions, nodes, triggerType, automations = [], params, onPatch, steps, duplicateOutputNames }: FieldInputProps) {
   const { t } = useTranslation();
+  const fieldRef = useRef<HTMLDivElement>(null);
   let control;
   const varNames = variables.map((v) => v.name);
   const placeholder = fieldPlaceholder(field, triggerType);
@@ -270,6 +295,30 @@ export function FieldInput({ field, value, onChange, variables, sources, channel
       break;
     case 'nodeNum':
       control = <NodeNumFieldInput value={value} onChange={onChange} placeholder={placeholder} />;
+      break;
+    case 'datetimeLocal':
+      // A date is read in the rule's time zone (#5515). The first date typed
+      // fills a blank zone with the browser's, so the times mean what the
+      // person sees on their own clock.
+      control = (
+        <input type="datetime-local" className="ae-input" value={typeof value === 'string' ? value : ''}
+          onChange={(e) => {
+            const next = e.target.value;
+            if (next && onPatch && isBlankText(params?.timezone)) onPatch({ [field.name]: next, timezone: browserTimeZone() });
+            else onChange(next);
+          }} />
+      );
+      break;
+    case 'timeZone':
+      control = (
+        <>
+          <input className="ae-input" list="ae-timezones" value={typeof value === 'string' ? value : ''}
+            placeholder={browserTimeZone()} onChange={(e) => onChange(e.target.value)} />
+          <datalist id="ae-timezones">
+            {timeZoneNames().map((z) => <option key={z} value={z} />)}
+          </datalist>
+        </>
+      );
       break;
     case 'textarea':
       control = field.tokens
@@ -340,6 +389,18 @@ export function FieldInput({ field, value, onChange, variables, sources, channel
     case 'nodeMulti':
       control = <NodeMultiFieldInput value={value} onChange={onChange} nodes={nodes} />;
       break;
+    case 'tracePaths':
+      control = (
+        <>
+          <TracePathsFieldInput value={value} onChange={onChange} />
+          {field.warning && (
+            <div className="ae-field-warn" role="note">
+              <UiIcon name="alert" size={14} /> <span>{field.warning}</span>
+            </div>
+          )}
+        </>
+      );
+      break;
     case 'scriptselect':
       control = (
         <select className="ae-select" value={(value ?? '') as string} onChange={(e) => onChange(e.target.value)}>
@@ -385,7 +446,7 @@ export function FieldInput({ field, value, onChange, variables, sources, channel
               <label key={s.id} className="ae-switch" style={{ display: 'block', marginBottom: '0.2rem' }}>
                 <input type="checkbox" checked={sel.includes(s.id)} onChange={(e) =>
                   onChange(e.target.checked ? [...sel, s.id] : sel.filter((x) => x !== s.id))} />
-                {' '}{s.name}{badge ? <span className="ae-chip">{badge}</span> : null}
+                {' '}{s.name}{badge ? <span className={protoBadgeClass(badge)}>{badge}</span> : null}
                 {/* Prefer canTransmit: a TX-disabled radio with UDP Broadcast on
                     still delivers, so it must not be flagged (#4394). Older
                     servers omit the field — fall back to the raw radio flag. */}
@@ -470,7 +531,7 @@ export function FieldInput({ field, value, onChange, variables, sources, channel
                   ? [...sel, { name: c.name, protocol: c.protocol }]
                   : sel.filter((x) => !same(x, c)))} />
               {' '}{c.name || '(Primary)'}
-              {protoBadge(c.protocol) ? <span className="ae-chip">{protoBadge(c.protocol)}</span> : null}
+              {protoBadge(c.protocol) ? <span className={protoBadgeClass(protoBadge(c.protocol))}>{protoBadge(c.protocol)}</span> : null}
               {c.encryption ? <span className="ae-chip">{c.encryption}</span> : null}
               {c.sources && c.sources.length > 1 ? <span className="ae-chip">{c.sources.length} sources</span> : null}
             </label>
@@ -485,10 +546,30 @@ export function FieldInput({ field, value, onChange, variables, sources, channel
             triggerType={triggerType} variableNames={varNames} steps={stepScope} onChange={onChange} />
         : <input className="ae-input" value={(value ?? '') as string} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />;
   }
+  // #5697: a placeholder that is a usable template can be copied in with one
+  // tap. Only while the field is empty, so typed text is never replaced.
+  const suggestion = field.suggestTemplate && placeholder && isBlankText(value) ? placeholder : null;
+  const useSuggestion = () => {
+    if (!suggestion) return;
+    onChange(suggestion);
+    // Keep the user in the field, caret at the end, ready to edit.
+    requestAnimationFrame(() => {
+      const el = fieldRef.current?.querySelector<HTMLTextAreaElement | HTMLInputElement>('textarea, input');
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+    });
+  };
   return (
-    <div className="ae-field">
+    <div className="ae-field" ref={fieldRef}>
       <label className="ae-field-label">{field.label}</label>
       {control}
+      {suggestion && (
+        <button type="button" className="ae-suggest-btn" onClick={useSuggestion}
+          aria-label={t('automation.suggestedTemplate.use_aria', 'Use suggested template for {{field}}', { field: field.label })}>
+          <UiIcon name="edit" size={13} /> {t('automation.suggestedTemplate.use', 'Use suggested template')}
+        </button>
+      )}
       {field.help && <div className="ae-help-text">{field.help}</div>}
     </div>
   );
@@ -504,6 +585,7 @@ function BlockFields({ block, triggerType, variables, sources, channels, scripts
   block: FormBlock; triggerType: string; variables: VariableOption[]; sources: SourceOption[]; channels: UnifiedChannelOption[]; scripts: ScriptOption[]; regions: string[]; nodes: NodeMultiOption[]; automations: AutomationOption[]; onParams: (p: Record<string, unknown>) => void;
   steps: StepTokenScope; duplicateOutputNames: ReadonlySet<string>;
 }) {
+  const { t } = useTranslation();
   const def = BLOCK_BY_TYPE[block.type];
   if (!def) return null;
   const patch = (changes: Record<string, unknown>) => {
@@ -514,6 +596,17 @@ function BlockFields({ block, triggerType, variables, sources, channels, scripts
     }
     onParams(next);
   };
+  // #5697: say plainly when this step will send nothing (or less than meant),
+  // with a one-tap fix where the catalog has a suggested template.
+  const empty = emptySendFinding(block.type, block.params);
+  const fixes: Record<string, string> = {};
+  if (empty) {
+    for (const name of empty.fields) {
+      const f = def.fields.find((x) => x.name === name);
+      const ph = f?.suggestTemplate ? fieldPlaceholder(f, triggerType) : undefined;
+      if (ph) fixes[name] = ph;
+    }
+  }
   return (
     <>
       {def.fields.filter((f) => fieldVisible(f, block.params)).map((f) => {
@@ -522,6 +615,22 @@ function BlockFields({ block, triggerType, variables, sources, channels, scripts
           params={block.params} onPatch={patch} steps={steps} duplicateOutputNames={duplicateOutputNames}
           onChange={(v) => onParams({ ...block.params, [f.name]: v })} />;
       })}
+      {empty && (
+        <div className="ae-field-warn ae-empty-send" role="note" data-testid="empty-send-warning">
+          <UiIcon name="alert" size={14} />
+          <span>
+            {`${empty.detail.charAt(0).toUpperCase()}${empty.detail.slice(1)}.`}
+            {Object.keys(fixes).length > 0 && (
+              <>
+                {' '}
+                <button type="button" className="ae-suggest-btn ae-suggest-btn--inline" onClick={() => patch(fixes)}>
+                  {t('automation.suggestedTemplate.use', 'Use suggested template')}
+                </button>
+              </>
+            )}
+          </span>
+        </div>
+      )}
     </>
   );
 }

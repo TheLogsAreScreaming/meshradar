@@ -31,20 +31,61 @@ import { createMeshNodeDataProvider } from '../services/automation/meshNodeData.
 import { unifyChannels, sourceProtocol } from '../services/automation/channelUnify.js';
 import { estimateHomeFromNodeHistory } from '../services/automation/leftHomeFromHistory.js';
 
+import { validateCron, cronMinGapMs } from '../utils/cronScheduler.js';
+import { readScheduleWindow, scheduleMinIntervalMs, SCHEDULE_MIN_INTERVAL_MS, SCHEDULE_MIN_INTERVAL_MINUTES } from '../../types/scheduleWindow.js';
+
 const router = Router();
 
 const canRead = requirePermission('automations', 'read');
 const canWrite = requirePermission('automations', 'write');
 
 /** Normalise a config (object or JSON string) → validated → JSON string. */
-function validateConfig(raw: unknown): { ok: true; json: string } | { ok: false; errors: string[] } {
+function validateConfig(raw: unknown): { ok: true; json: string; warnings: string[] } | { ok: false; errors: string[] } {
   let parsed: unknown = raw;
   if (typeof raw === 'string') {
     try { parsed = JSON.parse(raw); } catch { return { ok: false, errors: ['config is not valid JSON'] }; }
   }
   const result = validateAutomationGraph(parsed);
   if (!result.valid) return { ok: false, errors: result.errors };
-  return { ok: true, json: JSON.stringify(result.graph) };
+  const cronErrors = scheduleCronErrors(result.graph);
+  if (cronErrors.length > 0) return { ok: false, errors: cronErrors };
+  return { ok: true, json: JSON.stringify(result.graph), warnings: result.warnings ?? [] };
+}
+
+/**
+ * Minimum interval of a scheduled rule (#5515). One fire sends to every chosen
+ * channel on every chosen source, so a cron that fires every minute is a
+ * flood. Checked here, at save, because it needs the cron parser, which the
+ * browser does not ship. A rule saved before the limit keeps running; it just
+ * cannot be saved, imported or duplicated again without slowing down.
+ *
+ * A rule whose only actions are scheduled path traces (#5723) may tick each
+ * minute: see scheduleMinIntervalMs.
+ */
+export function scheduleCronErrors(graph: { nodes: Array<{ id: string; type: string; params?: Record<string, unknown> }> } | undefined): string[] {
+  const errors: string[] = [];
+  const minMs = scheduleMinIntervalMs(graph?.nodes ?? []);
+  for (const n of graph?.nodes ?? []) {
+    if (n.type !== 'trigger.schedule') continue;
+    const cron = typeof n.params?.cron === 'string' ? n.params.cron.trim() : '';
+    if (!cron) continue; // an unset cron is never scheduled; the builder flags it
+    const timezone = readScheduleWindow(n.params).timeZone ?? undefined;
+    if (!validateCron(cron)) {
+      errors.push(`trigger.schedule "${n.id}": "${cron}" is not a valid cron expression`);
+      continue;
+    }
+    const gap = cronMinGapMs(cron, { timezone });
+    if (gap !== null && gap < minMs) {
+      const minimum = minMs === SCHEDULE_MIN_INTERVAL_MS
+        ? `every ${SCHEDULE_MIN_INTERVAL_MINUTES} minutes`
+        : `every ${Math.round(minMs / 1000)} s`;
+      errors.push(
+        `trigger.schedule "${n.id}": "${cron}" fires every ${Math.max(1, Math.round(gap / 1000))} s at its fastest; ` +
+        `the minimum is ${minimum}`,
+      );
+    }
+  }
+  return errors;
 }
 
 /**
@@ -329,7 +370,9 @@ router.post('/', canWrite, async (req: Request, res: Response) => {
       createdByUserId: (req as any).user?.id ?? null,
     });
     await reloadAutomations();
-    res.status(201).json(created);
+    // #5697: non-blocking findings (an empty message, …) ride along so API and
+    // import callers see what the builder shows.
+    res.status(201).json(v.warnings.length > 0 ? { ...created, warnings: v.warnings } : created);
   } catch (error) {
     logger.error('Error creating automation:', error);
     res.status(500).json({ error: 'Failed to create automation' });
@@ -346,6 +389,12 @@ router.post('/:id/duplicate', canWrite, async (req: Request, res: Response) => {
     }
     const name = rawName.length > 0 ? rawName : `${source.name} (copy)`;
     if (!(await checkForwardingTogglePermission(req, res, source.config))) return;
+    // A copy is a new rule, so it must meet the schedule minimum (#5515) even
+    // when the original predates it.
+    let sourceGraph: Parameters<typeof scheduleCronErrors>[0];
+    try { sourceGraph = JSON.parse(source.config); } catch { sourceGraph = undefined; }
+    const cronErrors = scheduleCronErrors(sourceGraph);
+    if (cronErrors.length > 0) return fail(res, 400, 'SCHEDULE_TOO_FREQUENT', cronErrors.join('; '));
     // Duplicates land DISABLED so the user reviews before flipping them on
     // (mirrors the /import path). Uniqueness on `name` is not enforced by the
     // table, matching the plain POST / handler, so no collision check here.
@@ -380,7 +429,7 @@ router.post('/import', canWrite, async (req: Request, res: Response) => {
       name, description, enabled: false, config: v.json,
       createdByUserId: (req as any).user?.id ?? null,
     });
-    res.status(201).json(created);
+    res.status(201).json(v.warnings.length > 0 ? { ...created, warnings: v.warnings } : created);
   } catch (error) {
     logger.error('Error importing automation:', error);
     res.status(500).json({ error: 'Failed to import automation' });
@@ -394,16 +443,26 @@ router.put('/:id', canWrite, async (req: Request, res: Response) => {
     if (name !== undefined) patch.name = name;
     if (description !== undefined) patch.description = description;
     if (enabled !== undefined) patch.enabled = !!enabled;
+    let warnings: string[] = [];
     if (config !== undefined) {
       const v = validateConfig(config);
       if (!v.ok) return res.status(400).json({ error: 'invalid automation config', details: v.errors });
       if (!(await checkForwardingTogglePermission(req, res, v.json))) return;
       patch.config = v.json;
+      warnings = v.warnings;
+    } else if (patch.enabled === true) {
+      // Enabling without supplying a new config arms the stored graph's
+      // scheduler, so gate against the stored config (#6096) — the same path
+      // the dedicated /enable handler guards. (A new config above is already
+      // gated; when the row is absent the gate is skipped and the update below
+      // 404s.)
+      const existing = await databaseService.automations.getAutomation(req.params.id);
+      if (existing && !(await checkForwardingTogglePermission(req, res, existing.config))) return;
     }
     const updated = await databaseService.automations.updateAutomation(req.params.id, patch);
     if (!updated) return res.status(404).json({ error: 'automation not found' });
     await reloadAutomations();
-    res.json(updated);
+    res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
   } catch (error) {
     logger.error('Error updating automation:', error);
     res.status(500).json({ error: 'Failed to update automation' });
@@ -412,6 +471,16 @@ router.put('/:id', canWrite, async (req: Request, res: Response) => {
 
 router.post('/:id/enable', canWrite, async (req: Request, res: Response) => {
   try {
+    // Enabling arms the scheduler: a forwarding-toggle automation will later
+    // fire on its own against the sources its graph targets. So re-apply the
+    // per-source gate the save/run-now paths enforce (#6071/#6096). A user with
+    // only the global `automations:write` grant must not activate a
+    // forwarding-toggle rule someone else authored against a source they lack
+    // per-source `automation` write on — otherwise /enable is a way around the
+    // save-time check. Mirrors the run-now handler's stored-config check; when
+    // the row is absent the gate is skipped and setEnabled is a harmless no-op.
+    const auto = await databaseService.automations.getAutomation(req.params.id);
+    if (auto && !(await checkForwardingTogglePermission(req, res, auto.config))) return;
     await databaseService.automations.setEnabled(req.params.id, true);
     await reloadAutomations();
     res.json({ success: true });
@@ -532,6 +601,16 @@ router.post('/:id/run-now', canWrite, async (req: Request, res: Response) => {
   try {
     const engine = getAutomationEngine();
     if (!engine) return fail(res, 503, 'ENGINE_NOT_READY', 'automation engine not started');
+    // Run-now dispatches LIVE actions, so re-apply the per-source gate that the
+    // save paths (create/update/import/duplicate) enforce (#6071). A user with
+    // only the global `automations:write` grant must not be able to fire a
+    // forwarding-toggle automation against a source they lack per-source
+    // `automation` write on — otherwise run-now is a way around the save-time
+    // check for a rule someone else authored. Mirrors the duplicate handler's
+    // stored-config check. When the row is absent the gate is skipped and the
+    // engine reports `not_found` below.
+    const auto = await databaseService.automations.getAutomation(req.params.id);
+    if (auto && !(await checkForwardingTogglePermission(req, res, auto.config))) return;
     const result = await engine.runNow(req.params.id);
     if (result.reason === 'not_found') return fail(res, 404, 'AUTOMATION_NOT_FOUND', 'automation not found');
     if (result.reason === 'invalid') return fail(res, 400, 'INVALID_AUTOMATION', 'automation config is invalid');
@@ -553,6 +632,14 @@ router.delete('/:id', canWrite, async (req: Request, res: Response) => {
       await databaseService.automationHomeAnchorsRepo?.deleteByAutomation(req.params.id);
     } catch (e) {
       logger.warn(`Failed to clean home anchors for automation ${req.params.id}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // Drop its stored cooldown / rate-limit state. (If this fails, or a fire
+    // queued just before the delete lands after it, the engine's load() removes
+    // rows whose automation no longer exists.)
+    try {
+      await databaseService.automationFireStateRepo?.deleteByAutomation(req.params.id);
+    } catch (e) {
+      logger.warn(`Failed to clean fire state for automation ${req.params.id}: ${e instanceof Error ? e.message : String(e)}`);
     }
     await reloadAutomations();
     res.json({ success: true });

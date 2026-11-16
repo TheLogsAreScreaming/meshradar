@@ -75,11 +75,11 @@ Every automation has exactly one trigger (the **WHEN**). Each trigger exposes a 
 | **A node enters/leaves a region** | A node crosses a geofence | `Enters` / `Leaves` / `Moves while inside (dwell)`, plus a map region editor |
 | **A watched node becomes mobile** | A hand-selected node flips from stationary → mobile | Multi-select of nodes (stationary candidates highlighted); MeshMonitor’s >100 m position-history heuristic |
 | **A watched node leaves its home position** | A hand-selected node moves farther than a threshold from its home/anchor | Multi-select of nodes, threshold in metres (default 300). Home is seeded from position-history inliers when available (else first live fix); while within half the threshold, home is gently averaged. Saved automations can **Reset homes from history** |
-| **A watched node's heartbeat is lost** | A hand-selected node stops being heard for longer than a per-node deadline | Multi-select of nodes; per-node timeout minutes (default 60); MeshCore parity |
-| **A watched node comes back after a heartbeat loss** | A watched node is heard again after its own lost-heartbeat alert fired | Pairs one-to-one with the loss trigger so a recovery automation only fires for nodes that had actually gone silent |
-| **A watched node rebooted** | An uptime reset is detected (uptime decreases without a matching graceful reboot) | Multi-select of nodes; suppresses matched self-triggered reboots so an automation-initiated `deviceReboot` doesn't re-fire the alert |
-| **A watched node's external power changed** | A node reports losing or restoring external power (voltage / power-source telemetry) | Multi-select of nodes; separate `lost` vs `restored` fires, both exposed as `{{ trigger.event }}` |
-| **A watched node's battery is trending down** | A node's battery drops through a threshold with a sustained negative slope over the window | Multi-select of nodes; threshold percent (default 25); window hours (default 24). Doubles as a solar underperformance proxy on nodes that normally recharge each day |
+| **A node goes silent (heartbeat lost)** | A node has not been heard for longer than the threshold. Checked about once a minute against every node on every source | `Silent for (minutes)`, required (the builder suggests 60). Fires once per node, then again only after the node is heard and goes silent once more. Meshtastic and MeshCore. Narrow it with **Source is one of…** |
+| **A silent node is heard again (recovery)** | A node that had been silent longer than the threshold is heard again | `Was silent for (minutes)`, required. Match it to the value on the paired "goes silent" rule. `{{ trigger.offlineDurationMinutes }}` gives the time offline |
+| **A node reboots unexpectedly** | A node's uptime counter drops (by more than 10 seconds) between two readings | No options. Read from uptime telemetry the node already sends, so no packet is sent. Never fires on a node's first reading. Any reboot counts, one you asked for included |
+| **A node switches power source (mains ↔ battery)** | A node crosses between external power and battery | `Direction`: **Either direction**, **Lost external power**, or **Regained external power**. `{{ trigger.direction }}` reads `lost` or `restored`. On MeshCore this is a guess from battery voltage (4.2 V or more counts as powered), so expect false alerts there |
+| **A node’s battery is steadily draining** | A node's battery level falls by at least a set amount across a lookback window. Checked about every 15 minutes | `Lookback window (hours)` and `Minimum drop (percentage points)`, both required (the builder suggests 12 and 20). Fires once per decline and re-arms when the battery recovers. Meshtastic only. A proxy for a solar node that is not charging |
 | **A node becomes a likely aircraft** | A node's reported altitude puts it more than the source's [likely-aircraft](/features/settings#likely-aircraft-detection) threshold above the terrain (or the sea-level fallback, when terrain elevation is unavailable) | Any node — narrow with a **Source is one of…** condition on a wide MQTT feed. Meshtastic only |
 
 ### Became mobile & left home (tamper / theft monitoring)
@@ -91,6 +91,26 @@ These two triggers are designed for fleets of **stationary** GPS nodes (rooftops
 - **Left home** — on the first position after you add a node to the rule, MeshMonitor stores that fix as the node’s **home** for this automation. Later fixes farther than **Threshold (metres)** fire the automation. Returning within the threshold re-arms it. Homes are stored in the database so a MeshMonitor restart does not silently re-home a stolen node.
 - Prefer **Cooldown applies to = node** so one stolen site does not suppress alerts for the rest of the fleet.
 - Pair with **Send a message** (channel) and/or **Send a notification** (Apprise) actions.
+
+### New neighbour confirmed {#new-neighbour-confirmed}
+
+`trigger.neighborAdded` (MeshCore) fires once when a repeater's neighbour table lists a node it did
+not list before, and the node is still listed after the **Confirm after** time (default 72 hours,
+6 to 336). A neighbour that drops out of a full read of the table before then never alerts.
+
+- **No airtime.** It reads the neighbour table MeshMonitor already polls and stores a first-seen
+  and last-heard time per neighbour. It sends nothing and adds no poll.
+- **No burst on deploy.** The first poll of each repeater only records what is already listed.
+  A node purge or deleting the source records a fresh baseline.
+- **Zero-hop repeaters only.** The firmware lists only repeaters heard directly. Repeater sources
+  poll every 5 minutes. A Companion source polls only for nodes with neighbour polling turned on,
+  and reads the 10 strongest neighbours per poll, so a weak new neighbour may never confirm.
+- **Tokens.** `{{ node.* }}` describes the new neighbour. `trigger.reporterName`,
+  `trigger.reporterPublicKey`, `trigger.neighborPublicKey`, `trigger.snr`, `trigger.firstSeenAt`,
+  `trigger.lastHeardAt`, `trigger.confirmedAfterHours` and `trigger.sightings` are also available.
+  Filter by signal with a number condition on `snr`.
+- **Limit.** The Device Health template caps it at 5 alerts per hour.
+- A neighbour unseen for 30 days counts as new again when it returns.
 
 ### Became likely aircraft
 
@@ -121,6 +141,10 @@ The message trigger can filter on text (substring or regex) and on the **channel
 by **channel name** rather than raw slot index: the same logical channel can sit in a different slot
 on different sources, so a name match is portable across your whole mesh.
 
+A channel that MeshMonitor decrypts with a **Channel Database** key (every channel on an MQTT
+source, for example) takes its name from that Channel Database entry. So `LongFast` matches, and
+`{{ trigger.channelName }}` reads `LongFast`, even though the source has no channel slot for it.
+
 - **On channels** *(multi-select)* — pick one or more channels (unified by name across your
   sources). The trigger fires when a message arrives on **any** of the selected channels — an
   OR-list — so a single automation can cover "channel A **or** channel C" without a separate copy
@@ -149,6 +173,36 @@ every hour). It is backed by a live [croner](https://github.com/Hexagon/croner) 
   isn't offered here (see [Cooldown applies to](#cooldown-applies-to)).
 - The cron is **validated at save time** (5-field, no seconds) — an invalid expression is rejected
   in the builder rather than silently never firing.
+- **Fastest allowed: every 5 minutes.** One fire sends to every chosen channel on every chosen
+  source, so a cron that fires each minute to six channels is 360 sends an hour. A save, import or
+  duplicate of a faster cron is refused. A rule saved before this limit keeps running, and can be
+  switched on and off, but must slow down the next time it is edited. The one exception is a rule
+  whose only action is [Trace MeshCore paths on a schedule](#trace-meshcore-paths-on-a-schedule),
+  which may tick each minute because that step paces itself.
+
+#### Timed events: start, end and time zone
+
+Three optional fields turn a schedule into a timed event, for a net, an exercise or a maintenance
+notice:
+
+| Field | What it does |
+|---|---|
+| **Start** | The rule does not fire before this date and time. Blank = it can fire now. |
+| **End** | The rule does not fire at or after this. When it passes, the rule **turns itself off**. Blank = it runs until you turn it off. |
+| **Time zone** | The zone the cron, the start and the end are read in (an IANA name such as `America/New_York`). Blank = the server's zone, which is usually UTC in Docker. Required with a start or end; the builder fills in your browser's zone when you pick a date. |
+
+Example: "every 30 minutes on October 3 from 08:00 to 12:00, New York time" is cron
+`*/30 * * * *`, start `2026-10-03 08:00`, end `2026-10-03 12:00`, zone `America/New_York`. It
+fires at 08:00, 08:30 … 11:30 and is off by 12:00. Pair it with one **Send a message** action
+that lists every Meshtastic and MeshCore channel to post to.
+
+- The automations list shows **Starts …**, **Until …** or **Ended …** beside a timed rule.
+- To run an ended event again, change its dates and enable it. Enabling it with the old dates
+  turns it straight off again.
+- The dates are part of the saved rule, so a restart or a save never counts as a fire and never
+  moves the window. Sends that fell while the server was down are skipped, not caught up.
+- **Run Now** ignores the window, like it ignores the cron.
+- The **Timed Announcement** template in the gallery sets all of this up from one form.
 
 Because a schedule has no triggering message and no subject node, a **Send a message** action under
 a schedule trigger **must name a target source** (see [Send a message](#send-a-message)).
@@ -169,9 +223,8 @@ or polygon ray-cast). See also the dedicated [Geofence Triggers](/features/geofe
 
 ### Cooldown applies to
 
-The five triggers with a **Cooldown (seconds)** field — **A message is received**, **A new node is
-discovered**, **A node is updated**, **Telemetry is received**, and **A node enters/leaves a
-region** — also get a **Cooldown applies to** select, directly beneath it. It's hidden until you set
+Every trigger with a **Cooldown (seconds)** field, which is all of them except **On a schedule** and
+**A system event**, also gets a **Cooldown applies to** select, directly beneath it. It's hidden until you set
 a non-zero cooldown, and setting the cooldown back to `0` hides it again without losing your choice
 — the value is remembered if you raise the cooldown again later. (Schedule and System triggers have
 no cooldown field at all, so they get no scope field either.)
@@ -232,7 +285,7 @@ There's no dedicated field for this in the visual builder yet — set it via the
 (the builder's "advanced" JSON fallback, or JSON import/export). The [MT↔MC Bridge
 template](#template-gallery) sets a safe default (20 actions / 60 seconds) for you, exposed as a
 **Max relays per minute** field in its install wizard — see [Recipe — Meshtastic ↔ MeshCore
-bridge](#recipe-—-meshtastic-↔-meshcore-bridge).
+bridge](#recipe-mt-mc-bridge).
 
 ## Conditions
 
@@ -245,6 +298,7 @@ different set — this is how If / ElseIf / Else is built.
 | **Always (no filtering)** | A pass-through that always matches — use it when a rule should act unconditionally |
 | **Number comparison** | A numeric field (`==`, `!=`, `>`, `<`, `>=`, `<=`). Fields come from the event (e.g. hop count, SNR/RSSI, **is a direct message**, **arrived via MQTT**, **direct RF / 0 hops**), the hydrated **node** record (battery, hops away, role, position, age, …), or the node's **latest telemetry**. The value can be a literal or `{{ var.name }}` |
 | **Text comparison** | A string field (`contains`, `equals`, `starts with`, `ends with`, `matches regex`, `doesn't contain`, `is one of`, `isn't one of`) over message text, node name/role, node info completeness, etc. |
+| **MeshCore message scope** | A MeshCore message's region scope: **A specific region…** (one or more region names, with an optional **Also match unscoped**), **Unscoped (no region)**, or **Any scoped message**. Meshtastic messages never match |
 | **Source is one of…** | The **Source filter** — restricts the workflow to a chosen subset of sources (the "global but scopeable" knob). Leave empty to allow any source |
 | **Distance from a point** | The subject node is within / farther than *N* km of a reference lat/lon |
 | **Variable check** | Compares a [user-defined variable](#variables) against a literal or another value; with no operator it tests "is set / flag raised?" |
@@ -253,22 +307,25 @@ different set — this is how If / ElseIf / Else is built.
 A missing or undefined field never throws — numeric/string comparisons against it simply evaluate
 **false**.
 
-### `isDM` / `viaMqtt` / `zeroHop` — booleans as `1`/`0`
+### `isDM` / `viaMqtt` / `viaIp` / `zeroHop` — booleans as `1`/`0`
 
 The message trigger's **Number comparison** field picker offers **Is a direct message** (`isDM`),
-**Arrived via MQTT** (`viaMqtt`), and **Direct RF, 0 hops** (`zeroHop`) alongside hop count, SNR,
-and RSSI. All three resolve as a number — `1` for true, `0` for false — because a boolean value
+**Arrived via MQTT** (`viaMqtt`), **Arrived over IP** (`viaIp`), and **Direct RF, 0 hops**
+(`zeroHop`) alongside hop count, SNR, and RSSI. All four resolve as a number — `1` for true, `0` for false — because a boolean value
 compared with `condition.numeric` is coerced the same way (`true → 1`, `false → 0`). Compare with
 `== 1` / `== 0` rather than a boolean literal:
 
 - `isDM == 1` — the message is a direct message; `isDM == 0` — it's a channel/broadcast post.
 - `viaMqtt == 1` — it arrived over an MQTT bridge; `viaMqtt == 0` — it arrived over RF.
+- `viaIp == 1` — it reached your node over MQTT or multicast UDP; `viaIp == 0` — it came over RF.
+  This is the test Auto-Acknowledge uses for its IP row.
 - `zeroHop == 1` — it arrived direct over RF with 0 hops; `zeroHop == 0` — it was relayed (1+
-  hops) or arrived via MQTT.
+  hops) or arrived over IP (MQTT or UDP).
 
 `zeroHop` is a precomputed convenience for the same "zero-hop, heard directly" test — `hops == 0`
-**and** `viaMqtt == 0` — that Auto-Acknowledge uses to define "ZeroHop" for its own
-{Channel,Direct} × {ZeroHop,MultiHop} response matrix, collapsed into one field. Prefer it over
+**and** `viaIp == 0` — that Auto-Acknowledge uses to define "ZeroHop" for its own
+{Channel,Direct} × {ZeroHop,MultiHop,IP} response matrix, collapsed into one field. Auto-Acknowledge's
+MultiHop row is `zeroHop == 0` **and** `viaIp == 0`; its IP row is `viaIp == 1`. Prefer it over
 hand-rolling the two-condition version, and especially over branching a single `hops > 0` node on
 its true/false ports: a packet with no hop information at all resolves `hops` to `undefined`, so
 both `hops == 0` and `hops > 0` evaluate **false** and neither branch of a `hops`-based split ever
@@ -353,13 +410,37 @@ Reacts to the triggering message with an emoji. Minimal by design — it carries
   whose hop data is missing) record a **skipped no-op**, not a run failure.
 - The **Emoji** field is hidden while hop-count mode is selected; your fixed emoji is remembered if
   you switch back to it later.
-- MeshCore sources are still skipped — MeshCore has no tapback concept on the protocol.
+- On a **MeshCore** source the tapback is sent as a MeshCore One reaction. It works only when the trigger is a MeshCore message that same source received; any other case is recorded as a skip. Hop limit does not apply. The run also skips when the source has **Send reactions from MeshMonitor** off, is in receive-only mode, or already sent that emoji to that message.
+- When the trigger is itself a MeshCore reaction, the tapback is always a recorded skip: MeshMonitor never reacts to a reaction, so two rules cannot answer each other with emoji.
 - **Hop limit** *(advanced)* — how far the reaction may travel. Same rules as
   **Hop limit** under [Send a message](#send-a-message). A zero-hop reaction to a zero-hop message is
   the common case: the sender is adjacent by definition, so there is nothing to gain by relaying it.
 - **Send via sources** — which radios send the reaction. Leave none to use the source that
   triggered the automation — but a source **is required** for source-less triggers (System events
   and Schedules).
+
+### MeshCore reactions as a trigger {#meshcore-reaction-trigger}
+
+A MeshCore emoji reaction does **not** fire **A message is received** unless the rule has **Also fire on MeshCore reactions** ticked (under the trigger's advanced options). The box is off on every existing rule, so nothing changes on upgrade. It has no effect on Meshtastic, where a tapback always fires a message rule; filter those with `trigger.isTapback`.
+
+When it fires on a reaction:
+
+| Token | Value |
+|---|---|
+| `{{trigger.text}}` | The emoji |
+| `{{trigger.isTapback}}` | `true` (also set on a Meshtastic tapback) |
+| `{{trigger.emoji}}` | `1` |
+| `{{trigger.reactionTargetText}}` | Text of the message reacted to, when this source has it |
+| `{{trigger.reactionTargetSender}}` | Who sent that message |
+| `{{trigger.reactionTargetId}}` | Its id, when matched |
+
+**Reply to the triggering message** on a reaction trigger prefixes `@[reactor]:` and sends where the reaction arrived.
+
+Your own reactions never fire a rule, including one sent by another of your MeshCore sources.
+
+::: warning A reaction is one tap
+A rule that sends a message for every reaction can flood a channel, and there is no built-in limit. Set a **cooldown** on any rule that ticks this box. Take extra care if another node reacts to every message automatically: your reply and its reaction would then answer each other without end.
+:::
 
 ### Send a message
 
@@ -370,25 +451,31 @@ Sends text to a channel or as a DM, with full `{{ }}` token interpolation in the
 > is logged as skipped, with the reason. See [The empty-send rule](#the-empty-send-rule).
 
 - **Send via sources** — a multi-select of which radios to transmit through. **MQTT sources are
-  receive-only and excluded.** Both **Meshtastic and MeshCore** sources are valid send targets.
+  receive-only and excluded.** **Meshtastic, MeshCore and Reticulum** sources are all valid send
+  targets, shown with **MT / MC / RET badges**.
   Leave it empty to use the source that triggered the automation — but a source **is required** for
   source-less triggers (System events and Schedules).
 - **On channels** — a multi-select of channels, **unified across sources by protocol + name** and
   shown with **MC / MT badges**. The correct local slot is resolved per source, and a Meshtastic
   channel is never sent to a MeshCore source (and vice-versa). Disabled channel slots are excluded.
-  Raw channel PSKs are never sent to the browser.
-- **DM to node #** — send as a direct message instead of to a channel (Meshtastic only — MeshCore
-  sends always go to a channel/region, never a DM-by-node). `{{ trigger.from }}` replies to the
-  sender.
+  Raw channel PSKs are never sent to the browser. **Reticulum has no channels**, so a channel
+  selection never applies to a Reticulum source — see [Reticulum (LXMF) support](#reticulum-lxmf-support).
+- **DM to node #** — send as a direct message instead of to a channel. On Meshtastic give a node
+  number; on MeshCore give the contact's public key; on **Reticulum** give the destination's LXMF
+  hash. `{{ trigger.from }}` replies to the sender of a Meshtastic message, a MeshCore DM, or a
+  Reticulum message. It does not work for a MeshCore channel post, which carries no sender key. A
+  Reticulum send **always** needs a destination — with none, the step is a recorded skip (there is
+  no broadcast fallback).
 - **Reply to the triggering message** — on **Meshtastic** this threads the reply as a tapback (via
   the triggering packet id). MeshCore has no packet-id/thread concept on the wire, so on **MeshCore**
   this instead **auto-prepends the sender mention** `@[<senderLabel>]: ` to the outgoing text — the same
   `@[Name]:` markup the in-app reply button uses — so an automation can reply to whoever sent the
-  triggering message without hand-writing the mention. The label comes from
+  triggering message without hand-writing the mention. On **Reticulum** the reply is threaded natively:
+  the outgoing LXMF message carries the triggering message's hash as its `replyToHash`. The label comes from
   `{{ trigger.senderLabel }}` (sender name → channel name → id), so even an anonymous channel post
   still gets a sensible mention; if nothing at all can be resolved nothing is prepended, and if your
   text already begins with an `@[…]` mention it is left as-is (no double mention). See
-  [Universal message tokens](#universal-message-tokens-meshtastic--meshcore) — reference the sender via
+  [Universal message tokens](#universal-message-tokens) — reference the sender via
   `{{ trigger.senderLabel }}` / `{{ trigger.fromName }}`, not the raw `{{ trigger.from }}`.
 - **MeshCore scope** *(advanced; MeshCore sources only — ignored by Meshtastic)* — which region a
   MeshCore message floods to: **Inherit (channel / source default)**, **Match the triggering
@@ -440,6 +527,58 @@ slot of each selected channel.
 > retry), and the resend can never trigger a fresh automation. See
 > [Automated Channel-Send Auto-Retry](/features/meshcore#automated-channel-send-auto-retry).
 
+### Reticulum (LXMF) support {#reticulum-lxmf-support}
+
+Reticulum sources take part in the same **A message is received** trigger as Meshtastic and
+MeshCore — one `trigger.message` automation fires across all three protocols — and can be a target
+of the **Send a message** action. Reticulum carries LXMF, an address-to-address messaging layer
+with **no channels and no broadcast**: every message is a direct message between two LXMF
+destination hashes. That one fact drives everything below.
+
+**As a trigger.** An inbound LXMF message fires **A message is received**. Because LXMF has no
+channel concept, only the **text** filters apply:
+
+| Filter | Reticulum |
+|--------|-----------|
+| **Message contains** (`textContains`) | **Matches** (case-insensitive substring of the body). |
+| **Matches regex** (`regex`) | **Matches** (against the body). |
+| **On channels / On channel (name) / On channel #** | **Never matches** — LXMF has no channels. A rule that filters by channel never fires on a Reticulum message. |
+| **From / To / Port number** | **Never matches** — these are Meshtastic-only filters. |
+
+Your own outbound LXMF messages never fire a rule: `ReticulumManager`'s self-origin guard drops
+them before the trigger is ever raised.
+
+**Tokens.** A Reticulum `trigger.message` exposes the universal tokens plus LXMF-specific ones.
+Fields with no equivalent on LXMF are **always blank**:
+
+- `{{ trigger.fromName }}` / `{{ trigger.senderLabel }}` — the sender's announced display name,
+  falling back to the raw LXMF hash when the sender has not announced a name.
+- `{{ trigger.from }}` / `{{ trigger.fromId }}` / `{{ trigger.to }}` / `{{ trigger.toId }}` — the
+  LXMF destination hashes.
+- `{{ trigger.title }}`, `{{ trigger.quality }}`, `{{ trigger.method }}`,
+  `{{ trigger.signatureValidated }}`, `{{ trigger.ratcheted }}`, `{{ trigger.replyToHash }}`,
+  `{{ trigger.threadHash }}` — LXMF-only; empty on Meshtastic and MeshCore.
+- `{{ trigger.protocol }}` is `reticulum` and `{{ trigger.protocolShort }}` is `RET`.
+- **Always blank on Reticulum:** `channel`, `channelName`, `packetId`, `hops`, `hopStart`,
+  `hopLimit`, `portnum`, `wantAck`, and the MeshCore scope tokens (`scopeName`/`scopeCode`/`scoped`)
+  — none exist in LXMF.
+
+**Send and reply.** When a Reticulum source is a **Send a message** target:
+
+- **A destination is required.** Give the recipient's LXMF hash in **DM to node #**, or use
+  `{{ trigger.from }}` to reply to the sender. With no resolvable destination the step is a
+  **recorded skip** — there is no channel to fall back to.
+- **On channels is ignored** for a Reticulum source.
+- **Reply to the triggering message** sets the outgoing LXMF `replyToHash` to the triggering
+  message's hash, threading the reply natively.
+- The step **fails** (not skips) when the Reticulum source is not connected or the send is
+  rejected — the same failure semantics as a MeshCore send.
+
+**Protocol-specific actions are skipped.** The Meshtastic/MeshCore-only actions — **Send a tapback**,
+**Manage the node**, **Request data from a node**, **Device reboot**, and **Trace MeshCore paths on
+a schedule** — have no Reticulum equivalent, so targeting a Reticulum source records a **skip** with
+the reason rather than failing the run.
+
 ### Manage the node
 
 Runs an admin/management operation on the subject node: **Favorite / Unfavorite**, **Ignore /
@@ -460,6 +599,32 @@ Asks a node to report data — the automation equivalent of the manual request b
   triggering node. Not used for **Announce self**.
 - **Channel #** *(advanced; Meshtastic only)* — which channel to send the request on (e.g. a private
   sensor channel); ignored by MeshCore.
+
+### Trace MeshCore paths on a schedule
+
+Traces to one or more MeshCore contacts, **each on its own interval**, and keeps the per-hop SNR. For example, trace to a hilltop repeater every 10 minutes and to a distant room server every 10 hours, in one automation.
+
+| Field | Meaning |
+|---|---|
+| **Paths** | One row per contact: the contact's public key (64 hex characters), an optional name, the hop hash width, and how often to trace (minutes). |
+| **Via MeshCore sources** | Which MeshCore companion sends the traces. A Schedule trigger has no source of its own, so pick one. |
+| **Trace the return leg too** | Brings the trace back along the same route so both directions of each hop are measured. Doubles each trace's airtime. |
+
+**How to set it up:** use a **Schedule** trigger that fires every minute (cron `* * * * *`). On each run the step traces only the paths that are due and leaves the rest alone. A run where nothing was due writes no entry in the Runs log, so the log shows the runs that did something.
+
+**Limits** (each trace is a packet relayed hop by hop):
+
+- A path runs **at most every 10 minutes**; the builder and the server both refuse a shorter interval.
+- One source sends **at most 12 scheduled traces an hour**. Paths past that are skipped and wait. The Runs log says so once an hour while the source stays at the cap, not on every tick.
+- Up to 20 paths per step.
+- A path's last run and the hourly count are stored, so restarting MeshMonitor or saving the automation does not make every path fire again. A path that is new runs on the next tick.
+- A trace that fails or gets no reply still counts as that path's run. Nothing is retried.
+
+**Hop hash width.** A trace follows the contact's stored path, which is a list of 1- or 2-byte hashes. "As the contact's path" sends it as stored. Choosing 1 byte shortens a 2-byte path. Choosing 2 bytes widens a 1-byte path, which works only when every hop matches exactly one of your contacts; otherwise that trace is not sent and the run says why.
+
+**Where the results go.** The SNR readings land in each contact's **Trace SNR history** (see [MeshCore: Trace SNR History](/features/meshcore#trace-snr-history)), marked as traces MeshMonitor sent. The contact needs a known path; one with no path is skipped.
+
+MeshCore companion sources only. A **Test** (dry run) sends nothing and does not use up a path's interval.
 
 ### Send a notification (Apprise)
 
@@ -494,6 +659,8 @@ Responder uses) when the automation fires.
     [Step results for this run](#step-results-for-this-run).
   - **A variable** — keep it after the run. Use a **`json`** typed variable and index into the
     result later with `{{ var.name.field }}` (see [Variables](#variables) and [Tokens](#tokens)).
+- **Timeout (seconds)** *(advanced, optional)* — how long the script may run. Blank uses the script
+  runner's default of 30 seconds.
 - A non-zero exit code is recorded as an action error on the run. Path-traversal protection, the
   interpreter pick, and the execution timeout are reused from the existing script runner.
 - **If the variable cannot take the result, the step fails.** That happens when the variable no
@@ -525,7 +692,7 @@ their own joke.
 
 1. **WHEN** *Message received*, **Text contains** `/joke`.
 2. **THEN** *Run a script* — **Script** `joke.py`, **Store result in** *This run only*, name `joke`.
-3. **THEN** *Send a message* — **Text** `{{ steps.joke.output }}`, with **Reply to the triggering
+3. **THEN** *Send a message* — **Message** `{{ steps.joke.output }}`, with **Reply to the triggering
    message** ticked.
 
 If `joke.py` prints `Why did the node cross the mesh?`, that line is the reply. If it prints
@@ -694,6 +861,22 @@ Airtime: every node within the hop limit rebroadcasts the waypoint. On a 30-node
 one send is about 30 transmissions, around 30 seconds of channel time at LongFast. At the
 30-minute limit that is under 2 % of the channel per waypoint. Hop limit 0 is one transmission.
 
+### Reboot the node
+
+Reboots the physical device, for example to restart a flaky BLE bridge or MQTT proxy each night.
+
+- **Reboot which node(s)** — the connected node(s) to reboot. Leave none to use the source that
+  triggered the automation. A source is required for Schedule and System triggers. MQTT sources
+  have no device and are left out.
+- **Remote target node #** *(advanced; Meshtastic only)* — blank reboots the connected node. A
+  node number or hex id (`!3ca956de`) reboots that remote node over the mesh by remote admin, so
+  the target must have granted admin access. On a MeshCore source a remote target is skipped.
+- **Reboot delay (seconds)** *(advanced; Meshtastic only)* — how long the device waits before it
+  reboots. Default 10.
+
+A reboot shows up as an uptime reset, so **A node reboots unexpectedly** fires for it like for any
+other reboot.
+
 ### Set a variable / flag
 
 Writes a **dynamic** [variable](#variables): **Set to value**, **Increment by**, **Raise flag**, or
@@ -728,20 +911,31 @@ The gallery ships with these templates today:
   a fixed feature toggle.
 - **MT↔MC Bridge** — relays channel text both ways between a Meshtastic channel and a MeshCore
   channel, tagged with its protocol of origin. See [Recipe — Meshtastic ↔ MeshCore
-  bridge](#recipe-—-meshtastic-↔-meshcore-bridge) below for the full walkthrough, including the
+  bridge](#recipe-mt-mc-bridge) below for the full walkthrough, including the
   flood-safety guidance you should read before enabling it.
-- **Device Health** — a one-click starter for the device-health trigger family (heartbeat lost /
-  recovered, node rebooted, external power changed, battery trending down). Pick the nodes you want
-  to watch and the wizard installs one automation per event, each pre-wired to send an Apprise
-  notification. Automations land disabled for review, so you can tune thresholds and add channels
-  before flipping them on. Works for both Meshtastic and MeshCore nodes.
+- **Device Health** — a one-click starter for node-health alerts: low battery or voltage, high
+  temperature, channel utilization or noise floor, a node gone silent or heard again, a reboot, lost
+  external power, and a steadily draining battery. Tick the alerts you want, and optionally limit
+  them to some sources or nodes (leave both empty to watch everything). The wizard installs one
+  automation per alert, each pre-wired to send an Apprise notification. Automations land disabled
+  for review, so you can tune thresholds before flipping them on. The silent and heard-again alerts
+  work for Meshtastic and MeshCore nodes; the reboot, power and draining-battery alerts are
+  Meshtastic only. The **clock out of sync** alert is MeshCore only. It reads a node's clock from
+  the adverts MeshMonitor already hears, so it sends nothing. It fires after two samples in a row
+  are off by more than the threshold (300 seconds by default, 120 to 86400), once per episode, and
+  at most 10 times an hour. A repeater whose clock was never set reads "Clock not set". MQTT
+  sources are not sampled. A MeshCore-only alert, "a repeater gains a confirmed new neighbour", is
+  covered under [New neighbour confirmed](#new-neighbour-confirmed).
+- **Timed Announcement** — posts a message to the Meshtastic and MeshCore channels you pick, on a
+  repeat (every 5 minutes up to once a day), between a start and an end time. It turns itself off
+  when the event ends. See [Timed events](#timed-events-start-end-and-time-zone).
 
 Every template installs through the same [JSON import](#overview) path as a hand-exported automation
 (`POST /api/automations/import`), so it lands disabled, and a template that installs a **pair** of
 automations (like the Bridge) reports each one's install result separately — a partial failure on one
 automation doesn't silently swallow the other.
 
-## Recipe — per-channel range-test acks (issue #4340)
+## Recipe — per-channel range-test acks (issue #4340) {#recipe-per-channel-range-test-acks-issue-4340}
 
 A common base-station setup runs a busy **primary** community channel plus a quieter secondary
 channel (call it **RangeTest**) set aside for range testers. The operator wants an ack on the
@@ -834,7 +1028,7 @@ Engine feature built for exactly that. Two short automations — one per channel
 would-be per-channel Auto-Acknowledge field, and the hop-count tapback carries the "how many hops
 did that take" signal for free, in its own packet, regardless of which text (if any) accompanies it.
 
-## Recipe — Meshtastic ↔ MeshCore bridge
+## Recipe — Meshtastic ↔ MeshCore bridge {#recipe-mt-mc-bridge}
 
 MeshMonitor can bridge **text messages** between a Meshtastic channel and a MeshCore channel — a
 message posted on one side is relayed to the other, tagged with where it came from. This is built
@@ -913,11 +1107,76 @@ test channel first, and watch the destination mesh for a few minutes before trus
 (a busier channel, a second channel pair) only deliberately, one step at a time — not by pointing an
 existing bridge pair at a wider channel filter and hoping.
 
+## Recipe — Meshtastic ↔ Reticulum DM relay {#recipe-mt-ret-relay}
+
+MeshMonitor can relay **direct messages** between one Meshtastic node and one LXMF destination on a
+Reticulum source — for example a handheld on your mesh talking to an LXMF bot that only exists on
+Reticulum. Like the [Meshtastic ↔ MeshCore bridge](#recipe-mt-mc-bridge) it is a matched pair of
+Automation Engine rules, not a native bridge, and it needs the Reticulum send support from #6143
+(v4.17.2 or later). The [Forwarding](/features/automation#forwarding) section cannot do this: it
+forwards within one source only.
+
+**Text only.** LXMF titles, fields and attachments are not relayed, and nothing is relayed to or
+from a channel: LXMF has no channels, and a Meshtastic channel post was never meant for one
+destination.
+
+### Manual construction
+
+**Automation A — "MT → RET Relay"**
+
+**WHEN** *A message is received*
+- **Rate limit:** `5` actions / `60` seconds. Set via the automation's JSON today (see
+  [Rate limit](#rate-limit-flood-ceiling)).
+- Leave **From** empty on the trigger and filter the sender with a condition instead — on a
+  Reticulum source the trigger's **From** field never matches, so keep both rules the same shape.
+
+**RULE** (all conditions must match)
+1. **Source is one of…:** the Meshtastic source.
+2. **Number comparison:** `isDM == 1` — direct messages to your node only.
+3. **Text comparison:** **Sender node id** `equals` the handheld's node id, e.g. `!a5d0d27c`. `equals` is an
+   exact match, so type node ids and LXMF hashes in lowercase, as MeshMonitor stores them.
+4. **Text comparison:** Message text **doesn't contain** `[fwd]`.
+
+**THEN**
+- `Send a message` → **Send via sources:** the Reticulum source. **DM to node #:** the LXMF
+  destination hash (32 hex characters). Body:
+
+  ```
+  [fwd] {{ trigger.fromName }}: {{ trigger.text }}
+  ```
+
+**Automation B — "RET → MT Relay"** is the mirror image: **Source is one of…** the Reticulum source,
+**Sender node id** `equals` the LXMF hash, the same `[fwd]` guard, and `Send a message` via the
+Meshtastic source with **DM to node #** set to the handheld's node **number** (decimal, so
+`!a5d0d27c` is `2781926012`). Skip the `isDM` condition on this side — every LXMF message is a DM.
+Body:
+
+  ```
+  [fwd] {{ trigger.fromName }}: {{ trigger.text }}
+  ```
+
+### Before you enable it
+
+- **The two sides must know each other.** The LXMF destination only receives from MeshMonitor's own
+  LXMF identity, and most LXMF clients and bots ignore a sender they have never seen announce. Use
+  **Announce now** on the Reticulum source first, and make sure the destination has announced so
+  MeshMonitor has a path to it.
+- **Keep replies short.** A Meshtastic text message holds about 200 bytes. The Automation Engine
+  sends the body as it is, so a long LXMF reply is not cut down for the radio; the `[fwd] name: `
+  prefix counts too. A bot on the Reticulum side should keep its answers to one packet.
+- **Loop guard.** The `[fwd]` condition on both rules stops a relayed message from being relayed
+  again, the same way the `MT@` / `MC@` tags do in the MeshCore bridge, and MeshMonitor never fires
+  a message trigger for its own sends. The rate limit is the last line of defence. See
+  [flood safety](#flood-safety).
+- **Install disabled, test with one message each way,** then watch the destination for a few
+  minutes before trusting it. **Run now** cannot exercise these rules: its synthetic event has no
+  source, so **Source is one of…** fails. A real message is the only test.
+
 ## Converting Auto-Acknowledge to an automation
 
 The legacy [Auto Acknowledge](/features/automation#auto-acknowledge) feature predates the engine and
-keeps working unchanged. A **Convert to an Automation…** button in its settings section (Info tab →
-**Auto Acknowledge**) turns an existing per-source configuration into one or two editable
+keeps working unchanged. A **Convert to an Automation…** button in its settings section (a
+source's **Automation** tab → **Auto Acknowledge**) turns an existing per-source configuration into one or two editable
 automations, so you can move to the engine without re-typing anything. The button is disabled with
 a tooltip while you have unsaved Auto Acknowledge edits — converting always uses the last **saved**
 configuration.
@@ -993,12 +1252,8 @@ blank instead of Auto-Acknowledge's literal `N/A` when unavailable; `{DATE}`/`{T
 format; and a pre-send delay becomes one blocking `action.delay` before the first send, rather than
 Auto-Acknowledge's own non-blocking timer applied independently to the tapback and the reply.
 
-One further gap isn't itemized in the report because it isn't tied to any one setting: Auto
-Acknowledge itself selects the *Direct* vs. standard reply template on the raw "0 hops travelled"
-value, not on the same `viaMqtt`-aware ZeroHop test its own toggles use — so an MQTT-relayed,
-0-hop message can be routed to the *MultiHop* cell for enable/disable purposes while still getting
-the *Direct* message's wording. The converter reproduces this quirk faithfully (it also keys the
-message-text choice off `zeroHop`), rather than "fixing" it into a behavior change.
+Auto-Acknowledge and the converter pick the *Direct* reply template the same way: on ZeroHop cells
+only. An IP message at 0 hops lands in the IP row and gets the standard template.
 
 ## Variables
 
@@ -1060,14 +1315,14 @@ values, the set-variable value) accept **double-brace tokens**:
 | Token | Resolves to |
 | --- | --- |
 | `{{ trigger.* }}` | A field from the current trigger (e.g. `{{ trigger.text }}`, `{{ trigger.fromId }}`, `{{ trigger.hops }}`, `{{ trigger.value }}`, `{{ trigger.latestVersion }}`). The available fields depend on the trigger type |
-| `{{ trigger.hopEmoji }}` | The message trigger's hop count as an emoji — `*️⃣` direct, `1️⃣`–`7️⃣` (`7️⃣` = 7 or more), or `#️⃣` when the message came in through an MQTT source. Same mapping as the tapback's hop-count mode above. Blank when the hop count is unknown |
+| `{{ trigger.hopEmoji }}` | The message trigger's hop count as an emoji — `*️⃣` direct, `1️⃣`–`7️⃣` (`7️⃣` = 7 or more), or `#️⃣` when the message came in through an MQTT source. The source's **0-hop tapback** and **MQTT tapback** settings (Auto Acknowledge) replace `*️⃣` and `#️⃣`. Same mapping as the tapback's hop-count mode above. Blank when the hop count is unknown |
 | `{{ trigger.viaMqttSource }}` | `true` when the message came in through an MQTT Bridge / MQTT Broker source rather than over RF — the `#️⃣` case. Distinct from `viaMqtt`, which is the packet's own relay flag |
 | `{{ trigger.sourceId }}` / `{{ trigger.timestamp }}` | Available for every trigger; `timestamp` renders as a local date/time |
 | `{{ var.name }}` | A user-defined variable; `{{ var.name.field }}` for nested `json` access |
 | `{{ steps.name.output }}` / `{{ steps.name.ok }}` | The result a **Run a script** step stored for this run, and whether it ran; `{{ steps.name.output.field }}` for nested JSON. See [Step results for this run](#step-results-for-this-run) |
 | `{{ NOW }}` | The current time, rendered as a local `YYYY-MM-DD HH:mm:ss` |
 
-### Universal message tokens (Meshtastic + MeshCore)
+### Universal message tokens (Meshtastic + MeshCore) {#universal-message-tokens}
 
 A **message** trigger (`trigger.message`) fires on both protocols, so these tokens are **standardized**
 to mean the same thing on each — use them and your automation is portable:
@@ -1091,7 +1346,7 @@ which mesh" tag on a relayed message:
 
 renders as `MT@Alice: hello`. This is exactly the pattern the [MT↔MC Bridge
 template](#template-gallery) uses — see [Recipe — Meshtastic ↔ MeshCore
-bridge](#recipe-—-meshtastic-↔-meshcore-bridge).
+bridge](#recipe-mt-mc-bridge).
 
 `{{ trigger.senderLabel }}` is the **"just works" label for addressing a reply** — it always resolves
 to something usable. Prefer it (or `{{ trigger.fromName }}`) over the **raw identity** tokens:

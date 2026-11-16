@@ -686,6 +686,16 @@ describe('ApiService BASE_URL Support', () => {
       }));
     });
 
+    it('purgeTelemetry includes sourceId in the body only when given', async () => {
+      mockFetch.mockResolvedValue(createMockResponse({ success: true }));
+
+      await apiService.purgeTelemetry(0, 'src-1');
+      expect(JSON.parse(mockFetch.mock.calls.at(-1)![1].body)).toEqual({ olderThanHours: 0, sourceId: 'src-1' });
+
+      await apiService.purgeTelemetry(0);
+      expect(JSON.parse(mockFetch.mock.calls.at(-1)![1].body)).toEqual({ olderThanHours: 0 });
+    });
+
     it('purgeMessages should POST to purge messages endpoint', async () => {
       mockFetch.mockResolvedValue(createMockResponse({ success: true }));
 
@@ -745,6 +755,24 @@ describe('ApiService BASE_URL Support', () => {
       await apiService.getDeviceConfig();
 
       expect(mockFetch).toHaveBeenCalledWith('/api/device-config');
+    });
+
+    // #6353: /api/config must be read for the viewed source, or the node
+    // address falls back to the env default (192.168.1.100).
+    it('getConfig should scope /api/config to the given source', async () => {
+      mockFetch.mockResolvedValue(createMockResponse({ meshtasticNodeIp: '192.0.2.7' }));
+
+      await apiService.getConfig('src a');
+
+      expect(mockFetch).toHaveBeenCalledWith('/api/config?sourceId=src%20a');
+    });
+
+    it('getConfig should read the unscoped /api/config with no source', async () => {
+      mockFetch.mockResolvedValue(createMockResponse({}));
+
+      await apiService.getConfig(null);
+
+      expect(mockFetch).toHaveBeenCalledWith('/api/config');
     });
 
     it('getCurrentConfig should call current config endpoint', async () => {
@@ -1199,6 +1227,17 @@ describe('ApiService BASE_URL Support', () => {
         expect.objectContaining({ method: 'GET', credentials: 'include' })
       );
       expect(appendedAnchor.download).toMatch(/^channel-42-\d+\.json$/);
+    });
+
+    it('exportChannel sends the sourceId the route requires', async () => {
+      mockFetch.mockResolvedValue(mockBlobResponse(true));
+
+      await apiService.exportChannel(3, 'src a');
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        '/api/channels/3/export?sourceId=src%20a',
+        expect.objectContaining({ method: 'GET', credentials: 'include' })
+      );
     });
   });
 

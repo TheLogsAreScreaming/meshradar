@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
 import {
@@ -15,12 +15,16 @@ import {
 } from './constants';
 import { MODEM_PRESET_NAMES } from '../../utils/loraFrequency';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import styles from './LoRaConfigSection.module.css';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
+import { ConfigSection } from '../shared/config/ConfigSection';
 
 interface LoRaConfigSectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
   usePreset: boolean;
   modemPreset: number;
   /**
@@ -67,11 +71,21 @@ interface LoRaConfigSectionProps {
   setTxEnabled: (value: boolean) => void;
   setOverrideDutyCycle: (value: boolean) => void;
   setPaFanDisabled: (value: boolean) => void;
+  /**
+   * #6181: LoRaConfig.transparent_mode as the device reports it. Read-only:
+   * MeshRadar cannot turn it on, and a save keeps the device's value.
+   */
+  transparentMode?: boolean;
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
+  /** Bumped when the page reloads config from the node (#5797). */
+  configVersion?: number;
 }
 
 const LoRaConfigSection: React.FC<LoRaConfigSectionProps> = ({
+  canWrite = true,
+  configVersion,
   usePreset,
   modemPreset,
   unknownModemPresetName = null,
@@ -110,6 +124,7 @@ const LoRaConfigSection: React.FC<LoRaConfigSectionProps> = ({
   setTxEnabled,
   setOverrideDutyCycle,
   setPaFanDisabled,
+  transparentMode = false,
   isSaving,
   onSave
 }) => {
@@ -158,77 +173,43 @@ const LoRaConfigSection: React.FC<LoRaConfigSectionProps> = ({
     setPendingRecipe(null);
   }, [pendingRecipe, region, firmwareVersion, setBandwidth, setSpreadFactor, setCodingRate]);
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // What the node holds; moves on a successful save or a reload (#5797)
+  const values = {
     usePreset, modemPreset, bandwidth, spreadFactor, codingRate, frequencyOffset,
     overrideFrequency, region, hopLimit, txPower, channelNum, femLnaMode, sx126xRxBoostedGain,
     ignoreMqtt, configOkToMqtt, txEnabled, overrideDutyCycle, paFanDisabled
-  });
-
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      usePreset !== initial.usePreset ||
-      modemPreset !== initial.modemPreset ||
-      bandwidth !== initial.bandwidth ||
-      spreadFactor !== initial.spreadFactor ||
-      codingRate !== initial.codingRate ||
-      frequencyOffset !== initial.frequencyOffset ||
-      overrideFrequency !== initial.overrideFrequency ||
-      region !== initial.region ||
-      hopLimit !== initial.hopLimit ||
-      txPower !== initial.txPower ||
-      channelNum !== initial.channelNum ||
-      femLnaMode !== initial.femLnaMode ||
-      sx126xRxBoostedGain !== initial.sx126xRxBoostedGain ||
-      ignoreMqtt !== initial.ignoreMqtt ||
-      configOkToMqtt !== initial.configOkToMqtt ||
-      txEnabled !== initial.txEnabled ||
-      overrideDutyCycle !== initial.overrideDutyCycle ||
-      paFanDisabled !== initial.paFanDisabled
-    );
-  }, [usePreset, modemPreset, bandwidth, spreadFactor, codingRate, frequencyOffset,
-      overrideFrequency, region, hopLimit, txPower, channelNum, femLnaMode, sx126xRxBoostedGain,
-      ignoreMqtt, configOkToMqtt, txEnabled, overrideDutyCycle, paFanDisabled]);
+  };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values, { reseedKey: configVersion });
 
   // Reset to initial values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setUsePreset(initial.usePreset);
-    setModemPreset(initial.modemPreset);
-    setBandwidth(initial.bandwidth);
-    setSpreadFactor(initial.spreadFactor);
-    setCodingRate(initial.codingRate);
-    setFrequencyOffset(initial.frequencyOffset);
-    setOverrideFrequency(initial.overrideFrequency);
-    setRegion(initial.region);
-    setHopLimit(initial.hopLimit);
-    setTxPower(initial.txPower);
-    setChannelNum(initial.channelNum);
-    setFemLnaMode(initial.femLnaMode);
-    setSx126xRxBoostedGain(initial.sx126xRxBoostedGain);
-    setIgnoreMqtt(initial.ignoreMqtt);
-    setConfigOkToMqtt(initial.configOkToMqtt);
-    setTxEnabled(initial.txEnabled);
-    setOverrideDutyCycle(initial.overrideDutyCycle);
-    setPaFanDisabled(initial.paFanDisabled);
-  }, [setUsePreset, setModemPreset, setBandwidth, setSpreadFactor, setCodingRate,
+    setUsePreset(baseline.usePreset);
+    setModemPreset(baseline.modemPreset);
+    setBandwidth(baseline.bandwidth);
+    setSpreadFactor(baseline.spreadFactor);
+    setCodingRate(baseline.codingRate);
+    setFrequencyOffset(baseline.frequencyOffset);
+    setOverrideFrequency(baseline.overrideFrequency);
+    setRegion(baseline.region);
+    setHopLimit(baseline.hopLimit);
+    setTxPower(baseline.txPower);
+    setChannelNum(baseline.channelNum);
+    setFemLnaMode(baseline.femLnaMode);
+    setSx126xRxBoostedGain(baseline.sx126xRxBoostedGain);
+    setIgnoreMqtt(baseline.ignoreMqtt);
+    setConfigOkToMqtt(baseline.configOkToMqtt);
+    setTxEnabled(baseline.txEnabled);
+    setOverrideDutyCycle(baseline.overrideDutyCycle);
+    setPaFanDisabled(baseline.paFanDisabled);
+  }, [baseline, setUsePreset, setModemPreset, setBandwidth, setSpreadFactor, setCodingRate,
       setFrequencyOffset, setOverrideFrequency, setRegion, setHopLimit, setTxPower,
       setChannelNum, setFemLnaMode, setSx126xRxBoostedGain, setIgnoreMqtt, setConfigOkToMqtt,
       setTxEnabled, setOverrideDutyCycle, setPaFanDisabled]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      usePreset, modemPreset, bandwidth, spreadFactor, codingRate, frequencyOffset,
-      overrideFrequency, region, hopLimit, txPower, channelNum, femLnaMode, sx126xRxBoostedGain,
-      ignoreMqtt, configOkToMqtt, txEnabled, overrideDutyCycle, paFanDisabled
-    };
-  }, [onSave, usePreset, modemPreset, bandwidth, spreadFactor, codingRate, frequencyOffset,
-      overrideFrequency, region, hopLimit, txPower, channelNum, femLnaMode, sx126xRxBoostedGain,
-      ignoreMqtt, configOkToMqtt, txEnabled, overrideDutyCycle, paFanDisabled]);
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Danger-confirm on the true->false TX transition (#4294). Enabling never prompts,
   // and cancelling the confirm leaves the checkbox checked.
@@ -255,23 +236,7 @@ const LoRaConfigSection: React.FC<LoRaConfigSectionProps> = ({
 
   return (
     <NumberInputScope scope={numberScope}>
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('lora_config.title')}
-        <a
-          href="https://meshmonitor.org/features/device#lora-radio-configuration"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('lora_config.view_docs')}
-        >
-          <UiIcon name="help" />
-        </a>
-      </h3>
+    <ConfigSection canWrite={canWrite} title={t('lora_config.title')} docsUrl="https://meshmonitor.org/features/device#lora-radio-configuration">
       <div className="setting-item">
         <label htmlFor="usePreset" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
           <input
@@ -688,6 +653,28 @@ const LoRaConfigSection: React.FC<LoRaConfigSectionProps> = ({
         </label>
       </div>
       <div className="setting-item">
+        <label htmlFor="transparentMode" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+          <input
+            id="transparentMode"
+            type="checkbox"
+            checked={transparentMode}
+            disabled
+            readOnly
+            style={{ marginTop: '0.2rem', flexShrink: 0 }}
+          />
+          <div style={{ flex: 1 }}>
+            <div>{t('lora_config.transparent_mode')}</div>
+            <span className="setting-description">{t('lora_config.transparent_mode_description')}</span>
+          </div>
+        </label>
+        {transparentMode && (
+          <div role="alert" className={styles.presetWarning} data-testid="lora-transparent-mode-warning">
+            <UiIcon name="alert" />
+            <span>{t('banners.transparent_mode')}</span>
+          </div>
+        )}
+      </div>
+      <div className="setting-item">
         <label htmlFor="overrideDutyCycle" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
           <input
             id="overrideDutyCycle"
@@ -717,7 +704,7 @@ const LoRaConfigSection: React.FC<LoRaConfigSectionProps> = ({
           </div>
         </label>
       </div>
-    </div>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

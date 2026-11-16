@@ -11,9 +11,10 @@ import type { MeshCoreMessage } from '../../meshcoreManager.js';
 import type { ReticulumMessageRow } from '../../../db/repositories/reticulum.js';
 import type { MeshCoreNodeEventFacts, NodeAircraftData, NodeUpdateOrigin } from '../dataEventEmitter.js';
 import type { TriggerType } from '../../../types/automation.js';
+import { clockOffsetText, clockDirection } from '../../../utils/clockOutOfSync.js';
 import { compileUserRegex } from '../../../utils/safeRegex.js';
-import { hopCountEmoji, hopOrMqttEmoji } from '../../../utils/hopEmoji.js';
-import { autoAckIsZeroHop } from '../../utils/autoAckDecision.js';
+import { hopCountEmoji, hopOrMqttEmoji, type HopEmojiOverrides } from '../../../utils/hopEmoji.js';
+import { autoAckIsIp, autoAckIsZeroHop } from '../../utils/autoAckDecision.js';
 import { REPLY_CONTEXT_TAPBACK, REPLY_CONTEXT_REPLY } from '../../../utils/replyContext.js';
 
 /** Meshtastic broadcast address (0xFFFFFFFF); also defined inline in the manager. */
@@ -97,6 +98,8 @@ export interface MessageContextLabels {
    * DB access. Absent/false → today's hop-count behaviour.
    */
   viaMqttSource?: boolean;
+  /** The source's chosen 0-hop / MQTT glyphs (#5890). Absent → built-in. */
+  hopEmojis?: HopEmojiOverrides;
 }
 
 /** Build the trigger context for a `message:new` event. */
@@ -133,6 +136,7 @@ export function buildMessageContext(
   const isReply = !isTapback && msg.replyId != null;
   const replyContext = isTapback ? REPLY_CONTEXT_TAPBACK : isReply ? REPLY_CONTEXT_REPLY : '';
   const fields: Record<string, unknown> = {
+    isTapback,
     from: Number(msg.fromNodeNum),
     fromId: msg.fromNodeId,
     fromName,
@@ -158,7 +162,7 @@ export function buildMessageContext(
     // over RF), so keying on it would silently change the glyph existing
     // automations already emit. Keyed this way, the new glyph is unreachable for
     // every source type that can fire an automation today.
-    hopEmoji: hopOrMqttEmoji(hops, labels?.viaMqttSource),
+    hopEmoji: hopOrMqttEmoji(hops, labels?.viaMqttSource, labels?.hopEmojis),
     /**
      * True when the message arrived through an MQTT source. Exposed as its own
      * token so a rule can branch on transport without string-matching hopEmoji.
@@ -171,7 +175,14 @@ export function buildMessageContext(
     // deriveHops' raw value (undefined / possibly negative) — see the Phase 1 note.
     // `zeroHop` is the AutoAck-faithful, TOTAL 1/0 form: it is never NaN, so a rule
     // can branch on it inside a flat AND-chain instead of needing condition ports.
-    zeroHop: autoAckIsZeroHop(typeof hops === 'number' && hops > 0 ? hops : 0, msg.viaMqtt) ? 1 : 0,
+    // #5796: an IP message (MQTT or multicast UDP, by flag or transport) is
+    // never zero-hop, exactly as in checkAutoAcknowledge.
+    zeroHop: autoAckIsZeroHop(typeof hops === 'number' && hops > 0 ? hops : 0, msg.viaMqtt, msg.transportMechanism) ? 1 : 0,
+    // #5796: the matrix's IP row as a TOTAL 1/0 field (never NaN). 1 when the
+    // packet reached the node over MQTT or multicast UDP — the same
+    // autoAckIsIp() that picks the IP row in checkAutoAcknowledge. Distinct
+    // from viaMqttSource (the SOURCE type) and wider than viaMqtt (adds UDP).
+    viaIp: autoAckIsIp(msg.viaMqtt, msg.transportMechanism) ? 1 : 0,
     isDM,
     isChannel: isBroadcast,
     isBroadcast,
@@ -209,6 +220,22 @@ export function parseMeshCoreChannelIdx(fromPublicKey: string | undefined): numb
 }
 
 /**
+ * Channel slot of a MeshCore message row, whichever direction it travelled.
+ * A RECEIVED channel post keeps `channel-<idx>` in `fromPublicKey` (above), but
+ * an OUTGOING one (the operator's own send, stored by `sendMessage` /
+ * `sendChannelMessageAs`) keeps our own pubkey in `fromPublicKey` and the
+ * `channel-<idx>` slot in `toPublicKey`. Reading only `fromPublicKey` made our
+ * own channel posts look like DMs, so the MT↔MC bridge (which opts into
+ * self-origin events via `includeSelf`) never relayed them (#6409).
+ */
+export function meshCoreMessageChannelIdx(
+  msg: { fromPublicKey?: string | null; toPublicKey?: string | null },
+): number | undefined {
+  return parseMeshCoreChannelIdx(msg.fromPublicKey ?? undefined)
+    ?? parseMeshCoreChannelIdx(msg.toPublicKey ?? undefined);
+}
+
+/**
  * Build the trigger context for a MeshCore `meshcore:message` event (#3833).
  *
  * MeshCore identity is a public-key string — there is no Meshtastic `nodeNum`,
@@ -221,9 +248,14 @@ export function buildMeshCoreMessageContext(
   msg: MeshCoreMessage,
   sourceId: string | null,
   timestamp: number,
-  labels?: { channelName?: string | null },
+  labels?: {
+    channelName?: string | null;
+    reactionTarget?: { text: string; fromName: string | null } | null;
+    hopEmojis?: HopEmojiOverrides;
+  },
 ): TriggerContext {
-  const channelIdx = parseMeshCoreChannelIdx(msg.fromPublicKey);
+  const isTapback = !!msg.reactionEmoji;
+  const channelIdx = meshCoreMessageChannelIdx(msg);
   const isChannel = channelIdx !== undefined;
   const isRoom = msg.messageType === 'room_post';
   // DM = addressed to us (recipient pubkey set) and not a channel/room post.
@@ -250,21 +282,33 @@ export function buildMeshCoreMessageContext(
     to: msg.toPublicKey,
     toId: msg.toPublicKey,
     text: msg.text,
+    // Row id of the received message (#5762): a MeshCore tapback reacts to it.
+    // On a reaction trigger (#5763) this is the reaction row's own id.
+    meshcoreMessageId: msg.id,
+    isTapback,
+    emoji: isTapback ? 1 : undefined,
+    replyContext: isTapback ? REPLY_CONTEXT_TAPBACK : '',
+    reactionTargetId: isTapback ? (msg.reactionTargetId ?? undefined) : undefined,
+    reactionTargetText: isTapback ? (labels?.reactionTarget?.text ?? undefined) : undefined,
+    reactionTargetSender: isTapback
+      ? (labels?.reactionTarget?.fromName ?? msg.reactionTargetSender ?? undefined)
+      : undefined,
     channel: channelIdx,
     isDM,
     isChannel,
     isBroadcast: isChannel,
     hops,
-    // #4340: same shared table as the Meshtastic context; MeshCore has no
-    // tapback concept, but the token is usable in action.sendMessage bodies.
+    // #4340: same shared table as the Meshtastic context; the token is usable
+    // in action.sendMessage bodies.
     // #4594: MeshCore sources are never `mqtt_broker`/`mqtt_bridge`, so the MQTT
     // glyph is unreachable here — `hopCountEmoji` directly, and the companion
     // token is a constant false so it is never undefined on a message trigger.
-    hopEmoji: hopCountEmoji(hops),
+    hopEmoji: hopCountEmoji(hops, labels?.hopEmojis),
     viaMqttSource: false,
     // #4340 Phase 4: same derivation as buildMessageContext. MeshCore messages
     // carry no viaMqtt concept — `undefined` reads as not-MQTT, never NaN.
     zeroHop: autoAckIsZeroHop(typeof hops === 'number' && hops > 0 ? hops : 0, undefined) ? 1 : 0,
+    viaIp: 0,
     snr: msg.snr,
     rssi: msg.rssi,
     // MeshCore scope/region (#3833). `scopeCode` 0 = explicitly unscoped, null/
@@ -322,22 +366,39 @@ export function buildMeshCoreMessageContext(
  * DM), so `channel`/`channelName` are always unset here — a rule filtering
  * on either never matches a Reticulum message (see
  * {@link reticulumMessageMatchesFilter}).
+ *
+ * `opts.displayName` is the sender's announced display name (from the
+ * `reticulum_destinations` row), resolved by the engine call site; it fills
+ * `fromName`/`senderLabel` so a reply can address the sender by name. Both
+ * fall back to the raw LXMF hash when no name has been announced.
+ *
+ * `messageHash` is this message's own LXMF hash (the part of `msg.id` after the
+ * `${sourceId}_` prefix), so "Reply to the triggering message" can set it as
+ * the outgoing `replyToHash`. (`replyToHash`/`threadHash` on the context are the
+ * INBOUND message's own reply/thread markers, not a handle to reply TO it.)
  */
 export function buildReticulumMessageContext(
   msg: ReticulumMessageRow,
   sourceId: string | null,
   timestamp: number,
+  opts: { displayName?: string | null } = {},
 ): TriggerContext {
   const fromId = msg.fromHash;
-  const senderLabel = fromId;
+  const displayName = opts.displayName?.trim() || undefined;
+  const senderLabel = displayName ?? fromId;
+  // The LXMF hash of THIS message (id = `${sourceId}_${hash}`), for replyToHash.
+  const id = typeof msg.id === 'string' ? msg.id : '';
+  const prefix = `${msg.sourceId ?? ''}_`;
+  const messageHash = id.startsWith(prefix) ? id.slice(prefix.length) : id;
   const fields: Record<string, unknown> = {
     from: msg.fromHash,
     fromId: msg.fromHash,
-    fromName: undefined,
+    fromName: displayName,
     to: msg.toHash,
     toId: msg.toHash,
     text: msg.content,
     title: msg.title,
+    messageHash,
     channel: undefined,
     channelName: undefined,
     senderLabel,
@@ -348,6 +409,7 @@ export function buildReticulumMessageContext(
     hopEmoji: hopCountEmoji(undefined),
     viaMqttSource: false,
     zeroHop: 0,
+    viaIp: 0,
     snr: msg.snr,
     rssi: msg.rssi,
     quality: msg.quality,
@@ -619,6 +681,86 @@ export function buildNodeRebootedContext(
 }
 
 /**
+ * Build the trigger context for a confirmed new MeshCore neighbour
+ * (`trigger.neighborAdded`, #6274). The subject node is the NEIGHBOUR, so
+ * `{{ node.* }}` describes it and node-scoped cooldown keys off its public key;
+ * the reporter (the repeater whose table listed it) is in the `reporter*` fields.
+ * Detection happened in the neighbour watch; this only shapes what the
+ * conditions and interpolation read.
+ */
+export function buildNeighborAddedContext(
+  d: {
+    reporterPublicKey: string;
+    reporterName?: string | null;
+    neighborPublicKey: string;
+    firstSeenAt: number;
+    lastHeardAt: number;
+    snr: number | null;
+    sightings: number;
+  },
+  sourceId: string | null,
+  timestamp: number,
+): TriggerContext {
+  const confirmedAfterHours = Math.round(((d.lastHeardAt - d.firstSeenAt) / 3_600_000) * 10) / 10;
+  return {
+    triggerType: 'trigger.neighborAdded',
+    sourceId,
+    subjectNodeNum: null,
+    subjectNodeKey: d.neighborPublicKey,
+    timestamp,
+    fields: {
+      reporterName: d.reporterName ?? '',
+      reporterPublicKey: d.reporterPublicKey,
+      neighborPublicKey: d.neighborPublicKey,
+      publicKey: d.neighborPublicKey,
+      snr: d.snr ?? undefined,
+      firstSeenAt: d.firstSeenAt,
+      lastHeardAt: d.lastHeardAt,
+      confirmedAfterHours,
+      sightings: d.sightings,
+      sourceId,
+      timestamp,
+    },
+  };
+}
+
+/**
+ * Build the trigger context for a MeshCore clock sample that starts an
+ * out-of-sync episode (`trigger.clockOutOfSync`, #6273). Subject node = the
+ * node whose clock is off. MeshCore has no node number, so the subject key is
+ * the public key (same degrade as {@link buildNodeRebootedContext}).
+ * `thresholdSeconds` is the firing automation's own threshold, so this builds
+ * one context per automation.
+ */
+export function buildClockOutOfSyncContext(
+  publicKey: string,
+  offsetSeconds: number,
+  sampleSource: 'advert' | 'device',
+  thresholdSeconds: number,
+  sourceId: string | null,
+  timestamp: number,
+): TriggerContext {
+  return {
+    triggerType: 'trigger.clockOutOfSync',
+    sourceId,
+    subjectNodeNum: null,
+    subjectNodeKey: publicKey,
+    timestamp,
+    fields: {
+      nodeNum: null,
+      publicKey,
+      offsetSeconds,
+      offsetText: clockOffsetText(offsetSeconds),
+      direction: clockDirection(offsetSeconds),
+      sampleSource,
+      thresholdSeconds,
+      sourceId,
+      timestamp,
+    },
+  };
+}
+
+/**
  * Build the trigger context for a node's transition INTO the likely-aircraft
  * flagged state (`trigger.becameLikelyAircraft` — #5364/#5365 Phase 1 WP3,
  * spec §4.10). Subject node = the flagged node, so `{{ node.* }}` hydration
@@ -762,7 +904,22 @@ export function buildBatteryTrendContext(
   };
 }
 
-/** Build the trigger context for a single telemetry reading (engine fans the batch out). */
+/** The MeshCore contact a telemetry reading came from (#6397). */
+export interface MeshCoreTelemetrySubject {
+  publicKey: string;
+  name?: string | null;
+  advType?: number | null;
+}
+
+/**
+ * Build the trigger context for a single telemetry reading (engine fans the batch out).
+ *
+ * MeshCore readings (#6397) pass `meshcore`: their `nodeNum` is a hash of the
+ * public key, so no `{{ node.* }}` row exists for it. They add the same
+ * identity tokens the other MeshCore triggers carry: `trigger.publicKey`,
+ * `trigger.name` and `trigger.roleName`. `subjectNodeNum` stays the hashed
+ * number so the persisted per-node cooldown keeps its key across the upgrade.
+ */
 export function buildTelemetryContext(
   nodeNum: number,
   telemetryType: string,
@@ -770,13 +927,28 @@ export function buildTelemetryContext(
   unit: string | undefined,
   sourceId: string | null,
   timestamp: number,
+  meshcore?: MeshCoreTelemetrySubject,
 ): TriggerContext {
   return {
     triggerType: 'trigger.telemetry',
     sourceId,
     subjectNodeNum: Number(nodeNum),
     timestamp,
-    fields: { nodeNum: Number(nodeNum), telemetryType, value, unit, sourceId, timestamp },
+    fields: {
+      nodeNum: Number(nodeNum),
+      telemetryType,
+      value,
+      unit,
+      sourceId,
+      timestamp,
+      ...(meshcore
+        ? {
+            publicKey: meshcore.publicKey,
+            name: meshcore.name || undefined,
+            roleName: meshCoreRoleName(meshcore.advType),
+          }
+        : {}),
+    },
   };
 }
 
@@ -1001,6 +1173,11 @@ export function messageMatchesFilter(msg: DbMessage, params: Record<string, unkn
   return true;
 }
 
+/** True only for an explicit boolean `true` (the checkbox); absent/'true' stay off. */
+export function messageFilterIncludesMeshCoreReactions(params: Record<string, unknown> = {}): boolean {
+  return params.includeMeshCoreReactions === true;
+}
+
 /**
  * Pre-filter for MeshCore `trigger.message` events — the MeshCore analogue of
  * {@link messageMatchesFilter}. Honors only cross-protocol params (text/regex/
@@ -1017,7 +1194,8 @@ export function meshCoreMessageMatchesFilter(
   channelName?: string | null,
 ): boolean {
   if (params.portnum != null || params.from != null || params.to != null) return false;
-  const channelIdx = parseMeshCoreChannelIdx(msg.fromPublicKey);
+  if (msg.reactionEmoji && !messageFilterIncludesMeshCoreReactions(params)) return false;
+  const channelIdx = meshCoreMessageChannelIdx(msg);
   const channelNames = messageFilterChannelNames(params);
   if (channelNames.length > 0) {
     if (channelName == null) return false;
@@ -1095,7 +1273,10 @@ export function describeMeshCoreFilterMiss(
   if (params.portnum != null || params.from != null || params.to != null) {
     return 'rule uses Meshtastic-only filters (from/to/portnum) — never matches MeshCore';
   }
-  const channelIdx = parseMeshCoreChannelIdx(msg.fromPublicKey);
+  if (msg.reactionEmoji && !messageFilterIncludesMeshCoreReactions(params)) {
+    return 'MeshCore reaction: the rule does not have "Also fire on MeshCore reactions" on';
+  }
+  const channelIdx = meshCoreMessageChannelIdx(msg);
   const channelNames = messageFilterChannelNames(params);
   if (channelNames.length > 0) {
     const resolved = channelName == null ? null : channelName.toLowerCase();

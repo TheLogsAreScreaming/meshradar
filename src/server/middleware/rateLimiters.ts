@@ -6,6 +6,7 @@
  * Logs all rate limit events for visibility
  */
 
+import type { Request, RequestHandler } from 'express';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { getEnvironmentConfig } from '../config/environment.js';
 import { logger } from '../../utils/logger.js';
@@ -176,6 +177,41 @@ export const meshcoreDeviceLimiter = rateLimit({
   ...rateLimitConfig,
 });
 
+/**
+ * Protocol-aware limiter for v1 routes that serve more than one protocol
+ * (#6263). Mount it AFTER `attachSource`: it reads `req.source.type` and runs
+ * the limiter registered for that protocol, or passes through when none is.
+ * Pass the SAME limiter instances the UI routes use (`meshcoreDeviceLimiter`),
+ * so the v1 API and the UI draw from one bucket.
+ */
+export const protocolLimiter = (
+  limiters: { meshtastic?: RequestHandler; meshcore?: RequestHandler },
+): RequestHandler => (req, res, next) => {
+  const type = (req as Request & { source?: { type?: string } }).source?.type ?? '';
+  const limiter = type.startsWith('meshcore') ? limiters.meshcore : limiters.meshtastic;
+  if (limiter) return limiter(req, res, next);
+  next();
+};
+
+// Rate limiting for Meshtastic device operations (the remote-admin CLI console,
+// #6154). Each call spawns the `meshtastic` CLI and relays over RF, so it is
+// capped like the MeshCore device limiter rather than general API.
+// Default: 10 operations per minute in production, 60 in development.
+export const meshtasticDeviceLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: env.isProduction ? 10 : 60,
+  message: 'Too many device operations, please slow down',
+  handler: (req, res) => {
+    const ip = req.ip || 'unknown';
+    logger.warn(`🚫 Rate limit exceeded for MESHTASTIC DEVICE - IP: ${ip}, Path: ${req.path}`);
+    res.status(429).json({
+      error: 'Too many device operations, please slow down',
+      retryAfter: '1 minute'
+    });
+  },
+  ...rateLimitConfig,
+});
+
 // Elevation profile/test — each call fans out to N outbound tile fetches, so
 // this is stricter than general API. Private network IPs (RFC 1918 + loopback)
 // are exempt via rateLimitConfig's keyGenerator/skip behavior below.
@@ -303,4 +339,27 @@ export const translateLimiter = rateLimit({
     });
   },
   ...(env.rateLimitTranslate === 0 ? { skip: () => true } : {}),
+});
+
+// MQTT root-topic finder (#6287) — each start opens a ~60 s subscribe-only
+// connection to a third-party broker, so this limiter protects THAT broker,
+// not our CPU. Unlike the limiters above it does NOT skip private-network IPs
+// (a reverse proxy puts every client on one). Keyed per user, then IP.
+// The in-service caps (1 per user / endpoint, 2 total, 2 min cooldown) are the
+// real control; this is the outer layer. 5 starts per 10 minutes.
+export const mqttRootFinderLimiter = rateLimit({
+  ...rateLimitConfig,
+  windowMs: 10 * 60 * 1000,
+  max: 5,
+  keyGenerator: (req) => userOrIpKeyGenerator(req as { ip?: string; user?: { id?: number | string } }),
+  handler: (req, res) => {
+    const key = userOrIpKeyGenerator(req as { ip?: string; user?: { id?: number | string } });
+    logger.warn(`🚫 Rate limit exceeded for MQTT_ROOT_FINDER - Key: ${key}`);
+    res.status(429).json({
+      success: false,
+      error: 'Too many topic searches, please wait before starting another',
+      code: 'ROOT_FINDER_BUSY',
+      retryAfterSeconds: 600,
+    });
+  },
 });

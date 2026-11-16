@@ -14,7 +14,9 @@ import meshcorePacketLogService from '../services/meshcorePacketLogService.js';
 import { decodeMeshCorePacket } from '../../utils/meshcorePacketDecode.js';
 import { auditMeshcoreEvent } from './meshcoreRouteShared.js';
 import { ok, fail } from '../utils/apiResponse.js';
+import { listMeshCorePacketsForViewer, isMeshCoreIngestSource, MESHCORE_PACKET_MAX_LIMIT } from '../services/meshcorePacketList.js';
 import { decodeGroupPacketForViewer, type PacketDecodeViewer } from '../utils/meshcorePacketPlaintext.js';
+import { isMeshCoreMqttFedSourceType } from '../../utils/meshcoreSourceTypes.js';
 
 const router = Router({ mergeParams: true });
 
@@ -25,24 +27,80 @@ const router = Router({ mergeParams: true });
  * Filters: payload_type, route_type, since (ms). Returns the same envelope
  * shape as the Meshtastic packet monitor so the frontend can share logic.
  */
+const MESHCORE_SEARCH_MAX_LEN = 100;
+
+type ParsedPacketFilters =
+  | {
+      ok: true;
+      filters: {
+        payloadType?: number;
+        routeType?: number;
+        since?: number;
+        search?: string;
+        srcHash?: string;
+        senderPubKey?: string;
+        pathHash?: string;
+      };
+    }
+  | { ok: false; code: string; message: string };
+
 /**
- * True when `sourceId` names a `meshcore_mqtt` ingest source.
- *
- * Swallows lookup failures and answers `false`, because every caller uses this
- * only to pick which retention cap to *report*. A source-table hiccup should
- * cost a slightly wrong number in the settings box, not a 500 on the packet
- * list itself.
+ * One parser for every packet endpoint (list, grouped, export, distribution).
+ * Params: payload_type, route_type, since (s or ms), search, src_hash,
+ * sender (alias advert_pubkey), path_hash.
  */
-async function isMeshCoreIngestSource(sourceId: string): Promise<boolean> {
-  try {
-    const src = await databaseService.sources?.getSource?.(sourceId);
-    return src?.type === 'meshcore_mqtt';
-  } catch {
-    return false;
+export function parseMeshCorePacketFilters(q: Request['query']): ParsedPacketFilters {
+  const str = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined);
+  const num = (v: unknown): number | undefined => {
+    if (v === undefined) return undefined;
+    const n = parseInt(String(v), 10);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  let since = num(q.since);
+  // Accept seconds or milliseconds (mirror Meshtastic packet routes).
+  if (since !== undefined && since < 1e12) since = since * 1000;
+
+  const search = str(q.search)?.trim() || undefined;
+  if (search && search.length > MESHCORE_SEARCH_MAX_LEN) {
+    return { ok: false, code: 'INVALID_SEARCH', message: `search must be at most ${MESHCORE_SEARCH_MAX_LEN} characters` };
   }
+  const hashOk = (v: string) => /^[0-9a-f]{2,6}$/i.test(v) && v.length % 2 === 0;
+  const srcHash = str(q.src_hash);
+  if (srcHash !== undefined && !hashOk(srcHash)) {
+    return { ok: false, code: 'INVALID_SRC_HASH', message: 'src_hash must be 1 to 3 bytes of hex' };
+  }
+  const pathHash = str(q.path_hash);
+  if (pathHash !== undefined && !hashOk(pathHash)) {
+    return { ok: false, code: 'INVALID_PATH_HASH', message: 'path_hash must be 1 to 3 bytes of hex' };
+  }
+  const sender = str(q.sender) ?? str(q.advert_pubkey);
+  if (sender !== undefined && !/^[0-9a-f]{2,64}$/i.test(sender)) {
+    return { ok: false, code: 'INVALID_SENDER', message: 'sender must be 2 to 64 hex characters' };
+  }
+  return {
+    ok: true,
+    filters: {
+      payloadType: num(q.payload_type),
+      routeType: num(q.route_type),
+      since,
+      search,
+      srcHash: srcHash?.toLowerCase(),
+      senderPubKey: sender?.toLowerCase(),
+      pathHash: pathHash?.toLowerCase(),
+    },
+  };
 }
 
-const MESHCORE_PACKET_MAX_LIMIT = 1000;
+/**
+ * Parse `cursor=<ts>_<id>`; null when absent, undefined when malformed.
+ * Digit caps keep both parts inside Number.MAX_SAFE_INTEGER (ms epoch, row id).
+ */
+export function parseCursor(v: unknown): { untilTs: number; untilId: number } | null | undefined {
+  if (v === undefined || v === '') return null;
+  const m = /^(\d{1,13})_(\d{1,10})$/.exec(String(v));
+  if (!m) return undefined;
+  return { untilTs: Number(m[1]), untilId: Number(m[2]) };
+}
 
 router.get(
   '/packets',
@@ -52,47 +110,24 @@ router.get(
     try {
       const sourceId = (req.params as { id?: string }).id!;
       const offset = Math.max(parseInt(req.query.offset as string, 10) || 0, 0);
-      // Honor the user-configured retention cap (meshcore_packet_log_max_count)
-      // as the default effective limit, the same way the export endpoint does
-      // (issue #3690). An explicit client-supplied `limit` still wins so a
-      // caller can request fewer rows; both are clamped by the hard ceiling.
-      const maxCount = await meshcorePacketLogService.getMaxCount();
-      const requestedLimit = parseInt(req.query.limit as string, 10);
-      const effectiveLimit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : maxCount;
-      const limit = Math.min(Math.max(effectiveLimit, 1), MESHCORE_PACKET_MAX_LIMIT);
-      const payloadType = req.query.payload_type !== undefined ? parseInt(req.query.payload_type as string, 10) : undefined;
-      const routeType = req.query.route_type !== undefined ? parseInt(req.query.route_type as string, 10) : undefined;
-      let since = req.query.since !== undefined ? parseInt(req.query.since as string, 10) : undefined;
-      // Accept seconds or milliseconds (mirror Meshtastic packet routes).
-      if (since !== undefined && since < 1e12) since = since * 1000;
+      const parsed = parseMeshCorePacketFilters(req.query);
+      if (!parsed.ok) return fail(res, 400, parsed.code, parsed.message);
+      const cursor = parseCursor(req.query.cursor);
+      if (cursor === undefined) return fail(res, 400, 'INVALID_CURSOR', 'cursor must be <timestamp>_<id>');
 
-      const query = {
-        sourceId,
-        offset,
-        limit,
-        payloadType: Number.isFinite(payloadType as number) ? payloadType : undefined,
-        routeType: Number.isFinite(routeType as number) ? routeType : undefined,
-        since: Number.isFinite(since as number) ? since : undefined,
-      };
+      const { packets, total, limit, hasMore, nextCursor, enabled, maxCount, maxAgeHours, isIngestSource } =
+        await listMeshCorePacketsForViewer({
+          sourceId,
+          filters: parsed.filters,
+          offset,
+          requestedLimit: parseInt(req.query.limit as string, 10),
+          cursor,
+        });
 
-      // The cap that applies to THIS source: retention is per-source-kind
-      // (#5040 Phase 2), so a region feed reports its own, far larger cap.
-      //
-      // Non-fatal by design. This only decides which cap NUMBER to display, so
-      // a source row that cannot be read must degrade to the device default,
-      // never fail the packet list — the packets are the point of the endpoint.
-      const isIngestSource = await isMeshCoreIngestSource(sourceId);
-      const [packets, total, enabled, maxAgeHours] = await Promise.all([
-        meshcorePacketLogService.getPackets(query),
-        meshcorePacketLogService.getPacketCount({ sourceId, payloadType: query.payloadType, routeType: query.routeType, since: query.since }),
-        meshcorePacketLogService.isEnabled(),
-        meshcorePacketLogService.getMaxAgeHours(),
-      ]);
-
-      res.json({ packets, total, offset, limit, enabled, maxCount: isIngestSource ? await meshcorePacketLogService.getIngestMaxCount() : maxCount, maxAgeHours, isIngestSource });
+      res.json({ packets, total, offset, limit, hasMore, nextCursor, enabled, maxCount, maxAgeHours, isIngestSource });
     } catch (error) {
       logger.error('[API] Error fetching MeshCore packets:', error);
-      res.status(500).json({ success: false, error: 'Failed to fetch packets' });
+      fail(res, 500, 'PACKETS_FETCH_FAILED', 'Failed to fetch packets');
     }
   },
 );
@@ -124,33 +159,19 @@ router.get(
       const requestedLimit = parseInt(req.query.limit as string, 10);
       const effectiveLimit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : maxCount;
       const limit = Math.min(Math.max(effectiveLimit, 1), MESHCORE_PACKET_MAX_LIMIT);
-      const payloadType = req.query.payload_type !== undefined ? parseInt(req.query.payload_type as string, 10) : undefined;
-      const routeType = req.query.route_type !== undefined ? parseInt(req.query.route_type as string, 10) : undefined;
-      let since = req.query.since !== undefined ? parseInt(req.query.since as string, 10) : undefined;
-      if (since !== undefined && since < 1e12) since = since * 1000;
+      const parsed = parseMeshCorePacketFilters(req.query);
+      if (!parsed.ok) return fail(res, 400, parsed.code, parsed.message);
 
-      const query = {
-        sourceId,
-        offset,
-        limit,
-        payloadType: Number.isFinite(payloadType as number) ? payloadType : undefined,
-        routeType: Number.isFinite(routeType as number) ? routeType : undefined,
-        since: Number.isFinite(since as number) ? since : undefined,
-      };
+      const query = { sourceId, offset, limit, ...parsed.filters };
 
       // The cap that applies to THIS source: retention is per-source-kind
       // (#5040 Phase 2), so a region feed reports its own, far larger cap.
       const src = await databaseService.sources.getSource(sourceId);
-      const isIngestSource = src?.type === 'meshcore_mqtt';
+      const isIngestSource = isMeshCoreMqttFedSourceType(src?.type);
       const [packets, total, enabled, maxAgeHours] = await Promise.all([
         meshcorePacketLogService.getGroupedPackets(query),
         // Group count, not row count — paging is over groups here.
-        meshcorePacketLogService.getGroupedPacketCount({
-          sourceId,
-          payloadType: query.payloadType,
-          routeType: query.routeType,
-          since: query.since,
-        }),
+        meshcorePacketLogService.getGroupedPacketCount({ sourceId, ...parsed.filters }),
         meshcorePacketLogService.isEnabled(),
         meshcorePacketLogService.getMaxAgeHours(),
       ]);
@@ -158,7 +179,7 @@ router.get(
       res.json({ packets, total, offset, limit, enabled, maxCount: isIngestSource ? await meshcorePacketLogService.getIngestMaxCount() : maxCount, maxAgeHours, isIngestSource });
     } catch (error) {
       logger.error('[API] Error fetching grouped MeshCore packets:', error);
-      res.status(500).json({ success: false, error: 'Failed to fetch grouped packets' });
+      fail(res, 500, 'GROUPED_PACKETS_FAILED', 'Failed to fetch grouped packets');
     }
   },
 );
@@ -179,13 +200,13 @@ router.get(
       const sourceId = (req.params as { id?: string }).id!;
       const rawHex = typeof req.query.raw_hex === 'string' ? req.query.raw_hex.trim() : '';
       if (!rawHex) {
-        return res.status(400).json({ success: false, error: 'raw_hex is required' });
+        return fail(res, 400, 'INVALID_REQUEST', 'raw_hex is required');
       }
       const receptions = await meshcorePacketLogService.getPacketReceptions(sourceId, rawHex);
       res.json({ receptions, total: receptions.length });
     } catch (error) {
       logger.error('[API] Error fetching MeshCore packet receptions:', error);
-      res.status(500).json({ success: false, error: 'Failed to fetch receptions' });
+      fail(res, 500, 'RECEPTIONS_FAILED', 'Failed to fetch receptions');
     }
   },
 );
@@ -219,7 +240,35 @@ router.get(
       res.json({ total, enabled, maxCount, maxAgeHours, isIngestSource: isIngest });
     } catch (error) {
       logger.error('[API] Error fetching MeshCore packet stats:', error);
-      res.status(500).json({ success: false, error: 'Failed to fetch packet stats' });
+      fail(res, 500, 'PACKET_STATS_FAILED', 'Failed to fetch packet stats');
+    }
+  },
+);
+
+/**
+ * GET /api/sources/:id/meshcore/packets/stats/distribution
+ *
+ * Payload-type, route-type and top-advert-sender distribution under the same
+ * filters as the list. Response: { byPayloadType, byRouteType, topSenders, total, enabled }.
+ * Counts are receptions (rows), like the flat list.
+ */
+router.get(
+  '/packets/stats/distribution',
+  optionalAuth(),
+  requirePermission('packetmonitor', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      const parsed = parseMeshCorePacketFilters(req.query);
+      if (!parsed.ok) return fail(res, 400, parsed.code, parsed.message);
+      const [distribution, enabled] = await Promise.all([
+        meshcorePacketLogService.getDistribution({ sourceId, ...parsed.filters }),
+        meshcorePacketLogService.isEnabled(),
+      ]);
+      return res.json({ ...distribution, enabled });
+    } catch (error) {
+      logger.error('[API] Error fetching MeshCore packet distribution:', error);
+      return fail(res, 500, 'DISTRIBUTION_FAILED', 'Failed to fetch packet distribution');
     }
   },
 );
@@ -245,11 +294,8 @@ router.get(
   async (req: Request, res: Response) => {
     try {
       const sourceId = (req.params as { id?: string }).id!;
-      const payloadType = req.query.payload_type !== undefined ? parseInt(req.query.payload_type as string, 10) : undefined;
-      const routeType = req.query.route_type !== undefined ? parseInt(req.query.route_type as string, 10) : undefined;
-      let since = req.query.since !== undefined ? parseInt(req.query.since as string, 10) : undefined;
-      // Accept seconds or milliseconds (mirror the list endpoint).
-      if (since !== undefined && since < 1e12) since = since * 1000;
+      const parsed = parseMeshCorePacketFilters(req.query);
+      if (!parsed.ok) return fail(res, 400, parsed.code, parsed.message);
 
       // Export every retained packet matching the filters (up to the cap).
       const maxCount = await meshcorePacketLogService.getMaxCount();
@@ -257,15 +303,11 @@ router.get(
         sourceId,
         offset: 0,
         limit: maxCount,
-        payloadType: Number.isFinite(payloadType as number) ? payloadType : undefined,
-        routeType: Number.isFinite(routeType as number) ? routeType : undefined,
-        since: Number.isFinite(since as number) ? since : undefined,
+        ...parsed.filters,
       });
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-      const hasActiveFilters = req.query.payload_type !== undefined ||
-                               req.query.route_type !== undefined ||
-                               req.query.since !== undefined;
+      const hasActiveFilters = Object.values(parsed.filters).some((v) => v !== undefined);
       const filterInfo = hasActiveFilters ? '-filtered' : '';
       const filename = `meshcore-packet-monitor${filterInfo}-${timestamp}.jsonl`;
 
@@ -288,7 +330,7 @@ router.get(
       logger.debug(`[API] Exported ${packets.length} MeshCore packets to ${filename}`);
     } catch (error) {
       logger.error('[API] Error exporting MeshCore packets:', error);
-      res.status(500).json({ success: false, error: 'Failed to export packets' });
+      fail(res, 500, 'EXPORT_FAILED', 'Failed to export packets');
     }
   },
 );
@@ -362,7 +404,7 @@ router.delete(
       res.json({ success: true, deleted });
     } catch (error) {
       logger.error('[API] Error clearing MeshCore packets:', error);
-      res.status(500).json({ success: false, error: 'Failed to clear packets' });
+      fail(res, 500, 'CLEAR_FAILED', 'Failed to clear packets');
     }
   },
 );

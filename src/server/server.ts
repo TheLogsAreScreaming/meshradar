@@ -17,12 +17,12 @@ import { createRequire } from 'module';
 import { logger } from '../utils/logger.js';
 import { setDiscardInvalidPositions, parseDiscardInvalidPositions } from '../utils/positionIngestConfig.js';
 import { setNoIndexEnabled, parseNoIndexEnabled } from '../utils/robotsConfig.js';
-import { FAVORITE_STORAGE_DAYS_DEFAULT } from '../utils/telemetryRetention.js';
+import { startTelemetryPurgeSchedule } from './services/telemetryPurgeSchedule.js';
+import { reloadPublicInstanceConfig } from './services/publicInstanceConfig.js';
 import { robotsTagMiddleware } from './middleware/robotsTag.js';
 import { getSessionMiddleware } from './auth/sessionConfig.js';
 import { initializeWebSocket } from './services/webSocketService.js';
 import { initializeOIDC } from './auth/oidcAuth.js';
-import { optionalAuth } from './auth/authMiddleware.js';
 import { apiLimiter } from './middleware/rateLimiters.js';
 import { setupAccessLogger } from './middleware/accessLogger.js';
 import { getEnvironmentConfig, resetEnvironmentConfig } from './config/environment.js';
@@ -48,12 +48,17 @@ import { cotFeedService } from './services/cotFeedService.js';
 import { serverEventNotificationService } from './services/serverEventNotificationService.js';
 import { versionCheckService } from './services/versionCheckService.js';
 import { coverageRetentionService } from './services/coverageRetentionService.js';
+import { directRfContactsRetentionService } from './services/directRfContactsRetentionService.js';
+import { flushDirectRfContacts } from './services/directRfContactRecorder.js';
+import { notificationHold } from './services/notificationDedup.js';
 import { translationCacheService } from './services/translation/translationCacheService.js';
 import { dynamicCspMiddleware, refreshTileHostnameCache } from './middleware/dynamicCsp.js';
-import settingsRoutes, { setSettingsCallbacks } from './routes/settingsRoutes.js';
+import { setSettingsCallbacks } from './routes/settingsRoutes.js';
+import { installNodeNameLocalResolver, reloadNodeNameSanitizer } from './services/nodeNameSanitizerService.js';
 import { bootstrapSources } from './bootstrapSources.js';
 import { transportTrafficService } from './services/transportTrafficService.js';
 import { migrateAutoResponderTriggers } from './services/autoResponderTriggerMigration.js';
+import { httpCompression } from './middleware/httpCompression.js';
 import { configureStaticServing, invalidateHtmlCache } from './staticServing.js';
 // Re-exported for backward compatibility — server.ts used to define
 // invalidateHtmlCache locally and `export function` it. No current importer
@@ -142,6 +147,10 @@ const helmetConfig =
       };
 
 app.use(helmet(helmetConfig));
+
+// Compress responses (API JSON, HTML, JS/CSS). Mounted before anything that
+// writes a body. Downloads and event streams are skipped; see httpCompression.ts.
+app.use(httpCompression());
 
 // Dynamic CSP middleware - adds custom tile server hostnames from database,
 // and sets frame-ancestors from IFRAME_ALLOWED_ORIGINS when configured.
@@ -232,7 +241,7 @@ const sessionMiddleware = getSessionMiddleware();
 app.use(sessionMiddleware);
 
 // Security: CSRF protection middleware
-import { csrfTokenMiddleware, csrfProtection, csrfTokenEndpoint } from './middleware/csrf.js';
+import { csrfTokenMiddleware, csrfProtection } from './middleware/csrf.js';
 app.use(csrfTokenMiddleware); // Generate and attach tokens to all requests
 // csrfProtection applied to API routes below (after CSRF token endpoint)
 
@@ -334,6 +343,16 @@ setTimeout(async () => {
       logger.error('Failed to start transportTrafficService (continuing boot):', error);
     }
 
+    // Node-name anti-spam (#6382, default OFF): compile the rules once and
+    // teach the runtime to skip each source's own node. Loaded before any
+    // source can ingest a packet; reloaded on save.
+    installNodeNameLocalResolver(sourceManagerRegistry);
+    await reloadNodeNameSanitizer().catch((err) => logger.warn('Failed to load node-name sanitizer settings:', err));
+
+    // MQTT-native send (#4305): learn our generated node ids before any source
+    // ingests a packet, so the self-origin guard knows them from the start.
+    await primeMqttNativeIdentityCache();
+
     // Bootstrap all enabled sources (auto-creating a Default source from env
     // only when none exist AND MESHTASTIC_NODE_IP was explicitly set).
     // Extracted into bootstrapSources() for testability — see WP1 of issue
@@ -349,18 +368,17 @@ setTimeout(async () => {
         meshtasticNodeIp: env.meshtasticNodeIp,
         meshtasticNodeIpProvided: env.meshtasticNodeIpProvided,
         meshtasticTcpPort: env.meshtasticTcpPort,
+        virtualNodeEnabled: env.virtualNodeEnabled,
+        virtualNodePort: env.virtualNodePort,
+        meshcoreDefault: env.meshcoreDefault,
       },
       registry: sourceManagerRegistry,
       makeMeshtastic: (id, cfg) => new MeshtasticManager(id, cfg),
     });
 
-    // Initialize backup scheduler. Pass a resolver (not a captured instance)
-    // so the scheduler always targets the registry's current primary
-    // meshtastic_tcp source, mirroring what the retired Proxy alias used to
-    // provide transparently (#3962 Phase 4.2a WP4).
-    backupSchedulerService.initialize(
-      () => getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager
-    );
+    // Initialize backup scheduler. Per-source: it walks the stored sources
+    // (Meshtastic TCP and MeshCore) and asks the registry for each live manager.
+    backupSchedulerService.initialize(sourceManagerRegistry);
     logger.debug('Backup scheduler initialized');
 
     // Initialize duplicate key scanner
@@ -384,6 +402,11 @@ setTimeout(async () => {
     // Initialize database maintenance service
     databaseMaintenanceService.initialize();
     logger.debug('Database maintenance service initialized');
+
+    // MQTT-native send (#4305): arm the NodeInfo cadence. The scheduler's first check runs
+    // a full minute after start and is due-based on the persisted last-sent
+    // time, so a restart is never a trigger.
+    startMqttNativeNodeInfoScheduler();
 
     // Initialize position estimation scheduler (global, batch — issue #3271)
     positionEstimationScheduler.initialize();
@@ -426,9 +449,24 @@ setTimeout(async () => {
     // automation references beacons.
     startMeshBeaconOfferIngestion();
 
+    // MeshWars forwarder: posts MeshCore heard-repeater results to MeshWars.
+    // Does nothing unless meshwarsEnabled is on; sends nothing over the air.
+    meshwarsForwarder.start();
+
     // ADS-B flight matching for likely aircraft (#5374). Subscribes to the
     // Phase 1 transition event; does nothing unless adsbMatchEnabled is on.
     startAdsbFlightMatching();
+
+    // #5704: ask a newly flagged aircraft for its position. Subscribes to the
+    // same transition event; sends nothing unless a source opts in.
+    startAircraftPositionRequests();
+
+    // MeshCore message and mention alerts (one ordered subscriber per source):
+    // mentions first, then the new-message alert. Sends nothing on air.
+    startMeshCoreMessageNotifications();
+
+    // Once per process: which MeshCore reaction wire format this build speaks.
+    logger.info(`[MeshCore] reaction wire format version ${MC_REACTION_FORMAT_VERSION} (MC1 >= 1.4.1; reads meshcore-open v3/v1)`);
 
     // Seed the global "discard invalid GPS positions" ingest gate from settings
     // (default ON = discard, the historical behavior). Refreshed live on save via
@@ -507,47 +545,9 @@ setTimeout(async () => {
   }
 }, 1000);
 
-// Schedule hourly telemetry purge to keep database performant
-// Keep telemetry for 7 days (168 hours) by default
-const TELEMETRY_RETENTION_HOURS = 168; // 7 days
-// Fallback retention for FAVORITED telemetry when no namespace configures one.
-// The real window comes from each source's `favoriteTelemetryStorageDays`,
-// resolved inside purgeOldTelemetryAsync (#5080).
-const FAVORITE_TELEMETRY_DEFAULT_DAYS = FAVORITE_STORAGE_DAYS_DEFAULT;
-setInterval(async () => {
-  try {
-    // Long migrations (e.g. on big MySQL telemetry tables) can keep the DB
-    // unready well past the first tick — wait before touching repos.
-    await databaseService.waitForReady();
-    // FAVORITE_TELEMETRY_DEFAULT_DAYS is only the fallback: purgeOldTelemetryAsync
-    // resolves each source's own `favoriteTelemetryStorageDays` (#5080).
-    const purgedCount = await databaseService.purgeOldTelemetryAsync(
-      TELEMETRY_RETENTION_HOURS,
-      FAVORITE_TELEMETRY_DEFAULT_DAYS
-    );
-    if (purgedCount > 0) {
-      logger.debug(`⏰ Hourly telemetry purge completed: removed ${purgedCount} records`);
-    }
-  } catch (error) {
-    logger.error('Error during telemetry purge:', error);
-  }
-}, 60 * 60 * 1000); // Run every hour
-
-// Run initial purge on startup
-setTimeout(async () => {
-  try {
-    // Wait for DB ready: on a fresh upgrade, schema migrations (e.g. 032 dedupe
-    // on a large MySQL telemetry table) can run longer than this 5s delay,
-    // and accessing databaseService.settings before init throws.
-    await databaseService.waitForReady();
-    await databaseService.purgeOldTelemetryAsync(
-      TELEMETRY_RETENTION_HOURS,
-      FAVORITE_TELEMETRY_DEFAULT_DAYS
-    );
-  } catch (error) {
-    logger.error('Error during initial telemetry purge:', error);
-  }
-}, 5000); // Wait 5 seconds after startup
+// Telemetry retention purge: once 5s after boot, then hourly. The startup run
+// is skipped on a boot that restored a backup (#6354).
+startTelemetryPurgeSchedule(databaseService);
 
 // Coverage Report retention sweep (#5277 Phase 1 WP2): hourly purge of RF
 // receptions older than the configured coverage_retention_days. The service
@@ -561,6 +561,12 @@ setTimeout(async () => {
     coverageRetentionService.start();
   } catch (error) {
     logger.error('Error starting Coverage Report retention sweep:', error);
+  }
+  // Direct RF Contacts (#6210): same shape, own setting (default 30 days).
+  try {
+    directRfContactsRetentionService.start();
+  } catch (error) {
+    logger.error('Error starting Direct RF Contacts retention sweep:', error);
   }
 }, 5000);
 
@@ -664,9 +670,10 @@ setTimeout(async () => {
 
 // MeshCore Time-Sync Scheduler (#4916) — periodically pushes the server's wall
 // clock to each opt-in remote repeater's RTC via the absolute `time <epoch>`
-// verb. The most expensive of the MeshCore schedulers: one sync is FOUR
-// packets (login + reply, then the CLI command + reply), because
-// `ensureSavedLogin` deliberately does not cache. It therefore honours the
+// verb. The most expensive of the MeshCore schedulers: one sync is 2 packets
+// (CLI command + reply) on a remembered admin session (#5785), 4 when a login
+// must go first, and at worst 1 + 4 when the remembered session is stale (one
+// fresh login, one retry, never more). It therefore honours the
 // same per-source 60s minimum through the shared `MeshCoreManager.lastMeshTxAt`
 // primitive, and its per-node cadence defaults to 12h with a 1h floor. That
 // cadence lives in a THIRD separate column set (`lastTimeSyncAt`, migration
@@ -703,38 +710,17 @@ setTimeout(async () => {
 }, 10 * 1000);
 
 // Create router for API routes
-const apiRouter = express.Router();
-
 // Import route handlers
-import authRoutes from './routes/authRoutes.js';
-import automationRoutes from './routes/automationRoutes.js';
-import autoAckConverterRoutes from './routes/autoAckConverterRoutes.js';
+import { MC_REACTION_FORMAT_VERSION } from '../utils/meshcoreReactions.js';
+import { startMeshCoreMessageNotifications } from './services/meshcoreMessageNotifier.js';
 import { startAutomationEngine } from './services/automation/automationEngineSingleton.js';
 import { startMeshBeaconOfferIngestion } from './services/meshBeaconOfferService.js';
+import { meshwarsForwarder } from './services/meshwarsForwarder.js';
 import { startAdsbFlightMatching } from './services/adsbMatchService.js';
-import userRoutes from './routes/userRoutes.js';
-import auditRoutes from './routes/auditRoutes.js';
-import securityRoutes from './routes/securityRoutes.js';
-import packetRoutes from './routes/packetRoutes.js';
-import solarRoutes from './routes/solarRoutes.js';
-import messageRoutes from './routes/messageRoutes.js';
-import readStateRoutes from './routes/readStateRoutes.js';
-import linkPreviewRoutes from './routes/linkPreviewRoutes.js';
-import scriptContentRoutes from './routes/scriptContentRoutes.js';
-import apiTokenRoutes from './routes/apiTokenRoutes.js';
-import mfaRoutes from './routes/mfaRoutes.js';
-import channelDatabaseRoutes from './routes/channelDatabaseRoutes.js';
-import newsRoutes from './routes/newsRoutes.js';
-import tileServerRoutes from './routes/tileServerTest.js';
-import v1Router from './routes/v1/index.js';
-import meshcoreRoutes from './routes/meshcoreRoutes.js';
+import { startAircraftPositionRequests } from './services/aircraftPositionRequestService.js';
 import { meshcoreMessageFilter } from './services/meshcoreMessageFilter.js';
-import mqttPacketRoutes from './routes/mqttPacketRoutes.js';
-import forwardingRoutes from './routes/forwardingRoutes.js';
-import atakRoutes from './routes/atakRoutes.js';
-import surveyRoutes from './routes/surveyRoutes.js';
-import beaconOfferRoutes from './routes/beaconOfferRoutes.js';
-import reticulumRoutes from './routes/reticulumRoutes.js';
+import { primeMqttNativeIdentityCache } from './services/mqttNative/mqttNativeIdentity.js';
+import { startMqttNativeNodeInfoScheduler, stopMqttNativeNodeInfoScheduler } from './services/mqttNative/mqttNativeNodeInfoScheduler.js';
 // meshcoreConfigFromSource / ensureMeshCoreManagerStarted moved to bootstrapSources.ts
 import { isMeshtasticManager, isMeshCoreManager } from './sourceManagerTypes.js';
 import { MeshCoreTelemetryPoller, setMeshCoreTelemetryPoller } from './services/meshcoreTelemetryPoller.js';
@@ -755,292 +741,31 @@ import {
   setMeshCoreTimeSyncScheduler,
 } from './services/meshcoreTimeSyncScheduler.js';
 import { getMeshCoreCredentialStore } from './services/meshcoreCredentialStore.js';
-import embedProfileRoutes from './routes/embedProfileRoutes.js';
 import embedPublicRoutes from './routes/embedPublicRoutes.js';
-import { privacyPublicRouter, privacyAdminRouter } from './routes/privacyRoutes.js';
-import firmwareUpdateRoutes from './routes/firmwareUpdateRoutes.js';
-import sourceRoutes from './routes/sourceRoutes.js';
-import unifiedRoutes from './routes/unifiedRoutes.js';
-import analysisRoutes from './routes/analysisRoutes.js';
-import aircraftRoutes from './routes/aircraftRoutes.js';
-import assetRoutes from './routes/assetRoutes.js';
-import meshIssuesRoutes from './routes/meshIssuesRoutes.js';
-import coverageRoutes from './routes/coverageRoutes.js';
-import crossSourceLinkRoutes from './routes/crossSourceLinkRoutes.js';
-import elevationRoutes from './routes/elevationRoutes.js';
-import gnssRoutes from './routes/gnssRoutes.js';
-import rfCoverageRoutes from './routes/rfCoverageRoutes.js';
+import { privacyPublicRouter } from './routes/privacyRoutes.js';
 import { firmwareUpdateService } from './services/firmwareUpdateService.js';
+import { createApiRouter } from './routes/apiRouter.js';
+import { dataPath } from './config/dataDir.js';
 import { createGeoJsonRouter } from './routes/geojsonRoutes.js';
 import { GeoJsonService } from './services/geojsonService.js';
 import { MapStyleService } from './services/mapStyleService.js';
 import { createMapStyleRouter } from './routes/mapStyleRoutes.js';
-import healthRoutes from './routes/healthRoutes.js';
-import cleanupRoutes from './routes/cleanupRoutes.js';
-import maintenanceRoutes from './routes/maintenanceRoutes.js';
-import themeRoutes from './routes/themeRoutes.js';
-import purgeRoutes from './routes/purgeRoutes.js';
-import tracerouteRoutes from './routes/tracerouteRoutes.js';
-import routeSegmentRoutes from './routes/routeSegmentRoutes.js';
-import neighborInfoRoutes from './routes/neighborInfoRoutes.js';
-import ignoredNodeRoutes from './routes/ignoredNodeRoutes.js';
-import announceRoutes from './routes/announceRoutes.js';
-import { backupRouter, systemBackupRouter } from './routes/backupRoutes.js';
-import { pushRouter, appriseRouter } from './routes/notificationRoutes.js';
-import meshRequestRoutes from './routes/meshRequestRoutes.js';
-import telemetryRoutes from './routes/telemetryRoutes.js';
-import connectionRoutes from './routes/connectionRoutes.js';
-import deviceStatusRoutes from './routes/deviceStatusRoutes.js';
-import statusRoutes from './routes/statusRoutes.js';
-import dataExchangeRoutes from './routes/dataExchangeRoutes.js';
-import serverInfoRoutes from './routes/serverInfoRoutes.js';
-import scriptRoutes, { scriptsEndpoint, getScriptsDirectory } from './routes/scriptRoutes.js';
-import deviceRoutes from './routes/deviceRoutes.js';
-import systemRoutes, { setSystemCallbacks } from './routes/systemRoutes.js';
-import channelRoutes from './routes/channelRoutes.js';
-import pollRoutes from './routes/pollRoutes.js';
-import configRoutes from './routes/configRoutes.js';
-import userPreferencesRoutes from './routes/userPreferencesRoutes.js';
-import adminRoutes from './routes/adminRoutes.js';
-import nodesRoutes from './routes/nodesRoutes.js';
-import translationRoutes from './routes/translationRoutes.js';
+import { scriptsEndpoint, getScriptsDirectory } from './routes/scriptRoutes.js';
+import { setSystemCallbacks } from './routes/systemRoutes.js';
+import { publicInstanceRedaction } from './middleware/publicInstanceRedaction.js';
 
-// CSRF token endpoint (must be before CSRF protection middleware)
-apiRouter.get('/csrf-token', csrfTokenEndpoint);
-
-// Health check endpoints (for upgrade watchdog and monitoring)
-apiRouter.use('/health', healthRoutes);
-
-// Debug endpoint for IP detection (development only)
-// Helps diagnose reverse proxy and rate limiting issues
-if (!env.isProduction) {
-  apiRouter.get('/debug/ip', (req, res) => {
-    res.json({
-      'req.ip': req.ip,
-      'req.ips': req.ips,
-      'x-forwarded-for': req.headers['x-forwarded-for'],
-      'x-real-ip': req.headers['x-real-ip'],
-      'trust-proxy': app.get('trust proxy'),
-      note: 'The rate limiter uses req.ip to identify clients',
-    });
-  });
-
-}
-
-// Authentication routes
-apiRouter.use('/auth', authRoutes);
-
-// API Token management routes (requires auth)
-apiRouter.use('/token', apiTokenRoutes);
-
-// MFA management routes (requires auth)
-apiRouter.use('/mfa', mfaRoutes);
-
-// v1 API routes (requires API token)
-apiRouter.use('/v1', v1Router);
-
-// User management routes (admin only)
-apiRouter.use('/users', optionalAuth(), userRoutes);
-
-// Audit log routes (admin only)
-apiRouter.use('/audit', optionalAuth(), auditRoutes);
-
-// Channel database routes (admin only, session-based)
-apiRouter.use('/channel-database', optionalAuth(), channelDatabaseRoutes);
-
-// Security routes (requires security:read)
-apiRouter.use('/security', optionalAuth(), securityRoutes);
-
-// Packet log routes (requires channels:read AND messages:read)
-apiRouter.use('/packets', optionalAuth(), packetRoutes);
-
-// Solar monitoring routes
-apiRouter.use('/solar', optionalAuth(), solarRoutes);
-
-// News routes (public feed, authenticated status endpoints)
-apiRouter.use('/news', newsRoutes);
-
-// Message routes (requires appropriate write permissions)
-apiRouter.use('/messages', optionalAuth(), messageRoutes);
-
-// Translation routes
-apiRouter.use('/translate', optionalAuth(), translationRoutes);
-
-// Per-user conversation read watermarks (#4607) — the durable anchor for the
-// unread divider and the jump-to-first-unread entry scroll on MeshCore.
-apiRouter.use('/read-state', readStateRoutes);
-
-// MeshCore routes — nested under `/api/sources/:id/meshcore/*` so each
-// request resolves the manager bound to a specific source. The legacy
-// un-nested `/api/meshcore/*` mount was dropped in slice 3 along with
-// the global `meshcore` permission resource; the new frontend talks to
-// the per-source surface only.
-apiRouter.use('/sources/:id/meshcore', meshcoreRoutes);
-
-// MQTT Packet Monitor routes — nested under `/api/sources/:id/mqtt/packets`
-// so each request resolves the retention log bound to a specific source.
-// No source-type check (mirrors meshcore): retained rows stay readable while
-// a source is disconnected or reconfigured. See
-// docs/internal/dev-notes/MQTT_PACKET_MONITOR_PHASE1_SPEC.md §2.11/§2.12.
-apiRouter.use('/sources/:id/mqtt/packets', mqttPacketRoutes);
-
-// Message Forwarding rules (#5446) — per-source, Meshtastic + MeshCore.
-apiRouter.use('/sources/:id/forwarding', forwardingRoutes);
-
-// ATAK Contacts routes — nested under `/api/sources/:id/atak` so each
-// request resolves the contact table bound to a specific source. No
-// source-type check (mirrors meshcore/mqtt): a non-Meshtastic or
-// disconnected source simply has no rows. See
-// docs/internal/dev-notes/ATAK_COT_PHASE2_SPEC.md §2g.
-apiRouter.use('/sources/:id/atak', atakRoutes);
-
-// MeshBeacon offer routes (#4723) — nested under `/api/sources/:id/beacon-offers`.
-// Per-source because accepting an offer is a device write against one radio.
-apiRouter.use('/sources/:id/beacon-offers', beaconOfferRoutes);
-
-// Network survey (#4726) — nested under `/api/sources/:id/survey`. Read-only
-// synthesis of already-collected data; emits no radio traffic.
-apiRouter.use('/sources/:id/survey', surveyRoutes);
-
-// Predictive RF coverage (#4727) — terrain-modelled, read-only, and NOT
-// per-source: the origin and radio parameters come from the request, so this
-// is a planning tool rather than a property of a configured radio.
-apiRouter.use('/rf', rfCoverageRoutes);
-
-// Reticulum routes — nested under `/api/sources/:id/reticulum` so each
-// request resolves the destinations/interfaces bound to a specific source.
-// Unlike meshcore, the manager is REMOVED from the registry on disconnect
-// (build spec §3.6/§7 risk 2), so the route guard tolerates an absent
-// manager and read endpoints keep serving persisted rows. See
-// docs/internal/dev-notes/RETICULUM_PHASE1A_BUILD_SPEC.md §3.7.
-apiRouter.use('/sources/:id/reticulum', reticulumRoutes);
-
-// Link preview routes
-apiRouter.use('/', linkPreviewRoutes);
-
-// Script content proxy routes (for User Scripts Gallery)
-apiRouter.use('/', scriptContentRoutes);
-
-// Tile server testing routes (for Custom Tileset Manager autodetect)
-apiRouter.use('/tile-server', optionalAuth(), tileServerRoutes);
-
-// Settings routes (GET/POST/DELETE /settings)
-apiRouter.use('/settings', settingsRoutes);
-
-// Configuration routes (GET /config, GET /config/current, POST /config/*)
-apiRouter.use('/config', configRoutes);
-
-// User preferences routes (GET/POST /user/map-preferences)
-apiRouter.use('/user', userPreferencesRoutes);
-
-// Admin routes (all requireAdmin(); config load/export/import, channel/owner
-// load, device metadata, reboot/set-time, suppressed-ghost mgmt, commands)
-apiRouter.use('/admin', adminRoutes);
-
-// Embed profile admin routes (admin only)
-apiRouter.use('/embed-profiles', embedProfileRoutes);
-
-// Firmware OTA update routes (admin only)
-apiRouter.use('/firmware', firmwareUpdateRoutes);
-
-// Sources management routes
-apiRouter.use('/sources', sourceRoutes);
-
-// Unified cross-source views
-apiRouter.use('/unified', unifiedRoutes);
-
-// Mesh issues analysis (#4964 Phase 1) — passive findings from data already
-// on disk. Separate router (analysisRoutes.ts is already 1000+ lines); see
-// meshIssuesRoutes.ts header for the cross-source permission filtering.
-// NOTE: More specific route must come BEFORE general /analysis router
-apiRouter.use('/analysis/mesh-issues', meshIssuesRoutes);
-
-// Coverage Report (#5277 Phase 1 WP3) — RF-reception query API. Also more
-// specific than /analysis and must be mounted before it; does not collide
-// with /analysis/coverage-grid since Express mount paths match whole
-// segments.
-apiRouter.use('/analysis/coverage', coverageRoutes);
-
-// Cross-source "heard here" map edges (#5561). More specific than /analysis;
-// mounted before it.
-apiRouter.use('/analysis/cross-source-links', crossSourceLinkRoutes);
-
-// Cross-source analysis workspace
-apiRouter.use('/analysis', analysisRoutes);
-
-// Likely-aircraft flight trails (#5364/#5365 Phase 3) — stored telemetry only.
-apiRouter.use('/aircraft', aircraftRoutes);
-
-// Asset Tracking (#5354) — global per-node asset flag + telemetry retention.
-apiRouter.use('/assets', assetRoutes);
-
-// Terrain link elevation profile (#4111 Phase 1)
-apiRouter.use('/elevation', elevationRoutes);
-
-// GNSS/GPS constellation overlay (#4729) — sky view + DOP compute over live TLEs
-apiRouter.use('/gnss', gnssRoutes);
-
-// GeoJSON overlay layer routes
-const geojsonDataDir = path.join(process.env.DATA_DIR || '/data', 'geojson');
+const geojsonDataDir = dataPath('geojson');
 const geojsonService = new GeoJsonService(geojsonDataDir);
 const geojsonRouter = createGeoJsonRouter(geojsonService);
-apiRouter.use('/geojson', geojsonRouter);
-// Privacy disclosure admin (#5156). The PUBLIC half is mounted below, before
-// the api router, so a logged-out visitor can read the policy; this half stays
-// behind rate limiting, CSRF and settings permissions.
-apiRouter.use('/privacy/admin', privacyAdminRouter);
-
-// MapLibre GL style routes
-const mapStyleDataDir = path.join(process.env.DATA_DIR || '/data', 'styles');
+const mapStyleDataDir = dataPath('styles');
 const mapStyleService = new MapStyleService(mapStyleDataDir);
 const mapStyleRouter = createMapStyleRouter(mapStyleService);
-apiRouter.use('/map-styles', mapStyleRouter);
-apiRouter.use('/cleanup', cleanupRoutes);
-apiRouter.use('/maintenance', maintenanceRoutes);
-apiRouter.use('/themes', themeRoutes);
-apiRouter.use('/purge', purgeRoutes);
-apiRouter.use('/traceroutes', tracerouteRoutes);
-apiRouter.use('/route-segments', routeSegmentRoutes);
-apiRouter.use('/neighbor-info', neighborInfoRoutes);
-apiRouter.use('/ignored-nodes', ignoredNodeRoutes);
-apiRouter.use('/announce', announceRoutes);
-apiRouter.use('/backup', backupRouter);
-apiRouter.use('/system/backup', systemBackupRouter);
-apiRouter.use('/push', pushRouter);
-apiRouter.use('/apprise', appriseRouter);
-apiRouter.use('/connection', connectionRoutes);
-// Mounted immediately before '/automations' so its '/:id' route cannot swallow
-// '/automations/convert/*' (#4340 Phase 4 WP3).
-apiRouter.use('/automations/convert', autoAckConverterRoutes);
-apiRouter.use('/automations', automationRoutes);
-// Mounted at '/' because these routers contain mixed top-level paths
-// (e.g. /traceroute, /telemetry/:nodeId, /device/tx-status, /virtual-node/status).
-apiRouter.use('/', meshRequestRoutes);
-apiRouter.use('/', telemetryRoutes);
-apiRouter.use('/', deviceStatusRoutes);
-apiRouter.use('/', statusRoutes);
-apiRouter.use('/', serverInfoRoutes);
-apiRouter.use('/', dataExchangeRoutes);
-// Mounted at '/' because these routers contain mixed top-level paths
-// (/device-config, /device/*, /system/*, /status, /version/check).
-apiRouter.use('/', deviceRoutes);
-apiRouter.use('/', systemRoutes);
-apiRouter.use('/channels', channelRoutes);
-// Mounted at '/' because the script routes use mixed top-level paths
-// (/scripts/*, /http/test). The public /api/scripts listing endpoint is
-// mounted separately on the app below (bypasses CSRF).
-apiRouter.use('/', scriptRoutes);
 
-// Consolidated polling endpoint (GET /poll). Mounted at '/' — appended after
-// the existing '/'-mounted routers per #3502 PR1 mount-placement rules.
-apiRouter.use('/', pollRoutes);
-
-// Node CRUD/favorite/ignore/position-override/notes/etc endpoints
-// (incl. /auto-favorite/status and /auto-ping/stop/:nodeNum). Mounted at
-// '/' — appended after the existing '/'-mounted routers per #3502 PR3
-// mount-placement rules (none of nodesRoutes' paths overlap an existing
-// '/'-mounted module's paths).
-apiRouter.use('/', nodesRoutes);
+const apiRouter = createApiRouter({
+  geojsonRouter,
+  mapStyleRouter,
+  includeDebugRoutes: !env.isProduction,
+});
 
 // Wire up side-effect callbacks for settingsRoutes
 setSettingsCallbacks({
@@ -1126,6 +851,16 @@ setSettingsCallbacks({
       }
     }
   },
+  setAutomationAirtimeCutoffNeighborSelection: (selection: { mode?: string; sampleCount?: number | string; nodes?: unknown }, sourceId?: string | null) => {
+    if (sourceId) {
+      const base = sourceManagerRegistry.getManager(sourceId);
+      if (base && isMeshtasticManager(base)) base.setAutomationAirtimeCutoffNeighborSelection(selection);
+    } else {
+      for (const mgr of sourceManagerRegistry.getAllManagers().filter(isMeshtasticManager)) {
+        mgr.setAutomationAirtimeCutoffNeighborSelection(selection);
+      }
+    }
+  },
   handleAutoWelcomeEnabled: () => { databaseService.handleAutoWelcomeEnabledAsync().catch(() => {}); return 0; },
   invalidateHtmlCache,
   setDiscardInvalidPositions: (enabled) => setDiscardInvalidPositions(enabled),
@@ -1188,9 +923,9 @@ app.use('/api/privacy', privacyPublicRouter);
 // Public embed config API (must come BEFORE apiRouter to avoid rate limiter and CSRF)
 // CSP middleware is applied per-route inside the router (needs req.params.profileId)
 if (BASE_URL) {
-  app.use(`${BASE_URL}/api/embed`, embedPublicRoutes);
+  app.use(`${BASE_URL}/api/embed`, publicInstanceRedaction({ forceAnonymous: true }), embedPublicRoutes);
 }
-app.use('/api/embed', embedPublicRoutes);
+app.use('/api/embed', publicInstanceRedaction({ forceAnonymous: true }), embedPublicRoutes);
 
 // Mount API router - this must come before static file serving
 // Apply rate limiting and CSRF protection to all API routes (except csrf-token endpoint)
@@ -1258,6 +993,7 @@ function gracefulShutdown(reason: string, exitCode = 0): void {
 
     aircraftAgeOutScheduler.shutdown();
     translationCacheService.stop();
+    stopMqttNativeNodeInfoScheduler();
 
     // Disconnect from Meshtastic
     try {
@@ -1276,6 +1012,27 @@ function gracefulShutdown(reason: string, exitCode = 0): void {
       ]);
     } catch (error) {
       logger.warn('Error flushing MeshCore filter hit counts:', error);
+    }
+
+    // #6210: write coalesced Direct RF Contacts counts before the DB closes.
+    try {
+      await Promise.race([
+        flushDirectRfContacts(),
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]);
+    } catch (error) {
+      logger.warn('Error flushing Direct RF Contacts:', error);
+    }
+
+    // #5729: send Apprise / desktop notifications still inside their 5 s
+    // collect hold, so a clean restart loses none. Bounded like the flushes above.
+    try {
+      await Promise.race([
+        notificationHold.flushAll(),
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]);
+    } catch (error) {
+      logger.warn('Error flushing held notifications:', error);
     }
 
     // #5101 P3 WP3: give the transport-traffic writer's final checkpoint up
@@ -1354,8 +1111,13 @@ void (async () => {
   // Eagerly populate embed origins cache so first CORS check works
   refreshEmbedOriginsCache();
 
-  server = app.listen(PORT, () => {
-    logger.debug(`MeshRadar server running on port ${PORT}`);
+  // Load the public-instance config before listening so no request can be
+  // served unredacted while the cache is still empty (#5156).
+  await reloadPublicInstanceConfig();
+
+  // host undefined -> net.Server binds every interface, as before
+  server = app.listen({ port: PORT, host: env.bindAddress }, () => {
+    logger.debug(`MeshRadar server running on ${env.bindAddress ?? '*'}:${PORT}`);
     logger.debug(`Environment: ${env.nodeEnv}`);
 
     // Initialize WebSocket server for real-time updates

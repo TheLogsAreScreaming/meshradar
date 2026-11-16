@@ -270,28 +270,6 @@
     ]
   },
   {
-    "name": "MeshManager Solar Forecast",
-    "filename": "solar-forecast.py",
-    "icon": "☀️",
-    "description": "Query MeshManager's solar forecast API and return an abbreviated summary with today's solar production forecast, percentage of historical average, and nodes at risk of low battery.",
-    "language": "Python",
-    "tags": ["Solar", "Forecast", "MeshManager", "Battery", "Monitoring"],
-    "githubPath": "Yeraze/meshmanager/main/examples/auto-responder-scripts/solar-forecast.py",
-    "exampleTrigger": "solar, forecast, sun",
-    "requirements": [
-      "Python 3.6+",
-      "MeshManager instance accessible via network",
-      "MESHMANAGER_URL environment variable"
-    ],
-    "author": "Yeraze",
-    "features": [
-      "Solar production forecast for today",
-      "Percentage of historical average output",
-      "Identifies nodes at risk of low battery",
-      "Formatted for mesh network 200-char limit"
-    ]
-  },
-  {
     "name": "Radio Identity + QTH",
     "filename": "mm_radio_id_qth.py",
     "icon": "📟",
@@ -384,6 +362,32 @@
       "Built-in alert deduplication (suppress repeated alerts)",
       "Environment variable configuration",
       "No external Python dependencies (uses only requests)"
+    ]
+  },
+  {
+    "name": "Orbit and Launch Alert",
+    "filename": "orbit_and_launch_alert.py",
+    "icon": "🚀",
+    "description": "Emoji-based rocket launch notifications, satellite overpass predictions, and ISS visibility estimates using The Space Devs Launch Library 2 schedules and CelesTrak orbital data propagated locally with SGP4. Companion to Sky and Sea Alert.",
+    "language": "Python",
+    "tags": ["Space", "Rocket Launches", "Satellites", "ISS", "SGP4", "Amateur Radio", "Alerts", "Auto Responder", "Timer Trigger"],
+    "githubPath": "maxhayim/meshmonitor-orbitandlaunch-alert/orbit_and_launch_alert.py",
+    "exampleTrigger": "!ola, !ola {cmd}, !ola {cmd} {arg} (Auto Responder); Timer Trigger every 5 minutes for automatic alerts",
+    "requirements": [
+      "Python 3.8+",
+      "Internet access for live data (demo mode works offline)",
+      "Optional: sgp4 for satellite/ISS passes (pip install --target /data/scripts/ola_vendor sgp4)",
+      "OLA_LAT/OLA_LON, or the node position MeshMonitor provides"
+    ],
+    "author": "maxhayim",
+    "features": [
+      "Launch countdown alerts (T-24H, T-1H, T-15M, scheduled T-0), delays, holds, and source-confirmed outcomes",
+      "Filters by country, agency, launch site, rocket, or mission",
+      "Local SGP4 pass predictions: AOS, max elevation, LOS, duration",
+      "ISS visible-pass estimates (dark sky + sunlit satellite)",
+      "Commands: !ola, launch, launches, iss, satellites, sat <NORAD>, visible, status, demo, help",
+      "Persistent alert ledger and offline cache; works with Meshtastic and MeshCore",
+      "Optional MQTT events; offline demo mode"
     ]
   },
   {

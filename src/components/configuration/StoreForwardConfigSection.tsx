@@ -1,13 +1,16 @@
-import React, { useRef, useMemo, useCallback } from 'react';
+import React, { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { UiIcon } from '../icons';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
 import ModuleAvailabilityNotice from './ModuleAvailabilityNotice';
+import { ConfigSection } from '../shared/config/ConfigSection';
 
 interface StoreForwardConfigSectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
   enabled: boolean;
   setEnabled: (value: boolean) => void;
   heartbeat: boolean;
@@ -21,10 +24,12 @@ interface StoreForwardConfigSectionProps {
   isServer: boolean;
   setIsServer: (value: boolean) => void;
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
 }
 
 const StoreForwardConfigSection: React.FC<StoreForwardConfigSectionProps> = ({
+  canWrite = true,
   enabled,
   setEnabled,
   heartbeat,
@@ -42,42 +47,26 @@ const StoreForwardConfigSection: React.FC<StoreForwardConfigSectionProps> = ({
 }) => {
   const { t } = useTranslation();
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // What the node holds; moves on a successful save (#5797)
+  const values = {
     enabled, heartbeat, records, historyReturnMax, historyReturnWindow, isServer
-  });
-
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      enabled !== initial.enabled ||
-      heartbeat !== initial.heartbeat ||
-      records !== initial.records ||
-      historyReturnMax !== initial.historyReturnMax ||
-      historyReturnWindow !== initial.historyReturnWindow ||
-      isServer !== initial.isServer
-    );
-  }, [enabled, heartbeat, records, historyReturnMax, historyReturnWindow, isServer]);
+  };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values);
 
   // Reset to initial values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setEnabled(initial.enabled);
-    setHeartbeat(initial.heartbeat);
-    setRecords(initial.records);
-    setHistoryReturnMax(initial.historyReturnMax);
-    setHistoryReturnWindow(initial.historyReturnWindow);
-    setIsServer(initial.isServer);
-  }, [setEnabled, setHeartbeat, setRecords, setHistoryReturnMax, setHistoryReturnWindow, setIsServer]);
+    setEnabled(baseline.enabled);
+    setHeartbeat(baseline.heartbeat);
+    setRecords(baseline.records);
+    setHistoryReturnMax(baseline.historyReturnMax);
+    setHistoryReturnWindow(baseline.historyReturnWindow);
+    setIsServer(baseline.isServer);
+  }, [baseline, setEnabled, setHeartbeat, setRecords, setHistoryReturnMax, setHistoryReturnWindow, setIsServer]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      enabled, heartbeat, records, historyReturnMax, historyReturnWindow, isServer
-    };
-  }, [onSave, enabled, heartbeat, records, historyReturnMax, historyReturnWindow, isServer]);
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Register with SaveBar
   const numberScope = useNumberInputScope();
@@ -93,24 +82,7 @@ const StoreForwardConfigSection: React.FC<StoreForwardConfigSectionProps> = ({
 
   return (
     <NumberInputScope scope={numberScope}>
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('storeforward_config.title')}
-        <a
-          href="https://meshmonitor.org/features/device#store-and-forward-configuration"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('storeforward_config.view_docs')}
-        >
-          <UiIcon name="help" />
-        </a>
-      </h3>
-      <ModuleAvailabilityNotice />
+    <ConfigSection canWrite={canWrite} title={t('storeforward_config.title')} docsUrl="https://meshmonitor.org/features/device#store-and-forward-configuration" notice={<ModuleAvailabilityNotice />}>
 
       {/* Enable Module */}
       <div className="setting-item">
@@ -220,7 +192,7 @@ const StoreForwardConfigSection: React.FC<StoreForwardConfigSectionProps> = ({
           </div>
         </>
       )}
-    </div>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

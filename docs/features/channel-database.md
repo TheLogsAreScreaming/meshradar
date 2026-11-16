@@ -33,12 +33,22 @@ The Channel Database is under **Global Settings** → **Channel Database**. Only
 3. Enter the channel details:
    - **Name** - A descriptive name for the channel
    - **PSK** - The Pre-Shared Key (Base64 encoded)
+   - **AEAD channel (AES-CCM, Experimental)** (optional) - Check this for a channel that uses authenticated encryption on firmware 2.8.1 or later. See [AEAD Channels](#aead-channels).
    - **Description** (optional) - Notes about the channel's purpose
 4. Click **Save**
 
 ::: tip PSK Format
 Enter the PSK in Base64 format, the same format used by Meshtastic. You can find channel PSKs in your device's channel configuration or exported settings.
 :::
+
+## AEAD Channels
+
+Firmware 2.8.1 added AEAD channels, which use AES-CCM authenticated encryption in place of AES-CTR. To decrypt one, check **AEAD channel (AES-CCM, Experimental)** on the entry. The box shows on Meshtastic entries only.
+
+- With the box on, the key opens only AEAD packets. With it off, the key opens only plain ones. An AEAD entry and a plain entry can share a name and key.
+- MeshMonitor tries an AEAD entry only with AES-CCM, as the firmware does. It skips the entry when it cannot tell where the packet was sent.
+- Changing the box re-runs retroactive decryption for that entry.
+- The box is kept in JSON export and import and in channel URL import. Entries with the flag show an **AEAD** badge.
 
 ## Channel Priority and Ordering
 
@@ -114,13 +124,14 @@ The import/export format is a JSON array of channel objects (a single object is 
 | `psk` | string | **Yes** | Pre-Shared Key as a Base64-encoded string. Accepted lengths when decoded: **1 byte** (Meshtastic shorthand: `AQ==` = default key, `Ag==`–`Cg==` = simple1–simple9), **16 bytes** (AES-128), or **32 bytes** (AES-256). PSK value `0` (no encryption) is rejected. |
 | `description` | string | No | Free-form notes. Defaults to empty string. |
 | `isEnabled` | boolean | No | When `true`, MeshMonitor uses this channel for decryption. Defaults to `true` on import. |
-| `enforceNameValidation` | boolean | No | When `true`, only attempt decryption if the packet's channel hash matches this channel's name. Useful when multiple channels share the same PSK. Defaults to `false`. |
+| `enforceNameValidation` | boolean | No | When `true`, only attempt decryption if the packet's channel hash matches this channel's name. Useful when multiple channels share the same PSK. Written on export. The file import does not read it: an imported channel starts with it off, so turn it on by hand if you need it. |
+| `protocol` | string | No | `meshtastic` (the default) or `meshcore`. Exports write it on every entry. For a `meshcore` entry, `psk` is the 16-byte channel secret; see [MeshCore Channels](#meshcore-channels). |
 
 #### Notes
 
 - **Sort order is not preserved on import.** New channels are appended to the end of the existing list. You can reorder them after import using drag-and-drop.
 - **`pskLength` is derived automatically** from the decoded PSK and does not need to be specified.
-- **Duplicate detection is not performed on import.** If you import the same file twice you will get duplicate entries.
+- **Duplicate detection is not performed on import** for Meshtastic entries. If you import the same file twice you will get duplicate entries. MeshCore entries are the exception: a secret that is already stored is refused, and the import stops at that entry.
 - **The `id`, `decryptedPacketCount`, `lastDecryptedAt`, `createdBy`, `createdAt`, and `updatedAt` fields** present on exports are ignored on import — the server assigns fresh values.
 
 #### Example: Minimal Import
@@ -139,7 +150,10 @@ If you only have channel names and PSKs, this is the smallest valid file:
 The Channel Database also holds **MeshCore** channel keys. A MeshCore entry is a 16-byte channel secret that MeshMonitor uses to decrypt MeshCore channel messages (GRP_TXT) heard by:
 
 - a **MeshCore MQTT ingest** source, and
-- a directly attached **MeshCore repeater** running a `MESH_PACKET_LOGGING` firmware build.
+- a directly attached **MeshCore repeater** running a `MESH_PACKET_LOGGING` firmware build, and
+- a **MeshCore Companion**, for channel messages it hears over the air on channels it does not hold. A channel that opened a message shows on that Companion's **Channels** page with a **(Virtual)** tag. It is receive-only: the radio lacks the key, so the send bar is hidden. A channel set on the radio keeps its normal behaviour.
+
+The same keys open channel packets (`GRP_TXT` and `GRP_DATA`) in the MeshCore Packet Monitor's **Packet Decode** view, on any MeshCore source. See [Decoding channel packets](/features/meshcore#decoding-channel-packets).
 
 A companion radio holds about 40 channels. Keys in the Channel Database are held by the server alone, so that limit does not apply. They are never written to a device.
 
@@ -277,7 +291,7 @@ The Channel Database is accessible via the V1 API:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/v1/channel-database` | List all channels (filtered by permission) |
+| GET | `/api/v1/channel-database` | List channels (filtered by permission). Returns Meshtastic entries by default; add `?protocol=meshcore` or `?protocol=all` for MeshCore entries |
 | GET | `/api/v1/channel-database/:id` | Get specific channel |
 | POST | `/api/v1/channel-database` | Create new channel (admin only) |
 | PUT | `/api/v1/channel-database/:id` | Update channel (admin only) |
@@ -287,7 +301,7 @@ The Channel Database is accessible via the V1 API:
 
 - **No transmit capability** - Database channels are read-only
 - **Requires encrypted packets to be captured** - Your node must receive the packets first
-- **AES decryption only** - Standard Meshtastic encryption (AES-128-CTR or AES-256-CTR)
+- **AES decryption only** - Standard Meshtastic encryption (AES-128-CTR or AES-256-CTR), and AES-CCM for AEAD channels
 - **Performance** - Very large numbers of channels may impact packet processing speed
 
 ## Troubleshooting

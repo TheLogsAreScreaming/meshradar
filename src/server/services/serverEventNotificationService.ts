@@ -72,7 +72,11 @@ class ServerEventNotificationService {
    * Call this when a source's node connection is established.
    * This is called from meshtasticManager's handleConnected.
    */
-  public async notifyNodeConnected(sourceId: string, sourceName: string): Promise<void> {
+  public async notifyNodeConnected(
+    sourceId: string,
+    sourceName: string,
+    link: 'radio' | 'broker' = 'radio',
+  ): Promise<void> {
     const state = this.getOrInitState(sourceId);
 
     // Skip the initial boot connection for this source
@@ -93,8 +97,11 @@ class ServerEventNotificationService {
           : 'unknown duration';
 
         const payload = {
-          title: `Node Reconnected · ${sourceName}`,
-          body: `Connection to Meshtastic node restored (was offline for ${disconnectDuration})`,
+          title: link === 'broker' ? `MQTT Broker Reconnected · ${sourceName}` : `Node Reconnected · ${sourceName}`,
+          // Broker wording never names the broker URL (it is redacted per viewer).
+          body: link === 'broker'
+            ? `Connection to the MQTT broker restored (was offline for ${disconnectDuration})`
+            : `Connection to the radio restored (was offline for ${disconnectDuration})`,
           type: 'success' as const,
           sourceId,
           sourceName,
@@ -112,7 +119,11 @@ class ServerEventNotificationService {
    * Call this when a source's node connection is lost.
    * This is called from meshtasticManager's handleDisconnected.
    */
-  public async notifyNodeDisconnected(sourceId: string, sourceName: string): Promise<void> {
+  public async notifyNodeDisconnected(
+    sourceId: string,
+    sourceName: string,
+    link: 'radio' | 'broker' = 'radio',
+  ): Promise<void> {
     const state = this.getOrInitState(sourceId);
 
     // Skip if we haven't had an initial connection yet
@@ -132,8 +143,8 @@ class ServerEventNotificationService {
 
     try {
       const payload = {
-        title: `Node Disconnected · ${sourceName}`,
-        body: 'Lost connection to Meshtastic node',
+        title: link === 'broker' ? `MQTT Broker Disconnected · ${sourceName}` : `Node Disconnected · ${sourceName}`,
+        body: link === 'broker' ? 'Lost connection to the MQTT broker' : "Lost connection to the source's radio",
         type: 'warning' as const,
         sourceId,
         sourceName,
@@ -143,6 +154,34 @@ class ServerEventNotificationService {
       logger.info(`Node disconnect notification sent for source ${sourceId}`);
     } catch (error) {
       logger.error('Error sending node disconnect notification:', error);
+    }
+  }
+
+  /**
+   * P7a (#6254): a MeshCore source's own radio reported a different public key
+   * than the one stored on its last connect. The caller (the MeshCore manager)
+   * is edge-triggered and persisted, so this fires once per detected change.
+   * Same `notifyOnServerEvents` preference as the connection events; only the
+   * first 8 hex chars of each key are sent.
+   */
+  public async notifyOwnKeyChanged(
+    sourceId: string,
+    sourceName: string,
+    oldKeyPrefix: string,
+    newKeyPrefix: string,
+  ): Promise<void> {
+    try {
+      const payload = {
+        title: `Node Key Changed · ${sourceName}`,
+        body: `The radio's public key changed from ${oldKeyPrefix.slice(0, 8)} to ${newKeyPrefix.slice(0, 8)}. This means a different device or a reset identity.`,
+        type: 'warning' as const,
+        sourceId,
+        sourceName,
+      };
+      await notificationService.broadcastToPreferenceUsers('notifyOnServerEvents', payload);
+      logger.info(`Own-key change notification sent for source ${sourceId}`);
+    } catch (error) {
+      logger.error('Error sending own-key change notification:', error);
     }
   }
 

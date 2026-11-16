@@ -24,6 +24,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const getAllChannels = vi.fn();
 const getChannelById = vi.fn();
 const upsertNodeAsync = vi.fn();
+const setSourceSetting = vi.fn();
 
 vi.mock('../../services/database.js', () => ({
   default: {
@@ -32,6 +33,7 @@ vi.mock('../../services/database.js', () => ({
       getChannelById: (...args: unknown[]) => getChannelById(...args),
     },
     upsertNodeAsync: (...args: unknown[]) => upsertNodeAsync(...args),
+    settings: { setSourceSetting: (...args: unknown[]) => setSourceSetting(...args) },
   },
 }));
 
@@ -69,7 +71,9 @@ vi.mock('../protobufService.js', () => ({
   },
 }));
 
-import { DeviceAdminService } from './deviceAdminService.js';
+import { DeviceAdminService, MODULE_READ_BACK_ATTEMPTS, MODULE_READ_BACK_TIMEOUT_MS } from './deviceAdminService.js';
+import { isModuleConfigNotAppliedError, isModuleConfigUnverifiedError } from '../errors/moduleConfigVerifyError.js';
+import { MODULE_FIELD_BY_ID } from '../constants/configTypes.js';
 
 /** Minimal fake implementing only what DeviceAdminService touches on the manager. */
 function makeFakeManager(overrides: Partial<{
@@ -96,15 +100,19 @@ function makeFakeManager(overrides: Partial<{
     isDeviceConnected: vi.fn(() => state.deviceConnected),
     getLocalNodeInfo: vi.fn(() => state.localNodeInfo),
     sendLocalAdminPacket: vi.fn().mockResolvedValue(undefined),
-    updateCachedDeviceConfig: vi.fn((section: string, values: Record<string, any>) => {
-      state.actualDeviceConfig = { ...state.actualDeviceConfig, [section]: { ...state.actualDeviceConfig?.[section], ...values } };
+    updateCachedDeviceConfig: vi.fn((section: string, values: Record<string, any>, mode: 'merge' | 'replace' = 'merge') => {
+      const next = mode === 'replace' ? { ...values } : { ...state.actualDeviceConfig?.[section], ...values };
+      state.actualDeviceConfig = { ...state.actualDeviceConfig, [section]: next };
     }),
-    updateCachedModuleConfig: vi.fn((section: string, values: Record<string, any>) => {
-      state.actualModuleConfig = { ...state.actualModuleConfig, [section]: { ...state.actualModuleConfig?.[section], ...values } };
+    updateCachedModuleConfig: vi.fn((section: string, values: Record<string, any>, mode: 'merge' | 'replace' = 'merge') => {
+      const next = mode === 'replace' ? { ...values } : { ...state.actualModuleConfig?.[section], ...values };
+      state.actualModuleConfig = { ...state.actualModuleConfig, [section]: next };
     }),
     getActualDeviceConfig: vi.fn(() => state.actualDeviceConfig),
     getActualModuleConfig: vi.fn(() => state.actualModuleConfig),
     getConnectionAddress: vi.fn().mockResolvedValue({ nodeIp: '10.0.0.5', tcpPort: 4403 }),
+    // Read-back (#5745): each test sets the node's answer.
+    readLocalModuleConfig: vi.fn<(configType: number, timeoutMs?: number) => Promise<Record<string, any> | null>>().mockResolvedValue(null),
   };
 }
 
@@ -114,6 +122,7 @@ describe('DeviceAdminService', () => {
     getAllChannels.mockResolvedValue([]);
     getChannelById.mockResolvedValue(null);
     upsertNodeAsync.mockResolvedValue(undefined);
+    setSourceSetting.mockResolvedValue(undefined);
   });
 
   describe('setter round-trip', () => {
@@ -138,7 +147,30 @@ describe('DeviceAdminService', () => {
       const svc = new DeviceAdminService(mgr as any);
       await svc.setLoRaConfig({ region: 1 });
       expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(1);
-      expect(mgr.updateCachedDeviceConfig).toHaveBeenCalledWith('lora', { region: 1 });
+      expect(mgr.updateCachedDeviceConfig).toHaveBeenCalledWith('lora', { region: 1, transparentMode: false }, 'replace');
+    });
+
+    // #6181: set_config replaces the whole LoRaConfig, so the device's own
+    // transparent_mode must ride along, and no caller may change it.
+    it('setLoRaConfig keeps the device-reported transparentMode, ignoring the caller', async () => {
+      const mgr = makeFakeManager({ actualDeviceConfig: { lora: { region: 1, transparentMode: true } } });
+      const svc = new DeviceAdminService(mgr as any);
+      await svc.setLoRaConfig({ region: 1, hopLimit: 4 });
+      expect(createSetLoRaConfigMessage).toHaveBeenCalledWith(
+        { region: 1, hopLimit: 4, transparentMode: true }, expect.any(Uint8Array),
+      );
+      expect(mgr.state.actualDeviceConfig.lora.transparentMode).toBe(true);
+
+      createSetLoRaConfigMessage.mockClear();
+      await svc.setLoRaConfig({ region: 1, transparentMode: false });
+      expect(createSetLoRaConfigMessage.mock.calls[0][0]).toMatchObject({ transparentMode: true });
+    });
+
+    it('setLoRaConfig never turns transparentMode on when the device has it off', async () => {
+      const mgr = makeFakeManager({ actualDeviceConfig: { lora: { region: 1 } } });
+      const svc = new DeviceAdminService(mgr as any);
+      await svc.setLoRaConfig({ region: 1, transparentMode: true });
+      expect(createSetLoRaConfigMessage.mock.calls[0][0]).toMatchObject({ transparentMode: false });
     });
 
     it('setChannelConfig rejects an out-of-range channel index without sending', async () => {
@@ -191,7 +223,7 @@ describe('DeviceAdminService', () => {
       );
       // One packet for set_fixed_position, one for the position config itself.
       expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(2);
-      expect(mgr.updateCachedDeviceConfig).toHaveBeenCalledWith('position', { positionBroadcastSecs: 900 });
+      expect(mgr.updateCachedDeviceConfig).toHaveBeenCalledWith('position', { positionBroadcastSecs: 900 }, 'replace');
     });
 
     it('hands a 0 interval to the encoder as 0 (position and device)', async () => {
@@ -215,8 +247,75 @@ describe('DeviceAdminService', () => {
       const mgr = makeFakeManager();
       const svc = new DeviceAdminService(mgr as any);
       await svc.setTelemetryConfig({ deviceUpdateInterval: 900 });
-      expect(mgr.updateCachedModuleConfig).toHaveBeenCalledWith('telemetry', { deviceUpdateInterval: 900 });
+      expect(mgr.updateCachedModuleConfig).toHaveBeenCalledWith('telemetry', { deviceUpdateInterval: 900 }, 'replace');
       expect(mgr.updateCachedDeviceConfig).not.toHaveBeenCalled();
+    });
+
+    it('setMQTTConfig replaces the cached MQTT module config (it used to land in the device config)', async () => {
+      const mgr = makeFakeManager();
+      const svc = new DeviceAdminService(mgr as any);
+      const mqtt = { enabled: true, mapReportSettings: { positionPrecision: 0, shouldReportLocation: true } };
+      await svc.setMQTTConfig(mqtt);
+      expect(createSetMQTTConfigMessage).toHaveBeenCalledWith(mqtt, expect.any(Uint8Array));
+      expect(mgr.updateCachedModuleConfig).toHaveBeenCalledWith('mqtt', mqtt, 'replace');
+      expect(mgr.updateCachedDeviceConfig).not.toHaveBeenCalled();
+    });
+
+    // Each local save caches what it sent in the bucket the protobuf puts it
+    // in (Config → device cache, ModuleConfig → module cache), and replaces
+    // the section, because firmware assigns the whole struct (#5713 follow-up).
+    const SAVES: Array<{
+      name: string;
+      run: (svc: DeviceAdminService, cfg: Record<string, unknown>) => Promise<void>;
+      bucket: 'device' | 'module';
+      key: string;
+    }> = [
+      { name: 'setDeviceConfig', run: (s, c) => s.setDeviceConfig(c), bucket: 'device', key: 'device' },
+      { name: 'setLoRaConfig', run: (s, c) => s.setLoRaConfig(c), bucket: 'device', key: 'lora' },
+      { name: 'setNetworkConfig', run: (s, c) => s.setNetworkConfig(c), bucket: 'device', key: 'network' },
+      { name: 'setPositionConfig', run: (s, c) => s.setPositionConfig(c), bucket: 'device', key: 'position' },
+      { name: 'setPowerConfig', run: (s, c) => s.setPowerConfig(c), bucket: 'device', key: 'power' },
+      { name: 'setDisplayConfig', run: (s, c) => s.setDisplayConfig(c), bucket: 'device', key: 'display' },
+      { name: 'setBluetoothConfig', run: (s, c) => s.setBluetoothConfig(c), bucket: 'device', key: 'bluetooth' },
+      { name: 'setMQTTConfig', run: (s, c) => s.setMQTTConfig(c), bucket: 'module', key: 'mqtt' },
+      { name: 'setNeighborInfoConfig', run: (s, c) => s.setNeighborInfoConfig(c), bucket: 'module', key: 'neighborInfo' },
+      { name: 'setTelemetryConfig', run: (s, c) => s.setTelemetryConfig(c), bucket: 'module', key: 'telemetry' },
+      { name: "setGenericModuleConfig('serial')", run: (s, c) => s.setGenericModuleConfig('serial', c), bucket: 'module', key: 'serial' },
+      { name: "setGenericModuleConfig('statusmessage')", run: (s, c) => s.setGenericModuleConfig('statusmessage', c), bucket: 'module', key: 'statusmessage' },
+      { name: "setGenericModuleConfig('extnotif')", run: (s, c) => s.setGenericModuleConfig('extnotif', c), bucket: 'module', key: 'externalNotification' },
+      { name: "setGenericModuleConfig('meshbeacon')", run: (s, c) => s.setGenericModuleConfig('meshbeacon', c), bucket: 'module', key: 'meshBeacon' },
+    ];
+
+    it.each(SAVES)('$name caches into the $bucket config as $key, replacing the section', async ({ run, bucket, key }) => {
+      const stale = { staleField: 99 };
+      const mgr = makeFakeManager({
+        actualDeviceConfig: bucket === 'device' ? { [key]: stale } : {},
+        actualModuleConfig: bucket === 'module' ? { [key]: stale } : {},
+      });
+      const svc = new DeviceAdminService(mgr as any);
+      const sent = { enabled: true, someInterval: 300 };
+      await run(svc, sent);
+      // setLoRaConfig always adds the device's own transparentMode (#6181).
+      const expected = key === 'lora' ? { ...sent, transparentMode: false } : sent;
+
+      const own = bucket === 'device' ? mgr.updateCachedDeviceConfig : mgr.updateCachedModuleConfig;
+      const other = bucket === 'device' ? mgr.updateCachedModuleConfig : mgr.updateCachedDeviceConfig;
+      expect(own).toHaveBeenCalledTimes(1);
+      expect(own).toHaveBeenCalledWith(key, expected, 'replace');
+      expect(other).not.toHaveBeenCalled();
+
+      // The read-back shows exactly what was sent; the field the save left out is gone.
+      const cache = bucket === 'device' ? mgr.state.actualDeviceConfig : mgr.state.actualModuleConfig;
+      expect(cache[key]).toEqual(expected);
+    });
+
+    it('a failed send leaves the cache alone', async () => {
+      const mgr = makeFakeManager({ actualModuleConfig: { neighborInfo: { enabled: false } } });
+      mgr.sendLocalAdminPacket.mockRejectedValueOnce(new Error('link down'));
+      const svc = new DeviceAdminService(mgr as any);
+      await expect(svc.setNeighborInfoConfig({ enabled: true })).rejects.toThrow('link down');
+      expect(mgr.updateCachedModuleConfig).not.toHaveBeenCalled();
+      expect(mgr.state.actualModuleConfig.neighborInfo).toEqual({ enabled: false });
     });
 
     it('setNodeOwner builds a set_owner admin message', async () => {
@@ -300,6 +399,240 @@ describe('DeviceAdminService', () => {
       expect(config.channels).toEqual([
         { index: 0, name: 'Primary', psk: 'None', uplinkEnabled: true, downlinkEnabled: true },
       ]);
+    });
+  });
+
+  // #5745: a verified save writes once, reads the module back, and trusts
+  // only the node's answer. The manager's own waiter/timeout is tested in
+  // meshtasticManager.readLocalModuleConfig.test.ts; here the fake answers.
+  describe('setGenericModuleConfig with verify (#5745)', () => {
+    const STATUSMESSAGE_ADMIN_TYPE = 13;
+    const SET_MODULE = new Uint8Array([10]);
+
+    it('resolves on a match and caches what the node returned, not what was sent', async () => {
+      const mgr = makeFakeManager({ actualModuleConfig: { statusmessage: { nodeStatus: 'old' } } });
+      const fromNode = { nodeStatus: 'Monitoring', extraFromNode: 1 };
+      mgr.readLocalModuleConfig.mockResolvedValue(fromNode);
+      const svc = new DeviceAdminService(mgr as any);
+
+      await svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'Monitoring' }, { verify: true });
+
+      expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(1);
+      expect(mgr.sendLocalAdminPacket).toHaveBeenCalledWith(SET_MODULE);
+      expect(mgr.readLocalModuleConfig).toHaveBeenCalledTimes(1);
+      expect(mgr.readLocalModuleConfig).toHaveBeenCalledWith(STATUSMESSAGE_ADMIN_TYPE, MODULE_READ_BACK_TIMEOUT_MS);
+      expect(mgr.updateCachedModuleConfig).toHaveBeenCalledTimes(1);
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual(fromNode);
+    });
+
+    it('remembers the verified status per source; a verified clear remembers ""', async () => {
+      const mgr = makeFakeManager();
+      const svc = new DeviceAdminService(mgr as any);
+      mgr.readLocalModuleConfig.mockResolvedValue({ nodeStatus: 'Monitoring' });
+      await svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'Monitoring' }, { verify: true });
+      expect(setSourceSetting).toHaveBeenLastCalledWith(mgr.sourceId, 'statusMessageLastVerified', 'Monitoring');
+
+      mgr.readLocalModuleConfig.mockResolvedValue({});
+      await svc.setGenericModuleConfig('statusmessage', { nodeStatus: '' }, { verify: true });
+      expect(setSourceSetting).toHaveBeenLastCalledWith(mgr.sourceId, 'statusMessageLastVerified', '');
+      expect(setSourceSetting).toHaveBeenCalledTimes(2);
+    });
+
+    it('never remembers an unverified or mismatched save', async () => {
+      const mgr = makeFakeManager();
+      const svc = new DeviceAdminService(mgr as any);
+      mgr.readLocalModuleConfig.mockResolvedValue({ nodeStatus: 'old' });
+      await expect(svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'new' }, { verify: true })).rejects.toThrow();
+      mgr.readLocalModuleConfig.mockResolvedValue(null);
+      await expect(svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'new' }, { verify: true })).rejects.toThrow();
+      expect(setSourceSetting).not.toHaveBeenCalled();
+    });
+
+    it('a storage failure does not fail a save the node confirmed', async () => {
+      const mgr = makeFakeManager();
+      const svc = new DeviceAdminService(mgr as any);
+      mgr.readLocalModuleConfig.mockResolvedValue({ nodeStatus: 'Monitoring' });
+      setSourceSetting.mockRejectedValue(new Error('db down'));
+      await expect(svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'Monitoring' }, { verify: true })).resolves.toBeUndefined();
+    });
+
+    it('reports a verified save in flight until it settles', async () => {
+      const mgr = makeFakeManager();
+      const svc = new DeviceAdminService(mgr as any);
+      let answer: (section: Record<string, any> | null) => void = () => {};
+      mgr.readLocalModuleConfig.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+      expect(svc.isVerifiedSaveInFlight()).toBe(false);
+      const save = svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'A' }, { verify: true });
+      expect(svc.isVerifiedSaveInFlight()).toBe(true);
+      answer({ nodeStatus: 'A' });
+      await save;
+      expect(svc.isVerifiedSaveInFlight()).toBe(false);
+    });
+
+    it('does not touch the cache before the node answers', async () => {
+      const mgr = makeFakeManager({ actualModuleConfig: { statusmessage: { nodeStatus: 'old' } } });
+      let answer: (section: Record<string, any> | null) => void = () => {};
+      mgr.readLocalModuleConfig.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+      const svc = new DeviceAdminService(mgr as any);
+
+      const save = svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'Monitoring' }, { verify: true });
+      await vi.waitFor(() => expect(mgr.readLocalModuleConfig).toHaveBeenCalledTimes(1));
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'old' });
+
+      answer({ nodeStatus: 'Monitoring' });
+      await save;
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'Monitoring' });
+    });
+
+    it.each([
+      ['an empty section', {}],
+      ['an empty string', { nodeStatus: '' }],
+    ])('verifies a clear when the node answers with %s', async (_name, fromNode) => {
+      const mgr = makeFakeManager({ actualModuleConfig: { statusmessage: { nodeStatus: 'old' } } });
+      mgr.readLocalModuleConfig.mockResolvedValue(fromNode);
+      const svc = new DeviceAdminService(mgr as any);
+
+      await svc.setGenericModuleConfig('statusmessage', { nodeStatus: '' }, { verify: true });
+
+      expect(mgr.readLocalModuleConfig).toHaveBeenCalledTimes(1);
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual(fromNode);
+    });
+
+    it('rejects with ModuleConfigNotAppliedError on a mismatch and caches the node value', async () => {
+      const mgr = makeFakeManager({ actualModuleConfig: { statusmessage: { nodeStatus: 'old' } } });
+      mgr.readLocalModuleConfig.mockResolvedValue({ nodeStatus: 'old' });
+      const svc = new DeviceAdminService(mgr as any);
+
+      const error = await svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'Monitoring' }, { verify: true })
+        .catch((e: unknown) => e);
+
+      expect(isModuleConfigNotAppliedError(error)).toBe(true);
+      expect((error as { nodeConfig: unknown }).nodeConfig).toEqual({ nodeStatus: 'old' });
+      // Two reads (the first could be a stale answer), one write.
+      expect(mgr.readLocalModuleConfig).toHaveBeenCalledTimes(MODULE_READ_BACK_ATTEMPTS);
+      expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(1);
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'old' });
+    });
+
+    it('a failed clear is a mismatch: the node still holds the old status', async () => {
+      const mgr = makeFakeManager();
+      mgr.readLocalModuleConfig.mockResolvedValue({ nodeStatus: 'old' });
+      const svc = new DeviceAdminService(mgr as any);
+      await expect(svc.setGenericModuleConfig('statusmessage', { nodeStatus: '' }, { verify: true }))
+        .rejects.toSatisfy(isModuleConfigNotAppliedError);
+    });
+
+    it('accepts a match on the second read after a stale first answer', async () => {
+      const mgr = makeFakeManager();
+      mgr.readLocalModuleConfig
+        .mockResolvedValueOnce({ nodeStatus: 'old' })
+        .mockResolvedValueOnce({ nodeStatus: 'Monitoring' });
+      const svc = new DeviceAdminService(mgr as any);
+
+      await svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'Monitoring' }, { verify: true });
+
+      expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(1);
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'Monitoring' });
+    });
+
+    it('retries the read once after no answer, never the write', async () => {
+      const mgr = makeFakeManager();
+      mgr.readLocalModuleConfig
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ nodeStatus: 'Monitoring' });
+      const svc = new DeviceAdminService(mgr as any);
+
+      await svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'Monitoring' }, { verify: true });
+
+      expect(mgr.readLocalModuleConfig).toHaveBeenCalledTimes(2);
+      expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects with ModuleConfigUnverifiedError when no read is answered and leaves the cache alone', async () => {
+      const mgr = makeFakeManager({ actualModuleConfig: { statusmessage: { nodeStatus: 'old' } } });
+      mgr.readLocalModuleConfig.mockResolvedValue(null);
+      const svc = new DeviceAdminService(mgr as any);
+
+      await expect(svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'Monitoring' }, { verify: true }))
+        .rejects.toSatisfy(isModuleConfigUnverifiedError);
+
+      expect(mgr.readLocalModuleConfig).toHaveBeenCalledTimes(MODULE_READ_BACK_ATTEMPTS);
+      expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(1);
+      expect(mgr.updateCachedModuleConfig).not.toHaveBeenCalled();
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'old' });
+    });
+
+    it('a failed write sends no read and leaves the cache alone', async () => {
+      const mgr = makeFakeManager({ actualModuleConfig: { statusmessage: { nodeStatus: 'old' } } });
+      mgr.sendLocalAdminPacket.mockRejectedValueOnce(new Error('link down'));
+      const svc = new DeviceAdminService(mgr as any);
+
+      await expect(svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'x' }, { verify: true }))
+        .rejects.toThrow('link down');
+      expect(mgr.readLocalModuleConfig).not.toHaveBeenCalled();
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'old' });
+    });
+
+    it('runs concurrent verified saves one at a time, each read after its own write', async () => {
+      const mgr = makeFakeManager();
+      const order: string[] = [];
+      let nodeStatus = '';
+      const answers: Array<() => void> = [];
+      createSetModuleConfigMessageGeneric.mockImplementation((_type: unknown, config: unknown) => {
+        // The write "lands" on the fake node when it is built and sent.
+        nodeStatus = (config as { nodeStatus: string }).nodeStatus;
+        order.push(`write:${nodeStatus}`);
+        return SET_MODULE;
+      });
+      mgr.readLocalModuleConfig.mockImplementation(() => new Promise((resolve) => {
+        order.push('read');
+        answers.push(() => resolve({ nodeStatus }));
+      }));
+      const svc = new DeviceAdminService(mgr as any);
+
+      const first = svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'A' }, { verify: true });
+      const second = svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'B' }, { verify: true });
+
+      await vi.waitFor(() => expect(answers).toHaveLength(1));
+      // The second write waits for the first read-back to end.
+      expect(order).toEqual(['write:A', 'read']);
+      answers[0]();
+      await first;
+      await vi.waitFor(() => expect(answers).toHaveLength(2));
+      answers[1]();
+      await second;
+
+      expect(order).toEqual(['write:A', 'read', 'write:B', 'read']);
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'B' });
+      createSetModuleConfigMessageGeneric.mockImplementation(() => SET_MODULE);
+    });
+
+    it('a failed verified save does not block the next one', async () => {
+      const mgr = makeFakeManager();
+      mgr.readLocalModuleConfig.mockResolvedValue(null);
+      const svc = new DeviceAdminService(mgr as any);
+      await expect(svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'A' }, { verify: true })).rejects.toThrow();
+
+      mgr.readLocalModuleConfig.mockResolvedValue({ nodeStatus: 'B' });
+      await svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'B' }, { verify: true });
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'B' });
+    });
+
+    it('without verify, statusmessage saves as before: no read, optimistic cache', async () => {
+      const mgr = makeFakeManager();
+      const svc = new DeviceAdminService(mgr as any);
+      await svc.setGenericModuleConfig('statusmessage', { nodeStatus: 'x' });
+      expect(mgr.readLocalModuleConfig).not.toHaveBeenCalled();
+      expect(mgr.state.actualModuleConfig.statusmessage).toEqual({ nodeStatus: 'x' });
+    });
+
+    it.each(['serial', 'meshbeacon', 'extnotif'])('verify is ignored for %s: no read is sent', async (moduleType) => {
+      const mgr = makeFakeManager();
+      const svc = new DeviceAdminService(mgr as any);
+      await svc.setGenericModuleConfig(moduleType, { enabled: true }, { verify: true });
+      expect(mgr.readLocalModuleConfig).not.toHaveBeenCalled();
+      expect(mgr.sendLocalAdminPacket).toHaveBeenCalledTimes(1);
+      expect(mgr.updateCachedModuleConfig).toHaveBeenCalledWith(MODULE_FIELD_BY_ID[moduleType], { enabled: true }, 'replace');
     });
   });
 });

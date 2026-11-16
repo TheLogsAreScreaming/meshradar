@@ -33,6 +33,11 @@ interface AutomationContextType {
   autoAckHopLimit: string;
   autoAckMaxResponses: number;
   setAutoAckMaxResponses: React.Dispatch<React.SetStateAction<number>>;
+  /** Tapback glyphs (#5890): '' = built-in. */
+  hopEmojiZeroHop: string;
+  setHopEmojiZeroHop: React.Dispatch<React.SetStateAction<string>>;
+  hopEmojiMqtt: string;
+  setHopEmojiMqtt: React.Dispatch<React.SetStateAction<string>>;
   setAutoAckHopLimit: React.Dispatch<React.SetStateAction<string>>;
   autoAckTestMessages: string;
   setAutoAckTestMessages: React.Dispatch<React.SetStateAction<string>>;
@@ -47,6 +52,9 @@ interface AutomationContextType {
   /** Hop-limit override (#5121): '' = inherit the node's own, else '0'–'7'. */
   autoAnnounceHopLimit: string;
   setAutoAnnounceHopLimit: React.Dispatch<React.SetStateAction<string>>;
+  /** Split a long announcement into up to 3 marked parts (#6330). */
+  autoAnnounceSplitLongMessages: boolean;
+  setAutoAnnounceSplitLongMessages: React.Dispatch<React.SetStateAction<boolean>>;
   autoAnnounceOnStart: boolean;
   setAutoAnnounceOnStart: React.Dispatch<React.SetStateAction<boolean>>;
   autoAnnounceUseSchedule: boolean;
@@ -129,12 +137,15 @@ export const AutomationProvider: React.FC<AutomationProviderProps> = ({ children
   const [autoAckMaxAttempts, setAutoAckMaxAttempts] = useState<number>(3);
   const [autoAckHopLimit, setAutoAckHopLimit] = useState<string>('');
   const [autoAckMaxResponses, setAutoAckMaxResponses] = useState<number>(AUTO_ACK_MAX_RESPONSES_DEFAULT);
+  const [hopEmojiZeroHop, setHopEmojiZeroHop] = useState<string>('');
+  const [hopEmojiMqtt, setHopEmojiMqtt] = useState<string>('');
   const [autoAckTestMessages, setAutoAckTestMessages] = useState<string>('');
   const [autoAnnounceEnabled, setAutoAnnounceEnabled] = useState<boolean>(false);
   const [autoAnnounceIntervalHours, setAutoAnnounceIntervalHours] = useState<number>(6);
   const [autoAnnounceMessage, setAutoAnnounceMessage] = useState<string>('MeshRadar {VERSION} online for {DURATION} {FEATURES}');
   const [autoAnnounceChannelIndexes, setAutoAnnounceChannelIndexes] = useState<number[]>([0]);
   const [autoAnnounceHopLimit, setAutoAnnounceHopLimit] = useState<string>('');
+  const [autoAnnounceSplitLongMessages, setAutoAnnounceSplitLongMessages] = useState<boolean>(false);
   const [autoAnnounceOnStart, setAutoAnnounceOnStart] = useState<boolean>(false);
   const [autoAnnounceUseSchedule, setAutoAnnounceUseSchedule] = useState<boolean>(false);
   const [autoAnnounceSchedule, setAutoAnnounceSchedule] = useState<string>('0 */6 * * *');
@@ -221,6 +232,8 @@ export const AutomationProvider: React.FC<AutomationProviderProps> = ({ children
         setAutoAckHopLimit(hopLimitSettingValue(s.autoAckHopLimit));
         // Always set: unset reads as the default (2) and a stored 0 stays 0.
         setAutoAckMaxResponses(resolveAutoAckMaxResponses(s.autoAckMaxResponses));
+        setHopEmojiZeroHop(s.hopEmojiZeroHop ?? '');
+        setHopEmojiMqtt(s.hopEmojiMqtt ?? '');
         if (s.autoAckTestMessages !== undefined) setAutoAckTestMessages(s.autoAckTestMessages);
 
         if (s.autoAnnounceEnabled !== undefined) setAutoAnnounceEnabled(bool('autoAnnounceEnabled'));
@@ -228,6 +241,7 @@ export const AutomationProvider: React.FC<AutomationProviderProps> = ({ children
         if (s.autoAnnounceMessage !== undefined) setAutoAnnounceMessage(s.autoAnnounceMessage);
         if (s.autoAnnounceChannelIndexes !== undefined) setAutoAnnounceChannelIndexes(jsonArr<number>('autoAnnounceChannelIndexes', [0]));
         setAutoAnnounceHopLimit(hopLimitSettingValue(s.autoAnnounceHopLimit));
+        setAutoAnnounceSplitLongMessages(s.autoAnnounceSplitLongMessages === 'true');
         if (s.autoAnnounceOnStart !== undefined) setAutoAnnounceOnStart(bool('autoAnnounceOnStart'));
         if (s.autoAnnounceUseSchedule !== undefined) setAutoAnnounceUseSchedule(bool('autoAnnounceUseSchedule'));
         if (s.autoAnnounceSchedule !== undefined) setAutoAnnounceSchedule(s.autoAnnounceSchedule);
@@ -283,12 +297,15 @@ export const AutomationProvider: React.FC<AutomationProviderProps> = ({ children
     autoAckMaxAttempts, setAutoAckMaxAttempts,
     autoAckHopLimit, setAutoAckHopLimit,
     autoAckMaxResponses, setAutoAckMaxResponses,
+    hopEmojiZeroHop, setHopEmojiZeroHop,
+    hopEmojiMqtt, setHopEmojiMqtt,
     autoAckTestMessages, setAutoAckTestMessages,
     autoAnnounceEnabled, setAutoAnnounceEnabled,
     autoAnnounceIntervalHours, setAutoAnnounceIntervalHours,
     autoAnnounceMessage, setAutoAnnounceMessage,
     autoAnnounceChannelIndexes, setAutoAnnounceChannelIndexes,
     autoAnnounceHopLimit, setAutoAnnounceHopLimit,
+    autoAnnounceSplitLongMessages, setAutoAnnounceSplitLongMessages,
     autoAnnounceOnStart, setAutoAnnounceOnStart,
     autoAnnounceUseSchedule, setAutoAnnounceUseSchedule,
     autoAnnounceSchedule, setAutoAnnounceSchedule,
@@ -331,12 +348,15 @@ export const AutomationProvider: React.FC<AutomationProviderProps> = ({ children
     autoAckMaxAttempts, setAutoAckMaxAttempts,
     autoAckHopLimit, setAutoAckHopLimit,
     autoAckMaxResponses, setAutoAckMaxResponses,
+    hopEmojiZeroHop, setHopEmojiZeroHop,
+    hopEmojiMqtt, setHopEmojiMqtt,
     autoAckTestMessages, setAutoAckTestMessages,
     autoAnnounceEnabled, setAutoAnnounceEnabled,
     autoAnnounceIntervalHours, setAutoAnnounceIntervalHours,
     autoAnnounceMessage, setAutoAnnounceMessage,
     autoAnnounceChannelIndexes, setAutoAnnounceChannelIndexes,
     autoAnnounceHopLimit, setAutoAnnounceHopLimit,
+    autoAnnounceSplitLongMessages, setAutoAnnounceSplitLongMessages,
     autoAnnounceOnStart, setAutoAnnounceOnStart,
     autoAnnounceUseSchedule, setAutoAnnounceUseSchedule,
     autoAnnounceSchedule, setAutoAnnounceSchedule,

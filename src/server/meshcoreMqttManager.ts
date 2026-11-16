@@ -42,6 +42,7 @@
 import { EventEmitter } from 'events';
 import type { ISourceManager, SourceStatus } from './sourceManagerRegistry.js';
 import { MqttBrokerClient } from './transports/mqttBrokerClient.js';
+import { attachBrokerLinkNotifier, type BrokerLinkNotifier } from './services/brokerLinkNotifier.js';
 import { redactBrokerUrl } from './utils/brokerUrl.js';
 import {
   decodeObserverPacketMessage,
@@ -50,10 +51,25 @@ import {
   decodeObserverStatusMessage,
   observerKeyFromTopic,
   type IngestedObserverPacket,
+  type IngestedObserverStatus,
 } from './services/meshcoreMqttIngestPacket.js';
 import meshcorePacketLogService from './services/meshcorePacketLogService.js';
 import { MC_TELEMETRY_PREFIX, nodeNumFromPubkey } from './services/meshcoreTelemetryPoller.js';
 import databaseService from '../services/database.js';
+import { isReactionText, mc1ChannelBody } from '../utils/meshcoreReactions.js';
+import {
+  meshcoreWireSecond,
+  meshcoreWireChannelText,
+  mc1HashForChannelWire,
+} from '../utils/meshcoreReactionTarget.js';
+import {
+  isReactionsInboundEnabled,
+  resolveInboundReaction,
+  notePendingReaction,
+  resolvePendingReactionsFor,
+  emitReactionResolutions,
+  type MeshCoreReactionFields,
+} from './services/meshcoreReactionIngest.js';
 import { decodeMeshCorePacket } from '../utils/meshcorePacketDecode.js';
 import type { MeshCoreNode, MeshCoreMessage } from './meshcoreManager.js';
 import {
@@ -62,8 +78,7 @@ import {
   decryptGroupTextFrame,
   frameChannelMessageId,
   ingestAdvertFrame,
-  keyedChannelIndex,
-  channelKeyFingerprint,
+  keyedFilingFor,
   noteVirtualChannelDecrypt,
   type ChannelKeyCandidate,
 } from './services/meshcoreFrameIngest.js';
@@ -76,6 +91,7 @@ import {
   getMeshCoreObserverReceiverPosition,
 } from './utils/coverageMeshCore.js';
 import { maybeRecordMeshCoreLink } from './services/crossSourceLinkRecorder.js';
+import { buildMeshCoreFlight, emitPacketFlight } from './services/packetFlights.js';
 import { isCoverageMqttEnabled } from './services/coverageMqttSettings.js';
 import { logger } from '../utils/logger.js';
 
@@ -190,11 +206,17 @@ export { advertLastHeardMs, pskToHex };
 
 export class MeshCoreMqttManager extends EventEmitter implements ISourceManager {
   readonly sourceId: string;
-  readonly sourceType = 'meshcore_mqtt' as const;
+  /**
+   * Widened so the embedded broker source (#6197), which reuses this ingest
+   * pipeline as a subclass, can carry its own discriminant.
+   */
+  readonly sourceType: 'meshcore_mqtt' | 'meshcore_mqtt_broker' = 'meshcore_mqtt';
 
-  private readonly sourceName: string;
+  protected readonly sourceName: string;
   private readonly config: MeshCoreMqttSourceConfig;
   private client: MqttBrokerClient | null = null;
+  /** Debounced broker-link alerts (#6307). Disposed silently on stop / auth stop. */
+  private brokerLink: BrokerLinkNotifier | null = null;
   private started = false;
   /**
    * True once the broker rejected {@link INGEST_MAX_AUTH_FAILURES} logins in a
@@ -208,7 +230,7 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
    */
   private authStopped = false;
 
-  private readonly stats: MeshCoreMqttIngestStats = {
+  protected readonly stats: MeshCoreMqttIngestStats = {
     received: 0,
     accepted: 0,
     rejected: 0,
@@ -264,7 +286,7 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
     // Ignore / Block lists (#5408) are classified synchronously on ingest.
     await meshcoreMessageFilter.loadSource(this.sourceId);
     try {
-      await this.openBroker();
+      await this.openTransport();
     } catch (err) {
       // Roll back so a later start() can retry. Leaving `started` true after a
       // failed connect would strand the source: never connected, and never
@@ -278,7 +300,7 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
   }
 
   /** Open and subscribe. Separated so start() can roll back cleanly on failure. */
-  private async openBroker(): Promise<void> {
+  protected async openTransport(): Promise<void> {
 
     const packetsTopic = observerPacketsSubscription(this.config.region);
     const statusTopic = observerStatusSubscription(this.config.region);
@@ -293,6 +315,13 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
       maxAuthFailures: INGEST_MAX_AUTH_FAILURES,
     });
     this.client = client;
+    // Attach BEFORE the manager's own 'auth-stopped' listener below: the alert
+    // for a stop must fire before onAuthStopped disposes the notifier.
+    this.brokerLink?.dispose();
+    this.brokerLink = attachBrokerLinkNotifier(client, {
+      sourceId: this.sourceId,
+      sourceName: this.sourceName,
+    });
 
     client.on('message', (msg: { topic: string; payload: Buffer }) => {
       this.handleMessage(msg.topic, msg.payload);
@@ -338,6 +367,8 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
       .disconnect()
       .catch((err) => logger.debug(`[MeshCoreMqtt:${this.sourceId}] error closing rejected client:`, err))
       .finally(() => {
+        this.brokerLink?.dispose();
+        this.brokerLink = null;
         client.removeAllListeners();
         client.on('error', () => {});
       });
@@ -363,6 +394,9 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
     this.started = false;
     // Stopped by hand is not "stopped by the broker"; start() begins clean.
     this.authStopped = false;
+    // Silent: stopping or restarting by hand is never an outage.
+    this.brokerLink?.dispose();
+    this.brokerLink = null;
     const client = this.client;
     this.client = null;
     if (!client) return;
@@ -385,7 +419,7 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
    * observer's identity must all be dropped without disturbing the stream. A
    * single bad message on a busy region feed can never throw.
    */
-  private handleMessage(topic: string, payload: Buffer): void {
+  protected handleMessage(topic: string, payload: Buffer): void {
     // Status heartbeats ride the same region prefix as packets but are a
     // different shape. Split on the topic suffix BEFORE any parsing or
     // counting: the packet counters must not drift by one per observer per
@@ -419,6 +453,21 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
         return;
       }
 
+      this.ingestDecodedPacket(decoded);
+    } catch (err) {
+      this.stats.rejected++;
+      logger.debug(`[MeshCoreMqtt:${this.sourceId}] failed to handle message:`, err);
+    }
+  }
+
+  /**
+   * Store and fan out one packet that already passed validation (decode and
+   * topic/body key cross-check). Counts it as accepted. Shared with the
+   * embedded broker source (#6197), which validates on its own so it can
+   * report a reason per connection.
+   */
+  protected ingestDecodedPacket(decoded: IngestedObserverPacket): void {
+    try {
       this.stats.accepted++;
       this.stats.lastPacketAt = Date.now();
       if (
@@ -434,6 +483,13 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
       // reconstructing the bridge shape.
       this.emit('ota_packet', decoded.event);
       void this.persistPacket(decoded);
+      // Live packet traffic on the map (#4835): the Observer is the receiver.
+      // Not tied to the packet-log setting; a no-op while no map watches.
+      emitPacketFlight(this.sourceId, () => buildMeshCoreFlight({
+        sourceId: this.sourceId,
+        receiverPubKey: decoded.originId,
+        event: decoded.event,
+      }));
       void this.ingestAdvert(decoded);
       void this.ingestChannelMessage(decoded);
       // Coverage Report (#5277 P3): opt-in per source (U1), reusing P2's
@@ -525,6 +581,11 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
    * the packet monitor can show validity per frame on demand. If this ever
    * needs to become a gate, that is the hook, and it belongs here.
    *
+   * #5909: the result IS now recorded (not enforced) as
+   * `meshcore_nodes.advertSignatureVerified`, but only while the global
+   * cross-source hop toggle is on, so the CPU cost stays opt-in. Another
+   * source may borrow a name from this one only when that marker is true.
+   *
    * Best-effort: a decode or write failure must never break the ingest stream.
    */
   private async ingestAdvert(decoded: IngestedObserverPacket): Promise<void> {
@@ -533,8 +594,12 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
       // delayed publish must not make a silent node look freshly heard. The
       // shared helper caps the claim at now, since a forged FUTURE time would
       // park the node at the top of every "last heard" sort indefinitely.
-      const advert = await ingestAdvertFrame(decoded.event.raw_hex, this.sourceId, { lastHeardMs: 'advert' });
-      if (advert) this.stats.advertsIngested++;
+      const ingested = await ingestAdvertFrame(decoded.event.raw_hex, this.sourceId, {
+        lastHeardMs: 'advert',
+        // #5909: record signature validity for cross-source hop resolution.
+        verifySignature: 'toggle',
+      });
+      if (ingested) this.stats.advertsIngested++;
     } catch (err) {
       logger.debug(`[MeshCoreMqtt:${this.sourceId}] failed to ingest advert:`, err);
     }
@@ -628,7 +693,11 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
       const timestampMs = plain.timestampSec > 0 ? plain.timestampSec * 1000 : Date.now();
       const id = channelMessageId(this.sourceId, group.channelHash, plain.timestampSec, plain.text);
 
-      const row = {
+      // Wire second for MC1 reaction hashing (#5759). Stored raw, even when
+      // the sender's clock is implausible.
+      const sec = meshcoreWireSecond(plain.timestampSec);
+
+      const row: MeshCoreMessage & { createdAt: number } = {
           id,
           // 'channel-N' is how this table encodes channel membership; the
           // channel queries match on it. An empty value here would fall through
@@ -646,8 +715,12 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
           snr: decoded.event.snr ?? undefined,
           rssi: decoded.event.rssi ?? undefined,
           createdAt: Date.now(),
-          // Only for a virtual-channel key (#5552); slot-keyed rows are unchanged.
-          ...(plain.keyFingerprint ? { keyFingerprint: plain.keyFingerprint } : {}),
+          ...(sec !== null ? { senderTimestamp: sec } : {}),
+          // Provenance of the decrypting key (#6308). Every row is key-gated,
+          // whether a device slot or a virtual channel opened it.
+          keyFingerprint: plain.keyFingerprint,
+          keySourceId: plain.keySourceId,
+          keyChannelIdx: plain.keyChannelIdx,
       };
 
       // Ignore / Block (#5408): block drops the message before it is stored;
@@ -665,8 +738,63 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
         return;
       }
 
-      const inserted = await databaseService.meshcore.insertMessage(row, this.sourceId);
+      // Reactions (#5759): an MQTT source has no node of its own, so no self
+      // name or key. The id above stays derived from the raw text.
+      let fields: Required<MeshCoreReactionFields> | null = null;
+      const parseBody = plain.senderName ? plain.text : mc1ChannelBody(plain.text);
+      if (isReactionText(parseBody) && (await isReactionsInboundEnabled(this.sourceId))) {
+        const res = await resolveInboundReaction({
+          sourceId: this.sourceId,
+          scope: 'channel',
+          channelIdx: plain.channelIdx,
+          body: parseBody,
+          reactorName: plain.senderName,
+          reactorKey: null,
+          selfName: null,
+          selfKey: null,
+          now: Date.now(),
+        });
+        if (res.kind === 'duplicate') return;
+        if (res.kind === 'reaction') fields = res.fields;
+      }
+      if (fields) {
+        Object.assign(row, fields);
+        row.text = fields.reactionEmoji ?? row.text;
+      }
+      // mc1Hash is internal: it goes to the DB row only, never the emitted event.
+      const mc1Hash = fields
+        ? null
+        : mc1HashForChannelWire(meshcoreWireChannelText(plain.senderName, plain.text), sec);
+
+      const inserted = await databaseService.meshcore.insertMessage({ ...row, mc1Hash }, this.sourceId);
       if (!inserted) return; // A different observer's copy already landed.
+      if (fields) {
+        if (!fields.reactionTargetId) {
+          notePendingReaction(this.sourceId, {
+            id,
+            reactionFormat: fields.reactionFormat ?? '',
+            reactionTargetHash: fields.reactionTargetHash ?? '',
+          });
+        }
+      } else {
+        emitReactionResolutions(
+          this.sourceId,
+          await resolvePendingReactionsFor(
+            this.sourceId,
+            {
+              id,
+              fromPublicKey: row.fromPublicKey,
+              fromName: row.fromName ?? null,
+              text: row.text,
+              timestamp: row.timestamp,
+              senderTimestamp: sec,
+              mc1Hash,
+              messageType: 'channel',
+            },
+            { selfName: null, selfKey: null },
+          ),
+        );
+      }
       meshcoreMessageFilter.countHit(this.sourceId, verdict);
       this.stats.channelMessages++;
       noteVirtualChannelDecrypt(plain.key);
@@ -711,30 +839,23 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
     senderName: string | null;
     timestampSec: number;
     channelIdx: number;
-    /** Set only for a MeshCore virtual-channel key (#5552); gates reads. */
-    keyFingerprint: string | null;
+    /** Gates reads: every MQTT channel row is key-gated (#6308). */
+    keyFingerprint: string;
+    keySourceId: string | null;
+    keyChannelIdx: number | null;
     key: ChannelKeyCandidate;
   } | null> {
     const res = await decryptGroupTextFrame(group);
     if (!res) return null;
-    const base = { text: res.text, senderName: res.senderName, timestampSec: res.timestampSec, key: res.key };
-    if (res.key.channelIdx === null) {
-      // A virtual channel (#5552) has no device slot. File it under the
-      // secret-derived index and stamp the fingerprint, so only users granted
-      // that channel_database entry can read it.
-      return {
-        ...base,
-        channelIdx: keyedChannelIndex(res.key.secretHex),
-        keyFingerprint: channelKeyFingerprint(res.key.secretHex),
-      };
-    }
+    // One filing rule for every key (#6308): the secret-derived index plus the
+    // key's provenance, so reads gate on the key and slot N of two sources never
+    // merges into one un-gated channel.
     return {
-      ...base,
-      // The row id of the key that decrypted it IS the channel index — the
-      // only way to know which channel a frame belongs to, since the wire
-      // carries a hash rather than an index.
-      channelIdx: res.key.channelIdx,
-      keyFingerprint: null,
+      text: res.text,
+      senderName: res.senderName,
+      timestampSec: res.timestampSec,
+      key: res.key,
+      ...keyedFilingFor(res.key),
     };
   }
 
@@ -763,10 +884,23 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
    * would make an observer with a dead radio look mesh-alive.
    */
   private async handleStatus(payload: Buffer): Promise<void> {
+    let status: IngestedObserverStatus | null;
     try {
-      const status = decodeObserverStatusMessage(JSON.parse(payload.toString('utf8')));
-      if (!status) return;
+      status = decodeObserverStatusMessage(JSON.parse(payload.toString('utf8')));
+    } catch (err) {
+      logger.debug(`[MeshCoreMqtt:${this.sourceId}] failed to parse status:`, err);
+      return;
+    }
+    if (!status) return;
+    await this.ingestDecodedStatus(status);
+  }
 
+  /**
+   * Record one decoded `/status` heartbeat. Shared with the embedded broker
+   * source (#6197), which decodes and cross-checks the topic key itself.
+   */
+  protected async ingestDecodedStatus(status: IngestedObserverStatus): Promise<void> {
+    try {
       this.stats.statusMessages++;
 
       // Read the prior snapshot BEFORE the delete/set below overwrites it. Its

@@ -138,6 +138,14 @@ export interface ResolvedMeshIssueThresholds {
   autoCloseCleanRuns: number;
   /** km, B1/B6 cluster-adjacency distance guard (#4976). */
   routerClusterMaxLinkKm: number;
+  /** hours, A6 stale window for Meshtastic infra nodes (#6279). */
+  staleHoursMeshtastic: number;
+  /** hours, A6 stale window for MeshCore repeaters and room servers. */
+  staleHoursMeshcore: number;
+  /** percent, Meshtastic low-battery line (A3 battery clause and A8). */
+  lowBatteryPct: number;
+  /** millivolts, MeshCore low-battery line (A8). */
+  lowBatteryMv: number;
   /** Resolved, validated, sorted `mesh_issues_disabled_rules` (#4964 report
    *  reorg, spec §4.5/§5.2). Unknown ids dropped. */
   disabledRules: string[];
@@ -212,6 +220,10 @@ export interface MeshIssueNodeSummary {
   nodeNum: number | null;
   /** `longName ?? shortName ?? !hex`; `null` for the Mesh-wide group. */
   nodeName: string | null;
+  /** Set only for a MeshCore node group (`mc:<publicKey>`; `nodeNum` is null there). */
+  subjectKey?: string;
+  /** MeshCore groups only: viewer-permitted sources behind the group. */
+  sourceIds?: string[];
   total: number;
   bySeverity: { critical: number; warning: number; info: number };
   worstSeverity: MeshIssueSeverity;
@@ -234,7 +246,9 @@ export interface MeshIssuesSummary {
 export type MeshIssueBulkScope =
   | { scope: 'issueType'; issueType: string }
   /** `nodeNum: null` == the Mesh-wide group. */
-  | { scope: 'node'; nodeNum: number | null };
+  | { scope: 'node'; nodeNum: number | null }
+  /** One MeshCore node group (`mc:<publicKey>`). */
+  | { scope: 'subject'; subjectKey: string };
 
 /** Response of the bulk dismiss/restore endpoints. Deliberately carries no
  *  `skipped` count — see spec §4.4 / §12.2 (a skipped count would disclose
@@ -281,6 +295,10 @@ export const ISSUE_TYPE_LABELS: Record<string, string> = {
   A3_infra_power: 'Infrastructure node on failing power',
   A4_mobile_infra: 'Mobile infrastructure node',
   A5_cosplay_router: 'Router not advertised as unmessagable',
+  A6_stale_node: 'Stale infrastructure node',
+  A7_no_position: 'Infrastructure node without a position',
+  A8_low_battery: 'Low battery',
+  A9_bad_position: 'Impossible reported position',
   B1_router_cluster: 'Router cluster',
   B2_redundant_router: 'Redundant router',
   B3_asymmetric_link: 'Asymmetric link',
@@ -303,6 +321,10 @@ export const ISSUE_TYPE_BLURBS: Record<string, string> = {
   A3_infra_power: 'An infrastructure-role node is resetting or deep-discharging on battery power.',
   A4_mobile_infra: 'A node running a routing role is moving, which routing roles assume it will not do.',
   A5_cosplay_router: 'A dedicated router role is not advertising itself as unmessagable.',
+  A6_stale_node: 'This infrastructure node has not been heard for longer than its stale window.',
+  A7_no_position: 'This infrastructure node has no position that MeshRadar can use, so maps and coverage checks skip it.',
+  A8_low_battery: 'The latest battery reading on this infrastructure node is under the low-battery line.',
+  A9_bad_position: 'This node reports a position that cannot be real, such as 0, 0 or out-of-range coordinates.',
   B1_router_cluster: 'Several routers in one spot hear each other, so each one re-floods the same packets.',
   B2_redundant_router: 'This router reaches almost the same neighbours as another one nearby.',
   B3_asymmetric_link: 'One end of this link hears the other far better than the reverse.',
@@ -537,14 +559,27 @@ export function coverageNotes(coverage: MeshIssuesCoverageWire): CoverageNote[] 
       severity: 'hint',
     });
   }
-  if (!coverage.evidence.packetLog) {
+  // With no hop-horizon source at all, the B6 note above already says to
+  // enable a packet log; saying the Meshtastic one is off repeats it.
+  if (!coverage.evidence.packetLog && coverage.hopHorizonSource !== null) {
     notes.push({
       rule: 'B6',
       note: 'the Meshtastic packet log is off',
       severity: 'blocked',
     });
   }
+  // The server's B6 skip ("no packet log enabled") restates the B6 hop-horizon
+  // note above, so it is left out when that note is shown. Any other skip for
+  // a rule that already has a blocked line (two C2 reasons, a "muted in
+  // settings") joins that line instead of listing the rule twice
+  // (#4173 review L29).
   for (const skip of coverage.skippedRules) {
+    if (skip.rule === 'B6' && coverage.hopHorizonSource === null && skip.reason === 'no packet log enabled') continue;
+    const prior = notes.find((n) => n.rule === skip.rule && n.severity === 'blocked');
+    if (prior) {
+      if (!prior.note.split('; ').includes(skip.reason)) prior.note = `${prior.note}; ${skip.reason}`;
+      continue;
+    }
     notes.push({ rule: skip.rule, note: skip.reason, severity: 'blocked' });
   }
   if (coverage.tracerouteSentinelHopsDropped > 0) {

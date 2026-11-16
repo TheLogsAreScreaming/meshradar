@@ -29,6 +29,14 @@ export const nodesSqlite = sqliteTable('nodes', {
   transportLastRf: integer('transportLastRf'),
   transportLastMqtt: integer('transportLastMqtt'),
   transportLastUdp: integer('transportLastUdp'),
+  /** #5156: the ok_to_mqtt bit (Data.bitfield bit 0) of the latest
+   *  MQTT-delivered packet whose bitfield we could read. NULL = unknown. */
+  mqttOkToMqtt: integer('mqttOkToMqtt', { mode: 'boolean' }),
+  /** #5156: unix seconds when mqttOkToMqtt was read. */
+  mqttOkToMqttAt: integer('mqttOkToMqttAt'),
+  /** #5156: unix seconds of the last packet heard over LoRa with via_mqtt
+   *  clear (real RF, not an MQTT downlink). NULL = never. */
+  rfDirectLastHeard: integer('rfDirectLastHeard'),
   isStoreForwardServer: integer('isStoreForwardServer', { mode: 'boolean' }),
   macaddr: text('macaddr'),
   latitude: real('latitude'),
@@ -90,6 +98,8 @@ export const nodesSqlite = sqliteTable('nodes', {
   positionOverrideIsPrivate: integer('positionOverrideIsPrivate', { mode: 'boolean' }).default(false),
   // Map visibility — when true, suppress this node's marker on maps only (issue #3549)
   hideFromMap: integer('hideFromMap', { mode: 'boolean' }).default(false),
+  // #5923: an admin pinned `channel`; packet-driven upserts leave it alone.
+  channelLocked: integer('channelLocked', { mode: 'boolean' }).default(false),
   // User capability flags from the node's User protobuf (issue #3684)
   isUnmessagable: integer('isUnmessagable', { mode: 'boolean' }).default(false),
   isLicensed: integer('isLicensed', { mode: 'boolean' }).default(false),
@@ -120,6 +130,12 @@ export const nodesSqlite = sqliteTable('nodes', {
   aircraftFixedAt: integer('aircraftFixedAt'),
   aircraftFixedLatitude: real('aircraftFixedLatitude'),
   aircraftFixedLongitude: real('aircraftFixedLongitude'),
+  // Manual aircraft mark (#5715, migration 200): 'not_aircraft' | 'aircraft'.
+  // A 'not_aircraft' mark keeps its anchor in aircraftFixed*. Never written by
+  // `upsertNode`.
+  aircraftManualMark: text('aircraftManualMark'),
+  aircraftManualMarkAt: integer('aircraftManualMarkAt'),
+  aircraftManualMarkBy: integer('aircraftManualMarkBy'),
   // Timestamps
   createdAt: integer('createdAt').notNull(),
   updatedAt: integer('updatedAt').notNull(),
@@ -147,6 +163,10 @@ export const nodesPostgres = pgTable('nodes', {
   transportLastRf: pgBigint('transportLastRf', { mode: 'number' }),
   transportLastMqtt: pgBigint('transportLastMqtt', { mode: 'number' }),
   transportLastUdp: pgBigint('transportLastUdp', { mode: 'number' }),
+  /** #5156: MQTT consent — see the SQLite definition. */
+  mqttOkToMqtt: pgBoolean('mqttOkToMqtt'),
+  mqttOkToMqttAt: pgBigint('mqttOkToMqttAt', { mode: 'number' }),
+  rfDirectLastHeard: pgBigint('rfDirectLastHeard', { mode: 'number' }),
   isStoreForwardServer: pgBoolean('isStoreForwardServer'),
   macaddr: pgText('macaddr'),
   // Using doublePrecision for coordinates (REAL only has ~7 significant digits, causes position jumps)
@@ -208,6 +228,7 @@ export const nodesPostgres = pgTable('nodes', {
   positionOverrideIsPrivate: pgBoolean('positionOverrideIsPrivate').default(false),
   // Map visibility — when true, suppress this node's marker on maps only (issue #3549)
   hideFromMap: pgBoolean('hideFromMap').default(false),
+  channelLocked: pgBoolean('channelLocked').default(false),
   // User capability flags from the node's User protobuf (issue #3684)
   isUnmessagable: pgBoolean('isUnmessagable').default(false),
   isLicensed: pgBoolean('isLicensed').default(false),
@@ -235,6 +256,10 @@ export const nodesPostgres = pgTable('nodes', {
   aircraftFixedAt: pgBigint('aircraftFixedAt', { mode: 'number' }),
   aircraftFixedLatitude: pgDoublePrecision('aircraftFixedLatitude'),
   aircraftFixedLongitude: pgDoublePrecision('aircraftFixedLongitude'),
+  // Manual aircraft mark (#5715, migration 200). See the SQLite table above.
+  aircraftManualMark: pgText('aircraftManualMark'),
+  aircraftManualMarkAt: pgBigint('aircraftManualMarkAt', { mode: 'number' }),
+  aircraftManualMarkBy: pgInteger('aircraftManualMarkBy'),
   // Timestamps
   createdAt: pgBigint('createdAt', { mode: 'number' }).notNull(),
   updatedAt: pgBigint('updatedAt', { mode: 'number' }).notNull(),
@@ -262,6 +287,10 @@ export const nodesMysql = mysqlTable('nodes', {
   transportLastRf: myBigint('transportLastRf', { mode: 'number' }),
   transportLastMqtt: myBigint('transportLastMqtt', { mode: 'number' }),
   transportLastUdp: myBigint('transportLastUdp', { mode: 'number' }),
+  /** #5156: MQTT consent — see the SQLite definition. */
+  mqttOkToMqtt: myBoolean('mqttOkToMqtt'),
+  mqttOkToMqttAt: myBigint('mqttOkToMqttAt', { mode: 'number' }),
+  rfDirectLastHeard: myBigint('rfDirectLastHeard', { mode: 'number' }),
   isStoreForwardServer: myBoolean('isStoreForwardServer'),
   macaddr: myVarchar('macaddr', { length: 32 }),
   latitude: myDouble('latitude'),
@@ -322,6 +351,7 @@ export const nodesMysql = mysqlTable('nodes', {
   positionOverrideIsPrivate: myBoolean('positionOverrideIsPrivate').default(false),
   // Map visibility — when true, suppress this node's marker on maps only (issue #3549)
   hideFromMap: myBoolean('hideFromMap').default(false),
+  channelLocked: myBoolean('channelLocked').default(false),
   // User capability flags from the node's User protobuf (issue #3684)
   isUnmessagable: myBoolean('isUnmessagable').default(false),
   isLicensed: myBoolean('isLicensed').default(false),
@@ -349,6 +379,10 @@ export const nodesMysql = mysqlTable('nodes', {
   aircraftFixedAt: myBigint('aircraftFixedAt', { mode: 'number' }),
   aircraftFixedLatitude: myDouble('aircraftFixedLatitude'),
   aircraftFixedLongitude: myDouble('aircraftFixedLongitude'),
+  // Manual aircraft mark (#5715, migration 200). See the SQLite table above.
+  aircraftManualMark: myVarchar('aircraftManualMark', { length: 16 }),
+  aircraftManualMarkAt: myBigint('aircraftManualMarkAt', { mode: 'number' }),
+  aircraftManualMarkBy: myInt('aircraftManualMarkBy'),
   // Timestamps
   createdAt: myBigint('createdAt', { mode: 'number' }).notNull(),
   updatedAt: myBigint('updatedAt', { mode: 'number' }).notNull(),

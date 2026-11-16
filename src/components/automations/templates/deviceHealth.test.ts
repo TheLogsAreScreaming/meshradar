@@ -214,4 +214,83 @@ describe('deviceHealthTemplate', () => {
       }
     }
   });
+
+  describe('clock out of sync (MeshCore, #6273)', () => {
+    it('declares the checkbox and a gated threshold field', () => {
+      const byName = Object.fromEntries(deviceHealthTemplate.params.map((p) => [p.name, p]));
+      expect(byName.clockOutOfSync.kind).toBe('checkbox');
+      expect(byName.clockOutOfSync.label).toBe('Alert when a node\'s clock is out of sync (MeshCore)');
+      expect(byName.clockDriftThresholdSeconds.showIf).toEqual({ field: 'clockOutOfSync', truthy: true });
+      expect(byName.clockDriftThresholdSeconds.placeholder).toBe('300');
+    });
+
+    it('builds the trigger with the default 300 s threshold and a 10 an hour rate limit', () => {
+      const built = buildMany({ clockOutOfSync: true });
+      expect(built).toHaveLength(1);
+      expect(built[0].name).toBe('Device Health — Clock out of sync');
+      const t = triggerNode(built[0].config);
+      expect(t.type).toBe('trigger.clockOutOfSync');
+      expect(t.params).toEqual({ thresholdSeconds: 300, rateLimit: { maxActions: 10, windowSeconds: 3600 } });
+      const notify = built[0].config.nodes.find((n) => n.type === 'action.notify')!;
+      expect(notify.params!.body).toBe('{{ node.longName }} clock is {{ trigger.offsetText }} (threshold {{ trigger.thresholdSeconds }}s).');
+      expect(validateAutomationGraph(built[0].config).valid).toBe(true);
+    });
+
+    it('honours a valid threshold and falls back for an out-of-range one', () => {
+      expect(triggerNode(buildMany({ clockOutOfSync: true, clockDriftThresholdSeconds: '900' })[0].config).params!.thresholdSeconds).toBe(900);
+      for (const bad of ['60', '100000', '300.5']) {
+        const built = buildMany({ clockOutOfSync: true, clockDriftThresholdSeconds: bad });
+        expect(triggerNode(built[0].config).params!.thresholdSeconds).toBe(300);
+        expect(validateAutomationGraph(built[0].config).valid).toBe(true);
+      }
+    });
+
+    it('is appended last, so the low-battery floor stays at index 0', () => {
+      const built = buildMany({ lowBattery: true, clockOutOfSync: true });
+      expect(built.map((b) => b.name)).toEqual(['Device Health — Low battery', 'Device Health — Clock out of sync']);
+    });
+  });
+});
+
+describe('deviceHealthTemplate: confirmed new neighbour (#6274)', () => {
+  const nb = (values: Record<string, unknown>) => {
+    const built = buildMany({ neighborConfirmed: true, ...values });
+    expect(built).toHaveLength(1);
+    return built[0];
+  };
+
+  it('declares the checkbox and gates its fields behind it', () => {
+    const byName = Object.fromEntries(deviceHealthTemplate.params.map((p) => [p.name, p]));
+    expect(byName.neighborConfirmed.kind).toBe('checkbox');
+    for (const f of ['neighborConfirmHours', 'neighborMinSnr']) {
+      expect(byName[f].showIf).toEqual({ field: 'neighborConfirmed', truthy: true });
+    }
+  });
+
+  it('builds trigger.neighborAdded with the default 72 h and a 5 per hour rate limit', () => {
+    const { name, config } = nb({});
+    expect(name).toBe('Device Health — New neighbour confirmed');
+    expect(triggerNode(config).type).toBe('trigger.neighborAdded');
+    expect(triggerNode(config).params).toEqual({ confirmHours: 72, rateLimit: { maxActions: 5, windowSeconds: 3600 } });
+    expect(validateAutomationGraph(config).valid).toBe(true);
+  });
+
+  it('clamps confirmHours to 6..336 and rounds', () => {
+    expect(triggerNode(nb({ neighborConfirmHours: '2' }).config).params!.confirmHours).toBe(6);
+    expect(triggerNode(nb({ neighborConfirmHours: '9999' }).config).params!.confirmHours).toBe(336);
+    expect(triggerNode(nb({ neighborConfirmHours: '48.4' }).config).params!.confirmHours).toBe(48);
+  });
+
+  it('adds an SNR condition only when asked, and never the Meshtastic node-id filter', () => {
+    const plain = nb({ nodeNums: [111] }).config;
+    expect(plain.nodes.some((n) => n.type === 'condition.string')).toBe(false);
+    expect(plain.nodes.some((n) => n.type === 'condition.numeric')).toBe(false);
+    const withSnr = nb({ neighborMinSnr: '5' }).config;
+    expect(withSnr.nodes.find((n) => n.type === 'condition.numeric')!.params).toEqual({ field: 'snr', op: '>=', value: '5' });
+  });
+
+  it('keeps the source filter', () => {
+    const { config } = nb({ sourceIds: ['mc-1'] });
+    expect(config.nodes.find((n) => n.type === 'condition.sourceFilter')!.params).toEqual({ sourceIds: ['mc-1'] });
+  });
 });

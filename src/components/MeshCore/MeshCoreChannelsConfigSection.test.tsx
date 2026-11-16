@@ -10,7 +10,7 @@
  *   - The secret input is hidden by default and toggles on "Show".
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 
 vi.mock('react-i18next', async () => {
   const { createReactI18nextMock } = await import('../../test/mockI18n');
@@ -43,6 +43,15 @@ const csrfFetchMock = vi.fn((url: string, ...rest: any[]) => {
       }),
     );
   }
+  if (typeof url === 'string' && url.includes('/meshcore/status')) {
+    // Slot capacity probe (#6257): its own effect, so it must not eat a queued channel response.
+    return Promise.resolve(
+      new Response(JSON.stringify({ success: true, data: { localNode: { maxChannels: 8 } } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+  }
   channelCalls.push([url, ...rest]);
   const next = responseQueue.shift();
   return Promise.resolve(next ?? new Response('null', { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -55,7 +64,20 @@ vi.mock('../../hooks/useCsrfFetch', () => ({
   useCsrfFetch: () => csrfFetchMock,
 }));
 
+// The share/import modals call ApiService directly (#6257).
+const apiMock = vi.hoisted(() => ({ encodeChannelUrl: vi.fn(), decodeChannelUrl: vi.fn(), importConfig: vi.fn() }));
+vi.mock('../../services/api', () => ({ default: apiMock }));
+vi.mock('../common/QrCodeCanvas', () => ({ QrCodeCanvas: () => null }));
+vi.mock('../../hooks/useResolvedSourceId', () => ({ useResolvedSourceId: () => 'src-resolved' }));
+
 import { MeshCoreChannelsConfigSection } from './MeshCoreChannelsConfigSection';
+
+const button = (name: string | RegExp) => screen.getByRole('button', { name });
+const addButton = () => button('Add channel');
+const saveButton = () => button('Save to device');
+/** Click the confirm button inside the open ConfirmDialog. */
+const confirmDialog = (name: string | RegExp) =>
+  fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name }));
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -90,10 +112,10 @@ describe('MeshCoreChannelsConfigSection — list rendering', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText('# Public')).toBeTruthy();
-      expect(screen.getByText('# Town')).toBeTruthy();
+      expect(screen.getByText('Public')).toBeTruthy();
+      expect(screen.getByText('Town')).toBeTruthy();
       // Unnamed slot falls back to "Channel N".
-      expect(screen.getByText('# Channel 2')).toBeTruthy();
+      expect(screen.getByText('Channel 2')).toBeTruthy();
     });
 
     const calledUrl = channelCalls[0][0] as string;
@@ -112,15 +134,15 @@ describe('MeshCoreChannelsConfigSection — list rendering', () => {
 
   it('disables Edit/Delete when canWrite=false', async () => {
     csrfFetchMock.mockResolvedValueOnce(
-      jsonResponse([{ id: 0, name: 'Public', psk: 'AAECAwQFBgcICQoLDA0ODw==' }]),
+      jsonResponse([{ id: 1, name: 'Town', psk: 'AAECAwQFBgcICQoLDA0ODw==' }]),
     );
     render(
       <MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={false} />,
     );
-    await waitFor(() => screen.getByText('# Public'));
-    expect((screen.getByText('Edit') as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByText('Delete') as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByText('+ Add channel') as HTMLButtonElement).disabled).toBe(true);
+    await waitFor(() => screen.getByText('Town'));
+    expect((button('Edit') as HTMLButtonElement).disabled).toBe(true);
+    expect((button('Delete') as HTMLButtonElement).disabled).toBe(true);
+    expect((addButton() as HTMLButtonElement).disabled).toBe(true);
   });
 });
 
@@ -137,9 +159,9 @@ describe('MeshCoreChannelsConfigSection — add channel', () => {
     render(
       <MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />,
     );
-    await waitFor(() => screen.getByText('# Public'));
+    await waitFor(() => screen.getByText('Public'));
 
-    fireEvent.click(screen.getByText('+ Add channel'));
+    fireEvent.click(addButton());
 
     expect(screen.getByText('Adding channel 1')).toBeTruthy();
 
@@ -162,7 +184,7 @@ describe('MeshCoreChannelsConfigSection — add channel', () => {
       expect(screen.getByText('No channels reported by the device yet.')).toBeTruthy(),
     );
 
-    fireEvent.click(screen.getByText('+ Add channel'));
+    fireEvent.click(addButton());
 
     expect(screen.getByText('Adding channel 1')).toBeTruthy();
     expect(screen.queryByText('Adding channel 0')).toBeNull();
@@ -185,14 +207,14 @@ describe('MeshCoreChannelsConfigSection — add channel', () => {
     render(
       <MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />,
     );
-    await waitFor(() => screen.getByText('# Public'));
+    await waitFor(() => screen.getByText('Public'));
 
-    fireEvent.click(screen.getByText('+ Add channel'));
+    fireEvent.click(addButton());
     const nameInput = screen.getByLabelText('Name') as HTMLInputElement;
     fireEvent.change(nameInput, { target: { value: 'NewChan' } });
 
     await act(async () => {
-      fireEvent.click(screen.getByText('Save'));
+      fireEvent.click(saveButton());
     });
 
     // Find the PUT call.
@@ -208,7 +230,7 @@ describe('MeshCoreChannelsConfigSection — add channel', () => {
     expect(body.psk).toBe('AQIDBAUGBwgJCgsMDQ4PEA==');
 
     // Re-fetch happened (third csrfFetch call is a GET).
-    await waitFor(() => screen.getByText('# NewChan'));
+    await waitFor(() => screen.getByText('NewChan'));
   });
 });
 
@@ -242,7 +264,7 @@ describe('MeshCoreChannelsConfigSection — hashtag channels', () => {
       expect(screen.getByText('No channels reported by the device yet.')).toBeTruthy(),
     );
 
-    fireEvent.click(screen.getByText('+ Add channel'));
+    fireEvent.click(addButton());
     const nameInput = screen.getByLabelText('Name') as HTMLInputElement;
     const secretInput = screen.getByLabelText('Secret (hex, 32 chars)') as HTMLInputElement;
 
@@ -256,7 +278,7 @@ describe('MeshCoreChannelsConfigSection — hashtag channels', () => {
     );
     // The derived secret is read-only and Regenerate is disabled.
     expect(secretInput.readOnly).toBe(true);
-    expect((screen.getByText('Regenerate') as HTMLButtonElement).disabled).toBe(true);
+    expect((button('Generate') as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('Save sends the # name and the derived PSK to the device', async () => {
@@ -274,7 +296,7 @@ describe('MeshCoreChannelsConfigSection — hashtag channels', () => {
       expect(screen.getByText('No channels reported by the device yet.')).toBeTruthy(),
     );
 
-    fireEvent.click(screen.getByText('+ Add channel'));
+    fireEvent.click(addButton());
     const nameInput = screen.getByLabelText('Name') as HTMLInputElement;
     await act(async () => {
       fireEvent.change(nameInput, { target: { value: '#test' } });
@@ -285,7 +307,7 @@ describe('MeshCoreChannelsConfigSection — hashtag channels', () => {
     );
 
     await act(async () => {
-      fireEvent.click(screen.getByText('Save'));
+      fireEvent.click(saveButton());
     });
 
     let putCall: any;
@@ -322,7 +344,7 @@ describe('MeshCoreChannelsConfigSection — hashtag channels', () => {
       expect(screen.getByText('No channels reported by the device yet.')).toBeTruthy(),
     );
 
-    fireEvent.click(screen.getByText('+ Add channel'));
+    fireEvent.click(addButton());
     const nameInput = screen.getByLabelText('Name') as HTMLInputElement;
 
     // Type the hashtag name AND save inside the same act() flush — without a
@@ -330,7 +352,7 @@ describe('MeshCoreChannelsConfigSection — hashtag channels', () => {
     // random placeholder, but the saved PSK must be the deterministic key.
     await act(async () => {
       fireEvent.change(nameInput, { target: { value: '#bot' } });
-      fireEvent.click(screen.getByText('Save'));
+      fireEvent.click(saveButton());
     });
 
     let putCall: any;
@@ -351,8 +373,7 @@ describe('MeshCoreChannelsConfigSection — hashtag channels', () => {
 });
 
 describe('MeshCoreChannelsConfigSection — delete + secret-visibility', () => {
-  it('Delete sends DELETE to /api/channels/<idx>?sourceId=<src> and refetches', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  it('Delete asks in a dialog, then sends DELETE to /api/channels/<idx>?sourceId=<src> and refetches', async () => {
 
     csrfFetchMock
       // initial list
@@ -370,13 +391,18 @@ describe('MeshCoreChannelsConfigSection — delete + secret-visibility', () => {
     render(
       <MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />,
     );
-    await waitFor(() => screen.getByText('# GoneSoon'));
+    await waitFor(() => screen.getByText('GoneSoon'));
 
     // Find the row with GoneSoon and click its Delete button (the second one).
-    const deleteButtons = screen.getAllByText('Delete') as HTMLButtonElement[];
-    expect(deleteButtons.length).toBe(2);
+    // Slot 0 (Public) has no Delete (#5826), so GoneSoon's is the only one.
+    const deleteButtons = screen.getAllByRole('button', { name: 'Delete' });
+    expect(deleteButtons.length).toBe(1);
+    fireEvent.click(deleteButtons[0]);
+    // Nothing is sent until the dialog is confirmed.
+    expect(channelCalls.find(c => c[1]?.method === 'DELETE')).toBeUndefined();
+    expect(screen.getByRole('dialog').textContent).toContain('Delete channel 1?');
     await act(async () => {
-      fireEvent.click(deleteButtons[1]);
+      confirmDialog('Delete');
     });
 
     const deleteCall = channelCalls.find(
@@ -386,29 +412,202 @@ describe('MeshCoreChannelsConfigSection — delete + secret-visibility', () => {
     expect(deleteCall![0]).toBe('/api/channels/1?sourceId=src-a');
 
     await waitFor(() => {
-      expect(screen.queryByText('# GoneSoon')).toBeNull();
+      expect(screen.queryByText('GoneSoon')).toBeNull();
     });
-
-    confirmSpy.mockRestore();
   });
 
   it('Secret input is type=password by default and switches to text when Show is clicked', async () => {
     csrfFetchMock.mockResolvedValueOnce(
-      jsonResponse([{ id: 0, name: 'Public', psk: 'AAECAwQFBgcICQoLDA0ODw==' }]),
+      jsonResponse([{ id: 1, name: 'Town', psk: 'AAECAwQFBgcICQoLDA0ODw==' }]),
     );
 
     render(
       <MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />,
     );
-    await waitFor(() => screen.getByText('# Public'));
+    await waitFor(() => screen.getByText('Town'));
 
-    fireEvent.click(screen.getByText('Edit'));
+    fireEvent.click(button('Edit'));
     const secretInput = screen.getByLabelText('Secret (hex, 32 chars)') as HTMLInputElement;
     expect(secretInput.type).toBe('password');
 
-    fireEvent.click(screen.getByText('Show'));
+    fireEvent.click(button('Show'));
     expect(secretInput.type).toBe('text');
     // Hex of the base64 'AAECAwQFBgcICQoLDA0ODw==' is 000102030405060708090a0b0c0d0e0f.
     expect(secretInput.value).toBe('000102030405060708090a0b0c0d0e0f');
+  });
+});
+
+describe('MeshCoreChannelsConfigSection — slot 0 is the Public channel (#5826)', () => {
+  it('offers no Edit or Delete on the stock Public slot, only a note', async () => {
+    csrfFetchMock.mockResolvedValueOnce(jsonResponse([
+      { id: 0, name: 'Public', psk: null },
+      { id: 1, name: 'Town', psk: 'EBESExQVFhcYGRobHB0eHw==' },
+    ]));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Town'));
+
+    expect(screen.getAllByRole('button', { name: 'Edit' })).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: 'Delete' })).toHaveLength(1);
+    expect(screen.queryByText('Reset to Public')).toBeNull();
+    expect(screen.getByTestId('mc-public-slot-hint').textContent).toBe('Public channel, fixed by the firmware');
+  });
+
+  it('a misconfigured slot 0 offers Reset, which sends the DELETE the server allows', async () => {
+    csrfFetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 0, name: 'Wrong', psk: 'EBESExQVFhcYGRobHB0eHw==' }]))
+      .mockResolvedValueOnce(jsonResponse({ success: true }))
+      .mockResolvedValueOnce(jsonResponse([{ id: 0, name: 'Public', psk: null }]));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Wrong'));
+
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull();
+    fireEvent.click(button('Reset to Public'));
+    expect(screen.getByRole('dialog').textContent).toMatch(/slot 0/);
+    await act(async () => {
+      confirmDialog('Reset to Public');
+    });
+    const deleteCall = channelCalls.find(c => c[1]?.method === 'DELETE');
+    expect(deleteCall![0]).toBe('/api/channels/0?sourceId=src-a');
+  });
+});
+
+describe('MeshCoreChannelsConfigSection — one editing model (#5829)', () => {
+  const ROWS = [
+    { id: 0, name: 'Public', psk: null },
+    { id: 1, name: 'Town', psk: 'AAECAwQFBgcICQoLDA0ODw==', scope: 'muenchen' },
+    { id: 2, name: '#general', psk: 'TEnz8kYp9e5K1bOWXbR5hQ==' },
+  ];
+
+  it('sends nothing but reads on mount', async () => {
+    csrfFetchMock.mockResolvedValueOnce(jsonResponse(ROWS));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Town'));
+    expect(channelCalls.every(c => !c[1]?.method || c[1].method === 'GET')).toBe(true);
+  });
+
+  it('collapsed cards show the slot, the encryption status and the scope', async () => {
+    csrfFetchMock.mockResolvedValueOnce(jsonResponse(ROWS));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Town'));
+    const cards = screen.getAllByTestId('mc-channel-card');
+    expect(cards[0].textContent).toContain('Slot 0');
+    expect(cards[0].textContent).toContain('Public key');
+    expect(cards[1].textContent).toContain('Slot 1');
+    expect(cards[1].textContent).toContain('Private key');
+    expect(cards[1].textContent).toContain('Scope: muenchen');
+    expect(cards[2].textContent).toContain('Hashtag key (public)');
+  });
+
+  it('Save to device stays off until the draft changes, then sends one PUT', async () => {
+    csrfFetchMock
+      .mockResolvedValueOnce(jsonResponse(ROWS))
+      .mockResolvedValueOnce(jsonResponse({ success: true }))
+      .mockResolvedValueOnce(jsonResponse(ROWS));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Town'));
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Edit' })[0]);
+    expect((saveButton() as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'City' } });
+    expect((saveButton() as HTMLButtonElement).disabled).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(saveButton());
+    });
+    const puts = channelCalls.filter(c => c[1]?.method === 'PUT');
+    expect(puts).toHaveLength(1);
+    expect(puts[0][0]).toBe('/api/channels/1');
+    expect(JSON.parse(puts[0][1].body)).toEqual({
+      name: 'City',
+      psk: 'AAECAwQFBgcICQoLDA0ODw==',
+      scope: 'muenchen',
+      sourceId: 'src-a',
+    });
+  });
+
+  it('Cancel drops the draft and writes nothing', async () => {
+    csrfFetchMock.mockResolvedValueOnce(jsonResponse(ROWS));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Town'));
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Edit' })[0]);
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Changed' } });
+    fireEvent.click(button('Cancel'));
+    expect(screen.queryByLabelText('Name')).toBeNull();
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Edit' })[0]);
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Town');
+    expect(channelCalls.some(c => c[1]?.method === 'PUT')).toBe(false);
+  });
+
+  it('asks before opening another card over unsaved edits', async () => {
+    csrfFetchMock.mockResolvedValueOnce(jsonResponse(ROWS));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Town'));
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Edit' })[0]);
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Changed' } });
+    // The only collapsed card left with Edit is #general.
+    fireEvent.click(button('Edit'));
+    expect(screen.getByRole('dialog').textContent).toContain('Discard unsaved changes?');
+
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Keep editing' }));
+    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Changed');
+
+    fireEvent.click(button('Edit'));
+    confirmDialog('Discard changes');
+    await waitFor(() => expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('#general'));
+  });
+
+  it('opening a card with no edits switches without asking', async () => {
+    csrfFetchMock.mockResolvedValueOnce(jsonResponse(ROWS));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Town'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'Edit' })[0]);
+    fireEvent.click(button('Edit'));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    await waitFor(() => expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('#general'));
+  });
+});
+
+// #6257 P8a: share / import and the maxChannels-bounded free slot.
+describe('MeshCoreChannelsConfigSection — share, import and slot capacity', () => {
+  const PSK = 'AAECAwQFBgcICQoLDA0ODw==';
+
+  it('Share opens the MeshCore share modal preselected on that channel', async () => {
+    csrfFetchMock.mockResolvedValueOnce(
+      jsonResponse([
+        { id: 0, name: 'Public', psk: PSK },
+        { id: 1, name: 'Town', psk: PSK },
+        { id: 2, name: 'Keyless', psk: null },
+      ]),
+    );
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Town'));
+    // Slot 0 (Public) and a channel without a secret have no Share button.
+    expect(screen.getAllByTestId('mc-channel-share')).toHaveLength(1);
+
+    apiMock.encodeChannelUrl.mockResolvedValue('meshcore://channel/add?name=Town&secret=x');
+    fireEvent.click(screen.getByTestId('mc-channel-share'));
+    expect(screen.getByText('export_config.meshcore_title')).toBeTruthy();
+    await waitFor(() => expect((screen.getAllByRole('radio')[1] as HTMLInputElement).checked).toBe(true));
+    await waitFor(() => expect(apiMock.encodeChannelUrl).toHaveBeenCalledWith([1], false, undefined, 'src-a'));
+  });
+
+  it('Import from URL opens the MeshCore import modal', async () => {
+    csrfFetchMock.mockResolvedValueOnce(jsonResponse([{ id: 0, name: 'Public', psk: PSK }]));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Public'));
+    fireEvent.click(screen.getByTestId('mc-channel-import'));
+    expect(screen.getByText('import_config.meshcore_title')).toBeTruthy();
+  });
+
+  it('disables Add channel when slots 1..maxChannels-1 are all used (no 255 fallback)', async () => {
+    const rows = [{ id: 0, name: 'Public', psk: PSK }];
+    for (let i = 1; i <= 7; i++) rows.push({ id: i, name: `Ch${i}`, psk: PSK });
+    csrfFetchMock.mockResolvedValueOnce(jsonResponse(rows));
+    render(<MeshCoreChannelsConfigSection baseUrl="" sourceId="src-a" canWrite={true} />);
+    await waitFor(() => screen.getByText('Ch7'));
+    expect((addButton() as HTMLButtonElement).disabled).toBe(true);
   });
 });

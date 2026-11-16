@@ -93,6 +93,7 @@ export interface DeviceInfo {
   favoriteLocked?: boolean;
   isIgnored?: boolean;
   hideFromMap?: boolean; // #3549: suppress this node's marker on maps only
+  channelLocked?: boolean; // #5923: admin-pinned channel; traffic does not change it
   notes?: string; // #3921: free-text per-node MeshRadar-local annotation
   isUnmessagable?: boolean; // #3684: User.is_unmessagable — node won't receive DMs
   /** #5317: set when the row came from an imported contact URL and the node has not been heard yet. */
@@ -162,6 +163,12 @@ export interface DeviceInfo {
   aircraftAgedOutAt?: number | null;
   /** ms epoch when the node was reclassified as fixed (sticky mark); null/absent = no mark. */
   aircraftFixedAt?: number | null;
+  /** Manual aircraft mark (#5715): 'not_aircraft' | 'aircraft'; absent = none. */
+  aircraftManualMark?: 'not_aircraft' | 'aircraft' | null;
+  /** ms epoch the manual mark was set. */
+  aircraftManualMarkAt?: number | null;
+  /** users.id of who set the manual mark. */
+  aircraftManualMarkBy?: number | null;
 }
 
 export interface Channel {

@@ -152,6 +152,7 @@ Both tables follow the 3-backend Drizzle pattern (`src/db/schema/settings.ts` ex
 4. **Safety rails (critical):**
    - **Loop guard:** max action count per run + max graph-step count; an action that re-triggers its own workflow must not recurse infinitely (track originating run id / depth).
    - **Cooldown / rate-limit** per automation (carry over the existing `autoAckCooldownSeconds` concept) to prevent mesh spam.
+     **Persisted** in `automation_fire_state` (migration 219, global, no `sourceId`): one `cooldown` row per (automation, cooldown key) holding the last fire, and one `rate` row per automation holding the fire times still inside its window. Every fire queues an ordered, non-blocking write; `load()` (startup and every save/enable/disable/delete) restores the rows for live rules, taking the newer of memory and disk, and prunes rows for deleted rules and rows past the rule's current window. So a restart never counts as a fire, and a restart, a save, or a disable/re-enable never resets a cooldown or a rate window. `runNow` on a disabled rule reads that rule's rows first. Changing `cooldownScope` changes the key shape, so the rule starts fresh under the new scope (as before); the old keys age out.
    - **Airtime awareness:** respect existing `automationAirtimeCutoff*` settings before send actions.
    - **Self-origin guard (#3914):** the engine drops every event that originated from our OWN node — a message whose `fromNodeNum` (Meshtastic) / `fromPublicKey` (MeshCore) is the source's local node, and telemetry / node-updates for the local node. This is what stops an `action.sendMessage` reply (which re-enters the bus via `emitNewMessage`/`emitMeshCoreMessage`) from re-triggering its own rule in an infinite mesh loop, and stops our own periodic telemetry/node-info from spuriously firing rules. Identity is resolved per-source/protocol via optional `NodeDataProvider.getLocalNodeNum`/`getSelfPublicKey` accessors (real impls read the live manager registries; absent in a unit test → nothing is dropped). Mirrors the legacy MeshCore auto-responder's `checkAutoResponder` self-reply guard. (Geofence checks are intentionally NOT self-excluded — "when my own tracker enters a region" is a valid automation and carries no loop risk.)
    - Action failures are caught, logged to the run, and do not crash the engine.
@@ -257,6 +258,14 @@ in `src/services/database.ts`). **Resolution rules (apply to every field):**
 
 **`trigger.telemetry`** — payload `TelemetryBatchData {[nodeNum]: DbTelemetry[]}` (event `telemetry:batch`).
 > Engine **fans the batch out** into individual readings and evaluates the trigger once per reading. Pre-filter on `telemetryType`.
+>
+> **Emitters (the trigger was dead until these existed):** Meshtastic TCP `saveTelemetryMetrics` and MQTT `TELEMETRY_APP` ingest call `dataEventEmitter.emitTelemetry` after each stored reading. Rules:
+> - Live readings only: firmware 2.8 NodeDB replays and stale frames are stored but not emitted.
+> - **Loop guard:** a reading whose `decoded.requestId` names a telemetry request we sent (`src/server/services/ownTelemetryRequests.ts`) is flagged `answersOwnRequest` and never fires.
+> - **Self-origin (#3914):** our own telemetry is dropped, except LocalStats readings (flag `localStats`, e.g. `noiseFloor`), which only our own node produces.
+> - **Floor:** the engine raises any cooldown below `TELEMETRY_TRIGGER_MIN_COOLDOWN_SECONDS` (3600) to that, per node (`effectiveTelemetryCooldown` in `src/types/automation.ts`).
+> - Not wired: MeshCore (every reading answers our own poll/request, or carries a synthesized nodeNum and `mc_*` metric names), Reticulum, and derived rows (position, SNR/RSSI, hops, link quality, transport counters).
+> - Browsers receive `telemetry:batch` through its gate but no longer act on it (`useWebSocket.ts`).
 | field | source |
 |-------|--------|
 | `trigger.nodeNum` | batch key |

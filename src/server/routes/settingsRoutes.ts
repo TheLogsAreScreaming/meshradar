@@ -9,6 +9,7 @@
  * can be tested without importing the entire monolith.
  */
 
+import { isValidHopEmojiSetting, HOP_EMOJI_SETTING_MAX_LENGTH } from '../../utils/hopEmoji.js';
 import { Router, Request, Response } from 'express';
 import { optionalAuth, requirePermission, requireAdmin } from '../auth/authMiddleware.js';
 import databaseService from '../../services/database.js';
@@ -21,9 +22,23 @@ import { invalidatePkiDmGlobalCache } from '../services/sourcePkiKeyStore.js';
 import { invalidateCoverageMqttEnabled } from '../services/coverageMqttSettings.js';
 import { invalidateSignFlipContext, SIGN_FLIP_SETTING_KEYS } from '../services/signFlipCorrection.js';
 import { COVERAGE_MQTT_ENABLED_SETTING } from '../../utils/coverage.js';
-import { VALID_SETTINGS_KEYS, GLOBAL_ONLY_SETTINGS_KEYS, stripSecretSettings, isSecretSettingKey } from '../constants/settings.js';
+import { CHART_Y_RANGE_SETTING, normalizeChartYRangeMap } from '../../utils/chartYRange.js';
+import { VALID_SETTINGS_KEYS, GLOBAL_ONLY_SETTINGS_KEYS, ADMIN_ONLY_SETTINGS_KEYS, stripSecretSettings, isSecretSettingKey, isValidSecurityDeadNodeDays, SECURITY_DEAD_NODE_DAYS_RANGE } from '../constants/settings.js';
 import { TRANSLATION_PROVIDER_URL_SETTING_KEYS } from '../../types/translationProviders.js';
 import { ok, fail } from '../utils/apiResponse.js';
+import { assertSafeUrl, SsrfBlockedError } from '../utils/ssrfGuard.js';
+import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
+import { getPrimaryMeshtasticManager } from '../sourceManagerTypes.js';
+import { DEFAULT_MESHTASTIC_SOURCE_SETTING, applyDefaultMeshtasticSource } from '../utils/defaultMeshtasticSource.js';
+import {
+  clampNeighborSampleCount,
+  parseManualNeighborNodes,
+  MIN_NEIGHBOR_UTIL_SAMPLE_COUNT,
+  MAX_NEIGHBOR_UTIL_SAMPLE_COUNT,
+} from '../utils/airtimeCutoff.js';
+import { parseAutoPingSettingsUpdate, readAutoPingSettings } from '../utils/autoPingSettings.js';
+import { validateResponderTrigger } from '../utils/autoResponderMatcher.js';
+import { isResponderSyntax } from '../../utils/responderTrigger.js';
 import {
   requireSourcePermission,
   getSourceTarget,
@@ -31,6 +46,11 @@ import {
   readNewestAcrossSources,
 } from '../utils/sourceScopedAccess.js';
 import { validateFilterNameRegexOnSave } from '../utils/filterNameRegex.js';
+import { validateNodeNameSanitizerSettings } from '../../utils/nodeNameSanitizer.js';
+import { NODE_NAME_SANITIZE_KEYS } from '../../utils/nodeNameSanitizerConstants.js';
+import { reloadNodeNameSanitizer } from '../services/nodeNameSanitizerService.js';
+import { reloadPublicInstanceConfig } from '../services/publicInstanceConfig.js';
+import { PUBLIC_INSTANCE_SETTING_KEYS } from '../../utils/publicInstanceMode.js';
 import { positionEstimationScheduler } from '../services/positionEstimationScheduler.js';
 import {
   autoEnrichmentScheduler,
@@ -39,6 +59,11 @@ import {
   MIN_INTERVAL_MINUTES as AUTO_ENRICHMENT_MIN_INTERVAL_MINUTES,
   MAX_INTERVAL_MINUTES as AUTO_ENRICHMENT_MAX_INTERVAL_MINUTES,
 } from '../services/autoEnrichmentScheduler.js';
+import {
+  meshwarsForwarder,
+  MESHWARS_SETTINGS,
+  normalizeBaseUrl as normalizeMeshWarsBaseUrl,
+} from '../services/meshwarsForwarder.js';
 import { autoDeleteByDistanceService } from '../services/autoDeleteByDistanceService.js';
 import { NODE_DISPLAY_RANGES, SETTINGS_TAB_PER_SOURCE_KEYS, MAX_INFRA_NODE_AGE_HOURS_RANGE, TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_RANGE } from '../../constants/nodeDisplayDefaults.js';
 import { resolveAppriseServerUrl } from '../services/appriseNotificationService.js';
@@ -50,6 +75,7 @@ import {
 } from '../../utils/aircraftClassification.js';
 import { aircraftClassificationService } from '../services/aircraftClassificationService.js';
 import { isAdsbFeed, ADSB_FEED_IDS } from '../../utils/adsbFeeds.js';
+import { parseReliablePkiMode, isValidReliablePkiSourceMode } from '../services/reliablePki.js';
 import {
   AUTO_ACK_MAX_RESPONSES_MAX,
   AUTO_ACK_MAX_RESPONSES_MIN,
@@ -57,6 +83,9 @@ import {
 } from '../autoAckResponseCap.js';
 import { clampIntervalSetting, GEOFENCE_WHILE_INSIDE_MINUTES } from '../utils/schedulerInterval.js';
 import { GEOFENCE_RADIUS_KM_MAX } from '../../utils/geofenceLimits.js';
+import { keepServerRunState, parseStoredTriggers } from '../utils/timerRunState.js';
+import { findSplitTimerTooFrequent, findTimerTooManyChannels } from '../utils/timerSplitGuard.js';
+import { SPLIT_TIMER_MIN_INTERVAL_MINUTES, MESHCORE_TIMER_MAX_CHANNELS } from '../../utils/messageSplitLimits.js';
 
 // ─── Tile URL validation ─────────────────────────────────────────────────
 
@@ -173,6 +202,10 @@ export interface SettingsCallbacks {
   setAutomationAirtimeCutoffThreshold?: (threshold: number, sourceId?: string | null) => void;
   setAutomationAirtimeCutoffSource?: (source: string, sourceId?: string | null) => void;
   setAutomationAirtimeCutoffNeighborMaxHops?: (hops: number, sourceId?: string | null) => void;
+  setAutomationAirtimeCutoffNeighborSelection?: (
+    selection: { mode?: string; sampleCount?: number | string; nodes?: unknown },
+    sourceId?: string | null,
+  ) => void;
   handleAutoWelcomeEnabled?: () => number;
   invalidateHtmlCache?: () => void;
   // Global (default ON): push the new discard-invalid-positions value into the
@@ -204,6 +237,23 @@ export function setSettingsCallbacks(cb: SettingsCallbacks): void {
 // #4412 Phase 2: the three inactiveNodeNotificationService config keys.
 // Hoisted to module scope so both the per-source and global save paths reuse
 // the same list instead of each declaring their own copy.
+// Issue #6007: the airtime-cutoff neighbour selection keys, pushed to the
+// source's manager together after a save.
+const AIRTIME_NEIGHBOR_SELECTION_KEYS = [
+  'automationAirtimeCutoffNeighborMode',
+  'automationAirtimeCutoffNeighborSampleCount',
+  'automationAirtimeCutoffNeighborNodes',
+] as const;
+
+function airtimeNeighborSelection(settings: Record<string, unknown>): { mode?: string; sampleCount?: string; nodes?: string } {
+  const str = (v: unknown): string | undefined => (v === undefined ? undefined : String(v));
+  return {
+    mode: str(settings.automationAirtimeCutoffNeighborMode),
+    sampleCount: str(settings.automationAirtimeCutoffNeighborSampleCount),
+    nodes: str(settings.automationAirtimeCutoffNeighborNodes),
+  };
+}
+
 const INACTIVE_NODE_KEYS = [
   'inactiveNodeThresholdHours',
   'inactiveNodeCheckIntervalMinutes',
@@ -364,7 +414,16 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
     for (const key of VALID_SETTINGS_KEYS) {
       if (!(key in settings)) continue;
       if (!isAdminWriter && isSecretSettingKey(key)) continue;
-      if (sourceId && GLOBAL_ONLY_SETTINGS_KEYS.has(key)) {
+      // Admin-only keys (#5734): dropped for non-admins, like secrets above.
+      if (!isAdminWriter && ADMIN_ONLY_SETTINGS_KEYS.has(key)) continue;
+      // Global-only keys (AUTHZ-06, issue #6070). These are install-wide and
+      // security-relevant (externalUrl, pkiDmDecryptionGloballyEnabled,
+      // position_estimation_*, …). They are dropped from a per-source save
+      // (meaningless in a source namespace) AND from any non-admin save — a
+      // non-admin holding settings:write on a single source must not be able to
+      // overwrite them via a global (no-sourceId) POST. Only an admin writing
+      // in the global scope reaches the write below.
+      if (GLOBAL_ONLY_SETTINGS_KEYS.has(key) && (sourceId || !isAdminWriter)) {
         ignoredKeys.push(key);
         continue;
       }
@@ -399,6 +458,11 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       'aircraftAgeOutEnabled',
       // ADS-B flight matching (#5374): turns on third-party HTTP requests.
       'adsbMatchEnabled',
+      // Ducting overlay (#5734): lets map viewers trigger NOAA requests.
+      'ductingOverlayEnabled',
+      // MQTT root directory refresh (#6337): lets finder users trigger
+      // requests to api.meshtastic.org.
+      'mqttRootDirectoryRefreshEnabled',
     ] as const;
 
     for (const key of STRICT_BOOLEAN_SETTINGS_KEYS) {
@@ -408,6 +472,44 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
         return fail(res, 400, 'INVALID_BOOLEAN_SETTING',
           `${key} must be the boolean true or false (received "${v}")`);
       }
+    }
+
+    // Node-name anti-spam (#6382): booleans, the placeholder size, and every
+    // custom pattern (RE2, at most 256 characters) must be valid before any
+    // write, so a bad regex is a 400 rather than a silently skipped rule.
+    {
+      const sanitizerError = validateNodeNameSanitizerSettings(filteredSettings);
+      if (sanitizerError) {
+        return fail(res, 400, 'INVALID_NODE_NAME_SANITIZER_SETTING', sanitizerError);
+      }
+    }
+
+    // Reliable PKI (#5691). An unknown mode would read as 'off' — reject it so
+    // a client bug is visible instead of silently disabling the feature.
+    if ('reliablePkiMode' in filteredSettings && !parseReliablePkiMode(filteredSettings.reliablePkiMode)) {
+      return fail(res, 400, 'INVALID_RELIABLE_PKI_MODE', 'reliablePkiMode must be "off", "asNeeded" or "avoid"');
+    }
+    if ('reliablePkiSourceMode' in filteredSettings
+      && !isValidReliablePkiSourceMode(filteredSettings.reliablePkiSourceMode)) {
+      return fail(res, 400, 'INVALID_RELIABLE_PKI_MODE', 'reliablePkiSourceMode must be "inherit", "off", "asNeeded" or "avoid"');
+    }
+
+    // Default Meshtastic source (#5245): blank (= Automatic) or the id of an
+    // existing meshtastic_tcp source. A disabled one is allowed: it takes over
+    // when it is enabled. Anything else would be stored and silently ignored.
+    // Checked only when the value changes: a stored choice whose source was
+    // deleted since must not make every later Settings save fail (#3806 shape).
+    if (DEFAULT_MESHTASTIC_SOURCE_SETTING in filteredSettings) {
+      const chosen = filteredSettings[DEFAULT_MESHTASTIC_SOURCE_SETTING].trim();
+      const stored = (currentSettings[DEFAULT_MESHTASTIC_SOURCE_SETTING] ?? '').trim();
+      if (chosen && chosen !== stored) {
+        const source = await databaseService.sources.getSource(chosen);
+        if (!source || source.type !== 'meshtastic_tcp') {
+          return fail(res, 400, 'INVALID_DEFAULT_MESHTASTIC_SOURCE',
+            'defaultMeshtasticSourceId must be blank (automatic) or the id of a Meshtastic TCP source');
+        }
+      }
+      filteredSettings[DEFAULT_MESHTASTIC_SOURCE_SETTING] = chosen;
     }
 
     // Auto-Enrichment schedule floor (#5287). The scheduler clamps and rejects
@@ -499,6 +601,14 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
         `autoAckMaxResponses must be a whole number between ${AUTO_ACK_MAX_RESPONSES_MIN} and ${AUTO_ACK_MAX_RESPONSES_MAX} (0 = no cap)`);
     }
 
+    // #5890: blank (= built-in glyph) or one short emoji, never message text.
+    for (const key of ['hopEmojiZeroHop', 'hopEmojiMqtt'] as const) {
+      if (key in filteredSettings && !isValidHopEmojiSetting(filteredSettings[key])) {
+        return fail(res, 400, 'INVALID_INPUT',
+          `${key} must be blank or a single emoji (at most ${HOP_EMOJI_SETTING_MAX_LENGTH} characters, no spaces)`);
+      }
+    }
+
     if ('autoAckIgnoredNodes' in filteredSettings) {
       try {
         filteredSettings.autoAckIgnoredNodes = normalizeIgnoredNodeIds(filteredSettings.autoAckIgnoredNodes);
@@ -520,6 +630,12 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
         return fail(res, 400, 'INVALID_MAX_NODE_AGE_HOURS',
           `maxNodeAgeHours must be between ${R.min} and ${R.max} hours (0 = show all)`);
       }
+    }
+
+    // P7a (#6254): Security tab dead-node threshold, whole days.
+    if ('securityDeadNodeDays' in filteredSettings && !isValidSecurityDeadNodeDays(filteredSettings.securityDeadNodeDays)) {
+      return fail(res, 400, 'INVALID_SECURITY_DEAD_NODE_DAYS',
+        `securityDeadNodeDays must be a whole number between ${SECURITY_DEAD_NODE_DAYS_RANGE.min} and ${SECURITY_DEAD_NODE_DAYS_RANGE.max}`);
     }
 
     // #4899: separate Infrastructure age window (MeshCore repeaters/room
@@ -569,6 +685,36 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
     if ('adsbFeed' in filteredSettings && !isAdsbFeed(filteredSettings.adsbFeed)) {
       return fail(res, 400, 'INVALID_ADSB_FEED',
         `adsbFeed must be one of: ${ADSB_FEED_IDS.join(', ')}`);
+    }
+    // OpenSky (#5877) has no anonymous mode: the feed needs both credentials,
+    // whether they arrive in this save or are already stored. Also refuses a
+    // save that clears a credential while OpenSky stays selected.
+    if (['adsbFeed', 'adsb_opensky_client_id', 'adsb_opensky_client_secret'].some((k) => k in filteredSettings)) {
+      const effective = async (k: string): Promise<string> =>
+        (k in filteredSettings ? filteredSettings[k] : await databaseService.settings.getSetting(k)) ?? '';
+      if ((await effective('adsbFeed')) === 'opensky') {
+        const id = String(await effective('adsb_opensky_client_id')).trim();
+        const secret = String(await effective('adsb_opensky_client_secret')).trim();
+        if (!id || !secret) {
+          return fail(res, 400, 'ADSB_OPENSKY_CREDENTIALS_REQUIRED',
+            'OpenSky Network needs both a client ID and a client secret');
+        }
+      }
+    }
+    // MeshWars forwarder: an http(s) base URL, and turning it on needs a
+    // source and an API key, whether they arrive in this save or are stored.
+    if ('meshwarsBaseUrl' in filteredSettings
+      && String(filteredSettings.meshwarsBaseUrl).trim() !== ''
+      && !normalizeMeshWarsBaseUrl(String(filteredSettings.meshwarsBaseUrl))) {
+      return fail(res, 400, 'INVALID_MESHWARS_BASE_URL', 'MeshWars URL must start with http:// or https://');
+    }
+    if (Object.values(MESHWARS_SETTINGS).some((k) => k in filteredSettings)) {
+      const effective = async (k: string): Promise<string> =>
+        String((k in filteredSettings ? filteredSettings[k] : await databaseService.settings.getSetting(k)) ?? '').trim();
+      if ((await effective(MESHWARS_SETTINGS.enabled)) === 'true'
+        && (!(await effective(MESHWARS_SETTINGS.sourceId)) || !(await effective(MESHWARS_SETTINGS.apiKey)))) {
+        return fail(res, 400, 'MESHWARS_CONFIG_REQUIRED', 'MeshWars needs a MeshCore source and an API key');
+      }
     }
     if ('aircraftAgeOutAction' in filteredSettings
       && !isAircraftAgeOutAction(filteredSettings.aircraftAgeOutAction)) {
@@ -673,6 +819,66 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       }
     }
 
+    // Issue #6007: neighbour selection mode ('auto' | 'manual').
+    if ('automationAirtimeCutoffNeighborMode' in filteredSettings) {
+      const mode = filteredSettings.automationAirtimeCutoffNeighborMode;
+      if (mode !== 'auto' && mode !== 'manual') {
+        return fail(res, 400, 'INVALID_AIRTIME_NEIGHBOR_MODE', "automationAirtimeCutoffNeighborMode must be 'auto' or 'manual'");
+      }
+    }
+
+    // Issue #6007: sample count is user-set, clamped server-side to 3-5.
+    if ('automationAirtimeCutoffNeighborSampleCount' in filteredSettings) {
+      const count = parseInt(String(filteredSettings.automationAirtimeCutoffNeighborSampleCount), 10);
+      if (isNaN(count)) {
+        return fail(res, 400, 'INVALID_AIRTIME_SAMPLE_COUNT', 'automationAirtimeCutoffNeighborSampleCount must be a number (3-5)');
+      }
+      filteredSettings.automationAirtimeCutoffNeighborSampleCount = String(clampNeighborSampleCount(count));
+    }
+
+    // Issue #6007: manual picks are a JSON array of 3-5 unique node numbers
+    // (or empty, to clear). Manual mode needs a valid list in the same save.
+    if ('automationAirtimeCutoffNeighborNodes' in filteredSettings) {
+      const raw = filteredSettings.automationAirtimeCutoffNeighborNodes;
+      let arr: unknown;
+      try {
+        arr = typeof raw === 'string' ? JSON.parse(raw === '' ? '[]' : raw) : raw;
+      } catch {
+        arr = null;
+      }
+      const nodes = parseManualNeighborNodes(arr);
+      if (!Array.isArray(arr) || nodes.length !== arr.length) {
+        return fail(res, 400, 'INVALID_AIRTIME_NEIGHBOR_NODES', 'automationAirtimeCutoffNeighborNodes must be a JSON array of unique node numbers');
+      }
+      if (nodes.length !== 0 && (nodes.length < MIN_NEIGHBOR_UTIL_SAMPLE_COUNT || nodes.length > MAX_NEIGHBOR_UTIL_SAMPLE_COUNT)) {
+        return fail(res, 400, 'INVALID_AIRTIME_NEIGHBOR_NODES', `automationAirtimeCutoffNeighborNodes must list ${MIN_NEIGHBOR_UTIL_SAMPLE_COUNT}-${MAX_NEIGHBOR_UTIL_SAMPLE_COUNT} nodes`);
+      }
+      filteredSettings.automationAirtimeCutoffNeighborNodes = JSON.stringify(nodes);
+    }
+    if (filteredSettings.automationAirtimeCutoffNeighborMode === 'manual') {
+      const nodes = parseManualNeighborNodes(filteredSettings.automationAirtimeCutoffNeighborNodes);
+      if (nodes.length < MIN_NEIGHBOR_UTIL_SAMPLE_COUNT || nodes.length > MAX_NEIGHBOR_UTIL_SAMPLE_COUNT) {
+        return fail(res, 400, 'INVALID_AIRTIME_NEIGHBOR_NODES', `Manual mode needs automationAirtimeCutoffNeighborNodes with ${MIN_NEIGHBOR_UTIL_SAMPLE_COUNT}-${MAX_NEIGHBOR_UTIL_SAMPLE_COUNT} nodes`);
+      }
+    }
+
+    // Issue #6348: per-widget fixed Y-axis range. A JSON object of
+    // widgetKey -> { min?, max? }; non-finite bounds and min >= max pairs are
+    // dropped, so the stored value is always one the charts can draw.
+    if (CHART_Y_RANGE_SETTING in filteredSettings) {
+      const raw = filteredSettings[CHART_Y_RANGE_SETTING];
+      let parsed: unknown;
+      try {
+        parsed = typeof raw === 'string' ? JSON.parse(raw === '' ? '{}' : raw) : raw;
+      } catch {
+        parsed = null;
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return fail(res, 400, 'INVALID_CHART_Y_RANGE', `${CHART_Y_RANGE_SETTING} must be a JSON object`);
+      }
+      filteredSettings[CHART_Y_RANGE_SETTING] = JSON.stringify(normalizeChartYRangeMap(parsed));
+    }
+
     // Validate autoResponderTriggers JSON
     if ('autoResponderTriggers' in filteredSettings) {
       try {
@@ -697,6 +903,24 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
           }
           if (!Array.isArray(trigger.trigger) && typeof trigger.trigger !== 'string') {
             return res.status(400).json({ error: 'Trigger must be a string or array of strings' });
+          }
+
+          // Per-trigger switch (#6405). Optional; when present it must be a boolean.
+          if (trigger.enabled !== undefined && typeof trigger.enabled !== 'boolean') {
+            return fail(res, 400, 'INVALID_INPUT', 'enabled must be a boolean');
+          }
+
+          // Trigger syntax (#5924). Missing = 'pattern' (the DSL). A regex-mode
+          // trigger gets the same store-time checks as a MeshCore one; pattern
+          // mode is left as it was, so older triggers still save.
+          if (trigger.syntax !== undefined && !isResponderSyntax(trigger.syntax)) {
+            return fail(res, 400, 'INVALID_REGEX', 'syntax must be "pattern" or "regex"');
+          }
+          if (trigger.syntax === 'regex') {
+            const v = validateResponderTrigger(trigger.trigger, 'regex');
+            if (!v.ok) {
+              return fail(res, 400, 'INVALID_REGEX', `Invalid regex for trigger ${trigger.id}: ${v.error}`);
+            }
           }
 
           if (
@@ -777,8 +1001,28 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
             return res.status(400).json({ error: 'enabled must be a boolean' });
           }
         }
+
+        // A timer that splits long messages must fire at most every 5 minutes
+        // (#6330, same floor as MeshCore #6316).
+        const tooFast = findSplitTimerTooFrequent(triggers);
+        if (tooFast) {
+          return fail(res, 400, 'SPLIT_TIMER_INTERVAL_TOO_SHORT',
+            `Trigger ${tooFast.id}: a timer that splits long messages needs an interval of at least ${SPLIT_TIMER_MIN_INTERVAL_MINUTES} minutes`);
+        }
       } catch (error) {
         return res.status(400).json({ error: 'Invalid JSON format for timerTriggers' });
+      }
+    }
+
+    // MeshCore timers through the generic route (restore, scripts): the same
+    // 4-channel cap as the timer route (4.17.3 review M5).
+    if ('meshcoreTimerTriggers' in filteredSettings) {
+      let parsed: unknown = null;
+      try { parsed = JSON.parse(filteredSettings.meshcoreTimerTriggers); } catch { parsed = null; }
+      const tooMany = Array.isArray(parsed) ? findTimerTooManyChannels(parsed) : undefined;
+      if (tooMany) {
+        return fail(res, 400, 'TIMER_TOO_MANY_CHANNELS',
+          `Trigger ${tooMany.id}: a timer can send to at most ${MESHCORE_TIMER_MAX_CHANNELS} channels (it has ${tooMany.channels})`);
       }
     }
 
@@ -1050,6 +1294,18 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       }
     }
 
+    // Timer run state (lastRun / lastResult / lastError) is the scheduler's,
+    // not the page's: keep the stored values so a save can't roll back a
+    // newer run (#5827).
+    if ('timerTriggers' in filteredSettings) {
+      const storedJson = sourceId
+        ? await databaseService.settings.getSettingForSource(sourceId, 'timerTriggers')
+        : await databaseService.settings.getSetting('timerTriggers');
+      filteredSettings.timerTriggers = JSON.stringify(
+        keepServerRunState(JSON.parse(filteredSettings.timerTriggers), parseStoredTriggers(storedJson)),
+      );
+    }
+
     // Save to database
     if (sourceId) {
       // Per-source: store with source: prefix
@@ -1087,6 +1343,9 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
         if (!isNaN(hops)) {
           callbacks.setAutomationAirtimeCutoffNeighborMaxHops?.(hops, sourceId);
         }
+      }
+      if (AIRTIME_NEIGHBOR_SELECTION_KEYS.some((key) => key in filteredSettings)) {
+        callbacks.setAutomationAirtimeCutoffNeighborSelection?.(airtimeNeighborSelection(filteredSettings), sourceId);
       }
 
       // #4412: localStatsIntervalMinutes is read per-source by
@@ -1177,6 +1436,7 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
     }
 
     await databaseService.settings.setSettings(filteredSettings);
+    if (Object.values(MESHWARS_SETTINGS).some((k) => k in filteredSettings)) void meshwarsForwarder.refreshConfig();
 
     // ─── Side effects ───────────────────────────────────────────────────
     // PKI DM decryption master switch (#3441): invalidate the cached flag, and
@@ -1194,6 +1454,11 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       }
     }
 
+    if (DEFAULT_MESHTASTIC_SOURCE_SETTING in filteredSettings) {
+      // Live, no restart: later source-less resolutions see the new primary.
+      applyDefaultMeshtasticSource(sourceManagerRegistry, filteredSettings[DEFAULT_MESHTASTIC_SOURCE_SETTING]);
+    }
+
     if ('customTilesets' in filteredSettings) {
       void callbacks.refreshTileHostnameCache?.();
       logger.debug('🗺️ Refreshed CSP tile hostname cache after customTilesets update');
@@ -1208,6 +1473,15 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       const enabled = parseDiscardInvalidPositions(filteredSettings.discardInvalidPositions);
       callbacks.setDiscardInvalidPositions?.(enabled);
       logger.debug(`🗺️ discardInvalidPositions set to ${enabled} — ingest gate updated`);
+    }
+
+    if (NODE_NAME_SANITIZE_KEYS.some((key) => key in filteredSettings)) {
+      // Rebuild the cached rules; ingest never reads these settings per packet.
+      await reloadNodeNameSanitizer();
+    }
+
+    if (Object.values(PUBLIC_INSTANCE_SETTING_KEYS).some((key) => key in filteredSettings)) {
+      await reloadPublicInstanceConfig();
     }
 
     if ('noIndexEnabled' in filteredSettings) {
@@ -1267,6 +1541,10 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       if (!isNaN(hops) && hops >= 0 && hops <= 7) {
         callbacks.setAutomationAirtimeCutoffNeighborMaxHops?.(hops, sourceId);
       }
+    }
+
+    if (AIRTIME_NEIGHBOR_SELECTION_KEYS.some((key) => key in filteredSettings)) {
+      callbacks.setAutomationAirtimeCutoffNeighborSelection?.(airtimeNeighborSelection(filteredSettings), sourceId);
     }
 
     const keyRepairSettings = [
@@ -1464,8 +1742,16 @@ router.post('/test-apprise', requirePermission('settings', 'write'), async (req:
       return res.status(400).json({ ok: false, error: validation.error || 'Invalid URL', url: target });
     }
     const probeUrl = validation.probeUrl;
+    // Route the probe through the SSRF guard (SSRF-04, issue #6079). The
+    // hand-rolled denylist in validateAppriseProbeUrl only blocked the
+    // dotted-decimal 169.254/16 form and two metadata hostnames — it missed the
+    // IPv4-mapped IPv6 metadata form and every other link-local/multicast range.
+    // allowLoopback keeps the bundled Apprise server on localhost:8000 testable;
+    // non-strict keeps LAN/docker targets testable. A blocked target throws
+    // SsrfBlockedError, handled in the catch as a 400.
     const start = Date.now();
     try {
+      await assertSafeUrl(probeUrl, { strict: false, allowLoopback: true });
       const response = await fetch(probeUrl, {
         method: 'GET',
         signal: AbortSignal.timeout(5000),
@@ -1489,6 +1775,11 @@ router.post('/test-apprise', requirePermission('settings', 'write'), async (req:
         url: target,
       });
     } catch (error: any) {
+      // A blocked target is a validation failure, not a probe result — return
+      // 400 so we don't hand back a timing/status oracle for it (SSRF-04).
+      if (error instanceof SsrfBlockedError) {
+        return res.status(400).json({ ok: false, error: 'Host is not permitted', url: target });
+      }
       const latencyMs = Date.now() - start;
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
       const message = isTimeout
@@ -1521,10 +1812,20 @@ router.delete('/', requirePermission('settings', 'write'), async (req: Request, 
     const writable = await listPermittedSourceIds(req.user, 'settings', 'write');
     if (writable === 'all') {
       await databaseService.settings.deleteAllSettings();
+      void meshwarsForwarder.refreshConfig();
     } else {
       await databaseService.settings.deleteGlobalAndSourceSettings(writable);
     }
     callbacks.setTracerouteInterval?.(0);
+    // #6382: the reset removed the anti-spam settings, so the filter goes off.
+    await reloadNodeNameSanitizer();
+    // #5156: the reset removed the public-instance settings, so the mode goes off.
+    await reloadPublicInstanceConfig();
+    // #5245: the reset removed the stored default, so go back to Automatic.
+    applyDefaultMeshtasticSource(
+      sourceManagerRegistry,
+      await databaseService.settings.getSetting(DEFAULT_MESHTASTIC_SOURCE_SETTING),
+    );
 
     void databaseService.auditLogAsync(
       req.user!.id,
@@ -2086,12 +2387,7 @@ router.get('/auto-ping', perSourceSettings('read'), async (req, res) => {
       if (key in sourceOverrides) return sourceOverrides[key];
       return await databaseService.settings.getSetting(key);
     };
-    const settings = {
-      autoPingEnabled: (await readSetting('autoPingEnabled')) === 'true',
-      autoPingIntervalSeconds: parseInt((await readSetting('autoPingIntervalSeconds')) || '30', 10),
-      autoPingMaxPings: parseInt((await readSetting('autoPingMaxPings')) || '20', 10),
-      autoPingTimeoutSeconds: parseInt((await readSetting('autoPingTimeoutSeconds')) || '60', 10),
-    };
+    const settings = await readAutoPingSettings(readSetting);
     const sessions = autoPingManager ? await autoPingManager.getAutoPingSessions() : [];
     res.json({ settings, sessions });
   } catch (error) {
@@ -2102,8 +2398,13 @@ router.get('/auto-ping', perSourceSettings('read'), async (req, res) => {
 
 router.post('/auto-ping', perSourceSettings('write'), async (req, res) => {
   try {
-    const { autoPingEnabled, autoPingIntervalSeconds, autoPingMaxPings, autoPingTimeoutSeconds } = req.body;
     const autoPingSourceId = getSourceTarget(req).sourceId;
+    // Validate every field before writing any (ranges shared with the
+    // MeshCore route, #5953).
+    const parsed = parseAutoPingSettingsUpdate(req.body);
+    if (!parsed.ok) {
+      return fail(res, 400, parsed.code, parsed.message);
+    }
     const writeSetting = async (key: string, value: string) => {
       if (autoPingSourceId) {
         await databaseService.settings.setSourceSetting(autoPingSourceId, key, value);
@@ -2119,41 +2420,12 @@ router.post('/auto-ping', perSourceSettings('write'), async (req, res) => {
       return await databaseService.settings.getSetting(key);
     };
 
-    if (autoPingEnabled !== undefined) {
-      await writeSetting('autoPingEnabled', String(autoPingEnabled));
-      sourceOverrides['autoPingEnabled'] = String(autoPingEnabled);
-    }
-    if (autoPingIntervalSeconds !== undefined) {
-      const val = parseInt(String(autoPingIntervalSeconds), 10);
-      if (isNaN(val) || val < 10) {
-        return fail(res, 400, 'INVALID_INTERVAL', 'Interval must be at least 10 seconds.');
-      }
-      await writeSetting('autoPingIntervalSeconds', String(val));
-      sourceOverrides['autoPingIntervalSeconds'] = String(val);
-    }
-    if (autoPingMaxPings !== undefined) {
-      const val = parseInt(String(autoPingMaxPings), 10);
-      if (isNaN(val) || val < 1 || val > 100) {
-        return fail(res, 400, 'INVALID_MAX_PINGS', 'Max pings must be between 1 and 100.');
-      }
-      await writeSetting('autoPingMaxPings', String(val));
-      sourceOverrides['autoPingMaxPings'] = String(val);
-    }
-    if (autoPingTimeoutSeconds !== undefined) {
-      const val = parseInt(String(autoPingTimeoutSeconds), 10);
-      if (isNaN(val) || val < 10) {
-        return fail(res, 400, 'INVALID_TIMEOUT', 'Timeout must be at least 10 seconds.');
-      }
-      await writeSetting('autoPingTimeoutSeconds', String(val));
-      sourceOverrides['autoPingTimeoutSeconds'] = String(val);
+    for (const [key, value] of parsed.updates) {
+      await writeSetting(key, value);
+      sourceOverrides[key] = value;
     }
 
-    const settings = {
-      autoPingEnabled: (await readSetting('autoPingEnabled')) === 'true',
-      autoPingIntervalSeconds: parseInt((await readSetting('autoPingIntervalSeconds')) || '30', 10),
-      autoPingMaxPings: parseInt((await readSetting('autoPingMaxPings')) || '20', 10),
-      autoPingTimeoutSeconds: parseInt((await readSetting('autoPingTimeoutSeconds')) || '60', 10),
-    };
+    const settings = await readAutoPingSettings(readSetting);
 
     res.json({ success: true, settings });
   } catch (error) {
@@ -2222,6 +2494,34 @@ router.post('/distance-delete/run-now', acrossSources('write'), async (req, res)
   }
 });
 
+// GET /settings/default-meshtastic-source (#5245) — what a source-less request
+// resolves to right now, so the Settings page can show what "Automatic" picked
+// and whether the chosen default is in effect. Admin only, like the setting.
+//   mode 'automatic'  — no default set; effective = first TCP source started
+//   mode 'configured' — the chosen default is registered and in effect
+//   mode 'fallback'   — a default is set but not running (disabled, deleted,
+//                       not connected at boot); effective = the automatic pick
+router.get('/default-meshtastic-source', requireAdmin(), async (_req, res) => {
+  try {
+    const stored = await databaseService.settings.getSetting(DEFAULT_MESHTASTIC_SOURCE_SETTING);
+    const configuredSourceId = stored && stored.trim() ? stored.trim() : null;
+    const effectiveSourceId = getPrimaryMeshtasticManager(sourceManagerRegistry)?.sourceId ?? null;
+    const effective = effectiveSourceId ? await databaseService.sources.getSource(effectiveSourceId) : null;
+    const mode = !configuredSourceId
+      ? 'automatic'
+      : effectiveSourceId === configuredSourceId ? 'configured' : 'fallback';
+    return ok(res, {
+      configuredSourceId,
+      effectiveSourceId,
+      effectiveSourceName: effective?.name ?? null,
+      mode,
+    });
+  } catch (error) {
+    logger.error('Error resolving default Meshtastic source:', error);
+    return fail(res, 500, 'INTERNAL_ERROR', 'Failed to resolve the default Meshtastic source');
+  }
+});
+
 router.get('/position-estimation/status', requirePermission('settings', 'read'), async (_req, res) => {
   try {
     const status = await positionEstimationScheduler.getStatus();
@@ -2254,6 +2554,20 @@ router.post('/position-estimation/run-now', requireAdmin(), async (req, res) => 
       ? 'Position estimation already in progress'
       : 'Failed to run position estimation';
     res.status(message.includes('in progress') ? 409 : 500).json({ error: message });
+  }
+});
+
+/**
+ * MeshWars forwarder status. Settings save through POST /api/settings; this
+ * reports what was last sent, never the API key. Admin only, like the
+ * settings themselves: it names the source whose position is being sent.
+ */
+router.get('/meshwars/status', requireAdmin(), async (_req, res) => {
+  try {
+    return ok(res, await meshwarsForwarder.getStatus());
+  } catch (error) {
+    logger.error('Error fetching MeshWars status:', error);
+    return fail(res, 500, 'MESHWARS_STATUS_FAILED', 'Failed to fetch MeshWars status');
   }
 });
 

@@ -16,12 +16,24 @@ import databaseService from '../../services/database.js';
 import { requirePermission, hasPermission } from '../auth/authMiddleware.js';
 import { logger } from '../../utils/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
-import { resolveAdsbFeed } from '../../utils/adsbFeeds.js';
+import { resolveAdsbFeed, adsbFeedCredit } from '../../utils/adsbFeeds.js';
 import type { AircraftFlightMatchRow } from '../../db/repositories/aircraftFlightMatches.js';
 
 const router = Router({ mergeParams: true });
 
-export interface FlightMatchResponse extends Omit<AircraftFlightMatchRow, 'sourceId' | 'lookups' | 'episodeStartedAt' | 'firstLookupAt'> {
+/** Bookkeeping columns the route never returns (the last-lookup point is a node position). */
+type InternalMatchFields =
+  | 'sourceId'
+  | 'lookups'
+  | 'episodeStartedAt'
+  | 'firstLookupAt'
+  | 'lastLookupAt'
+  | 'lastLookupLat'
+  | 'lastLookupLon'
+  | 'rechecks'
+  | 'misses';
+
+export interface FlightMatchResponse extends Omit<AircraftFlightMatchRow, InternalMatchFields> {
   feedName: string;
   flightUrl: string | null;
   attribution: string;
@@ -44,7 +56,7 @@ export function toFlightMatchResponse(row: AircraftFlightMatchRow): FlightMatchR
     matchedAt: row.matchedAt,
     feedName: feed.name,
     flightUrl: row.hex ? feed.flightUrl(row.hex) : null,
-    attribution: `Data: ${feed.name}`,
+    attribution: adsbFeedCredit(feed),
   };
 }
 

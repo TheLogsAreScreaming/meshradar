@@ -52,6 +52,15 @@ vi.mock('../services/securityDigestService.js', () => ({
   }
 }));
 
+// The Apprise probe now runs the target URL through the SSRF guard (SSRF-04,
+// issue #6079), which resolves the host via DNS. The test hostnames are not
+// real, so stub the resolver to a public IP; the guard then passes through to
+// the stubbed `fetch` these tests assert on. `localhost` resolves to this same
+// public IP, which is fine — allowLoopback is irrelevant once it is public.
+vi.mock('node:dns/promises', () => ({
+  lookup: vi.fn().mockResolvedValue([{ address: '93.184.216.34', family: 4 }]),
+}));
+
 const adminUser = {
   id: 1,
   username: 'admin',
@@ -934,6 +943,32 @@ describe('settingsRoutes', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
+    // SSRF-04 (issue #6079): the old hand-rolled denylist only matched the
+    // dotted-decimal 169.254/16 form and two metadata hostnames, so the
+    // IPv4-mapped IPv6 metadata form slipped through to fetch().
+    it('rejects the IPv4-mapped IPv6 metadata address with 400 (no fetch)', async () => {
+      const app = createApp(adminUser);
+      const res = await request(app)
+        .post('/api/settings/test-apprise')
+        .send({ url: 'http://[::ffff:a9fe:a9fe]:8000' })
+        .expect(400);
+
+      expect(res.body.ok).toBe(false);
+      expect(res.body.error).toMatch(/not permitted/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a dotted-decimal cloud-metadata URL with 400 (no fetch)', async () => {
+      const app = createApp(adminUser);
+      const res = await request(app)
+        .post('/api/settings/test-apprise')
+        .send({ url: 'http://169.254.169.254/latest/meta-data/' })
+        .expect(400);
+
+      expect(res.body.ok).toBe(false);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     it('returns 403 when lacking settings:write permission', async () => {
       const app = createApp({ id: 2, username: 'user', isActive: true, isAdmin: false });
       (databaseService as any).findUserByIdAsync.mockResolvedValue({
@@ -1026,6 +1061,78 @@ describe('settingsRoutes', () => {
           .post('/api/settings')
           .send({ automationAirtimeCutoffNeighborMaxHops: String(value) })
           .expect(200);
+      });
+    });
+
+    // (a3) issue #6007: neighbour selection mode, sample count (3-5, clamped)
+    // and the manual pick list (3-5 unique node numbers).
+    describe('(a3) airtime cutoff neighbour selection (#6007)', () => {
+      const selectionSpy = vi.fn();
+      beforeEach(() => {
+        selectionSpy.mockClear();
+        setSettingsCallbacks({ setAutomationAirtimeCutoffNeighborSelection: selectionSpy });
+      });
+      afterAll(() => setSettingsCallbacks({}));
+
+      it('rejects an unknown mode', async () => {
+        const res = await request(createApp(adminUser))
+          .post('/api/settings').send({ automationAirtimeCutoffNeighborMode: 'random' }).expect(400);
+        expect(res.body.code).toBe('INVALID_AIRTIME_NEIGHBOR_MODE');
+        expect(databaseService.settings.setSettings).not.toHaveBeenCalled();
+      });
+
+      it('rejects a non-numeric sample count', async () => {
+        const res = await request(createApp(adminUser))
+          .post('/api/settings').send({ automationAirtimeCutoffNeighborSampleCount: 'abc' }).expect(400);
+        expect(res.body.code).toBe('INVALID_AIRTIME_SAMPLE_COUNT');
+      });
+
+      it.each([['1', '3'], ['4', '4'], ['9', '5']])('clamps sample count %s to %s before saving', async (sent, stored) => {
+        await request(createApp(adminUser))
+          .post('/api/settings?sourceId=mqtt-broker-1')
+          .send({ automationAirtimeCutoffNeighborSampleCount: sent })
+          .expect(200);
+        expect(databaseService.settings.setSourceSettings).toHaveBeenCalledWith(
+          'mqtt-broker-1',
+          expect.objectContaining({ automationAirtimeCutoffNeighborSampleCount: stored }),
+        );
+        expect(selectionSpy).toHaveBeenCalledWith(expect.objectContaining({ sampleCount: stored }), 'mqtt-broker-1');
+      });
+
+      it.each([
+        ['two nodes', '[1,2]'],
+        ['six nodes', '[1,2,3,4,5,6]'],
+        ['duplicates', '[1,1,2]'],
+        ['not an array', '{"a":1}'],
+        ['bad JSON', '[1,'],
+        ['bad entries', '[1,2,"x"]'],
+      ])('rejects a manual list with %s', async (_label, nodes) => {
+        const res = await request(createApp(adminUser))
+          .post('/api/settings').send({ automationAirtimeCutoffNeighborNodes: nodes }).expect(400);
+        expect(res.body.code).toBe('INVALID_AIRTIME_NEIGHBOR_NODES');
+        expect(selectionSpy).not.toHaveBeenCalled();
+      });
+
+      it('rejects manual mode without 3-5 picks in the same save', async () => {
+        const res = await request(createApp(adminUser))
+          .post('/api/settings').send({ automationAirtimeCutoffNeighborMode: 'manual' }).expect(400);
+        expect(res.body.code).toBe('INVALID_AIRTIME_NEIGHBOR_NODES');
+      });
+
+      it('accepts manual mode with 3-5 picks and an empty list in auto mode', async () => {
+        await request(createApp(adminUser))
+          .post('/api/settings?sourceId=mqtt-broker-1')
+          .send({ automationAirtimeCutoffNeighborMode: 'manual', automationAirtimeCutoffNeighborNodes: '[10, 20, 30, 40, 50]' })
+          .expect(200);
+        expect(selectionSpy).toHaveBeenCalledWith(
+          { mode: 'manual', sampleCount: undefined, nodes: '[10,20,30,40,50]' },
+          'mqtt-broker-1',
+        );
+        await request(createApp(adminUser))
+          .post('/api/settings')
+          .send({ automationAirtimeCutoffNeighborMode: 'auto', automationAirtimeCutoffNeighborNodes: '[]' })
+          .expect(200);
+        expect(selectionSpy).toHaveBeenLastCalledWith({ mode: 'auto', sampleCount: undefined, nodes: '[]' }, null);
       });
     });
 

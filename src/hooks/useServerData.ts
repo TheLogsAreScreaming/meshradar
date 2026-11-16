@@ -21,6 +21,12 @@ import { useSource } from "../contexts/SourceContext";
 import { applyPendingNodeOverrides } from "../utils/pendingToggles";
 import type { DeviceInfo, Channel } from "../types/device";
 
+// Shared empty fallbacks: a fresh `[]` / `{}` per render would give consumers
+// a new reference on every render while the poll has no data, breaking their
+// memos and effect dependencies.
+const EMPTY_CHANNELS: Channel[] = [];
+const EMPTY_UNREADS: Record<string, number> = {};
+
 /**
  * Hook to access nodes from the poll cache
  *
@@ -80,7 +86,7 @@ export function setNodeFieldInCache(
 export function useChannels() {
   const { data, isLoading, error } = usePoll();
   return {
-    channels: (data?.channels ?? []) as Channel[],
+    channels: (data?.channels ?? EMPTY_CHANNELS) as Channel[],
     isLoading,
     error,
   };
@@ -122,17 +128,50 @@ export function useTelemetryNodes() {
 
   const effectiveTelemetry = telemetry?.nodes?.length ? telemetry : prevRef.current;
 
+  // Same Set instance until the contents change: consumers key memos on
+  // these, and a fresh Set every render (or every poll with unchanged data)
+  // defeated all of them.
+  const nodesWithTelemetry = useStableSet(effectiveTelemetry?.nodes);
+  const nodesWithWeather = useStableSet(effectiveTelemetry?.weather);
+  const nodesWithEstimatedPosition = useStableSet(effectiveTelemetry?.estimatedPosition);
+  const nodesWithPKC = useStableSet(effectiveTelemetry?.pkc);
+  // nodeId → estimate uncertainty radius in km (issue #3271).
+  const rawUncertainty = (effectiveTelemetry as any)?.estimatedUncertainty as Record<string, number> | undefined;
+  const estimatedUncertainty = rawUncertainty ?? EMPTY_UNCERTAINTY;
+
   return {
-    nodesWithTelemetry: new Set(effectiveTelemetry?.nodes ?? []),
-    nodesWithWeather: new Set(effectiveTelemetry?.weather ?? []),
-    nodesWithEstimatedPosition: new Set(effectiveTelemetry?.estimatedPosition ?? []),
-    nodesWithPKC: new Set(effectiveTelemetry?.pkc ?? []),
+    nodesWithTelemetry,
+    nodesWithWeather,
+    nodesWithEstimatedPosition,
+    nodesWithPKC,
     // Known nodes with neither a real nor an estimated position (issue #3271).
     unmappedCount: (effectiveTelemetry as any)?.unmappedCount ?? 0,
-    // nodeId → estimate uncertainty radius in km (issue #3271).
-    estimatedUncertainty: ((effectiveTelemetry as any)?.estimatedUncertainty ?? {}) as Record<string, number>,
+    estimatedUncertainty,
     isLoading,
   };
+}
+
+const EMPTY_UNCERTAINTY: Record<string, number> = Object.freeze({}) as Record<string, number>;
+
+function sameItems<T>(a: readonly T[], b: readonly T[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * A Set built from `items`, kept as the same instance while the items are
+ * unchanged (same order and values). Order-sensitive on purpose: the server
+ * returns these lists in a stable order, and an exact compare stays O(n).
+ */
+function useStableSet<T>(items: readonly T[] | undefined): Set<T> {
+  const ref = useRef<{ items: readonly T[]; set: Set<T> } | null>(null);
+  const list = items ?? [];
+  if (!ref.current || !sameItems(ref.current.items, list)) {
+    ref.current = { items: list, set: new Set(list) };
+  }
+  return ref.current.set;
 }
 
 /**
@@ -160,12 +199,15 @@ export function useDeviceConfig() {
  */
 export function useDeviceNodes() {
   const { data } = usePoll();
-  const prevRef = useRef<Set<number>>(new Set());
+  const prevRef = useRef<{ items: readonly number[]; set: Set<number> }>({ items: [], set: new Set() });
   const deviceNodeNums = data?.deviceNodeNums;
-  if (deviceNodeNums && deviceNodeNums.length > 0) {
-    prevRef.current = new Set(deviceNodeNums);
+  // Keep the last non-empty list (avoids flicker on an empty poll), and keep
+  // the same Set instance while its contents are unchanged so it doesn't
+  // break memos downstream.
+  if (deviceNodeNums && deviceNodeNums.length > 0 && !sameItems(prevRef.current.items, deviceNodeNums)) {
+    prevRef.current = { items: deviceNodeNums, set: new Set(deviceNodeNums) };
   }
-  return prevRef.current;
+  return prevRef.current.set;
 }
 
 /**
@@ -176,8 +218,8 @@ export function useDeviceNodes() {
 export function useUnreadCountsFromPoll() {
   const { data } = usePoll();
   return {
-    channelUnreads: data?.unreadCounts?.channels ?? {},
-    dmUnreads: data?.unreadCounts?.directMessages ?? {},
+    channelUnreads: data?.unreadCounts?.channels ?? EMPTY_UNREADS,
+    dmUnreads: data?.unreadCounts?.directMessages ?? EMPTY_UNREADS,
   };
 }
 

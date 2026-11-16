@@ -20,7 +20,7 @@ import type { Router } from 'express';
 
 import { createRouteTestApp, type RouteTestHarness } from '../test-helpers/routeTestApp.js';
 import databaseService from '../../services/database.js';
-import { getPermissionGate, isAuthGate } from '../auth/authMiddleware.js';
+import { getPermissionGate, isAuthGate, isAdminGate } from '../auth/authMiddleware.js';
 import { isMeshcoreTxGate, getMeshcoreChannelGate } from './meshcoreRouteShared.js';
 
 const KEY_NODE = 'a1'.repeat(32);
@@ -65,10 +65,15 @@ const { default: contactsRoutes } = await import('./meshcoreContactsRoutes.js');
 const { default: configRoutes } = await import('./meshcoreConfigRoutes.js');
 const { default: messagingRoutes } = await import('./meshcoreMessagingRoutes.js');
 const { default: adminRoutes } = await import('./meshcoreAdminRoutes.js');
+const { default: remoteSettingsRoutes } = await import('./meshcoreRemoteSettingsRoutes.js');
 const { default: automationRoutes } = await import('./meshcoreAutomationRoutes.js');
 const { default: packetRoutes } = await import('./meshcorePacketRoutes.js');
 const { default: ingestReadRoutes } = await import('./meshcoreIngestReadRoutes.js');
 const { default: filterRoutes } = await import('./meshcoreFilterRoutes.js');
+const { default: traceRoutes } = await import('./meshcoreTraceRoutes.js');
+const { default: hopCandidatesRoutes } = await import('./meshcoreHopCandidatesRoutes.js');
+const { default: estimatedPositionRoutes } = await import('./meshcoreEstimatedPositionRoutes.js');
+const { perSourceCliHistoryRouter } = await import('./meshcoreCliHistoryRoutes.js');
 
 /**
  * A MeshCore manager that serves marked reads and records everything else.
@@ -488,14 +493,19 @@ function registeredRoutes(router: Router): RegisteredRoute[] {
  *  - `write`: `requireAuth()` + `requirePermission(x, 'write')`.
  *  - `admin`: `requireAuth()` + a `remote_admin` grant (remote admin, CLI and
  *    saved admin credentials; see MESHCORE_REMOTE_ADMIN.md).
+ *  - `site-admin`: `requireAuth()` + `requireAdmin()` (a MeshRadar admin, no per-source grant). Factory reset (P8a #6257).
  *  - `owner`: `requireAuth()` only. A handle to a job the caller started
  *    through a gated route; the handler serves it to that user on that source.
  *  - `channel-read` / `channel-write`: `requireMeshcoreChannelAccess()`, the
  *    channel's own grant or `messages` on the source. Writes need `requireAuth()`.
  *  - `listed`: no permission middleware; the handler answers only for the
  *    channels the caller may read.
+ *  - `handler-scoped`: `requireAuth()` only (so it looks like `owner`); the
+ *    handler checks the grants itself because the answer depends on two
+ *    resources. CLI history (#5892): remote rows need `remote_admin:read`,
+ *    local rows `configuration:read`, on this source; neither is a 403.
  */
-type Kind = 'read' | 'read-signed-in' | 'write' | 'admin' | 'owner' | 'channel-read' | 'channel-write' | 'listed';
+type Kind = 'read' | 'read-signed-in' | 'write' | 'admin' | 'owner' | 'channel-read' | 'channel-write' | 'listed' | 'handler-scoped' | 'site-admin';
 
 const CLASSIFIED: Record<string, Record<string, Kind>> = {
   device: {
@@ -514,6 +524,10 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'POST /contacts/refresh': 'write',
     'GET /contacts/device-sync': 'read',
     'POST /contacts/push-to-device': 'write',
+    'POST /contacts/remove-non-favorites': 'write',
+    // #6041: purge non-favourite nodes from MeshRadar's DB (preview + delete).
+    'GET /nodes/purge-non-favourites/preview': 'write',
+    'POST /nodes/purge-non-favourites': 'write',
     'POST /contacts/:publicKey/reset-path': 'write',
     'POST /contacts/:publicKey/discover-path': 'write',
     'POST /discover': 'write',
@@ -525,6 +539,8 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'DELETE /contacts/:publicKey': 'write',
     'POST /contacts/:publicKey/add-to-device': 'write',
     'GET /contacts/:publicKey/export': 'read-signed-in',
+    // #6370: import a MeshCore One contact-share token into the companion.
+    'POST /contacts/import-token': 'write',
     'POST /contacts/import': 'write',
     'GET /contacts/:publicKey/neighbours': 'read-signed-in',
     'GET /nodes/:publicKey/telemetry-config': 'read',
@@ -540,6 +556,11 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'PATCH /nodes/:publicKey/time-sync-config': 'write',
     'POST /nodes/:publicKey/time-sync': 'write',
     'POST /nodes/:publicKey/favorite': 'write',
+    // #5867: configuration:write; covered by meshcoreRemoteCliRoutes.test.ts.
+    'POST /nodes/:publicKey/remote-cli': 'write',
+    'GET /nodes/:publicKey/position-override': 'read',
+    'POST /nodes/:publicKey/position-override': 'write',
+    'DELETE /nodes/:publicKey/position-override': 'write',
     'POST /neighbors/request': 'read-signed-in',
     'GET /neighbors': 'read',
   },
@@ -548,6 +569,8 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'POST /config/discoverable': 'write',
     'GET /config/default-scope': 'read',
     'POST /config/default-scope': 'write',
+    'GET /config/sender-names': 'read', // #6282
+    'PUT /config/sender-names': 'write',
     'GET /config/default-path-hash-size': 'read',
     'POST /config/default-path-hash-size': 'write',
     'GET /saved-regions': 'read',
@@ -556,13 +579,24 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'POST /config/sync-time': 'write',
     'POST /config/reboot': 'write',
     'GET /config/private-key': 'write',
-    'POST /config/private-key': 'write',
+    // P9 #6255: restoring a key is admin only on both protocols.
+    'POST /config/private-key': 'site-admin',
+    'GET /config/repeater-settings': 'read',
+    'PATCH /config/repeater-settings': 'write',
+    'POST /config/power-off': 'site-admin',
     'POST /config/name': 'write',
     'POST /config/tx-power': 'write',
     'POST /config/radio': 'write',
     'POST /config/coords': 'write',
     'POST /config/advert-loc-policy': 'write',
     'POST /config/auto-add-contacts': 'write',
+    // P8a #6257: Companion BLE PIN (read is a pairing credential => write grant), multi-ACKs, factory reset.
+    'GET /config/ble-pin': 'write',
+    'POST /config/ble-pin': 'write',
+    'POST /config/multi-acks': 'write',
+    'POST /config/factory-reset': 'site-admin',
+    'GET /config/autoadd-config': 'read',
+    'POST /config/autoadd-config': 'write',
     'POST /config/telemetry-mode-base': 'write',
     'POST /config/telemetry-mode-loc': 'write',
     'POST /config/telemetry-mode-env': 'write',
@@ -572,12 +606,17 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'GET /messages': 'read',
     'GET /messages/channel/:idx': 'channel-read',
     'GET /messages/channel-counts': 'listed',
+    'GET /messages/dm/:publicKey': 'read',
+    'GET /messages/dm-peers': 'read',
+    'GET /messages/room/:publicKey': 'read',
+    'GET /messages/room-stats': 'read',
     'DELETE /messages': 'write',
     'DELETE /messages/channel/:idx': 'channel-write',
     'DELETE /messages/conversation/:publicKey': 'write',
     'DELETE /messages/:messageId': 'write',
     'POST /messages/send': 'write',
     'POST /messages/:messageId/resend': 'write',
+    'POST /messages/:messageId/reaction': 'write',
     'GET /rooms/servers': 'read',
     'POST /rooms/login': 'write',
     'POST /rooms/login-with-saved': 'write',
@@ -597,10 +636,27 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'POST /admin/login-cancel': 'owner',
     'DELETE /admin/credentials/:publicKey': 'admin',
     'GET /admin/status/:publicKey': 'admin',
+    // #5785 remembered admin session: status (DB only) and Log out.
+    'GET /admin/session/:publicKey': 'admin',
+    'DELETE /admin/session/:publicKey': 'admin',
   },
   automation: {
     'GET /automation/pathfinding': 'read',
     'POST /automation/pathfinding': 'write',
+    // #5953 Auto Ping: settings read/save, and a force-stop of a session.
+    'GET /automation/auto-ping': 'read',
+    'POST /automation/auto-ping': 'write',
+    'POST /automation/auto-ping/stop': 'write',
+    'GET /automation/auto-delete-distance': 'read',
+    'POST /automation/auto-delete-distance': 'write',
+    'POST /automation/auto-delete-distance/run': 'write',
+    'GET /automation/time-sync': 'read',
+    'GET /automation/remote-telemetry': 'read',
+    'GET /automation/auto-favorite': 'read',
+    'POST /automation/auto-favorite': 'write',
+    'POST /automation/auto-favorite/run': 'write',
+    'GET /automation/auto-welcome': 'read',
+    'POST /automation/auto-welcome': 'write',
     'GET /automation/pathfinding/filter': 'read',
     'POST /automation/pathfinding/filter': 'write',
     'GET /automation/autoack': 'read',
@@ -620,6 +676,7 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'GET /packets/grouped': 'read',
     'GET /packets/receptions': 'read',
     'GET /packets/stats': 'read',
+    'GET /packets/stats/distribution': 'read',
     'GET /packets/export': 'read',
     // POST for the body size; it decodes the caller's own bytes and changes nothing.
     'POST /packets/decode': 'read',
@@ -629,6 +686,8 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'GET /ingest/overview': 'read',
     'GET /ingest/nodes': 'read',
     'GET /ingest/messages': 'read',
+    // #6307: the Notifications channel picker (slot indices with messages + readable keyed channels).
+    'GET /ingest/channels': 'read',
   },
   filter: {
     'GET /ignored-nodes': 'read',
@@ -638,6 +697,31 @@ const CLASSIFIED: Record<string, Record<string, Kind>> = {
     'POST /message-filters': 'write',
     'PUT /message-filters/:filterId': 'write',
     'DELETE /message-filters/:filterId': 'write',
+  },
+  // #5722: per-hop trace SNR history. Stored data; sends nothing.
+  trace: {
+    'GET /hop-snr': 'read',
+    // #6260: newest trace we sent involving one contact. Stored data; sends nothing.
+    'GET /hop-snr/latest-trace': 'read',
+    // #5970: clears one link's stored history.
+    'DELETE /hop-snr': 'write',
+  },
+  // #5909: cross-source hop names. Stored data; sends nothing; off by default.
+  hopCandidates: {
+    'GET /hop-candidates': 'read',
+  },
+  // #6260: estimated positions solved on read from stored neighbour/trace data; sends nothing.
+  estimatedPositions: {
+    'GET /estimated-positions': 'read',
+  },
+  // #6256: remote structured settings over the remote-admin CLI (transmits; remote_admin:write).
+  remoteSettings: {
+    'POST /admin/settings/:publicKey/read': 'admin',
+    'PATCH /admin/settings/:publicKey': 'admin',
+  },
+  // #5892: stored CLI history. Sends nothing; grants checked per row kind.
+  cliHistory: {
+    'GET /cli-history': 'handler-scoped',
   },
 };
 
@@ -664,10 +748,15 @@ describe('guard: every MeshCore route is classified', () => {
     config: configRoutes,
     messaging: messagingRoutes,
     admin: adminRoutes,
+    remoteSettings: remoteSettingsRoutes,
     automation: automationRoutes,
     packet: packetRoutes,
     ingest: ingestReadRoutes,
     filter: filterRoutes,
+    trace: traceRoutes,
+    hopCandidates: hopCandidatesRoutes,
+    estimatedPositions: estimatedPositionRoutes,
+    cliHistory: perSourceCliHistoryRouter,
   };
   const key = (r: RegisteredRoute): string => `${r.method.toUpperCase()} ${r.path}`;
 
@@ -677,6 +766,7 @@ describe('guard: every MeshCore route is classified', () => {
     const signedIn = route.handlers.some((h) => isAuthGate(h));
     const channel = route.handlers.map((h) => getMeshcoreChannelGate(h)).find((a) => a !== undefined);
     const transmits = route.handlers.some((h) => isMeshcoreTxGate(h));
+    if (route.handlers.some((h) => isAdminGate(h))) return signedIn ? 'site-admin' : 'requireAdmin without requireAuth()';
     if (gates.length > 1) return 'more than one permission gate';
     if (transmits && !signedIn) return 'transmits without requireAuth()';
     const gate = gates[0];
@@ -707,7 +797,8 @@ describe('guard: every MeshCore route is classified', () => {
     // A new route must be added to CLASSIFIED, with a test for who it admits.
     expect(routes.map(key).sort()).toEqual(Object.keys(CLASSIFIED[name]).sort());
     for (const route of routes) {
-      expect(detected(route), `${name} ${key(route)}`).toBe(CLASSIFIED[name][key(route)]);
+      const expected = CLASSIFIED[name][key(route)];
+      expect(detected(route), `${name} ${key(route)}`).toBe(expected === 'handler-scoped' ? 'owner' : expected);
     }
   });
 

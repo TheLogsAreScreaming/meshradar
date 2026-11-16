@@ -12,18 +12,19 @@
  */
 
 import { useTranslation } from 'react-i18next';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import 'leaflet/dist/leaflet.css';
 import { Popup, useMap } from 'react-leaflet';
 import type { PathOptions } from 'leaflet';
 import L from 'leaflet';
 import { createNodeIcon } from '../../utils/mapIcons';
 import { markerAgeOpacity } from '../../utils/markerAgeOpacity';
-import { getNodeTypeCategory, categoryGlyphFamily } from '../../utils/nodeTypeCategory';
+import { getNodeTypeCategory, categoryGlyphFamily, markerRoleProps } from '../../utils/nodeTypeCategory';
 import { getHopColor } from '../../utils/mapIcons';
 import { NodeMarkersLayer, type NodeMarkerDescriptor } from '../map/layers/NodeMarkersLayer';
 import type { CustomTileset } from '../../config/tilesets';
 import DashboardWaypoints from './DashboardWaypoints';
+import { LocalMarkers } from '../map/layers/MapMarkersLayer';
 import DashboardAtakContacts from './DashboardAtakContacts';
 import DashboardNodePopup, { type NodeSourceRef } from './DashboardNodePopup';
 import DashboardNeighborPopup from './DashboardNeighborPopup';
@@ -44,6 +45,14 @@ import {
   type DashboardSource,
 } from '../../hooks/useDashboardData';
 import { getSourceColor, resolveSourceColor } from '../../utils/sourceColors';
+import { nodeSourceRingColor, nodeGatewayRingColor, applyNodeSourceRing } from './nodeSourceRing';
+import type { NodeGatewayRef } from '../../hooks/useDashboardData';
+import {
+  GatewayNameContext,
+  buildGatewayNameIndex,
+  resolveGatewayLabel,
+  gatewayLegendText,
+} from '../map/popups/gatewayLabel';
 import { getOwnNodePositions } from '../../utils/ownNodePositions';
 import { nodePassesTransportFilter, isMqttOnlySourceType } from '../../utils/nodeTransport';
 import {
@@ -74,17 +83,20 @@ import { MapSidebar } from '../map/MapSidebar';
 import { Map3DView } from '../map/Map3DView';
 import type { Node3DFeature } from '../map/Base3DMap';
 import { TilesetSelector } from '../TilesetSelector';
-import { resolve3DBasemap, buildTerrainTileUrl } from '../../config/basemap3d';
-import { useTerrainCapabilities } from '../../hooks/useTerrainCapabilities';
-import { appBasename } from '../../init';
+import { useMap3DToggle } from '../../hooks/useMap3DToggle';
 import { MapLoadingOverlay } from '../map/MapLoadingOverlay';
 import { TraceroutePathsLayer } from '../map/layers/TraceroutePathsLayer';
 import { NeighborLinksLayer, type NeighborLinkDescriptor } from '../map/layers/NeighborLinksLayer';
 import { CrossSourceLinksLayer } from '../map/layers/CrossSourceLinksLayer';
+import { PacketFlightsLayer } from '../map/layers/PacketFlightsLayer';
+import { PacketFlightsControl } from '../map/PacketFlightsControl';
+import type { FlightNodeEntry, PacketFlightStats } from '../../utils/packetFlightEdges';
 import { TracerouteConfirmedLinksLayer } from '../map/layers/TracerouteConfirmedLinksLayer';
+import DuctingLayer from '../map/layers/DuctingLayer';
+import { DuctingControl } from '../map/DuctingControl';
 import subToggleStyles from '../map/MapSubToggle.module.css';
 import { AccuracyRegionsLayer, type AccuracyRegionDescriptor } from '../map/layers/AccuracyRegionsLayer';
-import { snrToNeighborOpacity, dedupByUnorderedPair } from '../../utils/neighborLinks';
+import { snrToNeighborOpacity, pairNeighborRecords } from '../../utils/neighborLinks';
 import { UiIcon } from '../icons';
 import {
   parseSnapshotRoutePositions,
@@ -299,19 +311,10 @@ export default function DashboardMap({
   // #4704: 2D/3D toggle. `viewMode` is ephemeral (not persisted) — the toggle
   // is only offered when the server can serve DEM terrain tiles, and any
   // capability loss forces 2D on the spot (mirrors `useEffectiveViewMode`).
-  const terrainCaps = useTerrainCapabilities();
-  const canUse3D = !terrainCaps.isLoading && terrainCaps.enabled && terrainCaps.terrainTiles;
-  const [viewMode, setViewMode] = useState<'2d' | '3d'>('2d');
   const { t } = useTranslation();
-  const effective3D = viewMode === '3d' && canUse3D;
+  const { canUse3D, viewMode, setViewMode, effective3D, basemap3D, terrainTileUrl } =
+    useMap3DToggle(tilesetId, customTilesets, cartoApiKey);
   const unavailableIn3DTitle = effective3D ? 'Not available in 3D' : undefined;
-  const basemap3D = useMemo(
-    () => resolve3DBasemap(tilesetId, customTilesets, cartoApiKey),
-    [tilesetId, customTilesets, cartoApiKey],
-  );
-  // `appBasename` is the base-path prefix `ApiService` was seeded with at
-  // startup — module-scope constant, never changes.
-  const terrainTileUrl = useMemo(() => buildTerrainTileUrl(appBasename), []);
 
   const {
     showPaths,
@@ -332,8 +335,18 @@ export default function DashboardMap({
     setShowCrossSourceLinks,
     showTracerouteConfirmedLinks,
     setShowTracerouteConfirmedLinks,
+    showPacketFlights,
+    setShowPacketFlights,
+    packetFlightRate,
+    setPacketFlightRate,
+    showDucting,
+    setShowDucting,
+    ductingHoursAhead,
+    setDuctingHoursAhead,
     showWaypoints,
     setShowWaypoints,
+    showLocalMarkers,
+    setShowLocalMarkers,
     showAtakContacts,
     setShowAtakContacts,
     showPolarGrid,
@@ -342,6 +355,10 @@ export default function DashboardMap({
     setMapMaxAgeHours,
     spreadNodes,
     setSpreadNodes,
+    colorNodesBySource,
+    setColorNodesBySource,
+    colorNodesByGateway,
+    setColorNodesByGateway,
     aircraftDisplayMode,
     setAircraftDisplayMode,
     showAgedOutAircraft,
@@ -478,6 +495,48 @@ export default function DashboardMap({
   );
   const hasMeshCoreNodes = useMemo(() => nodes.some((n) => n.isMeshCore), [nodes]);
 
+  // #6175: stable, sorted gateway-id domain across every node that carries
+  // gateway membership. Drives the per-gateway ring colour and the legend — the
+  // same list keyed into `getSourceColor` so a gateway keeps one colour in both.
+  // Built from all merged nodes (not just positioned ones) so the colour mapping
+  // is stable as positionless nodes come and go across polls.
+  const gatewayIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const n of nodes) {
+      const gws = (n as { gateways?: NodeGatewayRef[] }).gateways;
+      if (!Array.isArray(gws)) continue;
+      for (const g of gws) if (g?.gatewayId) ids.add(g.gatewayId);
+    }
+    return Array.from(ids).sort();
+  }, [nodes]);
+
+  // #6386: nodeNum → known names, so the gateway legend and popup chips can
+  // show a name instead of the raw id. Display-only — `gatewayIds` (the colour
+  // domain) stays keyed on the raw id. Unified-only: only it carries gateways.
+  const gatewayNameIndex = useMemo(
+    () => (isUnified ? buildGatewayNameIndex(nodes) : null),
+    [nodes, isUnified],
+  );
+
+  // #4835: live packet traffic resolves each flight against the markers this
+  // map draws. Built only while the layer is on. The Unified map colours a
+  // flight by its source, as it does the source's other overlays.
+  const [packetFlightsStats, setPacketFlightsStats] = useState<PacketFlightStats | null>(null);
+  const packetFlightNodes = useMemo<FlightNodeEntry[]>(() => {
+    if (!showPacketFlights) return [];
+    return markerNodes.map(({ node, pos }) => ({
+      nodeNum: node.isMeshCore ? null : node.nodeNum,
+      publicKey: node.isMeshCore ? node.publicKey : null,
+      lat: pos.lat,
+      lng: pos.lng,
+    }));
+  }, [showPacketFlights, markerNodes]);
+  const packetFlightSourceColor = useCallback(
+    (id: string) => (isUnified ? getSourceColor(id, colorSourceIds) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- #4835 colorSourceIds is rebuilt each render; keyed on its contents
+    [isUnified, colorSourceIds.join('|')],
+  );
+
   // Flight trails (#5364/#5365 Phase 3): one per aircraft this map draws a
   // marker for — `nodesWithPosition` is already past Hide / age / transport /
   // "Show aged-out", so trails follow every one of those filters.
@@ -608,8 +667,8 @@ export default function DashboardMap({
   // to a currently-visible MeshCore node. Gated by the "Show Neighbors" toggle.
   // Endpoints are filtered through the same node pipeline above, so links to a
   // hidden node (stale / ignored / RF off) naturally drop out. Deduped by the
-  // unordered {publicKey, neighborPublicKey} pair (shared `dedupByUnorderedPair`,
-  // #4047 Phase 7 WP7) so the same link reported by multiple sources (Unified
+  // unordered {publicKey, neighborPublicKey} pair (shared `pairNeighborRecords`,
+  // #6403; freshest direction wins) so the same link reported by multiple sources (Unified
   // view) draws once. Emits descriptors for the shared `NeighborLinksLayer` —
   // fixed cyan/dashed look preserved verbatim, no `children` (no popup).
   //
@@ -631,6 +690,8 @@ export default function DashboardMap({
       a: [number, number];
       b: [number, number];
       snr: number | null;
+      lastHeardSecs: number | null;
+      timestamp: number | null;
     }[] = [];
     for (const e of (meshcoreNeighbors ?? [])) {
       const pk = e?.publicKey;
@@ -639,15 +700,20 @@ export default function DashboardMap({
       const a = positionByPublicKey.get(pk);
       const b = positionByPublicKey.get(npk);
       if (!a || !b) continue;
-      withPositions.push({ publicKey: pk, neighborPublicKey: npk, a, b, snr: e?.snr ?? null });
+      withPositions.push({
+        publicKey: pk,
+        neighborPublicKey: npk,
+        a,
+        b,
+        snr: e?.snr ?? null,
+        lastHeardSecs: e?.lastHeardSecs ?? null,
+        timestamp: e?.timestamp ?? null,
+      });
     }
-    const deduped = dedupByUnorderedPair(
-      withPositions,
-      (x) => x.publicKey,
-      (x) => x.neighborPublicKey,
-    );
-    return deduped.map(({ publicKey: pk, neighborPublicKey: npk, a, b, snr }) => {
-      const pairKey = pk < npk ? `${pk}~${npk}` : `${npk}~${pk}`;
+    // #6403: pick the freshest direction per pair (not the first row), so the
+    // link's opacity no longer flips between a stale and a current SNR.
+    return pairNeighborRecords(withPositions).map(({ pairKey, primary }) => {
+      const { a, b, snr } = primary;
       const positions: [[number, number], [number, number]] = [a, b];
       return {
         key: `mc-neighbor-${pairKey}`,
@@ -739,77 +805,139 @@ export default function DashboardMap({
   // that used to be duplicated inline here. `key` doubles as the spiderfier
   // tracking key (prefer the cross-source identity, fall back to nodeId so
   // MeshCore (no nodeNum) and unmerged rows still register).
-  const nodeMarkers: NodeMarkerDescriptor[] = markerNodes.map(({ node, pos }) => {
-    const hops = node.hopsAway ?? 999;
-    const shortName = node.shortName ?? node.user?.shortName;
-    const nodeId = node.nodeId ?? node.user?.id;
-    const isRouter = node.role === 2;
-    // #4075: role category drives the repeater-tower glyph for ROUTER_LATE
-    // (and REPEATER), not just ROUTER. Included in iconSig below so the icon
-    // cache distinguishes it from a plain client with the same hops/name.
-    const roleCategory = getNodeTypeCategory(node);
-    // MeshCore nodes carry nodeNum 0 (they have no meshtastic nodeNum), so the
-    // `${sourceId}:${nodeNum}` scheme would collapse EVERY MeshCore node on a
-    // source onto the same key — React's duplicate-key reconciliation then
-    // duplicates markers and leaks them across source switches (#4234: MeshCore
-    // ghost markers visible on every source's map). Key them by their public-key
-    // identity instead.
-    const markerKey = String(
-      node.isMeshCore
-        ? unifiedNodeKey(node) ?? nodeId ?? node.publicKey
-        : node.sourceId != null && node.nodeNum != null
-          ? `${node.sourceId}:${node.nodeNum}`
-          : nodeId ?? node.nodeNum,
-    );
-    // #3886: fade markers by recency instead of a flat opacity — full when
-    // freshly heard, fading toward a floor as lastHeard nears the age cutoff
-    // (cutoffTime, seconds). Favorites bypass the age gate above so they stay
-    // fully opaque regardless of age. NOTE: here a missing lastHeard yields
-    // full opacity ("assume fresh"), which differs on purpose from Map
-    // Analysis where a missing timestamp sits at the floor — the Dashboard
-    // already age-gates upstream, so anything that reaches this loop is
-    // presumed current.
-    const ageOpacity = node.isFavorite
-      ? 1
-      : markerAgeOpacity(
-          nowMs,
-          cutoffTime * 1000,
-          node.lastHeard != null ? node.lastHeard * 1000 : null,
-        );
+  //
+  // Memoized, and each descriptor (with its <Popup> element) is reused per key
+  // while its node object, position and opacity are unchanged, so the
+  // memoized markers in NodeMarkersLayer skip every node a poll didn't touch.
+  const markerDescriptorCacheRef = useRef<Map<string, {
+    node: unknown;
+    lat: number;
+    lng: number;
+    opacity: number;
+    ctx: string;
+    onSelect: typeof onNodeSourceSelect;
+    descriptor: NodeMarkerDescriptor;
+  }>>(new Map());
+  const nodeMarkers: NodeMarkerDescriptor[] = useMemo(() => {
+    const prevCache = markerDescriptorCacheRef.current;
+    const nextCache: typeof prevCache = new Map();
+    // #6125: the per-source ring flag and the source ordering both change the
+    // ring colour without changing the node reference, so they belong in `ctx`
+    // — the per-marker cache below reuses a descriptor whenever `node` and
+    // `ctx` match, so a toggle flip must invalidate every cached entry.
+    const ctx = `${aircraftDisplayMode}|${mapPinStyle}|${mapPinColorMode}|${colorNodesBySource && isUnified ? 1 : 0}|${colorSourceIds.join(',')}|${colorNodesByGateway && isUnified ? 1 : 0}|${gatewayIds.join(',')}`;
+    const descriptors = markerNodes.map(({ node, pos }): NodeMarkerDescriptor => {
+      const hops = node.hopsAway ?? 999;
+      const shortName = node.shortName ?? node.user?.shortName;
+      const nodeId = node.nodeId ?? node.user?.id;
+      // #6008: shared infrastructure rule (ROUTER, ROUTER_LATE, CLIENT_BASE and
+      // the deprecated router roles), matching every other map surface. The role
+      // category drives the glyph or corner badge, and is in iconSig below so the
+      // icon cache tells it apart from a plain client with the same hops/name.
+      const { isRouter, roleCategory } = markerRoleProps(node);
+      // MeshCore nodes carry nodeNum 0 (they have no meshtastic nodeNum), so the
+      // `${sourceId}:${nodeNum}` scheme would collapse EVERY MeshCore node on a
+      // source onto the same key — React's duplicate-key reconciliation then
+      // duplicates markers and leaks them across source switches (#4234: MeshCore
+      // ghost markers visible on every source's map). Key them by their public-key
+      // identity instead.
+      const markerKey = String(
+        node.isMeshCore
+          ? unifiedNodeKey(node) ?? nodeId ?? node.publicKey
+          : node.sourceId != null && node.nodeNum != null
+            ? `${node.sourceId}:${node.nodeNum}`
+            : nodeId ?? node.nodeNum,
+      );
+      // #3886: fade markers by recency instead of a flat opacity — full when
+      // freshly heard, fading toward a floor as lastHeard nears the age cutoff
+      // (cutoffTime, seconds). Favorites bypass the age gate above so they stay
+      // fully opaque regardless of age. NOTE: here a missing lastHeard yields
+      // full opacity ("assume fresh"), which differs on purpose from Map
+      // Analysis where a missing timestamp sits at the floor — the Dashboard
+      // already age-gates upstream, so anything that reaches this loop is
+      // presumed current.
+      // Rounded to 0.01 (no visible difference) so a 15 s poll, which moves
+      // `nowMs` a hair, doesn't hand every marker a new opacity.
+      const ageOpacity = node.isFavorite
+        ? 1
+        : Math.round(markerAgeOpacity(
+            nowMs,
+            cutoffTime * 1000,
+            node.lastHeard != null ? node.lastHeard * 1000 : null,
+          ) * 100) / 100;
 
-    // Likely-aircraft badge (#5364/#5365 Phase 1 WP4): 'show' never marks.
-    // An aged-out aircraft (Phase 2, only here when "Show aged-out" is on) is
-    // always badged and dimmed so it reads as "not current".
-    const agedOut = isAgedOutAircraft(node);
-    const markAircraft = agedOut || (aircraftDisplayMode !== 'show' && node.likelyAircraft === true);
+      // Likely-aircraft badge (#5364/#5365 Phase 1 WP4): 'show' never marks.
+      // An aged-out aircraft (Phase 2, only here when "Show aged-out" is on) is
+      // always badged and dimmed so it reads as "not current".
+      const agedOut = isAgedOutAircraft(node);
+      const markAircraft = agedOut || (aircraftDisplayMode !== 'show' && node.likelyAircraft === true);
+      const opacity = agedOut ? AGED_OUT_AIRCRAFT_OPACITY : ageOpacity;
 
-    return {
-      key: markerKey,
-      position: [pos.lat, pos.lng],
-      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${markAircraft ? 1 : 0}|${mapPinStyle}|${mapPinColorMode}`,
-      buildIcon: () =>
-        createNodeIcon({
-          variant: 'meshtastic',
-          hops,
-          isSelected: false,
-          isRouter,
-          roleCategory,
-          isUnmessagable: !!node.isUnmessagable,
-          isLikelyAircraft: markAircraft,
-          shortName,
-          showLabel: true,
-          pinStyle: mapPinStyle,
-          colorMode: mapPinColorMode,
-          nodeNum: Number.isFinite(Number(node.nodeNum)) ? Number(node.nodeNum) : undefined,
-        }),
-      opacity: agedOut ? AGED_OUT_AIRCRAFT_OPACITY : ageOpacity,
-      children: (
-        <Popup>
-          <DashboardNodePopup node={node} pos={pos} onSourceSelect={onNodeSourceSelect} />
-        </Popup>
-      ),
-    };
-  });
+      const cached = prevCache.get(markerKey);
+      if (
+        cached &&
+        cached.node === node &&
+        cached.lat === pos.lat &&
+        cached.lng === pos.lng &&
+        cached.opacity === opacity &&
+        cached.ctx === ctx &&
+        cached.onSelect === onNodeSourceSelect
+      ) {
+        nextCache.set(markerKey, cached);
+        return cached.descriptor;
+      }
+
+      // #6125/#6175: the marker ring colour. Off / By source / By gateway are a
+      // single 3-state mode (the two context booleans are mutually exclusive),
+      // so at most one path produces a colour. "By source" is unchanged from
+      // #6125; "By gateway" rings by the node's most-recent gateway (#6175).
+      // Folded into iconSig so the icon rebuilds when the mode flips or a node's
+      // source/gateway changes; NEVER folded into opacity/selection.
+      const sourceRingColor = colorNodesByGateway
+        ? nodeGatewayRingColor(colorNodesByGateway, isUnified, (node as { gateways?: NodeGatewayRef[] }).gateways, gatewayIds)
+        : nodeSourceRingColor(colorNodesBySource, isUnified, node.sourceId, colorSourceIds);
+
+      const descriptor: NodeMarkerDescriptor = {
+        key: markerKey,
+        position: [pos.lat, pos.lng],
+        iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${markAircraft ? 1 : 0}|${mapPinStyle}|${mapPinColorMode}|${sourceRingColor ?? ''}`,
+        buildIcon: () =>
+          applyNodeSourceRing(createNodeIcon({
+            variant: 'meshtastic',
+            hops,
+            isSelected: false,
+            isRouter,
+            roleCategory,
+            isUnmessagable: !!node.isUnmessagable,
+            isLikelyAircraft: markAircraft,
+            shortName,
+            showLabel: true,
+            pinStyle: mapPinStyle,
+            colorMode: mapPinColorMode,
+            nodeNum: Number.isFinite(Number(node.nodeNum)) ? Number(node.nodeNum) : undefined,
+          }), sourceRingColor),
+        opacity,
+        children: (
+          <Popup>
+            <DashboardNodePopup node={node} pos={pos} onSourceSelect={onNodeSourceSelect} />
+          </Popup>
+        ),
+      };
+      nextCache.set(markerKey, {
+        node,
+        lat: pos.lat,
+        lng: pos.lng,
+        opacity,
+        ctx,
+        onSelect: onNodeSourceSelect,
+        descriptor,
+      });
+      return descriptor;
+    });
+    markerDescriptorCacheRef.current = nextCache;
+    return descriptors;
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- #6125/#6175 colorSourceIds/gatewayIds are fresh arrays each render (see line ~255), listed by their stable join like the sourceColorFor callback above (#4835); isUnified/colorNodesBySource/colorNodesByGateway drive the ring and are plain values.
+  }, [markerNodes, nowMs, cutoffTime, aircraftDisplayMode, mapPinStyle, mapPinColorMode, onNodeSourceSelect, colorNodesBySource, colorNodesByGateway, isUnified, colorSourceIds.join(','), gatewayIds.join(',')]);
 
   // Position accuracy regions — drawn from precision_bits, mirroring NodesTab.
   // Shares the cell geometry with Map Analysis via `precisionCellBounds`. Uses
@@ -893,6 +1021,7 @@ export default function DashboardMap({
     : [];
 
   return (
+    <GatewayNameContext.Provider value={gatewayNameIndex}>
     <div className="dashboard-map-container" style={{ position: 'relative' }}>
       {effective3D ? (
         <>
@@ -958,6 +1087,9 @@ export default function DashboardMap({
 
         {showWaypoints && <DashboardWaypoints sourceId={sourceId} />}
 
+        {/* #5686: local map markers, view-only here (edit them on a source's map). */}
+        {showLocalMarkers && <LocalMarkers sourceId={sourceId} />}
+
         {showAtakContacts && <DashboardAtakContacts sourceId={sourceId} />}
 
         {/* Flight trails (#5364/#5365 Phase 3), below the node markers. */}
@@ -1011,6 +1143,16 @@ export default function DashboardMap({
 
         {/* Cross-source "heard here" edges (#5561). Mounted only while on, so
             it fetches nothing when off. */}
+        {/* Live packet traffic (#4835): mounted only while on. */}
+        {showPacketFlights && polarSourceIds.length > 0 && (
+          <PacketFlightsLayer
+            sourceIds={polarSourceIds}
+            nodes={packetFlightNodes}
+            maxPerSecond={packetFlightRate}
+            sourceColor={packetFlightSourceColor}
+            onStatsChange={setPacketFlightsStats}
+          />
+        )}
         {showCrossSourceLinks && polarSourceIds.length > 0 && (
           <CrossSourceLinksLayer enabled sourceIds={polarSourceIds} lookbackHours={effectiveMaxAge} />
         )}
@@ -1019,6 +1161,12 @@ export default function DashboardMap({
             one above. Mounted only while both toggles are on. */}
         {showCrossSourceLinks && showTracerouteConfirmedLinks && polarSourceIds.length > 0 && (
           <TracerouteConfirmedLinksLayer enabled sourceIds={polarSourceIds} lookbackHours={effectiveMaxAge} />
+        )}
+
+        {/* Tropospheric ducting overlay (#5734): one atmosphere for every
+            source. Mounted only while on. */}
+        {showDucting === true && (
+          <DuctingLayer hoursAhead={ductingHoursAhead ?? 0} />
         )}
       </BaseMap>
       )}
@@ -1037,6 +1185,69 @@ export default function DashboardMap({
               />
               <span className="dashboard-polar-grid-legend__name">
                 {sourceNameById.get(op.sourceId) ?? op.sourceId}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* #6125: source → colour key for the per-source ring. Reuses the polar
+          grid legend's styling. Shown only on the Unified map while the toggle
+          is on; moved to the top-left when the polar-grid legend already holds
+          the bottom-left corner so the two never overlap. */}
+      {isUnified && colorNodesBySource && colorSourceIds.length > 0 && (
+        <div
+          className="dashboard-polar-grid-legend dashboard-source-color-legend"
+          role="note"
+          aria-label="Node source colours"
+          style={
+            !effective3D && showPolarGrid && ownNodePositions.length > 0
+              ? { bottom: 'auto', top: 12 }
+              : undefined
+          }
+        >
+          <div className="dashboard-polar-grid-legend__title">
+            {t('map.colorNodesBySource', 'Colour nodes by source')}
+          </div>
+          {colorSourceIds.map((sid) => (
+            <div key={`src-color-${sid}`} className="dashboard-polar-grid-legend__row">
+              <span
+                className="dashboard-polar-grid-legend__swatch"
+                style={{ background: getSourceColor(sid, colorSourceIds) }}
+              />
+              <span className="dashboard-polar-grid-legend__name">
+                {sourceNameById.get(sid) ?? sid}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* #6175: gateway → colour key for the per-gateway ring. Mirrors the
+          source-colour legend above; shown only on the Unified map while the
+          gateway mode is on and some node carries gateway membership. */}
+      {isUnified && colorNodesByGateway && gatewayIds.length > 0 && (
+        <div
+          className="dashboard-polar-grid-legend dashboard-source-color-legend"
+          role="note"
+          aria-label="Node gateway colours"
+          style={
+            !effective3D && showPolarGrid && ownNodePositions.length > 0
+              ? { bottom: 'auto', top: 12 }
+              : undefined
+          }
+        >
+          <div className="dashboard-polar-grid-legend__title">
+            {t('map.colorNodesByGateway', 'Colour nodes by gateway')}
+          </div>
+          {gatewayIds.map((gid) => (
+            <div key={`gw-color-${gid}`} className="dashboard-polar-grid-legend__row">
+              <span
+                className="dashboard-polar-grid-legend__swatch"
+                style={{ background: getSourceColor(gid, gatewayIds) }}
+              />
+              <span className="dashboard-polar-grid-legend__name" title={gid}>
+                {gatewayLegendText(resolveGatewayLabel(gid, null, gatewayNameIndex))}
               </span>
             </div>
           ))}
@@ -1165,6 +1376,24 @@ export default function DashboardMap({
               <span>{t('map.traceroute_confirmed.toggle', 'Traceroute-Confirmed Links')}</span>
             </label>
           )}
+          {/* #4835: live packet traffic (dots flying to the receiver). */}
+          <PacketFlightsControl
+            checked={showPacketFlights === true}
+            onCheckedChange={setShowPacketFlights}
+            rate={packetFlightRate ?? 0}
+            onRateChange={setPacketFlightRate}
+            stats={packetFlightsStats}
+            disabledTitle={unavailableIn3DTitle}
+          />
+          {/* #5734: tropospheric ducting overlay. Renders nothing unless an
+              admin turned the overlay on. */}
+          <DuctingControl
+            checked={showDucting === true}
+            onCheckedChange={setShowDucting}
+            hoursAhead={ductingHoursAhead ?? 0}
+            onHoursAheadChange={setDuctingHoursAhead}
+            disabledTitle={unavailableIn3DTitle}
+          />
           <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
               type="checkbox"
@@ -1190,6 +1419,58 @@ export default function DashboardMap({
             />
             <span>Spread Nodes</span>
           </label>
+          {/* #6125/#6175: coloured ring around each node marker — Off / By source
+              / By gateway, a single 3-state mode. Unified map only (a
+              single-source map has one colour, so the ring carries no
+              information there). Keeps the role glyph and age opacity intact.
+              "By gateway" needs the MQTT packet log enabled to have any data;
+              with it off the gateway domain is empty and the ring draws
+              nothing, so the map behaves exactly like "Off". */}
+          {isUnified && (
+            <div
+              className="map-control-item map-control-item-group"
+              role="radiogroup"
+              aria-label={t('map.colorNodesBy', 'Colour nodes by')}
+            >
+              <span className="map-control-group-title">{t('map.colorNodesBy', 'Colour nodes by')}</span>
+              <label
+                className="map-control-subitem"
+                title={t('map.colorNodesOffHelp', 'Draw no ring — every node marker keeps its role colour only.')}
+              >
+                <input
+                  type="radio"
+                  name="colorNodesMode"
+                  checked={!colorNodesBySource && !colorNodesByGateway}
+                  onChange={() => { setColorNodesBySource(false); setColorNodesByGateway(false); }}
+                />
+                <span>{t('map.colorNodesOff', 'Off')}</span>
+              </label>
+              <label
+                className="map-control-subitem"
+                title={t('map.colorNodesBySourceHelp', 'Draw a coloured ring around each node marker in its source’s colour, matching the colours used in Unified Messages and the map legend. The role glyph and age fade stay unchanged.')}
+              >
+                <input
+                  type="radio"
+                  name="colorNodesMode"
+                  checked={colorNodesBySource && !colorNodesByGateway}
+                  onChange={() => setColorNodesBySource(true)}
+                />
+                <span>{t('map.colorNodesBySource', 'Colour nodes by source')}</span>
+              </label>
+              <label
+                className="map-control-subitem"
+                title={t('map.colorNodesByGatewayHelp', 'Draw a coloured ring around each node in the colour of the gateway that last relayed it. Needs an MQTT source with the packet monitor enabled. A node heard by several gateways rings by its most recent one.')}
+              >
+                <input
+                  type="radio"
+                  name="colorNodesMode"
+                  checked={colorNodesByGateway}
+                  onChange={() => setColorNodesByGateway(true)}
+                />
+                <span>{t('map.colorNodesByGateway', 'Colour nodes by gateway')}</span>
+              </label>
+            </div>
+          )}
           {/* RF/UDP/MQTT transport toggles have no meaning on an MQTT-only
               source (mqtt_bridge/mqtt_broker) — every node there arrived
               over MQTT, so the filter is skipped outright above and the
@@ -1231,6 +1512,15 @@ export default function DashboardMap({
               onChange={(e) => setShowWaypoints(e.target.checked)}
             />
             <span>Show Waypoints</span>
+          </label>
+          <label className="map-control-item" title={unavailableIn3DTitle}>
+            <input
+              type="checkbox"
+              checked={showLocalMarkers}
+              disabled={effective3D}
+              onChange={(e) => setShowLocalMarkers(e.target.checked)}
+            />
+            <span>Show Local Markers</span>
           </label>
           <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
@@ -1307,7 +1597,11 @@ export default function DashboardMap({
           </>
         </div>
         {/* Hops legend + tileset picker now live in the same sidebar (#4909). */}
-        {!effective3D && showLegend && <MapLegend embedded />}
+        {!effective3D && showLegend && (
+          // #6008: list the Meshtastic role markers when any Meshtastic node is
+          // on the map (a MeshCore-only dashboard has no use for them).
+          <MapLegend embedded showRoleMarkers={markerNodes.some(({ node }) => !node.isMeshCore)} />
+        )}
         {showTileSelector && (
           <TilesetSelector selectedTilesetId={tilesetId} onTilesetChange={setMapTileset} embedded />
         )}
@@ -1324,5 +1618,6 @@ export default function DashboardMap({
         </div>
       )}
     </div>
+    </GatewayNameContext.Provider>
   );
 }

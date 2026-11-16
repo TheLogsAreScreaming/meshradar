@@ -17,7 +17,7 @@ import {
 import { BaseRepository, DrizzleDatabase, SourceScope } from './base.js';
 import { DatabaseType, DbPushSubscription } from '../types.js';
 import { logger } from '../../utils/logger.js';
-import { defaultNotificationPreferences } from '../../utils/notificationDefaults.js';
+import { defaultNotificationPreferences, MESH_PREFERENCES_SOURCE_ID } from '../../utils/notificationDefaults.js';
 
 // Re-export for convenience
 export type { DbPushSubscription } from '../types.js';
@@ -54,6 +54,8 @@ export interface NotificationPreferences {
   notifyOnServerEvents: boolean;
   /** Alert when a waypoint arrives from the mesh within `waypointRadiusKm` (#4750). */
   notifyOnWaypoint: boolean;
+  notifyOnMention: boolean;
+  notifyOnAutoTrace: boolean;
   waypointRadiusKm: number;
   /** Explicit centre for the radius. NULL on both means "this source's own node". */
   waypointCenterLat: number | null;
@@ -71,6 +73,9 @@ export interface NotificationPreferences {
    */
   messageTitleTemplate: string | null;
   messageBodyTemplate: string | null;
+  /** Message text length (#6278): Web Push / desktop and Apprise. NULL = the default of 100. */
+  messageTextMaxPush: number | null;
+  messageTextMaxApprise: number | null;
 }
 
 /**
@@ -199,6 +204,30 @@ export class NotificationsRepository extends BaseRepository {
   }
 
   /**
+   * Remove the one row for this endpoint, source and owner (null = anonymous).
+   */
+  async removeSubscriptionRow(endpoint: string, sourceId: string, userId: number | null): Promise<void> {
+    const { pushSubscriptions } = this.tables;
+    await this.db.delete(pushSubscriptions).where(and(
+      eq(pushSubscriptions.endpoint, endpoint),
+      eq(pushSubscriptions.sourceId, sourceId),
+      userId === null ? isNull(pushSubscriptions.userId) : eq(pushSubscriptions.userId, userId),
+    ));
+  }
+
+  /**
+   * Every subscription row (one per user + source) for this endpoint.
+   */
+  async getSubscriptionsByEndpoint(endpoint: string): Promise<DbPushSubscription[]> {
+    const { pushSubscriptions } = this.tables;
+    const rows = await this.db
+      .select()
+      .from(pushSubscriptions)
+      .where(eq(pushSubscriptions.endpoint, endpoint));
+    return (rows as Record<string, unknown>[]).map(row => this.mapSubscriptionRow(row));
+  }
+
+  /**
    * Distinct sourceIds that hold a push subscription row for this endpoint.
    */
   async getSubscriptionSourceIds(endpoint: string): Promise<string[]> {
@@ -277,7 +306,13 @@ export class NotificationsRepository extends BaseRepository {
    * Save notification preferences for a user (insert or update).
    * Keeps branching: MySQL uses onDuplicateKeyUpdate, SQLite lacks notifyOnChannelMessage column.
    */
-  async saveUserPreferences(userId: number, prefs: NotificationPreferences, sourceId?: string): Promise<boolean> {
+  async saveUserPreferences(
+    userId: number,
+    prefs: NotificationPreferences,
+    sourceId?: string,
+    /** Mesh-wide row only (#5729): mark it saved, and/or set its push source list. */
+    meshOpts?: { meshDefaultsSaved?: boolean; pushSourceIds?: string[] | null },
+  ): Promise<boolean> {
     if (!Number.isInteger(userId) || userId <= 0) {
       logger.error(`Invalid userId: ${userId}`);
       return false;
@@ -299,6 +334,8 @@ export class NotificationsRepository extends BaseRepository {
       lowBatteryVoltageThreshold: prefs.lowBatteryVoltageThreshold,
       notifyOnServerEvents: prefs.notifyOnServerEvents,
       notifyOnWaypoint: prefs.notifyOnWaypoint,
+      notifyOnMention: prefs.notifyOnMention,
+      notifyOnAutoTrace: prefs.notifyOnAutoTrace,
       waypointRadiusKm: prefs.waypointRadiusKm,
       waypointCenterLat: prefs.waypointCenterLat,
       waypointCenterLon: prefs.waypointCenterLon,
@@ -314,6 +351,12 @@ export class NotificationsRepository extends BaseRepository {
       mutedDMs: JSON.stringify(prefs.mutedDMs ?? []),
       messageTitleTemplate: prefs.messageTitleTemplate ?? null,
       messageBodyTemplate: prefs.messageBodyTemplate ?? null,
+      messageTextMaxPush: prefs.messageTextMaxPush ?? null,
+      messageTextMaxApprise: prefs.messageTextMaxApprise ?? null,
+      ...(meshOpts?.meshDefaultsSaved !== undefined ? { meshDefaultsSaved: meshOpts.meshDefaultsSaved } : {}),
+      ...(meshOpts?.pushSourceIds !== undefined
+        ? { pushSourceIds: meshOpts.pushSourceIds === null ? null : JSON.stringify(meshOpts.pushSourceIds) }
+        : {}),
       updatedAt: now,
     };
 
@@ -384,6 +427,112 @@ export class NotificationsRepository extends BaseRepository {
       logger.error(`Failed to save preferences for user ${userId}:`, error);
       return false;
     }
+  }
+
+  /**
+   * The user's mesh-wide row (#5729), or null when there is none.
+   *
+   * `saved` is false for a row that only holds `pushSourceIds` (made by
+   * migration 235 or by a push subscription): its preference columns are then
+   * not the user's choice and must be ignored. `pushSourceIds` null means
+   * "every source the user can read".
+   */
+  async getMeshPreferences(
+    userId: number,
+    opts?: { rethrow?: boolean },
+  ): Promise<{ prefs: NotificationPreferences; saved: boolean; pushSourceIds: string[] | null } | null> {
+    if (!Number.isInteger(userId) || userId <= 0) return null;
+    try {
+      const { userNotificationPreferences: t } = this.tables;
+      const rows = await this.db
+        .select()
+        .from(t)
+        .where(and(eq(t.userId, userId), eq(t.sourceId, MESH_PREFERENCES_SOURCE_ID)))
+        .limit(1);
+      if (rows.length === 0) return null;
+      const row = rows[0] as Record<string, unknown>;
+      return {
+        prefs: this.mapPreferencesRow(row),
+        saved: Boolean(row.meshDefaultsSaved),
+        pushSourceIds: parsePushSourceIds(row.pushSourceIds),
+      };
+    } catch (error) {
+      logger.error(`Failed to get mesh-wide preferences for user ${userId}:`, error);
+      if (opts?.rethrow) throw error;
+      return null;
+    }
+  }
+
+  /**
+   * Set the mesh-wide row's push source list without touching anything else.
+   * With no row yet, writes one that holds only the list (`meshDefaultsSaved`
+   * false, every opt-in switch off), so a raw "who has X on" query never
+   * counts it.
+   */
+  async setPushSourceIds(userId: number, pushSourceIds: string[] | null): Promise<void> {
+    const { userNotificationPreferences: t } = this.tables;
+    const now = this.now();
+    const value = pushSourceIds === null ? null : JSON.stringify([...new Set(pushSourceIds)].sort());
+    const existing = await this.db
+      .select({ id: t.id })
+      .from(t)
+      .where(and(eq(t.userId, userId), eq(t.sourceId, MESH_PREFERENCES_SOURCE_ID)))
+      .limit(1);
+    if (existing.length > 0) {
+      await this.db
+        .update(t)
+        .set({ pushSourceIds: value, updatedAt: now })
+        .where(and(eq(t.userId, userId), eq(t.sourceId, MESH_PREFERENCES_SOURCE_ID)));
+      return;
+    }
+    // The active-schema union does not type `insert` across dialects; the
+    // values are plain columns every backend has.
+    const db = this.db as unknown as { insert: (table: unknown) => { values: (v: Record<string, unknown>) => Promise<unknown> } };
+    await db.insert(t).values({
+      userId,
+      sourceId: MESH_PREFERENCES_SOURCE_ID,
+      notifyOnMessage: false,
+      notifyOnDirectMessage: false,
+      appriseEnabled: false,
+      notifyOnNewNode: false,
+      notifyOnTraceroute: false,
+      notifyOnInactiveNode: false,
+      notifyOnLowBattery: false,
+      notifyOnWaypoint: false,
+      ...(this.isSQLite() ? {} : { notifyOnChannelMessage: false }),
+      pushSourceIds: value,
+      meshDefaultsSaved: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  /**
+   * Delete the user's row for one source: the source falls back to the
+   * mesh-wide default (#5729). Returns true when a row was removed.
+   */
+  async deleteUserPreferences(userId: number, sourceId: string): Promise<boolean> {
+    const { userNotificationPreferences: t } = this.tables;
+    const existing = await this.db
+      .select({ id: t.id })
+      .from(t)
+      .where(and(eq(t.userId, userId), eq(t.sourceId, sourceId)))
+      .limit(1);
+    if (existing.length === 0) return false;
+    await this.db.delete(t).where(and(eq(t.userId, userId), eq(t.sourceId, sourceId)));
+    return true;
+  }
+
+  /** The source ids (real sources only) this user has an override row for. */
+  async getOverrideSourceIds(userId: number): Promise<string[]> {
+    const { userNotificationPreferences: t } = this.tables;
+    const rows = await this.db
+      .select({ sourceId: t.sourceId })
+      .from(t)
+      .where(eq(t.userId, userId));
+    return (rows as Array<{ sourceId: string }>)
+      .map(r => r.sourceId)
+      .filter(id => id !== '' && id !== MESH_PREFERENCES_SOURCE_ID);
   }
 
   /**
@@ -466,6 +615,7 @@ export class NotificationsRepository extends BaseRepository {
         .select({
           userId: t.userId,
           sourceId: t.sourceId,
+          meshDefaultsSaved: t.meshDefaultsSaved,
           notifyOnInactiveNode: t.notifyOnInactiveNode,
           notifyOnMessage: t.notifyOnMessage,
           appriseEnabled: t.appriseEnabled,
@@ -476,7 +626,7 @@ export class NotificationsRepository extends BaseRepository {
         .where(inArray(t.userId, flaggedUserIds))
         .orderBy(asc(t.userId), asc(t.sourceId));
 
-      return rows.map((r: {
+      return rows.filter(isLiveRow).map((r: {
         userId: number;
         sourceId: string;
         notifyOnInactiveNode: boolean | number | null;
@@ -528,6 +678,7 @@ export class NotificationsRepository extends BaseRepository {
         .select({
           userId: t.userId,
           sourceId: t.sourceId,
+          meshDefaultsSaved: t.meshDefaultsSaved,
           notifyOnWaypoint: t.notifyOnWaypoint,
           waypointRadiusKm: t.waypointRadiusKm,
           waypointCenterLat: t.waypointCenterLat,
@@ -537,7 +688,7 @@ export class NotificationsRepository extends BaseRepository {
         .where(inArray(t.userId, flaggedUserIds))
         .orderBy(asc(t.userId), asc(t.sourceId));
 
-      return rows.map((r: {
+      return rows.filter(isLiveRow).map((r: {
         userId: number;
         sourceId: string;
         notifyOnWaypoint: boolean | number | null;
@@ -597,6 +748,7 @@ export class NotificationsRepository extends BaseRepository {
         .select({
           userId: t.userId,
           sourceId: t.sourceId,
+          meshDefaultsSaved: t.meshDefaultsSaved,
           notifyOnLowBattery: t.notifyOnLowBattery,
           notifyOnMessage: t.notifyOnMessage,
           appriseEnabled: t.appriseEnabled,
@@ -609,7 +761,7 @@ export class NotificationsRepository extends BaseRepository {
         .where(inArray(t.userId, flaggedUserIds))
         .orderBy(asc(t.userId), asc(t.sourceId));
 
-      return rows.map((r: {
+      return rows.filter(isLiveRow).map((r: {
         userId: number;
         sourceId: string;
         notifyOnLowBattery: boolean | number | null;
@@ -656,7 +808,9 @@ export class NotificationsRepository extends BaseRepository {
         .from(t)
         .where(eq(t.userId, userId))
         .orderBy(asc(t.sourceId));
-      return rows.map((row: Record<string, unknown>) => ({ sourceId: row.sourceId as string, prefs: this.mapPreferencesRow(row) }));
+      return (rows as Array<Record<string, unknown>>)
+        .filter(row => isLiveRow(row as { sourceId: string; meshDefaultsSaved?: unknown }))
+        .map((row: Record<string, unknown>) => ({ sourceId: row.sourceId as string, prefs: this.mapPreferencesRow(row) }));
     } catch (error) {
       logger.error(`Failed to get preference rows for user ${userId}:`, error);
       return [];
@@ -1365,6 +1519,8 @@ export class NotificationsRepository extends BaseRepository {
       lowBatteryVoltageThreshold: row.lowBatteryVoltageThreshold != null ? Number(row.lowBatteryVoltageThreshold) : d.lowBatteryVoltageThreshold,
       notifyOnServerEvents: boolOr(row.notifyOnServerEvents, d.notifyOnServerEvents),
       notifyOnWaypoint: boolOr(row.notifyOnWaypoint, d.notifyOnWaypoint),
+      notifyOnMention: boolOr(row.notifyOnMention, d.notifyOnMention),
+      notifyOnAutoTrace: boolOr(row.notifyOnAutoTrace, d.notifyOnAutoTrace),
       waypointRadiusKm: row.waypointRadiusKm != null ? Number(row.waypointRadiusKm) : d.waypointRadiusKm,
       waypointCenterLat: row.waypointCenterLat != null ? Number(row.waypointCenterLat) : null,
       waypointCenterLon: row.waypointCenterLon != null ? Number(row.waypointCenterLon) : null,
@@ -1377,6 +1533,33 @@ export class NotificationsRepository extends BaseRepository {
       mutedDMs: parseJsonArray(row.mutedDMs) as unknown as MutedDM[],
       messageTitleTemplate: typeof row.messageTitleTemplate === 'string' && row.messageTitleTemplate.length > 0 ? row.messageTitleTemplate : null,
       messageBodyTemplate: typeof row.messageBodyTemplate === 'string' && row.messageBodyTemplate.length > 0 ? row.messageBodyTemplate : null,
+      messageTextMaxPush: positiveIntOrNull(row.messageTextMaxPush),
+      messageTextMaxApprise: positiveIntOrNull(row.messageTextMaxApprise),
     };
   }
+}
+
+/**
+ * False for a mesh-wide row the user never saved (#5729): it holds only the
+ * push source list, so its preference columns must not count as settings.
+ */
+function isLiveRow(row: { sourceId: string; meshDefaultsSaved?: unknown }): boolean {
+  return row.sourceId !== MESH_PREFERENCES_SOURCE_ID || Boolean(row.meshDefaultsSaved);
+}
+
+/** A stored push source list: an array of ids, or null for "every source". */
+function parsePushSourceIds(value: unknown): string[] | null {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A stored text length reads back as a positive integer, or null (the default). */
+function positiveIntOrNull(value: unknown): number | null {
+  const n = typeof value === 'string' ? Number(value) : value;
+  return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : null;
 }

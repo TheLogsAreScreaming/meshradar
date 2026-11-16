@@ -36,9 +36,15 @@ vi.mock('@tanstack/react-query', () => ({
 // Not under test; it fetches on mount.
 // Ignore / Block sections (#5408) own TanStack queries; covered by their own tests.
 vi.mock('./MeshCoreIgnoredNodesSection', () => ({ MeshCoreIgnoredNodesSection: () => null }));
+vi.mock('./MeshCoreTelemetrySettingsSection', () => ({ MeshCoreTelemetrySettingsSection: () => null }));
+vi.mock('../settings/TelemetryDataActions', () => ({ default: () => <div data-testid="telemetry-data-section" /> }));
 vi.mock('./MeshCoreMessageFiltersSection', () => ({ MeshCoreMessageFiltersSection: () => null }));
 // Radio contact list (#5502) fetches on mount; covered by its own tests.
 vi.mock('./MeshCoreContactSyncSection', () => ({ MeshCoreContactSyncSection: () => null }));
+// Loads its own settings on mount (#5759); stubbed so the call counts below stay about receive-only.
+vi.mock('./MeshCoreReactionsSection', () => ({ MeshCoreReactionsSection: () => null }));
+// Loads its own setting on mount (#6178); stubbed so the call counts stay about receive-only.
+vi.mock('./MeshCoreRequiredRepeaterSection', () => ({ MeshCoreRequiredRepeaterSection: () => null }));
 vi.mock('./MeshCoreNodeDisplaySection', () => ({
   MeshCoreNodeDisplaySection: () => null,
 }));
@@ -77,6 +83,7 @@ function renderView(
       actions={makeActions(overrides)}
       baseUrl=""
       sourceId="src-a"
+      contacts={[]}
       receiveOnly={receiveOnly}
       {...props}
     />,

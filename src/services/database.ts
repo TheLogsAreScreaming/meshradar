@@ -36,6 +36,7 @@ import {
   ChannelsRepository,
   NodesRepository,
   type AircraftAgeOutCandidate,
+  type AircraftManualMarkWrite,
   MessagesRepository,
   TelemetryRepository,
   AuthRepository,
@@ -64,12 +65,24 @@ import {
   EstimatedPositionsRepository,
   AutoFavoriteTargetsRepository,
   SourcePkiKeysRepository,
+  MqttNativeIdentitiesRepository,
   MeshCoreObserverKeysRepository,
   MeshCoreObserverCredentialsRepository,
+  MeshCoreSourcePkiKeysRepository,
   MessageEventsRepository,
   MeshtasticHeardRepeatersRepository,
+  PkiExchangeStateRepository,
+  MapMarkersRepository,
+  MeshCoreHopSnrRepository,
+  MeshCoreTraceRunsRepository,
+  NodeNameHistoryRepository,
+  MeshCoreCliHistoryRepository,
+  MqttBrokerPresetsRepository,
+  MeshCoreAdminSessionsRepository,
+  PasskeysRepository,
   CoverageReceptionsRepository,
   CrossSourceLinksRepository,
+  DirectRfContactsRepository,
   CoverageSurveysRepository,
   TranslationsRepository,
   AircraftFlightMatchesRepository,
@@ -79,6 +92,7 @@ import {
   AutomationsRepository,
   AutomationVariablesRepository,
   AutomationHomeAnchorsRepository,
+  AutomationFireStateRepository,
   SavedRegionsRepository,
   PrivacyDocumentsRepository,
   SolarNodeOverridesRepository,
@@ -110,9 +124,10 @@ import type {
   TelemetryCadenceAggregate,
 } from '../db/repositories/index.js';
 import type { MeshIssueFinding } from '../server/services/meshIssues/types.js';
-import type { ConversationReadStateMap, AircraftFlightMatchRow, FlightMatchLookupWrite, AssetNode, AssetNodeSettings } from '../db/repositories/index.js';
+import type { ConversationReadStateMap, AircraftFlightMatchRow, FlightMatchLookupWrite, FlightMatchRecheckWrite, AssetNode, AssetNodeSettings } from '../db/repositories/index.js';
 import type { MeshCoreIgnoredNodeRow, MeshCoreMessageFilterRow, MeshCoreMessageFilterInput, MeshCoreFilterMode } from '../db/repositories/index.js';
 import type { MessageSourceScope } from '../db/repositories/index.js';
+import type { PasskeySummary, DbPasskey, CreatePasskeyInput } from '../db/repositories/index.js';
 import { assetRetentionCutoff } from '../utils/assetTracking.js';
 import type { ConversationKind } from '../db/schema/conversationReadState.js';
 import type { DatabaseType, DbPacketLog as DbTypesPacketLog, DbPacketCountByNode, DbPacketCountByPortnum, DbDistinctRelayNode } from '../db/types.js';
@@ -187,6 +202,7 @@ export interface DbNode {
   altitudeOverride?: number; // Override altitude
   positionOverrideIsPrivate?: boolean; // Override privacy (false = public, true = private)
   hideFromMap?: boolean; // #3549: suppress this node's marker on maps only
+  channelLocked?: boolean; // #5923: admin-pinned channel; traffic does not change it
   notes?: string; // #3921: free-text per-node MeshRadar-local annotation
   isUnmessagable?: boolean; // #3684: User.is_unmessagable — node won't receive DMs
   /** #5317: set when the row came from an imported contact URL and the node has not been heard yet. */
@@ -213,6 +229,15 @@ export interface DbNode {
   /** Anchor of the fixed mark; null when not marked. */
   aircraftFixedLatitude?: number | null;
   aircraftFixedLongitude?: number | null;
+  /**
+   * Manual aircraft mark (#5715): 'not_aircraft' | 'aircraft'; null when none.
+   * A 'not_aircraft' mark keeps its anchor in aircraftFixed*.
+   */
+  aircraftManualMark?: string | null;
+  /** Epoch ms the manual mark was set. */
+  aircraftManualMarkAt?: number | null;
+  /** users.id of who set the manual mark. */
+  aircraftManualMarkBy?: number | null;
   // Remote admin discovery (Migration 055)
   hasRemoteAdmin?: boolean; // Has remote admin access
   lastRemoteAdminCheck?: number; // Unix timestamp ms of last check
@@ -463,6 +488,14 @@ export interface ThemeDefinition {
   chatBubbleReceivedText?: string;
 }
 
+/**
+ * Fixed cost-10 bcrypt hash used to equalize login timing for unknown users
+ * (#6081). It is never a valid credential — it hashes a throwaway string — and
+ * exists only so `authenticateAsync` spends the same time whether or not the
+ * username exists, closing the enumeration side-channel.
+ */
+const DUMMY_PASSWORD_HASH = '$2b$10$uIwhve/fLYXbLsXbYYNgbuSNcpUylCSbVN6Y3J80Ik4XNQsI02vOq';
+
 class DatabaseService {
   public db: BetterSqlite3Database.Database;
   private isInitialized = false;
@@ -503,8 +536,15 @@ class DatabaseService {
   private cacheInitialized = false;
 
   // Track nodes that have already had their "new node" notification sent
-  // to avoid duplicate notifications when node data is updated incrementally
-  private newNodeNotifiedSet: Set<number> = new Set();
+  // to avoid duplicate notifications when node data is updated incrementally.
+  // nodeNum -> the sources that announced it, in announcement order (#5729):
+  // each source announces once, and the notification layer decides PER USER
+  // which source's announcement reaches them (the first they can read).
+  private newNodeAnnouncements: Map<number, string[]> = new Map();
+
+  private newNodeAnnounced(nodeNum: number, sourceId: string | undefined): boolean {
+    return this.newNodeAnnouncements.get(nodeNum)?.includes(sourceId ?? 'default') ?? false;
+  }
 
   // Ghost node suppression: nodeNum → expiresAt timestamp
   // Prevents resurrection of ghost nodes after reboot detection
@@ -616,13 +656,25 @@ class DatabaseService {
   public estimatedPositionsRepo: EstimatedPositionsRepository | null = null;
   public autoFavoriteTargetsRepo: AutoFavoriteTargetsRepository | null = null;
   public sourcePkiKeysRepo: SourcePkiKeysRepository | null = null;
+  public mqttNativeIdentitiesRepo: MqttNativeIdentitiesRepository | null = null;
   public meshcoreObserverKeysRepo: MeshCoreObserverKeysRepository | null = null;
   public meshcoreObserverCredentialsRepo: MeshCoreObserverCredentialsRepository | null = null;
+  public meshcoreSourcePkiKeysRepo: MeshCoreSourcePkiKeysRepository | null = null;
   public messageEventsRepo: MessageEventsRepository | null = null;
   public meshtasticHeardRepeatersRepo: MeshtasticHeardRepeatersRepository | null = null;
+  public pkiExchangeStateRepo: PkiExchangeStateRepository | null = null;
+  public mapMarkersRepo: MapMarkersRepository | null = null;
+  public meshcoreHopSnrRepo: MeshCoreHopSnrRepository | null = null;
+  public meshcoreTraceRunsRepo: MeshCoreTraceRunsRepository | null = null;
+  public nodeNameHistoryRepo: NodeNameHistoryRepository | null = null;
+  public meshcoreCliHistoryRepo: MeshCoreCliHistoryRepository | null = null;
+  public mqttBrokerPresetsRepo: MqttBrokerPresetsRepository | null = null;
+  public meshcoreAdminSessionsRepo: MeshCoreAdminSessionsRepository | null = null;
+  public passkeysRepo: PasskeysRepository | null = null;
   public coverageReceptionsRepo: CoverageReceptionsRepository | null = null;
   public coverageSurveysRepo: CoverageSurveysRepository | null = null;
   public crossSourceLinksRepo: CrossSourceLinksRepository | null = null;
+  public directRfContactsRepo: DirectRfContactsRepository | null = null;
   public translationsRepo: TranslationsRepository | null = null;
   public aircraftFlightMatchesRepo: AircraftFlightMatchesRepository | null = null;
   public meshcoreFiltersRepo: MeshCoreFiltersRepository | null = null;
@@ -631,6 +683,7 @@ class DatabaseService {
   public automationsRepo: AutomationsRepository | null = null;
   public automationVariablesRepo: AutomationVariablesRepository | null = null;
   public automationHomeAnchorsRepo: AutomationHomeAnchorsRepository | null = null;
+  public automationFireStateRepo: AutomationFireStateRepository | null = null;
   public savedRegionsRepo: SavedRegionsRepository | null = null;
   public privacyDocumentsRepo: PrivacyDocumentsRepository | null = null;
   public solarNodeOverridesRepo: SolarNodeOverridesRepository | null = null;
@@ -694,9 +747,19 @@ class DatabaseService {
     return this.sourcePkiKeysRepo;
   }
 
+  get mqttNativeIdentities(): MqttNativeIdentitiesRepository {
+    if (!this.mqttNativeIdentitiesRepo) throw new Error('Database not initialized');
+    return this.mqttNativeIdentitiesRepo;
+  }
+
   get meshcoreObserverKeys(): MeshCoreObserverKeysRepository {
     if (!this.meshcoreObserverKeysRepo) throw new Error('Database not initialized');
     return this.meshcoreObserverKeysRepo;
+  }
+
+  get meshcoreSourcePkiKeys(): MeshCoreSourcePkiKeysRepository {
+    if (!this.meshcoreSourcePkiKeysRepo) throw new Error('Database not initialized');
+    return this.meshcoreSourcePkiKeysRepo;
   }
 
   get messageEvents(): MessageEventsRepository {
@@ -709,6 +772,57 @@ class DatabaseService {
     return this.meshtasticHeardRepeatersRepo;
   }
 
+  /** Reliable PKI per-node exchange state (#5691). */
+  get pkiExchangeState(): PkiExchangeStateRepository {
+    if (!this.pkiExchangeStateRepo) throw new Error('Database not initialized');
+    return this.pkiExchangeStateRepo;
+  }
+
+  /** Local map markers (#5686): planning notes, never transmitted. */
+  get mapMarkers(): MapMarkersRepository {
+    if (!this.mapMarkersRepo) throw new Error('Database not initialized');
+    return this.mapMarkersRepo;
+  }
+
+  /** Per-hop SNR from MeshCore traces (#5722). */
+  get meshcoreTraceRuns(): MeshCoreTraceRunsRepository {
+    if (!this.meshcoreTraceRunsRepo) throw new Error('Database not initialized');
+    return this.meshcoreTraceRunsRepo;
+  }
+
+  get meshcoreHopSnr(): MeshCoreHopSnrRepository {
+    if (!this.meshcoreHopSnrRepo) throw new Error('Database not initialized');
+    return this.meshcoreHopSnrRepo;
+  }
+
+  get nodeNameHistory(): NodeNameHistoryRepository {
+    if (!this.nodeNameHistoryRepo) throw new Error('Database not initialized');
+    return this.nodeNameHistoryRepo;
+  }
+
+  /** MeshCore CLI commands people issued (#5892). */
+  get meshcoreCliHistory(): MeshCoreCliHistoryRepository {
+    if (!this.meshcoreCliHistoryRepo) throw new Error('Database not initialized');
+    return this.meshcoreCliHistoryRepo;
+  }
+
+  get mqttBrokerPresets(): MqttBrokerPresetsRepository {
+    if (!this.mqttBrokerPresetsRepo) throw new Error('Database not initialized');
+    return this.mqttBrokerPresetsRepo;
+  }
+
+  /** Remembered MeshCore remote-admin logins (#5785). */
+  get meshcoreAdminSessions(): MeshCoreAdminSessionsRepository {
+    if (!this.meshcoreAdminSessionsRepo) throw new Error('Database not initialized');
+    return this.meshcoreAdminSessionsRepo;
+  }
+
+  /** WebAuthn passkeys on local users (#5841). */
+  get passkeys(): PasskeysRepository {
+    if (!this.passkeysRepo) throw new Error('Database not initialized');
+    return this.passkeysRepo;
+  }
+
   get coverageReceptions(): CoverageReceptionsRepository {
     if (!this.coverageReceptionsRepo) throw new Error('Database not initialized');
     return this.coverageReceptionsRepo;
@@ -717,6 +831,11 @@ class DatabaseService {
   get crossSourceLinks(): CrossSourceLinksRepository {
     if (!this.crossSourceLinksRepo) throw new Error('Database not initialized');
     return this.crossSourceLinksRepo;
+  }
+
+  get directRfContacts(): DirectRfContactsRepository {
+    if (!this.directRfContactsRepo) throw new Error('Database not initialized');
+    return this.directRfContactsRepo;
   }
 
   get coverageSurveys(): CoverageSurveysRepository {
@@ -1190,13 +1309,25 @@ class DatabaseService {
       this.estimatedPositionsRepo = new EstimatedPositionsRepository(drizzleDb, this.drizzleDbType);
       this.autoFavoriteTargetsRepo = new AutoFavoriteTargetsRepository(drizzleDb, this.drizzleDbType);
       this.sourcePkiKeysRepo = new SourcePkiKeysRepository(drizzleDb, this.drizzleDbType);
+      this.mqttNativeIdentitiesRepo = new MqttNativeIdentitiesRepository(drizzleDb, this.drizzleDbType);
       this.meshcoreObserverKeysRepo = new MeshCoreObserverKeysRepository(drizzleDb, this.drizzleDbType);
       this.meshcoreObserverCredentialsRepo = new MeshCoreObserverCredentialsRepository(drizzleDb, this.drizzleDbType);
+      this.meshcoreSourcePkiKeysRepo = new MeshCoreSourcePkiKeysRepository(drizzleDb, this.drizzleDbType);
       this.messageEventsRepo = new MessageEventsRepository(drizzleDb, this.drizzleDbType);
       this.meshtasticHeardRepeatersRepo = new MeshtasticHeardRepeatersRepository(drizzleDb, this.drizzleDbType);
+      this.pkiExchangeStateRepo = new PkiExchangeStateRepository(drizzleDb, this.drizzleDbType);
+      this.mapMarkersRepo = new MapMarkersRepository(drizzleDb, this.drizzleDbType);
+      this.meshcoreHopSnrRepo = new MeshCoreHopSnrRepository(drizzleDb, this.drizzleDbType);
+      this.meshcoreTraceRunsRepo = new MeshCoreTraceRunsRepository(drizzleDb, this.drizzleDbType);
+      this.nodeNameHistoryRepo = new NodeNameHistoryRepository(drizzleDb, this.drizzleDbType);
+      this.meshcoreCliHistoryRepo = new MeshCoreCliHistoryRepository(drizzleDb, this.drizzleDbType);
+      this.mqttBrokerPresetsRepo = new MqttBrokerPresetsRepository(drizzleDb, this.drizzleDbType);
+      this.meshcoreAdminSessionsRepo = new MeshCoreAdminSessionsRepository(drizzleDb, this.drizzleDbType);
+      this.passkeysRepo = new PasskeysRepository(drizzleDb, this.drizzleDbType);
       this.coverageReceptionsRepo = new CoverageReceptionsRepository(drizzleDb, this.drizzleDbType);
       this.coverageSurveysRepo = new CoverageSurveysRepository(drizzleDb, this.drizzleDbType);
       this.crossSourceLinksRepo = new CrossSourceLinksRepository(drizzleDb, this.drizzleDbType);
+      this.directRfContactsRepo = new DirectRfContactsRepository(drizzleDb, this.drizzleDbType);
       this.translationsRepo = new TranslationsRepository(drizzleDb, this.drizzleDbType);
       this.aircraftFlightMatchesRepo = new AircraftFlightMatchesRepository(drizzleDb, this.drizzleDbType);
       this.meshcoreFiltersRepo = new MeshCoreFiltersRepository(drizzleDb, this.drizzleDbType);
@@ -1205,6 +1336,7 @@ class DatabaseService {
       this.automationsRepo = new AutomationsRepository(drizzleDb, this.drizzleDbType);
       this.automationVariablesRepo = new AutomationVariablesRepository(drizzleDb, this.drizzleDbType);
       this.automationHomeAnchorsRepo = new AutomationHomeAnchorsRepository(drizzleDb, this.drizzleDbType);
+      this.automationFireStateRepo = new AutomationFireStateRepository(drizzleDb, this.drizzleDbType);
       this.savedRegionsRepo = new SavedRegionsRepository(drizzleDb, this.drizzleDbType);
       this.privacyDocumentsRepo = new PrivacyDocumentsRepository(drizzleDb, this.drizzleDbType);
       this.solarNodeOverridesRepo = new SolarNodeOverridesRepository(drizzleDb, this.drizzleDbType);
@@ -1628,7 +1760,8 @@ class DatabaseService {
   ): void {
     const nodeNum = nodeData.nodeNum;
     if (nodeNum === undefined || nodeNum === null || nodeNum === 4294967295) return;
-    if (this.newNodeNotifiedSet.has(nodeNum)) return;
+    const newNodeSourceId: string = sourceId ?? (nodeData as any).sourceId ?? (existingNode as any)?.sourceId ?? 'default';
+    if (this.newNodeAnnounced(nodeNum, newNodeSourceId)) return;
 
     // Only notify on the incomplete -> complete transition, never for a node
     // that was already complete before this upsert.
@@ -1643,14 +1776,34 @@ class DatabaseService {
     };
     if (!isNodeComplete(mergedNode)) return;
 
-    this.newNodeNotifiedSet.add(nodeNum);
-    const newNodeSourceId = sourceId ?? (nodeData as any).sourceId ?? (existingNode as any)?.sourceId ?? 'default';
+    // Record synchronously, before any await, so two sources completing the
+    // same node at once still get a definite order.
+    const announced = this.newNodeAnnouncements.get(nodeNum) ?? [];
+    const earlier = [...announced];
+    announced.push(newNodeSourceId);
+    this.newNodeAnnouncements.set(nodeNum, announced);
     trackBackgroundTask(import('../server/services/notificationService.js').then(async ({ notificationService }) => {
       let sourceName = newNodeSourceId;
       try {
         const src = await this.sources.getSource(newNodeSourceId);
         if (src?.name) sourceName = src.name;
       } catch { /* fall back to id */ }
+      // Sources where this node was already known before THIS announcement
+      // (#5729, decision 5): those that announced earlier in this run, plus
+      // those whose row was already complete before this run started (a
+      // completion in this run would have announced). A source that
+      // announces after us is not one: it defers to us, not we to it.
+      let knownOnSourceIds: string[] = earlier;
+      try {
+        const announcedNow = this.newNodeAnnouncements.get(nodeNum) ?? [];
+        const rows = await this.nodes.getNodeIdentityAcrossSources(nodeNum);
+        const preExisting = rows
+          .filter(r => r.sourceId !== newNodeSourceId && !announcedNow.includes(r.sourceId) && isNodeComplete(r))
+          .map(r => r.sourceId);
+        knownOnSourceIds = [...new Set([...earlier, ...preExisting])];
+      } catch (err) {
+        logger.debug('Could not read the node on other sources for the new-node alert:', err);
+      }
       await notificationService.notifyNewNode(
         mergedNode.nodeId!,
         mergedNode.longName!,
@@ -1658,7 +1811,8 @@ class DatabaseService {
         mergedNode.hwModel ?? undefined,
         (nodeData.hopsAway ?? existingNode?.hopsAway) ?? undefined,
         newNodeSourceId,
-        sourceName
+        sourceName,
+        { nodeNum, knownOnSourceIds },
       );
     }).catch(err => logger.error('Failed to send new node notification:', err)));
   }
@@ -1680,7 +1834,7 @@ class DatabaseService {
     // notification (not yet notified, not the broadcast address). Once a node
     // has been notified this short-circuits to a single Set lookup.
     const needsCheck = nodeNum !== undefined && nodeNum !== null &&
-      nodeNum !== 4294967295 && !this.newNodeNotifiedSet.has(nodeNum);
+      nodeNum !== 4294967295 && !this.newNodeAnnounced(nodeNum, sid);
     const existingNode = needsCheck ? await this.nodes.getNode(nodeNum!, sid) as unknown as DbNode | null : null;
 
     await this.nodes.upsertNode(nodeData, sid);
@@ -3965,6 +4119,20 @@ class DatabaseService {
         }
       }
 
+      // Direct RF Contacts (#6210): per-source reception history, cleared on
+      // a purge or a source delete like the coverage receptions above.
+      if (this.directRfContactsRepo) {
+        try {
+          if (sourceId) {
+            await this.directRfContactsRepo.deleteForSource(sourceId);
+          } else {
+            await this.directRfContactsRepo.deleteAll();
+          }
+        } catch (err) {
+          logger.error('Failed to purge direct RF contacts during purge:', err);
+        }
+      }
+
       // Finally delete the nodes themselves
       if (this.nodesRepo) {
         await this.nodesRepo.deleteAllNodes(sourceId);
@@ -4104,13 +4272,11 @@ class DatabaseService {
 
 
   /**
-   * Async version of getLatestNeighborInfoPerNodeScoped — queries the repository
-   * for the latest neighbor info per node, then filters by sourceId when scoped.
+   * Latest neighbor info per (nodeNum, neighborNodeNum) pair. With `sourceId`,
+   * scoped to that source before the latest-per-pair pick.
    */
   async getLatestNeighborInfoPerNodeScopedAsync(sourceId?: string): Promise<DbNeighborInfo[]> {
-    const all = await this.neighbors.getLatestNeighborInfoPerNode();
-    if (!sourceId) return all as unknown as DbNeighborInfo[];
-    return (all as any[]).filter((ni: any) => ni.sourceId === sourceId) as unknown as DbNeighborInfo[];
+    return (await this.neighbors.getLatestNeighborInfoPerNode(sourceId)) as unknown as DbNeighborInfo[];
   }
 
   /**
@@ -4367,6 +4533,30 @@ class DatabaseService {
     logger.debug(`📝 Node ${nodeNum}@${sourceId} notes updated (${notes.length} chars)`);
   }
 
+  /**
+   * Set or clear a node's channel by hand, and lock or unlock it (#5923).
+   * While locked, traffic does not change the channel. Returns false when the
+   * node has no row on this source.
+   */
+  async setNodeChannelAsync(nodeNum: number, sourceId: string, channel: number | null, channelLocked: boolean): Promise<boolean> {
+    if (!this.nodesRepo) {
+      throw new Error('Nodes repository is not initialized');
+    }
+
+    const updated = await this.nodesRepo.setNodeChannel(nodeNum, sourceId, channel, channelLocked);
+
+    // Keep the in-memory cache consistent for sync readers.
+    const cached = this.nodeCache.get(nodeNum, sourceId);
+    if (updated && cached) {
+      cached.channel = channel ?? undefined;
+      cached.channelLocked = channelLocked;
+      cached.updatedAt = Date.now();
+    }
+
+    logger.debug(`Node ${nodeNum}@${sourceId} channel set to ${channel ?? 'none'} (locked: ${channelLocked})`);
+    return updated;
+  }
+
   // Authentication and Authorization
   private ensureAdminUser(): void {
     // Run asynchronously without blocking initialization. Track it only up to
@@ -4403,8 +4593,12 @@ class DatabaseService {
         logger.debug('🔐 Could not import systemRestoreService, proceeding without restore check');
       }
 
-      const password = 'changeme';
-      const adminUsername = getEnvironmentConfig().adminUsername;
+      // ADMIN_PASSWORD (#5874) applies only here, when the first admin is
+      // seeded. It never resets an existing admin's password.
+      const envConfig = getEnvironmentConfig();
+      const passwordFromEnv = envConfig.adminPasswordProvided && !!envConfig.adminPassword;
+      const password = passwordFromEnv ? envConfig.adminPassword! : 'changeme';
+      const adminUsername = envConfig.adminUsername;
 
       // Use AuthRepository for all database backends
       const allUsers = await this.auth.getAllUsers();
@@ -4459,9 +4653,14 @@ class DatabaseService {
       logger.warn('🔐 FIRST RUN: Admin user created');
       logger.warn('═══════════════════════════════════════════════════════════');
       logger.warn(`   Username: ${adminUsername}`);
-      logger.warn(`   Password: changeme`);
-      logger.warn('');
-      logger.warn('   ⚠️  IMPORTANT: Change this password after first login!');
+      if (passwordFromEnv) {
+        // Never log the value itself.
+        logger.warn('   Password: set from ADMIN_PASSWORD');
+      } else {
+        logger.warn(`   Password: changeme`);
+        logger.warn('');
+        logger.warn('   ⚠️  IMPORTANT: Change this password after first login!');
+      }
       logger.warn('═══════════════════════════════════════════════════════════');
       logger.warn('');
 
@@ -4730,6 +4929,19 @@ class DatabaseService {
     return this.conversationReadStateRepo.setLastReadAsync(userId, sourceId, kind, conversationKey, lastReadAt);
   }
 
+  /**
+   * Batch form of {@link setConversationReadStateAsync} for mark-all-read
+   * (#6261). Returns the effective watermarks grouped by kind.
+   */
+  async setConversationReadStateManyAsync(
+    userId: number | null,
+    sourceId: string,
+    entries: Array<{ kind: ConversationKind; conversationKey: string; lastReadAt: number }>
+  ): Promise<ConversationReadStateMap> {
+    if (!this.conversationReadStateRepo) return emptyReadStateMap();
+    return this.conversationReadStateRepo.setManyLastReadAsync(userId, sourceId, entries);
+  }
+
   cleanupOldReadMessages(days: number): number {
     const cutoff = Date.now() - (days * 24 * 60 * 60 * 1000);
     // eslint-disable-next-line no-restricted-syntax -- legacy raw SQL, pending future Drizzle migration batch
@@ -4797,8 +5009,8 @@ class DatabaseService {
     return 0;
   }
 
-  async getDistinctRelayNodesAsync(sourceId?: string): Promise<DbDistinctRelayNode[]> {
-    return this.packetLog.getDistinctRelayNodes(sourceId);
+  async getDistinctRelayNodesAsync(sourceId?: string, exclude?: number[] | 'all'): Promise<DbDistinctRelayNode[]> {
+    return this.packetLog.getDistinctRelayNodes(sourceId, exclude);
   }
 
   async updatePacketLogDecryptionAsync(
@@ -5016,6 +5228,8 @@ class DatabaseService {
       mfaEnabled: dbUser.mfaEnabled ?? false,
       mfaSecret: dbUser.mfaSecret ?? null,
       mfaBackupCodes: dbUser.mfaBackupCodes ?? null,
+      passwordLoginDisabled: Boolean(dbUser.passwordLoginDisabled),
+      passkeyRecoveryCodes: dbUser.passkeyRecoveryCodes ?? null,
       createdAt: dbUser.createdAt,
       lastLoginAt: dbUser.lastLoginAt,
     };
@@ -5048,13 +5262,24 @@ class DatabaseService {
    * Returns the user if authentication succeeds, null otherwise.
    */
   async authenticateAsync(username: string, password: string): Promise<any | null> {
+    const bcrypt = await import('bcrypt');
     const dbUser = await this.auth.getUserByUsername(username);
-    if (!dbUser || !dbUser.passwordHash) return null;
+    if (!dbUser || !dbUser.passwordHash) {
+      // Timing equalization (#6081): a missing user must take as long as a wrong
+      // password, or response latency leaks which usernames exist. Run a bcrypt
+      // compare against a fixed cost-10 dummy hash (same cost as real hashes),
+      // then fail.
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+      return null;
+    }
 
     // Verify password using bcrypt
-    const bcrypt = await import('bcrypt');
     const isValid = await bcrypt.compare(password, dbUser.passwordHash);
     if (!isValid) return null;
+
+    // Passkey-only account (#5841): the password no longer signs in. Checked
+    // after the bcrypt compare so the reply takes as long as a wrong password.
+    if (dbUser.passwordLoginDisabled) return null;
 
     // Update last login
     await this.auth.updateUser(dbUser.id, { lastLoginAt: Date.now() });
@@ -5318,10 +5543,84 @@ class DatabaseService {
   }
 
   /**
-   * Update backup codes for a user (after one is consumed).
+   * Consume an MFA backup code atomically (#6075). Writes `remainingCodes` only
+   * while the stored list still equals `expectedCodes`, so two concurrent
+   * requests submitting the same code cannot both succeed. Returns false when
+   * the stored codes changed underneath (the racing request lost).
    */
-  async consumeBackupCodeAsync(userId: number, remainingCodes: string): Promise<void> {
-    await this.auth.updateUser(userId, { mfaBackupCodes: remainingCodes });
+  async consumeBackupCodeAsync(userId: number, expectedCodes: string, remainingCodes: string): Promise<boolean> {
+    return this.auth.consumeBackupCode(userId, expectedCodes, remainingCodes);
+  }
+
+  // ============ ASYNC PASSKEY METHODS (#5841) ============
+
+  async createPasskeyAsync(input: CreatePasskeyInput): Promise<number> {
+    return this.passkeys.create(input);
+  }
+
+  /** Full row with key material: WebAuthn verification only. */
+  async getPasskeyByCredentialIdAsync(credentialId: string): Promise<DbPasskey | null> {
+    return this.passkeys.getByCredentialId(credentialId);
+  }
+
+  /** Full rows with key material: excludeCredentials / allowCredentials only. */
+  async listPasskeysForUserAsync(userId: number): Promise<DbPasskey[]> {
+    return this.passkeys.listByUser(userId);
+  }
+
+  /** No key material: safe to send to the owner or an admin. */
+  async listPasskeySummariesForUserAsync(userId: number): Promise<PasskeySummary[]> {
+    return this.passkeys.listSummariesByUser(userId);
+  }
+
+  async renamePasskeyAsync(userId: number, id: number, nickname: string | null): Promise<boolean> {
+    return this.passkeys.rename(userId, id, nickname);
+  }
+
+  /** Deletes only when the passkey belongs to `userId`. */
+  async deletePasskeyAsync(userId: number, id: number): Promise<boolean> {
+    return this.passkeys.delete(userId, id);
+  }
+
+  async deleteAllPasskeysForUserAsync(userId: number): Promise<number> {
+    return this.passkeys.deleteAllForUser(userId);
+  }
+
+  async updatePasskeyCounterAsync(id: number, counter: number, lastUsedAt?: number): Promise<void> {
+    return this.passkeys.updateCounterAndLastUsed(id, counter, lastUsedAt);
+  }
+
+  async countPasskeysForUserAsync(userId: number): Promise<number> {
+    return this.passkeys.countByUser(userId);
+  }
+
+  async getPasskeyOnlyStateAsync(
+    userId: number,
+  ): Promise<{ passwordLoginDisabled: boolean; passkeyRecoveryCodes: string | null } | null> {
+    return this.auth.getPasskeyOnlyState(userId);
+  }
+
+  async setPasskeyOnlyAsync(userId: number, disabled: boolean): Promise<void> {
+    await this.auth.setPasskeyOnly(userId, disabled);
+  }
+
+  /** `codes` is a JSON array of bcrypt hashes, or null to clear. */
+  async setPasskeyRecoveryCodesAsync(userId: number, codes: string | null): Promise<void> {
+    await this.auth.setPasskeyRecoveryCodes(userId, codes);
+  }
+
+  /** Password login back on, recovery codes gone (one write). */
+  async clearPasskeyOnlyAsync(userId: number): Promise<void> {
+    await this.auth.clearPasskeyOnly(userId);
+  }
+
+  /** Spend a recovery code; false when the stored codes changed underneath. */
+  async consumePasskeyRecoveryAsync(userId: number, expectedCodes: string): Promise<boolean> {
+    return this.auth.consumePasskeyRecovery(userId, expectedCodes);
+  }
+
+  async countPasskeysByUserAsync(): Promise<Map<number, number>> {
+    return this.passkeys.countAllByUser();
   }
 
   // ============ SESSION METHODS ============
@@ -5340,6 +5639,15 @@ class DatabaseService {
 
   async cleanupExpiredSessionsAsync(): Promise<number> {
     return this.auth.cleanupExpiredSessions();
+  }
+
+  /**
+   * Invalidate active sessions for a user (#6074 / #6077). Pass `exceptSid` to
+   * keep the caller's own session (self password change); omit it to terminate
+   * every session (admin reset). Returns the number of sessions removed.
+   */
+  async deleteSessionsByUserIdAsync(userId: number, exceptSid?: string): Promise<number> {
+    return this.auth.deleteSessionsByUserId(userId, exceptSid);
   }
 
   // ============ ASYNC CHANNEL DATABASE METHODS ============
@@ -5419,6 +5727,8 @@ class DatabaseService {
     fileSize?: number | null;
     nodeId?: string | null;
     nodeNum?: number | null;
+    sourceId?: string | null;
+    protocol?: string;
   }): Promise<void> {
     return this.backupHistory.insertBackupHistory({
       ...backup,
@@ -5643,6 +5953,8 @@ class DatabaseService {
     positionHistoryPointsOnly?: boolean;
       unreadIndicatorEnabled?: boolean;
       spreadNodes?: boolean;
+      /** Per-source coloured ring around node markers on Unified maps (#6125). */
+      colorNodesBySource?: boolean;
       /** Likely-aircraft map display choice (#5364/#5365). Null clears to the 'mark' default. */
       aircraftDisplayMode?: 'show' | 'mark' | 'hide' | null;
       /** Flight trails (#5364/#5365 Phase 3). */
@@ -5650,6 +5962,13 @@ class DatabaseService {
       aircraftTrailHours?: number;
   }): Promise<void> {
     return this.mapPreferences!.saveMapPreferences(userId, preferences);
+  }
+
+  /**
+   * Set the per-source "Show MQTT/Bridge Messages" toggle (#5824).
+   */
+  async setShowMqttMessagesForSourceAsync(userId: number, sourceId: string, value: boolean): Promise<void> {
+    return this.mapPreferences!.setShowMqttMessagesForSource(userId, sourceId, value);
   }
   // ============================================================
   // Async wrappers for sync methods (Phase 4 migration)
@@ -5965,6 +6284,14 @@ class DatabaseService {
     return this.aircraftFlightMatches.recordLookup(sourceId, nodeNum, write);
   }
 
+  async recordAircraftFlightMatchRecheckAsync(
+    sourceId: string,
+    nodeNum: number,
+    write: FlightMatchRecheckWrite,
+  ): Promise<boolean> {
+    return this.aircraftFlightMatches.recordRecheck(sourceId, nodeNum, write);
+  }
+
   async deleteAircraftFlightMatchAsync(sourceId: string, nodeNum: number): Promise<number> {
     return this.aircraftFlightMatches.deleteForNode(sourceId, nodeNum);
   }
@@ -5975,6 +6302,15 @@ class DatabaseService {
     fixed: { atMs: number; lat: number; lon: number } | null,
   ): Promise<void> {
     return this.nodes.setAircraftFixed(nodeNum, sourceId, fixed);
+  }
+
+  /** #5715: set or clear a person's aircraft mark. See NodesRepository.setAircraftManualMark. */
+  async setAircraftManualMarkAsync(
+    nodeNum: number,
+    sourceId: string,
+    mark: AircraftManualMarkWrite | null,
+  ): Promise<void> {
+    return this.nodes.setAircraftManualMark(nodeNum, sourceId, mark);
   }
 
   async listAircraftAgeOutCandidatesAsync(sourceId: string): Promise<AircraftAgeOutCandidate[]> {
@@ -6307,7 +6643,12 @@ class DatabaseService {
     return [];
   }
 
-  async getTelemetryByNodeAveragedAsync(nodeId: string, sinceTimestamp?: number, intervalMinutes?: number, maxHours?: number, sourceId?: string): Promise<DbTelemetry[]> {
+  /**
+   * Averaged telemetry for one node. `types`, when given, limits the result to
+   * those telemetry types (an empty list returns nothing): the cross-source
+   * dashboard asks only for favorited series (#5896).
+   */
+  async getTelemetryByNodeAveragedAsync(nodeId: string, sinceTimestamp?: number, intervalMinutes?: number, maxHours?: number, sourceId?: string, types?: readonly string[]): Promise<DbTelemetry[]> {
     if (!this.telemetryRepo) {
       return [];
     }
@@ -6323,7 +6664,8 @@ class DatabaseService {
         sinceTimestamp,
         actualIntervalMinutes,
         maxHours,
-        sourceId
+        sourceId,
+        types
       );
       return rows.map(t => this.normalizeBigInts(t));
     }
@@ -6333,7 +6675,8 @@ class DatabaseService {
       sinceTimestamp,
       actualIntervalMinutes,
       maxHours,
-      sourceId
+      sourceId,
+      types
     );
     return rows.map(t => this.normalizeBigInts(t));
   }

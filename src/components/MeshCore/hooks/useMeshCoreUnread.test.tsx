@@ -19,13 +19,19 @@ const SELF = 'a'.repeat(64);
 const PEER = 'b'.repeat(64);
 const contacts = [{ publicKey: SELF }, { publicKey: PEER }] as any;
 
-function routeFetch(latestTimestamps: Record<number, number>) {
+const ROOM = 'c'.repeat(64);
+const roomContacts = [{ publicKey: SELF }, { publicKey: PEER }, { publicKey: ROOM, advType: 3 }] as any;
+
+function routeFetch(latestTimestamps: Record<number, number>, roomStats: unknown[] = []) {
   csrfFetchMock.mockImplementation((url: string) => {
     if (url.includes('/api/channels/all')) {
       return Promise.resolve({ ok: true, json: async () => [{ id: 0 }, { id: 1 }] });
     }
     if (url.includes('/channel-counts')) {
       return Promise.resolve({ ok: true, json: async () => ({ latestTimestamps }) });
+    }
+    if (url.includes('/room-stats')) {
+      return Promise.resolve({ ok: true, json: async () => ({ success: true, data: roomStats }) });
     }
     return Promise.resolve({ ok: false, json: async () => ({}) });
   });
@@ -80,6 +86,20 @@ describe('useMeshCoreUnread', () => {
     await waitFor(() => expect(result.current.channels).toBe(true));
   });
 
+  it('a reaction in the pool makes neither a channel nor a DM unread (#5759)', async () => {
+    routeFetch({});
+    const messages = [
+      { id: 'r1', fromPublicKey: 'channel-1', fromName: 'Bob', timestamp: 5000, text: '👍', reactionEmoji: '👍' },
+      { id: 'r2', fromPublicKey: PEER, toPublicKey: SELF, timestamp: 5000, text: '👍', reactionEmoji: '👍' },
+    ] as any;
+    const { result } = renderHook(() =>
+      useMeshCoreUnread({ baseUrl: '', sourceId: 'src1', messages, contacts, selfKey: SELF, enabled: true }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(result.current.channels).toBe(false);
+    expect(result.current.dms).toBe(false);
+  });
+
   it('flags DMs unread from an incoming message in the pool (no fetch needed)', () => {
     routeFetch({});
     const messages = [{ fromPublicKey: PEER, toPublicKey: SELF, timestamp: 1000, text: 'hi' }] as any;
@@ -97,6 +117,63 @@ describe('useMeshCoreUnread', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(csrfFetchMock).not.toHaveBeenCalled();
     expect(result.current.channels).toBe(false);
+    expect(result.current.dms).toBe(false);
+  });
+
+  it('lights the rooms dot from the server latestReceivedAt (#6261)', async () => {
+    routeFetch({}, [{ roomPublicKey: ROOM, count: 3, latest: 100, latestReceivedAt: 5000 }]);
+    const { result } = renderHook(() =>
+      useMeshCoreUnread({ baseUrl: '', sourceId: 'src1', messages: [], contacts: roomContacts, selfKey: SELF, enabled: true }),
+    );
+    await waitFor(() => expect(result.current.rooms).toBe(true));
+    expect(result.current.unreadRooms.has(ROOM)).toBe(true);
+    expect(result.current.roomLatest.get(ROOM)).toBe(5000);
+    // Rooms never light the DM dot.
+    expect(result.current.dms).toBe(false);
+  });
+
+  it('does not poll room-stats when there are no room contacts (#6261)', async () => {
+    routeFetch({}, []);
+    renderHook(() =>
+      useMeshCoreUnread({ baseUrl: '', sourceId: 'src1', messages: [], contacts, selfKey: SELF, enabled: true }),
+    );
+    await new Promise((r) => setTimeout(r, 10));
+    expect(csrfFetchMock).not.toHaveBeenCalledWith(expect.stringContaining('/room-stats'));
+  });
+
+  it('a muted room lights no dot (#6261)', async () => {
+    routeFetch({}, [{ roomPublicKey: ROOM, count: 1, latest: 100, latestReceivedAt: 5000 }]);
+    const { result } = renderHook(() =>
+      useMeshCoreUnread({
+        baseUrl: '', sourceId: 'src1', messages: [], contacts: roomContacts, selfKey: SELF, enabled: true,
+        isDMMuted: (k) => k === ROOM,
+      }),
+    );
+    await waitFor(() => expect(csrfFetchMock).toHaveBeenCalledWith(expect.stringContaining('/room-stats')));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(result.current.rooms).toBe(false);
+  });
+
+  it('a room already read lights no dot (#6261)', async () => {
+    localStorage.setItem('meshmonitor-meshcore-room-lastread-src1', JSON.stringify({ [ROOM]: 9000 }));
+    routeFetch({}, [{ roomPublicKey: ROOM, count: 1, latest: 100, latestReceivedAt: 5000 }]);
+    const { result } = renderHook(() =>
+      useMeshCoreUnread({ baseUrl: '', sourceId: 'src1', messages: [], contacts: roomContacts, selfKey: SELF, enabled: true }),
+    );
+    await waitFor(() => expect(csrfFetchMock).toHaveBeenCalledWith(expect.stringContaining('/room-stats')));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(result.current.rooms).toBe(false);
+  });
+
+  it('a muted DM peer lights no DM dot (#6261)', () => {
+    routeFetch({});
+    const messages = [{ fromPublicKey: PEER, toPublicKey: SELF, timestamp: 1000, text: 'hi' }] as any;
+    const { result } = renderHook(() =>
+      useMeshCoreUnread({
+        baseUrl: '', sourceId: 'src1', messages, contacts, selfKey: SELF, enabled: true,
+        isDMMuted: (k) => k === PEER,
+      }),
+    );
     expect(result.current.dms).toBe(false);
   });
 });

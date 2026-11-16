@@ -41,6 +41,7 @@ import {
   sessionsSqlite, sessionsPostgres, sessionsMysql,
   auditLogSqlite, auditLogPostgres, auditLogMysql,
   apiTokensSqlite, apiTokensPostgres, apiTokensMysql,
+  userPasskeysSqlite, userPasskeysPostgres, userPasskeysMysql,
 } from './schema/auth.js';
 
 // Notification tables
@@ -110,6 +111,9 @@ import {
   meshcoreNeighborsSqlite, meshcoreNeighborsPostgres, meshcoreNeighborsMysql,
 } from './schema/meshcoreNeighbors.js';
 import {
+  meshcoreNeighborWatchSqlite, meshcoreNeighborWatchPostgres, meshcoreNeighborWatchMysql,
+} from './schema/meshcoreNeighborWatch.js';
+import {
   meshcorePacketLogSqlite, meshcorePacketLogPostgres, meshcorePacketLogMysql,
 } from './schema/meshcorePacketLog.js';
 import {
@@ -125,6 +129,30 @@ import {
   meshtasticHeardRepeatersSqlite, meshtasticHeardRepeatersPostgres, meshtasticHeardRepeatersMysql,
 } from './schema/meshtasticHeardRepeaters.js';
 import {
+  pkiExchangeStateSqlite, pkiExchangeStatePostgres, pkiExchangeStateMysql,
+} from './schema/pkiExchangeState.js';
+import {
+  mapMarkersSqlite, mapMarkersPostgres, mapMarkersMysql,
+} from './schema/mapMarkers.js';
+import {
+  meshcoreHopSnrSqlite, meshcoreHopSnrPostgres, meshcoreHopSnrMysql,
+} from './schema/meshcoreHopSnr.js';
+import {
+  meshcoreTraceRunsSqlite, meshcoreTraceRunsPostgres, meshcoreTraceRunsMysql,
+} from './schema/meshcoreTraceRuns.js';
+import {
+  nodeNameHistorySqlite, nodeNameHistoryPostgres, nodeNameHistoryMysql,
+} from './schema/nodeNameHistory.js';
+import {
+  mqttBrokerPresetsSqlite, mqttBrokerPresetsPostgres, mqttBrokerPresetsMysql,
+} from './schema/mqttBrokerPresets.js';
+import {
+  meshcoreCliHistorySqlite, meshcoreCliHistoryPostgres, meshcoreCliHistoryMysql,
+} from './schema/meshcoreCliHistory.js';
+import {
+  meshcoreAdminSessionsSqlite, meshcoreAdminSessionsPostgres, meshcoreAdminSessionsMysql,
+} from './schema/meshcoreAdminSessions.js';
+import {
   coverageReceptionsSqlite, coverageReceptionsPostgres, coverageReceptionsMysql,
 } from './schema/coverageReceptions.js';
 import {
@@ -133,6 +161,9 @@ import {
 import {
   crossSourceLinksSqlite, crossSourceLinksPostgres, crossSourceLinksMysql,
 } from './schema/crossSourceLinks.js';
+import {
+  directRfContactsSqlite, directRfContactsPostgres, directRfContactsMysql,
+} from './schema/directRfContacts.js';
 import {
   translationCacheSqlite, translationCachePostgres, translationCacheMysql,
   messageTranslationsSqlite, messageTranslationsPostgres, messageTranslationsMysql,
@@ -161,6 +192,9 @@ import {
 import {
   automationHomeAnchorsSqlite, automationHomeAnchorsPostgres, automationHomeAnchorsMysql,
 } from './schema/automationHomeAnchors.js';
+import {
+  automationFireStateSqlite, automationFireStatePostgres, automationFireStateMysql,
+} from './schema/automationFireState.js';
 
 // MeshCore saved-regions catalog (global — no sourceId) (#3770)
 import {
@@ -213,8 +247,14 @@ import {
   sourcePkiKeysSqlite, sourcePkiKeysPostgres, sourcePkiKeysMysql,
 } from './schema/sourcePkiKeys.js';
 import {
+  mqttNativeIdentitiesSqlite, mqttNativeIdentitiesPostgres, mqttNativeIdentitiesMysql,
+} from './schema/mqttNativeIdentities.js';
+import {
   meshcoreObserverKeysSqlite, meshcoreObserverKeysPostgres, meshcoreObserverKeysMysql,
 } from './schema/meshcoreObserverKeys.js';
+import {
+  meshcoreSourcePkiKeysSqlite, meshcoreSourcePkiKeysPostgres, meshcoreSourcePkiKeysMysql,
+} from './schema/meshcoreSourcePkiKeys.js';
 import {
   meshcoreObserverCredentialsSqlite, meshcoreObserverCredentialsPostgres, meshcoreObserverCredentialsMysql,
 } from './schema/meshcoreObserverCredentials.js';
@@ -269,6 +309,9 @@ export interface ActiveSchema {
   sessions: any;
   auditLog: any;
   apiTokens: any;
+  // WebAuthn passkeys on local users (#5841)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5841 matches the existing ActiveSchema per-dialect table pattern
+  userPasskeys: any;
 
   // Notification tables
   pushSubscriptions: any;
@@ -319,6 +362,8 @@ export interface ActiveSchema {
   meshcoreNodes: any;
   meshcoreMessages: any;
   meshcoreNeighbors: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #6274 same dialect-union escape hatch as every table above
+  meshcoreNeighborWatch: any;
   meshcorePacketLog: any;
   meshcorePositionHistory: any;
   meshcoreHeardRepeaters: any;
@@ -328,6 +373,31 @@ export interface ActiveSchema {
 
   // Meshtastic Heard-By (#4816 Phase 4 WP1)
   meshtasticHeardRepeaters: any;
+
+  // Reliable PKI per-node exchange state (#5691)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5691 matches the existing ActiveSchema per-dialect table pattern
+  pkiExchangeState: any;
+  // Local map markers (#5686)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5686 matches the existing ActiveSchema per-dialect table pattern
+  mapMarkers: any;
+  // MeshCore per-hop trace SNR (#5722)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5722 matches the existing ActiveSchema per-dialect table pattern
+  meshcoreHopSnr: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #6276 same per-backend union as every sibling table in this interface
+  meshcoreTraceRuns: any;
+  // Node rename history (#5862)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5862 matches the existing ActiveSchema per-dialect table pattern
+  nodeNameHistory: any;
+  // Saved MQTT broker presets (#5794)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5794 matches the existing ActiveSchema per-dialect table pattern
+  mqttBrokerPresets: any;
+  // MeshCore CLI command history (#5892)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5892 matches the existing ActiveSchema per-dialect table pattern
+  meshcoreCliHistory: any;
+
+  // MeshCore remote-admin sessions (#5785)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5785 matches the existing ActiveSchema per-dialect table pattern
+  meshcoreAdminSessions: any;
 
   // Coverage Report RF receptions (#5277 Phase 1 WP1)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5277 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
@@ -340,6 +410,10 @@ export interface ActiveSchema {
   // Cross-source "heard here" link aggregates, two source ids per row (#5561)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5561 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
   crossSourceLinks: any;
+
+  // Direct RF Contacts daily rollup, per-source (#6210)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #6210 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
+  directRfContacts: any;
 
   // Translation cache (global) + per-source message links (#5520)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5520 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
@@ -365,6 +439,8 @@ export interface ActiveSchema {
   automationVariableValues: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches ActiveSchema per-dialect table pattern
   automationHomeAnchors: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #3962 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
+  automationFireState: any;
 
   // MeshCore saved-regions catalog (global — no sourceId) (#3770)
   meshcoreSavedRegions: any;
@@ -401,9 +477,17 @@ export interface ActiveSchema {
   // Per-source PKI private keys for DM decryption (issue #3441)
   sourcePkiKeys: any;
 
+  // Per-source MQTT-native send identities (issue #4305)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #4305 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
+  mqttNativeIdentities: any;
+
   // Per-source MeshCore Analyzer Observer signing keys (epic #4457)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #4457 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
   meshcoreObserverKeys: any;
+
+  // Per-source MeshCore Companion device identity private keys (issue #6195)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #6195 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
+  meshcoreSourcePkiKeys: any;
 
   // Per-source MeshCore Analyzer Observer static MQTT credentials (issue #4595)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #4595 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
@@ -456,6 +540,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     sessions: sessionsSqlite,
     auditLog: auditLogSqlite,
     apiTokens: apiTokensSqlite,
+    userPasskeys: userPasskeysSqlite,
     pushSubscriptions: pushSubscriptionsSqlite,
     userNotificationPreferences: userNotificationPreferencesSqlite,
     waypointNotifications: waypointNotificationsSqlite,
@@ -485,14 +570,24 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreNodes: meshcoreNodesSqlite,
     meshcoreMessages: meshcoreMessagesSqlite,
     meshcoreNeighbors: meshcoreNeighborsSqlite,
+    meshcoreNeighborWatch: meshcoreNeighborWatchSqlite,
     meshcorePacketLog: meshcorePacketLogSqlite,
     meshcorePositionHistory: meshcorePositionHistorySqlite,
     meshcoreHeardRepeaters: meshcoreHeardRepeatersSqlite,
     messageEvents: messageEventsSqlite,
     meshtasticHeardRepeaters: meshtasticHeardRepeatersSqlite,
+    pkiExchangeState: pkiExchangeStateSqlite,
+    mapMarkers: mapMarkersSqlite,
+    meshcoreHopSnr: meshcoreHopSnrSqlite,
+    meshcoreTraceRuns: meshcoreTraceRunsSqlite,
+    nodeNameHistory: nodeNameHistorySqlite,
+    mqttBrokerPresets: mqttBrokerPresetsSqlite,
+    meshcoreCliHistory: meshcoreCliHistorySqlite,
+    meshcoreAdminSessions: meshcoreAdminSessionsSqlite,
     coverageReceptions: coverageReceptionsSqlite,
     coverageSurveys: coverageSurveysSqlite,
     crossSourceLinks: crossSourceLinksSqlite,
+    directRfContacts: directRfContactsSqlite,
     translationCache: translationCacheSqlite,
     messageTranslations: messageTranslationsSqlite,
     aircraftFlightMatches: aircraftFlightMatchesSqlite,
@@ -503,6 +598,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     automationVariables: automationVariablesSqlite,
     automationVariableValues: automationVariableValuesSqlite,
     automationHomeAnchors: automationHomeAnchorsSqlite,
+    automationFireState: automationFireStateSqlite,
     meshcoreSavedRegions: meshcoreSavedRegionsSqlite,
     privacyDocuments: privacyDocumentsSqlite,
     solarNodeOverrides: solarNodeOverridesSqlite,
@@ -516,7 +612,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     autoFavoriteTargets: autoFavoriteTargetsSqlite,
     autoFavoriteAssignments: autoFavoriteAssignmentsSqlite,
     sourcePkiKeys: sourcePkiKeysSqlite,
+    mqttNativeIdentities: mqttNativeIdentitiesSqlite,
     meshcoreObserverKeys: meshcoreObserverKeysSqlite,
+    meshcoreSourcePkiKeys: meshcoreSourcePkiKeysSqlite,
     meshcoreObserverCredentials: meshcoreObserverCredentialsSqlite,
     deadDropMessages: deadDropMessagesSqlite,
     atakContacts: atakContactsSqlite,
@@ -541,6 +639,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     sessions: sessionsPostgres,
     auditLog: auditLogPostgres,
     apiTokens: apiTokensPostgres,
+    userPasskeys: userPasskeysPostgres,
     pushSubscriptions: pushSubscriptionsPostgres,
     userNotificationPreferences: userNotificationPreferencesPostgres,
     waypointNotifications: waypointNotificationsPostgres,
@@ -570,14 +669,24 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreNodes: meshcoreNodesPostgres,
     meshcoreMessages: meshcoreMessagesPostgres,
     meshcoreNeighbors: meshcoreNeighborsPostgres,
+    meshcoreNeighborWatch: meshcoreNeighborWatchPostgres,
     meshcorePacketLog: meshcorePacketLogPostgres,
     meshcorePositionHistory: meshcorePositionHistoryPostgres,
     meshcoreHeardRepeaters: meshcoreHeardRepeatersPostgres,
     messageEvents: messageEventsPostgres,
     meshtasticHeardRepeaters: meshtasticHeardRepeatersPostgres,
+    pkiExchangeState: pkiExchangeStatePostgres,
+    mapMarkers: mapMarkersPostgres,
+    meshcoreHopSnr: meshcoreHopSnrPostgres,
+    meshcoreTraceRuns: meshcoreTraceRunsPostgres,
+    nodeNameHistory: nodeNameHistoryPostgres,
+    mqttBrokerPresets: mqttBrokerPresetsPostgres,
+    meshcoreCliHistory: meshcoreCliHistoryPostgres,
+    meshcoreAdminSessions: meshcoreAdminSessionsPostgres,
     coverageReceptions: coverageReceptionsPostgres,
     coverageSurveys: coverageSurveysPostgres,
     crossSourceLinks: crossSourceLinksPostgres,
+    directRfContacts: directRfContactsPostgres,
     translationCache: translationCachePostgres,
     messageTranslations: messageTranslationsPostgres,
     aircraftFlightMatches: aircraftFlightMatchesPostgres,
@@ -588,6 +697,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     automationVariables: automationVariablesPostgres,
     automationVariableValues: automationVariableValuesPostgres,
     automationHomeAnchors: automationHomeAnchorsPostgres,
+    automationFireState: automationFireStatePostgres,
     meshcoreSavedRegions: meshcoreSavedRegionsPostgres,
     privacyDocuments: privacyDocumentsPostgres,
     solarNodeOverrides: solarNodeOverridesPostgres,
@@ -601,7 +711,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     autoFavoriteTargets: autoFavoriteTargetsPostgres,
     autoFavoriteAssignments: autoFavoriteAssignmentsPostgres,
     sourcePkiKeys: sourcePkiKeysPostgres,
+    mqttNativeIdentities: mqttNativeIdentitiesPostgres,
     meshcoreObserverKeys: meshcoreObserverKeysPostgres,
+    meshcoreSourcePkiKeys: meshcoreSourcePkiKeysPostgres,
     meshcoreObserverCredentials: meshcoreObserverCredentialsPostgres,
     deadDropMessages: deadDropMessagesPostgres,
     atakContacts: atakContactsPostgres,
@@ -626,6 +738,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     sessions: sessionsMysql,
     auditLog: auditLogMysql,
     apiTokens: apiTokensMysql,
+    userPasskeys: userPasskeysMysql,
     pushSubscriptions: pushSubscriptionsMysql,
     userNotificationPreferences: userNotificationPreferencesMysql,
     waypointNotifications: waypointNotificationsMysql,
@@ -655,14 +768,24 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreNodes: meshcoreNodesMysql,
     meshcoreMessages: meshcoreMessagesMysql,
     meshcoreNeighbors: meshcoreNeighborsMysql,
+    meshcoreNeighborWatch: meshcoreNeighborWatchMysql,
     meshcorePacketLog: meshcorePacketLogMysql,
     meshcorePositionHistory: meshcorePositionHistoryMysql,
     meshcoreHeardRepeaters: meshcoreHeardRepeatersMysql,
     messageEvents: messageEventsMysql,
     meshtasticHeardRepeaters: meshtasticHeardRepeatersMysql,
+    pkiExchangeState: pkiExchangeStateMysql,
+    mapMarkers: mapMarkersMysql,
+    meshcoreHopSnr: meshcoreHopSnrMysql,
+    meshcoreTraceRuns: meshcoreTraceRunsMysql,
+    nodeNameHistory: nodeNameHistoryMysql,
+    mqttBrokerPresets: mqttBrokerPresetsMysql,
+    meshcoreCliHistory: meshcoreCliHistoryMysql,
+    meshcoreAdminSessions: meshcoreAdminSessionsMysql,
     coverageReceptions: coverageReceptionsMysql,
     coverageSurveys: coverageSurveysMysql,
     crossSourceLinks: crossSourceLinksMysql,
+    directRfContacts: directRfContactsMysql,
     translationCache: translationCacheMysql,
     messageTranslations: messageTranslationsMysql,
     aircraftFlightMatches: aircraftFlightMatchesMysql,
@@ -673,6 +796,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     automationVariables: automationVariablesMysql,
     automationVariableValues: automationVariableValuesMysql,
     automationHomeAnchors: automationHomeAnchorsMysql,
+    automationFireState: automationFireStateMysql,
     meshcoreSavedRegions: meshcoreSavedRegionsMysql,
     privacyDocuments: privacyDocumentsMysql,
     solarNodeOverrides: solarNodeOverridesMysql,
@@ -686,7 +810,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     autoFavoriteTargets: autoFavoriteTargetsMysql,
     autoFavoriteAssignments: autoFavoriteAssignmentsMysql,
     sourcePkiKeys: sourcePkiKeysMysql,
+    mqttNativeIdentities: mqttNativeIdentitiesMysql,
     meshcoreObserverKeys: meshcoreObserverKeysMysql,
+    meshcoreSourcePkiKeys: meshcoreSourcePkiKeysMysql,
     meshcoreObserverCredentials: meshcoreObserverCredentialsMysql,
     deadDropMessages: deadDropMessagesMysql,
     atakContacts: atakContactsMysql,

@@ -11,15 +11,28 @@ import packetLogService from '../services/packetLogService.js';
 import meshcorePacketLogService from '../services/meshcorePacketLogService.js';
 import { optionalAuth } from '../auth/authMiddleware.js';
 import { logger } from '../../utils/logger.js';
+import { ok, fail } from '../utils/apiResponse.js';
 import { PortNum, CHANNEL_DB_OFFSET } from '../constants/meshtastic.js';
 import { filterPacketsByPermissions, getAllowedChannels } from './packetPermissions.js';
-import { isAnyMeshCoreManager } from '../sourceManagerTypes.js';
+import { isAnyMeshCoreManager, isMeshCoreManager } from '../sourceManagerTypes.js';
+import { meshcoreMessageFilter } from '../services/meshcoreMessageFilter.js';
 import { isAnyMeshCoreSourceType, isDeviceMeshCoreSourceType } from '../../utils/nodeTypeCategory.js';
 import {
   getUserReadableVirtualChannelIds,
   canReadVirtualChannel,
 } from '../utils/virtualChannelPermissions.js';
-import { buildSourceDashboard } from '../services/sourceDashboardData.js';
+import {
+  buildSourceDashboard,
+  applyDashboardAgeWindow,
+  resolveDashboardAgeWindow,
+  localNodeNums,
+  dashboardNodePrefilter,
+} from '../services/sourceDashboardData.js';
+import {
+  getFavoriteTelemetrySeries,
+  getLatestTelemetrySnapshot,
+  parseTelemetryHours,
+} from '../services/unifiedTelemetryService.js';
 import {
   unifiedChannelDisplayName,
   loadSourcePresetNames,
@@ -29,15 +42,19 @@ import {
 import { extractPacketIdFromRowId } from '../utils/messageRowId.js';
 import { getMaxNodeAgeHoursForSources } from '../services/nodeDisplaySettings.js';
 import { canonicalMessageTime, plausibleRxTime } from '../utils/messageTime.js';
+import { storedWireSecond } from '../../utils/meshcoreReactionTarget.js';
 import type { DbPacketLog } from '../../db/types.js';
 import type { DbMeshCorePacket } from '../../db/repositories/meshcore.js';
 import { resolveMeshcoreKeyAccess, filterKeyedMessages } from '../utils/meshcoreKeyAccess.js';
 import { keyedChannelNames } from '../utils/meshcoreKeyedChannels.js';
 import type { MeshCoreKeyAccessFilter } from '../../db/repositories/index.js';
 import { ALL_SOURCES } from '../../db/repositories/base.js';
+import { ALL_CHANNELS_PARAM } from '../../utils/unifiedChannelFilter.js';
 import { channelKeyFingerprint, pskToHex } from '../services/meshcoreFrameIngest.js';
 import {
   clusterMeshCoreReceptions,
+  meshcoreClusterRefs,
+  MESHCORE_MERGE_WINDOW_MS,
   meshcoreChannelIndexOf,
   type MeshCoreMergeItem,
 } from '../utils/meshcoreMessageMerge.js';
@@ -48,6 +65,7 @@ import {
   prepareMeshCoreReception,
   type CrossSourceTags,
 } from '../services/crossSourceCorrelation.js';
+import { loadMqttConsentHiddenSet, dropMessagesNamingHiddenNodes, dropPacketsNamingHiddenNodes, dropRowsNamingHiddenNodes } from '../utils/mqttConsentVisibility.js';
 
 const router = Router();
 
@@ -69,10 +87,12 @@ function mapMeshCorePacketToTagged(
     id: p.id,
     packet_id: null,
     timestamp: p.timestamp,
-    // OTA logs have no sender identity; 0 + null name → frontend shows N/A.
+    // No numeric sender id (frontend Meshtastic links stay off). Show the
+    // derived sender (#6262): advert name, else a key prefix, else the src hash.
     from_node: 0,
     from_node_id: null,
-    from_node_longName: null,
+    from_node_longName:
+      p.advertName ?? (p.senderPubKey ? p.senderPubKey.slice(0, 8) : p.srcHash ? `#${p.srcHash}` : null),
     to_node: null,
     to_node_id: null,
     to_node_longName: null,
@@ -268,7 +288,12 @@ router.get('/channels', async (req: Request, res: Response) => {
  *     toNodeNum, toNodeId,
  *     channel, channelName,
  *     text, emoji, replyId,
- *     timestamp,        // canonical device time (earliest rxTime seen) — for display
+ *     meshcoreRowRefs?,                 // MeshCore non-reaction: dedupKey of each row behind it
+ *     reactionEmoji?, reactionTargetRefs?, // MeshCore reaction: emoji; target row dedupKeys ([] = unmatched)
+ *     timestamp,        // canonical device time (earliest rxTime seen) — for display.
+ *                       // MeshCore DMs/channels: earliest receipt time (#5973);
+ *                       // MeshCore room posts keep the sender's time.
+ *     senderTimestamp?, // MeshCore DM/channel: wire sender second, for the clock-offset badge (#5973)
  *     createdAt,        // earliest server DB arrival time across receptions — for ordering/cursor
  *     receptions: [{ sourceId, sourceName, hopStart, hopLimit, hopCount,
  *                    rxSnr, rxRssi, rxTime, timestamp }]
@@ -276,7 +301,12 @@ router.get('/channels', async (req: Request, res: Response) => {
  */
 router.get('/messages', async (req: Request, res: Response) => {
   try {
-    const channelName = ((req.query.channel as string) || '').trim();
+    const channelParam = ((req.query.channel as string) || '').trim();
+    // `__all__` (#5361): every readable channel, no direct messages, paged by
+    // the `before` cursor. Distinct from the legacy no-param form, which keeps
+    // its old shape (DMs included, newest window only) for existing callers.
+    const allChannels = channelParam === ALL_CHANNELS_PARAM;
+    const channelName = allChannels ? '' : channelParam;
     const beforeRaw = req.query.before as string | undefined;
     const before = beforeRaw ? parseInt(beforeRaw, 10) : undefined;
     const limit = Math.min(parseInt((req.query.limit as string) || '100', 10), 500);
@@ -330,6 +360,18 @@ router.get('/messages', async (req: Request, res: Response) => {
       timestamp: number;
       createdAt: number;
       receptions: Reception[];
+      /** MeshCore reaction entry (#5759): its emoji. */
+      reactionEmoji?: string;
+      /** MeshCore reaction entry: dedupKeys of target rows; empty = unmatched. */
+      reactionTargetRefs?: string[];
+      /** MeshCore non-reaction entry: dedupKey of every row behind it. */
+      meshcoreRowRefs?: string[];
+      /**
+       * MeshCore DM / channel entry (#5973): the wire sender second of the
+       * reception that opened the cluster, or null when none is stored. The
+       * client shows the sender's clock offset from it. Absent on room posts.
+       */
+      senderTimestamp?: number | null;
     };
 
     const merged = new Map<string, Merged>();
@@ -448,6 +490,29 @@ router.get('/messages', async (req: Request, res: Response) => {
           matchedIdx.map((idx) => databaseService.meshcore.getChannelMessages(idx, fetchLimit, source.id)),
         );
         rows = perChannel.flat();
+      } else if (allChannels) {
+        // Every channel, no DMs or room posts. Rows are read a merge window
+        // past the cursor so a message that straddles it keeps its later
+        // receptions; the entry-level cursor check below drops the overshoot.
+        const rowCursor = before === undefined ? undefined : before + MESHCORE_MERGE_WINDOW_MS;
+        rows = await databaseService.meshcore.getRecentChannelMessages(fetchLimit, source.id, rowCursor);
+        if (!canReadMessages) {
+          // No broad grant: keep only the channels this viewer may read.
+          const readable = new Map<number, boolean>();
+          const kept: typeof rows = [];
+          for (const m of rows) {
+            const idx = meshcoreChannelIndexOf(m) ?? 0;
+            let canRead = readable.get(idx);
+            if (canRead === undefined) {
+              canRead = user
+                ? await databaseService.checkPermissionAsync(user.id, `channel_${idx}`, 'read', source.id)
+                : false;
+              readable.set(idx, canRead);
+            }
+            if (canRead) kept.push(m);
+          }
+          rows = kept;
+        }
       } else {
         // No channel filter: include this source's channel + DM traffic. DMs
         // (and the whole MeshCore feed) ride on the broad messages:read grant.
@@ -458,8 +523,29 @@ router.get('/messages', async (req: Request, res: Response) => {
       meshcoreKeyAccess ??= resolveMeshcoreKeyAccess(user);
       rows = filterKeyedMessages(rows, await meshcoreKeyAccess);
 
+      // #5759: a reaction from an ignored or blocked sender is dropped. Plain
+      // rows are untouched (Unified applies no ignore list to them).
+      if (rows.some((x) => x.reactionEmoji)) {
+        try {
+          const { sourceManagerRegistry } = await import('../sourceManagerRegistry.js');
+          const mgr = sourceManagerRegistry.getManager(source.id);
+          const selfKey = mgr && isMeshCoreManager(mgr) ? mgr.getLocalNode()?.publicKey ?? null : null;
+          const dropped = new Set(
+            meshcoreMessageFilter
+              .annotate(source.id, rows.filter((x) => x.reactionEmoji), selfKey)
+              .filter((x) => (x as { filtered?: string }).filtered)
+              .map((x) => x.id),
+          );
+          rows = rows.filter((x) => !(x.reactionEmoji && dropped.has(x.id)));
+        } catch (err) {
+          logger.debug('MeshCore reaction filter failed in unified feed:', err);
+        }
+      }
+
       for (const m of rows) {
-        const idx = meshcoreChannelIndexOf(m);
+        // A legacy channel-0 row has no `channel-N` key on either side; in the
+        // all-channels read every row is channel traffic, so it is channel 0.
+        const idx = meshcoreChannelIndexOf(m) ?? (allChannels ? 0 : null);
         let channelIdentity: string | null = null;
         if (idx !== null) {
           channelIdentity = m.keyFingerprint ?? fingerprintBySlot.get(idx) ?? null;
@@ -475,7 +561,9 @@ router.get('/messages', async (req: Request, res: Response) => {
           channelIdentity,
           source,
           channelIdx: idx,
-          channelName: idx != null ? (nameByIdx.get(idx) ?? channelName) : '',
+          channelName:
+            (idx != null ? nameByIdx.get(idx) : null) ??
+            (channelName || (idx != null ? (idx === 0 ? PRIMARY_CHANNEL_NAME : `Channel ${idx}`) : '')),
         });
       }
     };
@@ -490,10 +578,8 @@ router.get('/messages', async (req: Request, res: Response) => {
           ? await databaseService.checkPermissionAsync(user.id, 'messages', 'read', source.id)
           : false);
 
-        // Resolve channel name → channel number AND build node-name map in
-        // parallel. Both are independent reads against this source's DB slice
-        // and used only inside this per-source block, so we can fan them out
-        // instead of running them back-to-back.
+        // Sender display names, filled once this source's page of messages is
+        // known (see the lookup after the message fetch below).
         const nodeMap = new Map<number, { longName?: string; shortName?: string }>();
         // Channel numbers on THIS source to fetch messages from. For a named
         // channel request this is the physical slot AND/OR any virtual channel
@@ -505,12 +591,18 @@ router.get('/messages', async (req: Request, res: Response) => {
         // synthetic virtual channel numbers (CHANNEL_DB_OFFSET + vcId).
         let allowedChannelsOnSource: Set<number> | null = null;
 
-        const [chansResult, nodesResult] = await Promise.allSettled([
-          channelName
-            ? databaseService.channels.getAllChannels(source.id)
-            : Promise.resolve(null),
-          databaseService.nodes.getAllNodes(source.id),
+        const [chansResult] = await Promise.allSettled([
+          databaseService.channels.getAllChannels(source.id),
         ]);
+
+        const presetName = sourcePresets.get(source.id) ?? null;
+        const channelNameByNum = new Map<number, string>();
+        if (chansResult.status === 'fulfilled') {
+          for (const c of chansResult.value ?? []) {
+            const dn = unifiedChannelDisplayName(c, presetName);
+            if (dn) channelNameByNum.set(c.id, dn);
+          }
+        }
 
         // Virtual channels are global — every enabled channel-database entry
         // can decrypt packets on this source — so every readable virtual
@@ -520,6 +612,11 @@ router.get('/messages', async (req: Request, res: Response) => {
           (vc) => vc.id != null &&
             canReadVirtualChannel(vc.id, readableVirtualIds),
         );
+        for (const vc of vcsOnSource) {
+          if (vc.id != null && vc.name) {
+            channelNameByNum.set(CHANNEL_DB_OFFSET + vc.id, vc.name.trim());
+          }
+        }
 
         if (channelName) {
           if (chansResult.status === 'rejected') {
@@ -593,18 +690,7 @@ router.get('/messages', async (req: Request, res: Response) => {
               allowedChannelsOnSource.add(CHANNEL_DB_OFFSET + vc.id);
             }
           }
-          if (allowedChannelsOnSource.size === 0 && !canReadMessages) return;
-        }
-
-        if (nodesResult.status === 'fulfilled') {
-          for (const n of nodesResult.value) {
-            nodeMap.set(Number(n.nodeNum), {
-              longName: n.longName ?? undefined,
-              shortName: n.shortName ?? undefined,
-            });
-          }
-        } else {
-          logger.warn(`Failed to load nodes for source ${source.id}:`, nodesResult.reason);
+          if (allowedChannelsOnSource.size === 0 && !(canReadMessages && !allChannels)) return;
         }
 
         // Fetch messages. Kept sequential after the channel lookup because the
@@ -626,6 +712,16 @@ router.get('/messages', async (req: Request, res: Response) => {
             ),
           );
           msgs = perChannel.flat();
+        } else if (allChannels) {
+          // Every readable channel in one cursor-paged query. The channel list
+          // is the filter, so DMs (channel -1) never load and each page holds
+          // `fetchLimit` rows however far back the cursor sits.
+          msgs = await databaseService.messages.getMessagesBeforeInChannels(
+            [...(allowedChannelsOnSource ?? [])],
+            before,
+            fetchLimit,
+            source.id,
+          );
         } else {
           // Legacy: no channel filter. Cursor-less offset fetch.
           // Exclude traceroute responses — the UI filters them out of message
@@ -646,6 +742,27 @@ router.get('/messages', async (req: Request, res: Response) => {
               return allowedChannelsOnSource!.has(ch);
             });
           }
+        }
+
+        // #5156: an anonymous caller loses messages from/to consent-hidden nodes.
+        msgs = dropMessagesNamingHiddenNodes(msgs, await loadMqttConsentHiddenSet(req.user, [source.id]), source.id);
+
+        // Sender names for this page only, not every node on the source: the
+        // whole-source load cost ~250 ms per 10 s poll on a 17k-node install.
+        // A failed lookup leaves names blank; the messages still come through.
+        try {
+          const names = await databaseService.nodes.getNodeNamesByNums(
+            [...new Set(msgs.map((m) => Number(m.fromNodeNum)))],
+            [source.id],
+          );
+          for (const [nodeNum, n] of names) {
+            nodeMap.set(nodeNum, {
+              longName: n.longName ?? undefined,
+              shortName: n.shortName ?? undefined,
+            });
+          }
+        } catch (err) {
+          logger.warn(`Failed to load nodes for source ${source.id}:`, err);
         }
 
         for (const m of msgs) {
@@ -717,8 +834,16 @@ router.get('/messages', async (req: Request, res: Response) => {
             if (existing.replyId == null && m.replyId != null && m.replyId > 0) {
               existing.replyId = m.replyId;
             }
+            if (!existing.channelName) {
+              const chName = channelName || channelNameByNum.get(m.channel);
+              if (chName) existing.channelName = chName;
+            }
           } else {
             const sender = nodeMap.get(fromNum);
+            const resolvedChannelName =
+              channelName ||
+              channelNameByNum.get(m.channel) ||
+              (m.channel === 0 ? (presetName ?? PRIMARY_CHANNEL_NAME) : `Channel ${m.channel}`);
             merged.set(dedupKey, {
               dedupKey,
               packetId,
@@ -730,7 +855,7 @@ router.get('/messages', async (req: Request, res: Response) => {
               toNodeNum: Number(m.toNodeNum),
               toNodeId: m.toNodeId,
               channel: m.channel,
-              channelName,
+              channelName: resolvedChannelName,
               text: m.text ?? '',
               emoji: m.emoji ?? null,
               replyId: m.replyId ?? null,
@@ -753,6 +878,11 @@ router.get('/messages', async (req: Request, res: Response) => {
       const first = cluster.members[0];
       const m = first.row;
       if (before !== undefined && !(m.createdAt < before)) continue;
+      const refs = meshcoreClusterRefs(cluster);
+      // #5973: a DM or channel entry shows its EARLIEST receipt time (members
+      // are in createdAt order) and carries the sender second for the offset.
+      // A room post replays on login, so it keeps the sender's time.
+      const roomPost = m.messageType === 'room_post';
       merged.set(cluster.dedupKey, {
         dedupKey: cluster.dedupKey,
         packetId: null,
@@ -770,8 +900,12 @@ router.get('/messages', async (req: Request, res: Response) => {
         text: m.text ?? '',
         emoji: null,
         replyId: null,
-        timestamp: m.timestamp,
+        timestamp: roomPost ? m.timestamp : m.createdAt,
         createdAt: m.createdAt,
+        ...(roomPost ? {} : { senderTimestamp: storedWireSecond(m) }),
+        ...(refs.reactionEmoji
+          ? { reactionEmoji: refs.reactionEmoji, reactionTargetRefs: refs.reactionTargetRefs ?? [] }
+          : { meshcoreRowRefs: refs.rowRefs }),
         receptions: cluster.members.map((x): Reception => ({
           sourceId: x.source.id,
           sourceName: x.source.name,
@@ -782,7 +916,8 @@ router.get('/messages', async (req: Request, res: Response) => {
           rxSnr: x.row.snr ?? null,
           rxRssi: x.row.rssi ?? null,
           rxTime: null,
-          timestamp: x.row.timestamp,
+          // Each source's own receipt time, except on a room post (#5973).
+          timestamp: roomPost ? x.row.timestamp : x.row.createdAt,
           // MeshCore has no XEdDSA packet signing concept.
           xeddsaSigned: null,
         })),
@@ -812,103 +947,39 @@ router.get('/messages', async (req: Request, res: Response) => {
  * GET /api/unified/telemetry?hours=24
  *
  * Returns the latest telemetry reading per node per type across all accessible
- * sources, sorted by timestamp descending. Each entry includes `sourceId` and
- * `sourceName`. Useful for a cross-source "fleet overview" dashboard.
+ * sources, sorted by timestamp descending. Each entry includes `sourceId`,
+ * `sourceName`, and whether it is on that source's favorites list
+ * (`favorited`) and the caller may change that list (`canEditFavorite`).
+ * One query per source (#5896); the per-node rules of GET
+ * /api/telemetry/:nodeId apply (see unifiedTelemetryService).
  *
- * ?hours=N  → only include readings from the past N hours (default 24)
+ * ?hours=N  -> only include readings from the past N hours (default 24, max 168)
  */
 router.get('/telemetry', async (req: Request, res: Response) => {
   try {
-    const hours = Math.min(parseInt(req.query.hours as string || '24', 10), 168);
-    // Telemetry timestamps are stored in milliseconds (see meshtasticManager.ts
-    // `Store in milliseconds (Unix timestamp in ms)`), so the cutoff must also
-    // be in ms. Previously the cutoff was computed in seconds, so the `hours`
-    // filter was effectively a no-op (ms values always exceed the s cutoff).
-    const cutoff = Date.now() - hours * 3600 * 1000;
-    const user = (req as any).user;
-    const isAdmin = user?.isAdmin ?? false;
-
-    const sources = await databaseService.sources.getAllSources();
-
-    const sourceResults = await Promise.allSettled(
-      sources.map(async (source) => {
-        // 'telemetry' is not a real permission resource (#4700) — gate on
-        // 'nodes:read' like the v1 telemetry route does.
-        const canRead = isAdmin || (user
-          ? await databaseService.checkPermissionAsync(user.id, 'nodes', 'read', source.id)
-          : false);
-        if (!canRead) return [];
-
-        // MeshCore nodes live in a separate table keyed by publicKey, not
-        // the Meshtastic `nodes` table's nodeId — enumerate from the right
-        // table per source type so MeshCore telemetry rows (also keyed by
-        // publicKey) actually get looked up (#4700).
-        const nodeList: Array<{
-          telemetryNodeId: string;
-          longName?: string | null;
-          shortName?: string | null;
-        }> =
-          isAnyMeshCoreSourceType(source.type)
-            ? (await databaseService.meshcore.getNodesBySource(source.id)).map((n) => ({
-                telemetryNodeId: n.publicKey,
-                longName: n.name,
-                shortName: null,
-              }))
-            : (await databaseService.nodes.getAllNodes(source.id)).map((n) => ({
-                telemetryNodeId: n.nodeId,
-                longName: n.longName,
-                shortName: n.shortName,
-              }));
-
-        const entries: Array<Record<string, unknown>> = [];
-
-        // Fan out per-node telemetry lookups in parallel rather than awaiting
-        // each one sequentially. On a multi-source deployment the sequential
-        // form was the dominant cost of /api/unified/telemetry — O(sources *
-        // nodes) serial round trips through Drizzle.
-        const perNodeLatest = await Promise.all(
-          nodeList.map((node) =>
-            databaseService.telemetry
-              .getLatestTelemetryByNode(node.telemetryNodeId, source.id)
-              .then((latest) => ({ node, latest }))
-              .catch((err) => {
-                logger.warn(
-                  `Failed to load telemetry for node ${node.telemetryNodeId} (source ${source.id}):`,
-                  err
-                );
-                return { node, latest: [] as Array<{ timestamp: number }> };
-              })
-          )
-        );
-
-        for (const { node, latest } of perNodeLatest) {
-          for (const t of latest as any[]) {
-            if (t.timestamp >= cutoff) {
-              entries.push({
-                ...t,
-                sourceId: source.id,
-                sourceName: source.name,
-                nodeLongName: node.longName,
-                nodeShortName: node.shortName,
-              });
-            }
-          }
-        }
-        return entries;
-      })
-    );
-
-    const allEntries: Array<Record<string, unknown>> = [];
-    for (const result of sourceResults) {
-      if (result.status === 'fulfilled') allEntries.push(...result.value);
-    }
-
-    allEntries.sort((a, b) => ((b.timestamp as number) ?? 0) - ((a.timestamp as number) ?? 0));
-
-    res.json(allEntries);
+    const hours = parseTelemetryHours(req.query.hours);
+    res.json(await getLatestTelemetrySnapshot(req.user, hours));
   } catch (error) {
     logger.error('Error fetching unified telemetry:', error);
     res.status(500).json({ error: 'Failed to fetch unified telemetry' });
+  }
+});
+
+/**
+ * GET /api/unified/telemetry/series?hours=24
+ *
+ * The cross-source Telemetry Dashboard (#5896): every favorited series across
+ * the sources the caller may read, one chart per (node, type) with one line
+ * per source, averaged to ~240 points per line. Same per-node rules as GET
+ * /api/telemetry/:nodeId.
+ */
+router.get('/telemetry/series', async (req: Request, res: Response) => {
+  try {
+    const hours = parseTelemetryHours(req.query.hours);
+    ok(res, await getFavoriteTelemetrySeries(req.user, hours));
+  } catch (error) {
+    logger.error('Error fetching unified telemetry series:', error);
+    fail(res, 500, 'INTERNAL_ERROR', 'Failed to fetch telemetry series');
   }
 });
 
@@ -978,6 +1049,13 @@ function matchesCrossSourceFilter(row: CrossSourceRowFields, filter: CrossSource
   return row.originSourceId !== null || row.likelyRelaySourceId !== null;
 }
 
+/** Parse an optional non-negative integer query param; undefined when absent or invalid. */
+function parseOptionalInt(v: unknown): number | undefined {
+  if (typeof v !== 'string' || v === '') return undefined;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
 /**
  * GET /api/unified/packets
  *
@@ -1038,6 +1116,9 @@ router.get('/packets', async (req: Request, res: Response) => {
     const from_node = req.query.from_node ? parseInt(req.query.from_node as string, 10) : undefined;
     const encrypted =
       req.query.encrypted === 'true' ? true : req.query.encrypted === 'false' ? false : undefined;
+    // MeshCore-namespace filters (#6262): payload_type / route_type.
+    const payload_type = parseOptionalInt(req.query.payload_type);
+    const route_type = parseOptionalInt(req.query.route_type);
     const sourceFilter = typeof req.query.sourceId === 'string' ? req.query.sourceId : undefined;
     const crossSourceRaw = typeof req.query.crossSource === 'string' ? req.query.crossSource : '';
     if (crossSourceRaw !== '' && !isCrossSourceFilter(crossSourceRaw)) {
@@ -1087,6 +1168,9 @@ router.get('/packets', async (req: Request, res: Response) => {
       from_node === undefined &&
       transport_mechanism === undefined &&
       encrypted !== true;
+    // Mirror rule: MeshCore payload/route filters cannot match a Meshtastic
+    // row, so when one is active Meshtastic sources are excluded.
+    const meshtasticEligible = payload_type === undefined && route_type === undefined;
 
     const perSource = await Promise.allSettled(
       fetchSources.map(async (source): Promise<SourceResult> => {
@@ -1097,6 +1181,8 @@ router.get('/packets', async (req: Request, res: Response) => {
             limit: fetchLimit,
             untilTs,
             untilId,
+            payloadType: payload_type,
+            routeType: route_type,
           });
           // No channel/message content to redact — viewing is already authorized
           // by the source-level packetmonitor:read check above.
@@ -1110,6 +1196,7 @@ router.get('/packets', async (req: Request, res: Response) => {
           return { rows: tagged, saturated: raw.length >= fetchLimit, oldest: oldestOf(raw) };
         }
 
+        if (!meshtasticEligible) return { rows: [], saturated: false, oldest: null };
         const raw = await packetLogService.getPacketsAsync({
           sourceId: source.id,
           limit: fetchLimit,
@@ -1125,7 +1212,12 @@ router.get('/packets', async (req: Request, res: Response) => {
           isAdmin,
           source.id
         );
-        const visible = filterPacketsByPermissions(raw, allowedChannels, isAdmin, canReadMessages);
+        // #5156: an anonymous caller loses packets from/to consent-hidden nodes.
+        const visible = dropPacketsNamingHiddenNodes(
+          filterPacketsByPermissions(raw, allowedChannels, isAdmin, canReadMessages),
+          await loadMqttConsentHiddenSet(user, [source.id]),
+          source.id,
+        );
         const tagged = visible.map((r) => withCrossSourceFields(
           { ...r, sourceId: source.id, sourceName: source.name },
           classifyMeshtasticReception(crossIndex, {
@@ -1206,7 +1298,7 @@ router.get('/packets', async (req: Request, res: Response) => {
       packets: sliced,
       hasMore,
       nextCursor,
-      sources: readableSources.map((s) => ({ id: s.id, name: s.name })),
+      sources: readableSources.map((s) => ({ id: s.id, name: s.name, type: s.type })),
     });
   } catch (error) {
     logger.error('Error fetching unified packets:', error);
@@ -1246,29 +1338,72 @@ router.get('/packets/distribution', async (req: Request, res: Response) => {
 
     const perSource = await Promise.all(
       readableSources.map(async (source) => {
-        // MeshCore OTA rows have no per-node/per-PortNum breakdown that aligns
-        // with the Meshtastic namespace, so they only contribute a source total.
         if (isAnyMeshCoreSourceType(source.type)) {
-          const count = await meshcorePacketLogService.getPacketCount({ sourceId: source.id, since });
-          return { source, byDevice: [], byType: [], meshcoreCount: count };
+          const dist = await meshcorePacketLogService.getDistribution({ sourceId: source.id, since });
+          return { source, protocol: 'meshcore' as const, mc: dist, byDevice: [] as any[], byType: [] as any[] };
         }
-        const [byDevice, byType] = await Promise.all([
-          packetLogService.getPacketCountsByNodeAsync({ since, limit: 10, sourceId: source.id }),
+        // #5156: an anonymous caller's top senders leave out consent-hidden
+        // nodes. Read enough extra rows that the top 10 are the top 10 visible.
+        const hidden = await loadMqttConsentHiddenSet(user, [source.id]);
+        const [byDeviceRaw, byType] = await Promise.all([
+          hidden.blocksAll(source.id)
+            ? Promise.resolve([])
+            : packetLogService.getPacketCountsByNodeAsync({ since, limit: 10 + hidden.nodeNumsFor(source.id).length, sourceId: source.id }),
           packetLogService.getPacketCountsByPortnumAsync({ since, sourceId: source.id }),
         ]);
-        return { source, byDevice, byType, meshcoreCount: 0 };
+        const byDevice = dropRowsNamingHiddenNodes(byDeviceRaw, hidden, () => source.id, (row) => [row.from_node]).slice(0, 10);
+        return { source, protocol: 'meshtastic' as const, mc: null, byDevice: byDevice as any[], byType: byType as any[] };
       })
     );
 
-    // Merge byDevice (sum per nodeNum), byType (sum per portnum), and tally per source.
-    const deviceMap = new Map<number, { from_node: number; from_node_id: string | null; from_node_longName: string | null; count: number }>();
-    const typeMap = new Map<number, { portnum: number; portnum_name: string; count: number }>();
+    // Merge byDevice and byType across protocols. Keys are protocol-tagged
+    // (`mt:<n>` / `mc:<n>`) so a MeshCore payload type never collides with a
+    // Meshtastic PortNum.
+    type DeviceEntry = {
+      from_node: number; from_node_id: string | null; from_node_longName: string | null;
+      count: number; protocol: 'meshtastic' | 'meshcore'; publicKey?: string;
+    };
+    type TypeEntry = { portnum: number; portnum_name: string; count: number; protocol: 'meshtastic' | 'meshcore' };
+    const deviceMap = new Map<string, DeviceEntry>();
+    const typeMap = new Map<string, TypeEntry>();
     const bySource: Array<{ sourceId: string; sourceName: string; count: number }> = [];
 
-    for (const { source, byDevice, byType, meshcoreCount } of perSource) {
-      let sourceTotal = meshcoreCount;
-      for (const d of byDevice as any[]) {
-        const key = Number(d.from_node);
+    for (const { source, mc, byDevice, byType } of perSource) {
+      let sourceTotal = 0;
+      if (mc) {
+        for (const t of mc.byPayloadType) {
+          const key = `mc:${t.payloadType}`;
+          const existing = typeMap.get(key);
+          if (existing) existing.count += t.count;
+          else typeMap.set(key, {
+            portnum: t.payloadType,
+            portnum_name: `MeshCore ${t.payloadTypeName ?? `Type ${t.payloadType}`}`,
+            count: t.count,
+            protocol: 'meshcore',
+          });
+          sourceTotal += t.count;
+        }
+        for (const d of mc.topSenders) {
+          const key = `mc:${d.senderPubKey}`;
+          const existing = deviceMap.get(key);
+          if (existing) {
+            existing.count += d.count;
+            if (!existing.from_node_longName && d.advertName) existing.from_node_longName = d.advertName;
+          } else {
+            deviceMap.set(key, {
+              from_node: 0,
+              from_node_id: null,
+              from_node_longName: d.advertName ?? null,
+              publicKey: d.senderPubKey,
+              count: d.count,
+              protocol: 'meshcore',
+            });
+          }
+        }
+      }
+      for (const d of byDevice) {
+        const num = Number(d.from_node);
+        const key = `mt:${num}`;
         const existing = deviceMap.get(key);
         if (existing) {
           existing.count += d.count;
@@ -1276,18 +1411,20 @@ router.get('/packets/distribution', async (req: Request, res: Response) => {
           if (!existing.from_node_id && d.from_node_id) existing.from_node_id = d.from_node_id;
         } else {
           deviceMap.set(key, {
-            from_node: key,
+            from_node: num,
             from_node_id: d.from_node_id ?? null,
             from_node_longName: d.from_node_longName ?? null,
             count: d.count,
+            protocol: 'meshtastic',
           });
         }
       }
-      for (const t of byType as any[]) {
-        const key = Number(t.portnum);
+      for (const t of byType) {
+        const num = Number(t.portnum);
+        const key = `mt:${num}`;
         const existing = typeMap.get(key);
         if (existing) existing.count += t.count;
-        else typeMap.set(key, { portnum: key, portnum_name: t.portnum_name, count: t.count });
+        else typeMap.set(key, { portnum: num, portnum_name: t.portnum_name, count: t.count, protocol: 'meshtastic' });
         sourceTotal += t.count;
       }
       bySource.push({ sourceId: source.id, sourceName: source.name, count: sourceTotal });
@@ -1412,7 +1549,8 @@ router.get('/status', async (req: Request, res: Response) => {
  * Each dataset is permission-gated inside `buildSourceDashboard` exactly as the
  * per-source endpoints are (unreadable datasets come back as []). An optional
  * `sources` filter scopes the response to the caller's known source list;
- * absent, every source is returned.
+ * absent, every source is returned. `ageWindow=settings` leaves out nodes the
+ * Dashboard map would hide by age (see applyDashboardAgeWindow).
  */
 router.get('/dashboard', async (req: Request, res: Response) => {
   try {
@@ -1436,9 +1574,22 @@ router.get('/dashboard', async (req: Request, res: Response) => {
       databaseService.settings,
       selected.map((s) => s.id),
     );
+    // `ageWindow=settings`: drop nodes the Dashboard map hides by age. Opt-in,
+    // because Map Analysis reads the same route and draws nodes of any age.
+    // The node read already skips most of them (nodePrefilter); the in-memory
+    // pass after it decides exactly.
+    const ageCut = req.query.ageWindow === 'settings'
+      ? { window: await resolveDashboardAgeWindow(), keep: localNodeNums() }
+      : null;
+    const nodePrefilter = ageCut
+      ? await dashboardNodePrefilter(selected.map((s) => s.id), ageCut.window, ageCut.keep)
+      : undefined;
     const bundles = await Promise.all(
-      selected.map((s) => buildSourceDashboard(s, user, { maxNodeAgeHours: ageBySource.get(s.id) })),
+      selected.map((s) => buildSourceDashboard(s, user, { maxNodeAgeHours: ageBySource.get(s.id), nodePrefilter })),
     );
+    if (ageCut) {
+      applyDashboardAgeWindow(bundles, ageCut.window, ageCut.keep);
+    }
     res.json(bundles);
   } catch (error) {
     logger.error('Error fetching unified dashboard data:', error);

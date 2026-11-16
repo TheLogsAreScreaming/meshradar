@@ -200,6 +200,15 @@ describe('executeAction', () => {
     expect('scopeOverride' in calls[0].args).toBe(false);
   });
 
+  it('sendMessage: splitLongMessages is forwarded only when on (#6316)', async () => {
+    const a = recorder();
+    await executeAction(node('action.sendMessage', { text: 'hi', channel: 1 }), ctx({ from: 5, channel: 1, isDM: false }), a.deps);
+    expect('splitLongMessages' in a.calls[0].args).toBe(false);
+    const b = recorder();
+    await executeAction(node('action.sendMessage', { text: 'hi', channel: 1, splitLongMessages: true }), ctx({ from: 5, channel: 1, isDM: false }), b.deps);
+    expect(b.calls[0].args.splitLongMessages).toBe(true);
+  });
+
   it('sendMessage: unscoped scope passes empty-string override', async () => {
     const { calls, deps } = recorder();
     await executeAction(
@@ -348,6 +357,71 @@ describe('executeAction', () => {
     expect(calls).toHaveLength(0); // deps never invoked
   });
 
+  it('tapback: a MeshCore reaction trigger is a recorded TARGET_IS_REACTION skip (#5763)', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.tapback', { emoji: '👍' }),
+      ctx({ protocol: 'meshcore', isTapback: true, meshcoreMessageId: 'r1', channel: 3, isDM: false }, 'mc', 'meshcore'),
+      deps,
+    );
+    expect(result).toEqual({ skipped: true, reason: 'meshcore reaction: TARGET_IS_REACTION' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('tapback: reacts on a MeshCore source to the triggering MeshCore message (#5762)', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.tapback', { emoji: '👍' }),
+      ctx({ protocol: 'meshcore', meshcoreMessageId: 'mc_msg_1', channel: 3, isDM: false }, 'mc', 'meshcore'),
+      deps,
+    );
+    expect(result).toBe(2);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual({ sourceId: 'mc', emoji: '👍', meshcoreMessageId: 'mc_msg_1' });
+  });
+
+  it('tapback: MeshCore target without a meshcoreMessageId is a recorded skip (#5762)', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.tapback', { emoji: '👍' }),
+      ctx({ protocol: 'meshcore', channel: 3 }, 'mc', 'meshcore'),
+      deps,
+    );
+    expect(result).toMatchObject({ skipped: true });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('tapback: MeshCore target on a different source than the trigger is a recorded skip (#5762)', async () => {
+    const { calls, deps } = recorder();
+    const c = ctx({ protocol: 'meshcore', meshcoreMessageId: 'x' }, 'mc1', 'meshcore');
+    const result = await executeAction(node('action.tapback', { emoji: '👍', sourceIds: ['mc2'] }), c, deps);
+    expect(result).toMatchObject({ skipped: true });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('tapback: a Meshtastic trigger aimed at a MeshCore source is a recorded skip (#5762)', async () => {
+    const { calls, deps } = recorder();
+    const data = {
+      getNode: async () => null,
+      getTelemetry: async () => null,
+      getSourceProtocol: async () => 'meshcore',
+    };
+    const c = { ...ctx({ protocol: 'meshtastic', packetId: 9, from: 5 }, 'mt'), data };
+    const result = await executeAction(node('action.tapback', { emoji: '👍', sourceIds: ['mc'] }), c, deps);
+    expect(result).toMatchObject({ skipped: true });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('tapback: TX-disabled MeshCore source records TX_DISABLED (#5762)', async () => {
+    const { deps } = recorderWithTxDisabled('sendTapback');
+    const result = await executeAction(
+      node('action.tapback', { emoji: '👍' }),
+      ctx({ protocol: 'meshcore', meshcoreMessageId: 'm' }, 'mc', 'meshcore'),
+      deps,
+    );
+    expect(result).toEqual({ skipped: true, reason: 'TX_DISABLED' });
+  });
+
   // ── source selection (#3996) ────────────────────────────────────────────
   it('tapback: explicit sourceIds fans out to each selected source', async () => {
     const { calls, deps } = recorder();
@@ -374,7 +448,7 @@ describe('executeAction', () => {
       deps,
     );
     expect(calls.map((c2) => c2.args.sourceId)).toEqual(['radioA']);
-    expect(results).toEqual([2, { skipped: true, reason: 'tapback is not supported on MeshCore' }]);
+    expect(results).toEqual([2, { skipped: true, reason: 'tapback on MeshCore needs a triggering MeshCore message on the same source' }]);
   });
 
   it('tapback: a single-entry explicit sourceIds still unwraps to a scalar result, not a one-element array', async () => {
@@ -450,7 +524,7 @@ describe('executeAction', () => {
       ctx({ from: 5, channel: 3, packetId: 99, isDM: false, hops: 2 }, 'mc', 'meshcore'),
       deps,
     );
-    expect(result).toMatchObject({ skipped: true, reason: 'tapback is not supported on MeshCore' });
+    expect(result).toMatchObject({ skipped: true, reason: 'tapback on MeshCore needs a triggering MeshCore message on the same source' });
     expect(calls).toHaveLength(0);
   });
 
@@ -1158,5 +1232,98 @@ describe('executeAction', () => {
         deps,
       )).rejects.toThrow('boom');
     });
+  });
+});
+
+// ── Reticulum / LXMF (#6143) ───────────────────────────────────────────────
+describe('executeAction — Reticulum (#6143)', () => {
+  it('sendMessage: DM target resolves as a string LXMF hash (not through num())', async () => {
+    const { calls, deps } = recorder();
+    await executeAction(
+      node('action.sendMessage', { text: 'pong', to: '{{ trigger.from }}' }),
+      ctx({ from: 'a1b2c3d4e5f6', isDM: true, protocol: 'reticulum', messageHash: 'h1' }, 'ret', 'reticulum'),
+      deps,
+    );
+    // The bug this guards: num() made the LXMF hash NaN → lost. It must be the raw string.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toMatchObject({ sourceId: 'ret', destination: 'a1b2c3d4e5f6', text: 'pong' });
+    // No channel-oriented args leak into a Reticulum send.
+    expect(calls[0].args.scopeOverride).toBeUndefined();
+  });
+
+  it('sendMessage: "reply to the triggering message" maps to replyToHash = the trigger message hash', async () => {
+    const { calls, deps } = recorder();
+    await executeAction(
+      node('action.sendMessage', { text: 'pong', to: '{{ trigger.from }}', replyToTrigger: true }),
+      ctx({ from: 'a1b2c3d4e5f6', isDM: true, protocol: 'reticulum', messageHash: 'lxmf-hash-9' }, 'ret', 'reticulum'),
+      deps,
+    );
+    expect(calls[0].args).toMatchObject({ destination: 'a1b2c3d4e5f6', replyToHash: 'lxmf-hash-9' });
+  });
+
+  it('sendMessage: no resolvable destination is a recorded skip (no broadcast fallback)', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.sendMessage', { text: 'hello' }), // no `to`
+      ctx({ protocol: 'reticulum' }, 'ret', 'reticulum'),
+      deps,
+    );
+    expect(calls).toHaveLength(0);
+    expect(result).toMatchObject({ skipped: true, reason: expect.stringMatching(/no channels/i) });
+  });
+
+  it('sendMessage: a channel selection does not create a Reticulum broadcast — still a no-destination skip', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.sendMessage', { text: 'hello', channels: [{ name: 'gauntlet', protocol: 'meshtastic' }] }),
+      ctx({ protocol: 'reticulum' }, 'ret', 'reticulum'),
+      deps,
+    );
+    expect(calls).toHaveLength(0);
+    expect(result).toMatchObject({ skipped: true });
+  });
+
+  it('tapback on a Reticulum source is a recorded skip', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.tapback', { emoji: '👍' }),
+      ctx({ protocol: 'reticulum' }, 'ret', 'reticulum'),
+      deps,
+    );
+    expect(calls).toHaveLength(0);
+    expect(result).toMatchObject({ skipped: true, reason: expect.stringMatching(/not supported on Reticulum/) });
+  });
+
+  it('nodeManage on a Reticulum source is a recorded skip (even with no subject node)', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.nodeManage', { op: 'favorite' }),
+      ctx({ protocol: 'reticulum' }, 'ret', 'reticulum'),
+      deps,
+    );
+    expect(calls).toHaveLength(0);
+    expect(result).toMatchObject({ skipped: true, reason: expect.stringMatching(/not supported on Reticulum/) });
+  });
+
+  it('requestData on a Reticulum source is a recorded skip', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.requestData', { op: 'telemetry', to: 'a1b2c3' }),
+      ctx({ protocol: 'reticulum' }, 'ret', 'reticulum'),
+      deps,
+    );
+    expect(calls).toHaveLength(0);
+    expect(result).toMatchObject({ skipped: true, reason: expect.stringMatching(/not supported on Reticulum/) });
+  });
+
+  it('deviceReboot on a Reticulum source is a recorded skip', async () => {
+    const { calls, deps } = recorder();
+    const result = await executeAction(
+      node('action.deviceReboot', {}),
+      ctx({ protocol: 'reticulum' }, 'ret', 'reticulum'),
+      deps,
+    );
+    expect(calls).toHaveLength(0);
+    expect(result).toMatchObject({ skipped: true, reason: expect.stringMatching(/not supported on Reticulum/) });
   });
 });

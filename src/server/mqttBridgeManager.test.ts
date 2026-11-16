@@ -795,16 +795,96 @@ describe('MqttBridgeManager', () => {
     // messages in that window.
     await new Promise((r) => setTimeout(r, 1000));
 
-    // Count appearances on upstream of THIS packet (any topic). Cap at a
-    // small number — 1 original + at most 1 echo before suppression kicks
-    // in is fine; 10+ would indicate runaway.
+    // The echo is recorded before the local republish (#5013), so the
+    // bridge never uplinks its own downlink: upstream sees only the original.
     const matchingPayloads = upstreamSeen.filter((m) => Buffer.compare(m.payload, envelope) === 0);
-    expect(matchingPayloads.length).toBeLessThan(5);
-
-    // Also confirm the bridge's uplinkOut counter is bounded (not 100+).
-    expect(bridge.getStatus().uplinkOut).toBeLessThan(5);
+    expect(matchingPayloads.length).toBe(1);
+    expect(bridge.getStatus().uplinkOut).toBe(0);
 
     await new Promise<void>((r) => pub.end(true, {}, () => r()));
+  });
+
+  // #5013: two bridges on one broker must not relay each other's upstream.
+  describe('a second bridge on the same broker', () => {
+    async function runTwoBridges(relayOtherBridges?: boolean): Promise<{
+      upstreamCopies: number;
+      other: MqttBridgeManager;
+    }> {
+      // Bridge A brings msh/US/TX down; bridge B only subscribes elsewhere,
+      // so any TX packet it sends upstream is a relay of A's traffic. Both
+      // reach the one test upstream, so single mode keeps their client ids
+      // apart (per_gateway would give both the broker's gateway id).
+      bridge = new MqttBridgeManager('bridge-a', 'A', {
+        brokerSourceId: 'local-broker',
+        forwardingMode: 'single',
+        upstream: { url: `mqtt://127.0.0.1:${upstreamPort}` },
+        subscriptions: ['msh/US/TX/#'],
+      });
+      const other = new MqttBridgeManager('bridge-b', 'B', {
+        brokerSourceId: 'local-broker',
+        forwardingMode: 'single',
+        upstream: { url: `mqtt://127.0.0.1:${upstreamPort}` },
+        subscriptions: ['msh/US/CA/#'],
+        ...(relayOtherBridges ? { relayOtherBridges } : {}),
+      });
+      await sourceManagerRegistry.addManager(bridge);
+      await sourceManagerRegistry.addManager(other);
+
+      await connectUpstream();
+      const seen: Buffer[] = [];
+      await new Promise<void>((resolve, reject) => {
+        upstreamClient!.subscribe('msh/#', { qos: 0 }, (err) => (err ? reject(err) : resolve()));
+      });
+      upstreamClient!.on('message', (_topic, payload) => seen.push(payload));
+
+      const envelope = buildPositionEnvelope({
+        from: 0x44444444,
+        latI: 440_000_000,
+        lngI: -780_000_000,
+        channelId: 'LongFast',
+        gatewayId: '!44444444',
+        packetId: 0x30000044,
+      });
+      upstreamClient!.publish('msh/US/TX/2/e/LongFast/!44444444', envelope);
+      await new Promise((r) => setTimeout(r, 800));
+      return {
+        upstreamCopies: seen.filter((p) => Buffer.compare(p, envelope) === 0).length,
+        other,
+      };
+    }
+
+    it('does not uplink a packet the other bridge brought down', async () => {
+      const { upstreamCopies, other } = await runTwoBridges();
+      expect(upstreamCopies).toBe(1); // the original publish only
+      expect(other.getStatus().uplinkOut).toBe(0);
+      expect(other.getStatus().uplinkBridgeRelayDrops).toBe(1);
+      expect(bridge.getStatus().uplinkOut).toBe(0);
+    });
+
+    it('relays it when relayOtherBridges is on', async () => {
+      const { upstreamCopies, other } = await runTwoBridges(true);
+      expect(other.getStatus().uplinkOut).toBe(1);
+      expect(other.getStatus().uplinkBridgeRelayDrops).toBe(0);
+      expect(upstreamCopies).toBe(2);
+    });
+
+    it('still uplinks traffic that started locally', async () => {
+      const { other } = await runTwoBridges();
+      const local = await connectLocalSubscriber();
+      const envelope = buildPositionEnvelope({
+        from: 0x55555555,
+        latI: 440_000_000,
+        lngI: -780_000_000,
+        channelId: 'LongFast',
+        gatewayId: '!55555555',
+        packetId: 0x30000055,
+      });
+      local.client.publish('msh/US/FL/2/e/LongFast/!55555555', envelope);
+      await new Promise((r) => setTimeout(r, 500));
+      expect(other.getStatus().uplinkOut).toBe(1);
+      expect(bridge.getStatus().uplinkOut).toBe(1);
+      await new Promise<void>((r) => local.client.end(true, {}, () => r()));
+    });
   });
 
   it('no rewrite configured: republish topic matches the original (regression guard)', async () => {
@@ -858,6 +938,37 @@ describe('MqttBridgeManager', () => {
     expect(localMessages.some((m) => m.topic === 'msh/CA/ON/PTBO')).toBe(true);
 
     await new Promise<void>((r) => localClient.end(true, {}, () => r()));
+    await new Promise<void>((r) => pub.end(true, {}, () => r()));
+  });
+
+  it.each([
+    { skipRaise: true, marked: true },
+    { skipRaise: false, marked: false },
+  ])('skipRaise=$skipRaise: tells the parent broker not to raise its packets (#5708)', async ({ skipRaise, marked }) => {
+    bridge = new MqttBridgeManager('skip-raise-bridge', 'SkipRaise', {
+      brokerSourceId: 'local-broker',
+      upstream: { url: `mqtt://127.0.0.1:${upstreamPort}` },
+      subscriptions: ['msh/#'],
+      ...(skipRaise ? { skipRaise: true } : {}),
+    });
+    await sourceManagerRegistry.addManager(bridge);
+    const parent = sourceManagerRegistry.getManager('local-broker') as unknown as { markSkipRaise: (f: number, id: number) => void };
+    const mark = vi.spyOn(parent, 'markSkipRaise');
+
+    const pub = connect(`mqtt://127.0.0.1:${upstreamPort}`, { reconnectPeriod: 0 });
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('pub connect timeout')), 3000);
+      pub.once('connect', () => { clearTimeout(t); resolve(); });
+    });
+    pub.publish('msh/CA/ON/PTBO', buildPositionEnvelope({
+      from: 0x55555555, latI: 440_000_000, lngI: -780_000_000,
+      channelId: 'LongFast', gatewayId: '!55555555', packetId: 0x30000005,
+    }));
+    await new Promise((r) => setTimeout(r, 300));
+
+    if (marked) expect(mark).toHaveBeenCalledWith(0x55555555, 0x30000005);
+    else expect(mark).not.toHaveBeenCalled();
+    mark.mockRestore();
     await new Promise<void>((r) => pub.end(true, {}, () => r()));
   });
 
@@ -1104,6 +1215,81 @@ describe('MqttBridgeManager', () => {
     await new Promise<void>((r) => localClient.end(true, {}, () => r()));
   });
 
+  it('uplinks a node\'s own map report, which has no ok_to_mqtt bit, but still gates other packets', async () => {
+    const upstreamTopics: string[] = [];
+    upstream.aedes.on('publish', (packet, client) => {
+      if (client) upstreamTopics.push(packet.topic);
+    });
+
+    bridge = new MqttBridgeManager('map-report-bridge', 'MapReport', {
+      brokerSourceId: 'local-broker',
+      upstream: { url: `mqtt://127.0.0.1:${upstreamPort}` },
+      subscriptions: [],
+      mode: 'publish_only',
+    });
+    await sourceManagerRegistry.addManager(bridge);
+
+    const localClient = connect(`mqtt://127.0.0.1:${localPort}`, {
+      username: 'u',
+      password: 'p',
+      reconnectPeriod: 0,
+      clientId: '!33333333',
+    });
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('local connect timeout')), 3000);
+      localClient.once('connect', () => {
+        clearTimeout(t);
+        resolve();
+      });
+    });
+
+    // What firmware MQTT::perhapsReportToMap publishes: MAP_REPORT_APP from
+    // the gateway itself, unencrypted, no Data.bitfield.
+    const r = getProtobufRoot();
+    if (!r) throw new Error('protobuf root not loaded');
+    const MapReport = r.lookupType('meshtastic.MapReport');
+    const mapBytes = meshtasticProtobufService.encodeServiceEnvelope({
+      packet: {
+        from: 0x33333333,
+        to: 0xffffffff,
+        channel: 0,
+        id: 0x40000010,
+        decoded: {
+          portnum: PortNum.MAP_REPORT_APP,
+          payload: MapReport.encode(MapReport.create({ longName: 'Test', latitudeI: 515_000_000, longitudeI: 0 })).finish(),
+        },
+      },
+      channelId: 'LongFast',
+      gatewayId: '!33333333',
+    });
+    if (!mapBytes) throw new Error('encode failed');
+    // A normal packet with the bit clear is still dropped.
+    const optOut = buildPositionEnvelope({
+      from: 0x33333333,
+      latI: 515_000_000,
+      lngI: 0,
+      channelId: 'LongFast',
+      gatewayId: '!33333333',
+      packetId: 0x40000011,
+      bitfield: 0,
+    });
+
+    localClient.publish('msh/EU_868/2/map/', Buffer.from(mapBytes));
+    localClient.publish('msh/EU_868/2/e/LongFast/!33333333', optOut);
+
+    await vi.waitFor(
+      () => expect(upstreamTopics).toContain('msh/EU_868/2/map/'),
+      { timeout: 5000, interval: 25 },
+    );
+    await vi.waitFor(
+      () => expect(bridge.getStatus().uplinkOkToMqttDrops).toBe(1),
+      { timeout: 5000, interval: 25 },
+    );
+    expect(upstreamTopics).not.toContain('msh/EU_868/2/e/LongFast/!33333333');
+
+    await new Promise<void>((r2) => localClient.end(true, {}, () => r2()));
+  });
+
   it('ignoreOkToMqtt: true uplinks packets regardless of the bit', async () => {
     const publishesByClient: Array<{ clientId: string | null; topic: string }> = [];
     upstream.aedes.on('publish', (packet, client) => {
@@ -1234,6 +1420,7 @@ describe('MqttBridgeManager', () => {
             0x40000005,
             0x33333333,
             0,
+            0xffffffff,
           ),
         { timeout: 5000, interval: 25 },
       );

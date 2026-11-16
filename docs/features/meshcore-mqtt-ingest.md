@@ -1,6 +1,6 @@
 # MeshCore MQTT Ingest
 
-::: tip Added in 4.17 (#5040)
+::: tip Added in 4.16 (#5040)
 Subscribe to a MeshCore Analyzer MQTT broker and see a whole region's traffic — packets, nodes and channel messages — without your radio having to hear any of it.
 :::
 
@@ -9,6 +9,8 @@ Subscribe to a MeshCore Analyzer MQTT broker and see a whole region's traffic �
 A `meshcore_mqtt` source **reads** a MeshCore-Analyzer-compatible broker. Where the [Analyzer Observer](/features/meshcore-analyzer-observer) publishes what *your* Companion heard, this consumes what **every observer in a region** heard.
 
 That is the whole point: your radio hears its own earshot, while a region feed carries the coverage of every node publishing to that broker.
+
+To have observers publish straight to MeshMonitor instead of to an external broker, use the [MeshCore MQTT Broker](/features/meshcore-mqtt-broker) source. It feeds the same pipeline.
 
 **This source has no radio.** It cannot transmit, and that is structural rather than a policy — its `sourceType` excludes it from every code path that drives a device, so there is nothing to accidentally re-enable.
 
@@ -37,13 +39,26 @@ The right-hand column is not a roadmap. Those are consequences of reading someon
 
 The source subscribes to `meshcore/{REGION}/+/packets` and `meshcore/{REGION}/+/status`.
 
+### Finding your region
+
+Not sure which code your area uses? Fill in the **Broker URL** (and login, if the broker needs one), then click **Find regions** under the Region field. MeshMonitor listens to the broker's observer status messages (`meshcore/+/+/status`) for 60 seconds and lists every region it heard, busiest first:
+
+- **Observers online** counts distinct observers whose status says `online` and is under 15 minutes old (or arrived live while listening). Status messages are retained, so an observer that died without saying so would otherwise count forever.
+- **Status messages** counts every status heard for that region, online or not.
+
+Status messages carry no location, so regions are ranked by activity, not distance. Click a region (or type a code) to fill the Region field; nothing is saved until you click **Save**.
+
+The search subscribes only: it never publishes, never touches your radio or this source's own connection, and uses its own throwaway client ID. It needs the **Sources: write** permission, the same as saving the source. Searches share the MQTT topic finder's limits: 60 seconds each, one at a time per user and per broker, two across the server, a 2-minute pause between searches, and 5 starts per 10 minutes. When editing a saved source with the password left blank, the stored login is used only if the broker URL still points at the same broker.
+
+A broker whose access rules forbid `meshcore/+/+/status` reports that it does not allow listing regions. Ask its operator for your code.
+
 ### One broker per source
 
 Deliberate. Add a second source for a second broker — creating two sources on the same broker **and** region is rejected with a 409, because per-observer de-duplication is scoped per source, so a duplicate feed would collapse nowhere and silently double every count.
 
-### Credentials need a fixed `SESSION_SECRET`
+### The broker password is stored as plaintext
 
-Same requirement as the Analyzer Observer. Note that a broker password here is stored as **plaintext** in the source's config — it is withheld from non-admin API responses, but it is not encrypted at rest. Use a broker account you are comfortable storing that way.
+A broker password here is stored as **plaintext** in the source's config. It is withheld from non-admin API responses, but it is not encrypted at rest, so it does not depend on `SESSION_SECRET` the way the Analyzer Observer's credentials do. Use a broker account you are comfortable storing that way.
 
 ### A rejected login stops after five tries
 
@@ -64,9 +79,11 @@ In the grouped view, an **Observers** count of `Local` means your own radio hear
 
 ## Channel messages
 
-Channel traffic is decrypted with the channel keys you already hold. You do not need to add channels to the ingest source — it reads keys from **every** source, which is how the codebase treats decryption keys generally.
+Channel traffic is decrypted with the channel keys you already hold. You do not need to add channels to the ingest source — it reads keys from **every** source, which is how the codebase treats decryption keys generally. It also uses MeshCore entries in the [Channel Database](/features/channel-database#meshcore-channels), so you can read a channel that none of your radios carries.
 
 Only channels you hold a key for are readable; everything else on the feed stays encrypted and is simply skipped.
+
+Every channel message is filed under a channel derived from its key, so two sources that hold the same key share one channel, and the Channels tab shows the channel name. A message is shown only to users who can read that key: a channel on one of your sources (`channel_N:read` or `messages:read` there) or a Channel Database entry you were granted. The Public channel, whose key is published in the firmware, is shown to every signed-in user with `messages:read` on the feed. Messages stored before this change whose key cannot be identified stay visible to admins only, tagged "older, key unknown". New entries start with no user access. See [Who can read MeshCore channel traffic](/features/channel-database#who-can-read-meshcore-channel-traffic).
 
 ::: warning A clock-less sender can hide a repeat
 MeshCore encrypts `timestamp | flags | text`. When a sender's clock is unset the timestamp is `0`, so two separate transmissions of *identical text on the same channel* are byte-identical on the wire and the second is treated as a duplicate. There is nothing to distinguish them; the alternative would break de-duplication for every observer.
@@ -113,6 +130,10 @@ A region feed is far higher volume than one radio's earshot, so it has its own c
 Both are editable in the Packet Monitor's settings. At 50,000 rows expect roughly 50–100MB of database per source — worth noticing on a Pi or a small container volume.
 
 Packet capture is opt-in, as it is for every monitor.
+
+## Notifications
+
+The source page has a **Notifications** tab for signed-in users. It alerts on channel messages you pick, inactive nodes, low observer battery, and broker connection loss. Direct messages, traces, mentions and new-node alerts do not apply to a feed with no radio. A region's channels can be busy, so nothing fires until you pick channels. See [MeshCore MQTT Region Feeds](/features/notifications#meshcore-mqtt-region-feeds) for the picker rules and the channel rules.
 
 ## Mesh impact
 

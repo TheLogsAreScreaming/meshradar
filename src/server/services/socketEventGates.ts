@@ -11,8 +11,9 @@
  * `SocketViewer` (grants held in memory); what it needs about the event that
  * is not in the payload comes from `prepare`, run at most once per event.
  */
-import databaseService, { type DbMessage } from '../../services/database.js';
-import type { DataEvent, DataEventType, NodeUpdateData, ConnectionStatusData, TelemetryBatchData } from './dataEventEmitter.js';
+import { meshcoreChannelIdx } from '../utils/meshcoreChannelIdx.js';
+import databaseService, { type DbMessage, type DbNode } from '../../services/database.js';
+import type { DataEvent, DataEventType, NodeUpdateData, ConnectionStatusData, TelemetryBatchData, NodeBatchData } from './dataEventEmitter.js';
 import type { SocketViewer } from './socketAccess.js';
 import type { ResourceType, PermissionAction } from '../../types/permission.js';
 import { canonicalMessageTime, messageReceivedAt } from '../utils/messageTime.js';
@@ -21,8 +22,44 @@ import { withholdPrivateOverride } from '../utils/nodeEnhancer.js';
 import { transformChannel } from '../utils/channelView.js';
 import { canSeeKeyedMessage } from '../utils/meshcoreKeyAccess.js';
 import { stripPositions } from '../utils/meshcorePositions.js';
+import { applyMeshCorePositionOverride, type MeshCorePositionOverride } from '../utils/meshcorePositionOverride.js';
 import { getCachedSignFlipContext, applySignFlipToTraceroute, applySignFlipCorrection } from './signFlipCorrection.js';
 import { logger } from '../../utils/logger.js';
+
+type ContactUpdatePayload = { sourceId: string; contact: { publicKey?: string; latitude?: number; longitude?: number } };
+interface ContactUpdatePrep {
+  payload: ContactUpdatePayload;
+  override: MeshCorePositionOverride | undefined;
+}
+
+/**
+ * A `meshcore:contact:updated` payload with the #5363 sign-flip correction
+ * applied, plus the contact's #5842 location override (if enabled). Errors
+ * read as "no correction" / "no override", as before.
+ */
+async function loadContactUpdate(event: DataEvent): Promise<ContactUpdatePrep> {
+  let payload = event.data as ContactUpdatePayload;
+  try {
+    const ctx = await getCachedSignFlipContext(event.sourceId);
+    if (ctx && payload?.contact) {
+      const contact = applySignFlipCorrection(payload.contact, ctx);
+      if (contact !== payload.contact) payload = { ...payload, contact };
+    }
+  } catch (err) {
+    logger.warn('[WebSocket] Sign-flip contact correction failed:', err);
+  }
+  let override: MeshCorePositionOverride | undefined;
+  const publicKey = payload?.contact?.publicKey;
+  if (event.sourceId && typeof publicKey === 'string') {
+    try {
+      const ov = await databaseService.meshcore.getNodePositionOverride(event.sourceId, publicKey);
+      if (ov?.enabled) override = ov;
+    } catch (err) {
+      logger.warn('[WebSocket] MeshCore position override read failed:', err);
+    }
+  }
+  return { payload, override };
+}
 
 /** Returned by a gate's `filter` when the viewer gets nothing. */
 export const WITHHOLD: unique symbol = Symbol('socket.withhold');
@@ -38,6 +75,12 @@ export interface SocketEventGate {
   rest: string;
   /** What a viewer who is not an admin must hold. Admins get every event. */
   rule: string;
+  /**
+   * `packet-flights`: joining the source is not enough; the socket must also
+   * have asked for live packet flights on it (`packet-flights:subscribe`,
+   * #4835). Admins included.
+   */
+  subscription?: 'packet-flights';
   /**
    * The payload as sent to an admin, computed once per event. Defaults to the
    * event's data unchanged.
@@ -167,17 +210,7 @@ async function loadNodeFacts(nodeNum: number, sourceId: string | undefined): Pro
   return row ? { channel: row.channel, isPrivate: row.positionOverrideIsPrivate } : null;
 }
 
-/**
- * The slot a MeshCore channel message belongs to, from the synthetic
- * `channel-<idx>` key on either end. Null for a DM or a room post.
- */
-export function meshcoreChannelIdx(message: { fromPublicKey?: string | null; toPublicKey?: string | null }): number | null {
-  for (const key of [message.toPublicKey, message.fromPublicKey]) {
-    const match = typeof key === 'string' ? /^channel-(\d+)$/.exec(key) : null;
-    if (match) return Number(match[1]);
-  }
-  return null;
-}
+export { meshcoreChannelIdx };
 
 /** `canAccessMeshcoreChannel`: the channel's own grant, or the legacy `messages` one. */
 function mayReadMeshcoreChannel(viewer: SocketViewer, sourceId: string, idx: number | null | undefined): boolean {
@@ -189,6 +222,24 @@ const MESHCORE_MESSAGES = 'GET /api/sources/:id/meshcore/messages';
 const MESHCORE_STATUS = 'GET /api/sources/:id/meshcore/status';
 const RETICULUM_MESSAGES = 'GET /api/sources/:id/reticulum/messages';
 const WAYPOINTS = 'GET /api/sources/:id/waypoints';
+
+/**
+ * Gate shared by `meshcore:message` and `meshcore:reaction:resolved` (#5759): a
+ * resolved reaction is a message row, so it follows the message rules.
+ */
+const MESHCORE_MESSAGE_GATE: SocketEventGate = {
+  scope: 'source',
+  rest: `${MESHCORE_MESSAGES}, GET .../messages/channel/:idx`,
+  rule: '`messages:read` on the source, or for a channel message `channel_N:read` there. A repeater-decrypted message also needs read access to its key (#5551).',
+  ensure: (viewer, event) =>
+    (event.data as { keyFingerprint?: string | null })?.keyFingerprint ? viewer.keyAccess() : undefined,
+  filter: (viewer, sourceId, payload: { fromPublicKey?: string; toPublicKey?: string | null; keyFingerprint?: string | null }) => {
+    if (!mayReadMeshcoreChannel(viewer, sourceId, meshcoreChannelIdx(payload))) return WITHHOLD;
+    if (!payload.keyFingerprint) return payload;
+    const access = viewer.loadedKeyAccess;
+    return access !== undefined && canSeeKeyedMessage(access, payload) ? payload : WITHHOLD;
+  },
+};
 
 export const SOCKET_EVENT_GATES: Record<DataEventType, SocketEventGate> = {
   'message:new': {
@@ -250,6 +301,33 @@ export const SOCKET_EVENT_GATES: Record<DataEventType, SocketEventGate> = {
     },
   },
 
+  'node:batch': {
+    scope: 'source',
+    rest: 'GET /api/poll (`nodes`)',
+    rule: 'Per node, as `node:updated`: `channel_N:viewOnMap` on the source, N = the channel the node was last heard on. A private position override is removed without `nodes_private:read` on the source.',
+    prepare: async (event) => {
+      const facts = new Map<string, NodeFacts | null>();
+      for (const nodeNum of Object.keys(event.data as NodeBatchData)) {
+        facts.set(nodeNum, await loadNodeFacts(Number(nodeNum), event.sourceId));
+      }
+      return facts;
+    },
+    filter: (viewer, sourceId, payload: NodeBatchData, facts: Map<string, NodeFacts | null>) => {
+      const visible: NodeBatchData = {};
+      let any = false;
+      for (const [nodeNum, fields] of Object.entries(payload)) {
+        const node = facts.get(nodeNum);
+        if (!node || !viewer.canViewNode(sourceId, node.channel)) continue;
+        const carriesOverride = 'latitudeOverride' in fields || 'longitudeOverride' in fields || 'altitudeOverride' in fields;
+        visible[Number(nodeNum)] = node.isPrivate && carriesOverride && !viewer.canViewPrivate(sourceId)
+          ? withholdPrivateOverride<Partial<DbNode>>(fields)
+          : fields;
+        any = true;
+      }
+      return any ? visible : WITHHOLD;
+    },
+  },
+
   'connection:status': {
     scope: 'source',
     rest: 'GET /api/poll (`connection`, `config`)',
@@ -302,19 +380,8 @@ export const SOCKET_EVENT_GATES: Record<DataEventType, SocketEventGate> = {
   'waypoint:deleted': needs('waypoints', 'read', WAYPOINTS),
   'waypoint:expired': needs('waypoints', 'read', WAYPOINTS),
 
-  'meshcore:message': {
-    scope: 'source',
-    rest: `${MESHCORE_MESSAGES}, GET .../messages/channel/:idx`,
-    rule: '`messages:read` on the source, or for a channel message `channel_N:read` there. A repeater-decrypted message also needs read access to its key (#5551).',
-    ensure: (viewer, event) =>
-      (event.data as { keyFingerprint?: string | null })?.keyFingerprint ? viewer.keyAccess() : undefined,
-    filter: (viewer, sourceId, payload: { fromPublicKey?: string; toPublicKey?: string | null; keyFingerprint?: string | null }) => {
-      if (!mayReadMeshcoreChannel(viewer, sourceId, meshcoreChannelIdx(payload))) return WITHHOLD;
-      if (!payload.keyFingerprint) return payload;
-      const access = viewer.loadedKeyAccess;
-      return access !== undefined && canSeeKeyedMessage(access, payload) ? payload : WITHHOLD;
-    },
-  },
+  'meshcore:message': MESHCORE_MESSAGE_GATE,
+  'meshcore:reaction:resolved': MESHCORE_MESSAGE_GATE,
   'meshcore:messages:deleted': {
     scope: 'source',
     rest: MESHCORE_MESSAGES,
@@ -347,31 +414,44 @@ export const SOCKET_EVENT_GATES: Record<DataEventType, SocketEventGate> = {
   'meshcore:contact:updated': {
     scope: 'source',
     rest: 'GET /api/sources/:id/meshcore/contacts',
-    rule: '`nodes:read` on the source. Position: `nodes:viewOnMap` on the source.',
+    rule: '`nodes:read` on the source. Position: `nodes:viewOnMap` on the source. A private location override: `nodes_private:read` on the source.',
     // #5363: a live contact update carries the same corrected position as
-    // the snapshot/contacts routes. A copy only.
+    // the snapshot/contacts routes. #5842: and the same location override,
+    // so an advert never moves a pinned contact back. Admins see it all.
     shape: async (event) => {
-      const payload = event.data as { sourceId: string; contact: object };
-      try {
-        const ctx = await getCachedSignFlipContext(event.sourceId);
-        if (ctx && payload?.contact) {
-          const contact = applySignFlipCorrection(payload.contact, ctx);
-          if (contact !== payload.contact) return { ...payload, contact };
-        }
-      } catch (err) {
-        logger.warn('[WebSocket] Sign-flip contact correction failed:', err);
-      }
-      return payload;
+      const { payload, override } = await loadContactUpdate(event);
+      if (!payload?.contact) return payload;
+      return { ...payload, contact: applyMeshCorePositionOverride(payload.contact, override, true) };
     },
-    filter: (viewer, sourceId, payload: { contact?: { latitude?: number; longitude?: number } }) => {
+    // The advert-only contact and the override, so `filter` can answer per viewer.
+    prepare: (event) => loadContactUpdate(event),
+    filter: (viewer, sourceId, payload: { contact?: { latitude?: number; longitude?: number } }, prep: ContactUpdatePrep | undefined) => {
       if (!viewer.can('nodes', 'read', sourceId)) return WITHHOLD;
-      if (!payload?.contact || viewer.can('nodes', 'viewOnMap', sourceId)) return payload;
-      return { ...payload, contact: stripPositions([payload.contact])[0] };
+      const base = prep?.payload ?? payload;
+      if (!base?.contact) return base;
+      if (!viewer.can('nodes', 'viewOnMap', sourceId)) {
+        return { ...base, contact: stripPositions([base.contact])[0] };
+      }
+      return {
+        ...base,
+        contact: applyMeshCorePositionOverride(base.contact, prep?.override, viewer.can('nodes_private', 'read', sourceId)),
+      };
     },
   },
   'meshcore:status:updated': needs('connection', 'read', MESHCORE_STATUS),
   'meshcore:local-node:updated': needs('connection', 'read', MESHCORE_STATUS),
   'meshcore:ota-packet': needs('packetmonitor', 'read', 'GET /api/sources/:id/meshcore/packets'),
+  // #4835: live packet traffic on the map. The same grant as the Packet
+  // Monitor routes, and only to sockets that asked for it on that source.
+  'packet:flight': {
+    ...needs(
+      'packetmonitor',
+      'read',
+      'None (live only). The same grant as GET /api/packets, GET /api/sources/:id/mqtt/packets and GET /api/sources/:id/meshcore/packets.',
+      '`packetmonitor:read` on the event\'s source, and a `packet-flights:subscribe` for that source.',
+    ),
+    subscription: 'packet-flights',
+  },
 
   'reticulum:message': needs('messages', 'read', RETICULUM_MESSAGES),
   'reticulum:delivery-state:updated': needs('messages', 'read', RETICULUM_MESSAGES),
@@ -389,7 +469,9 @@ export const SOCKET_EVENT_GATES: Record<DataEventType, SocketEventGate> = {
   'node:mobility': serverOnly('Feeds `trigger.becameMobile`.'),
   'node:rebooted': serverOnly('Feeds `trigger.nodeRebooted`.'),
   'node:powerChanged': serverOnly('Feeds `trigger.nodePowerChanged`.'),
+  'node:clockOffset': serverOnly('Feeds `trigger.clockOutOfSync`.'),
   'node:aircraft': serverOnly('Feeds `trigger.becameLikelyAircraft`.'),
+  'neighbor:sighting': serverOnly('Feeds `trigger.neighborAdded`.'),
   'meshbeacon:received': serverOnly('Feeds `trigger.meshBeacon`; the payload carries the offered channel PSK.'),
 };
 

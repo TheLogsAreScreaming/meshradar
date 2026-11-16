@@ -34,6 +34,7 @@ import { PermissionTestHelper } from '../test-helpers/permissionTestHelper.js';
 import { UserTestHelper } from '../test-helpers/userTestHelper.js';
 import { migration as baselineMigration } from '../migrations/001_v37_baseline.js';
 import { migration as sourceIdPermsMigration } from '../migrations/022_add_source_id_to_permissions.js';
+import { migration as passkeysMigration } from '../migrations/207_create_user_passkeys.js';
 import userRoutes from './userRoutes.js';
 import authRoutes from './authRoutes.js';
 
@@ -72,6 +73,8 @@ describe('User Management Routes', () => {
     baselineMigration.up(db);
     // Add sourceId column to permissions (migration 022)
     sourceIdPermsMigration.up(db);
+    // Passkey columns on users (migration 207, #5841)
+    passkeysMigration.up(db);
 
     const drizzleDb = drizzle(db, { schema });
     const authRepo = new AuthRepository(drizzleDb, 'sqlite');
@@ -161,6 +164,12 @@ describe('User Management Routes', () => {
     (DatabaseService as any).updatePasswordAsync = async (userId: number, newPassword: string) => {
       return userModel.updatePassword(userId, newPassword);
     };
+    // Passkeys (#5841): the users list counts them; an admin-set password
+    // turns password login back on.
+    (DatabaseService as any).countPasskeysByUserAsync = async () => new Map<number, number>();
+    (DatabaseService as any).clearPasskeyOnlyAsync = async (userId: number) => authRepo.clearPasskeyOnly(userId);
+    // Session invalidation on admin password reset (#6074).
+    (DatabaseService as any).deleteSessionsByUserIdAsync = vi.fn().mockResolvedValue(0);
     (DatabaseService as any).getUserPermissionSetAsync = async (userId: number) => {
       return permissionModel.getUserPermissionSet(userId);
     };
@@ -467,6 +476,8 @@ describe('User Management Routes', () => {
       const users = await userModel.findAll();
       const userId = users.find(u => u.username === 'user')!.id;
 
+      (DatabaseService as any).deleteSessionsByUserIdAsync.mockClear();
+
       const response = await adminAgent
         .post(`/api/users/${userId}/reset-password`)
         .expect(200);
@@ -474,6 +485,9 @@ describe('User Management Routes', () => {
       expect(response.body.success).toBe(true);
       expect(response.body.password).toBeDefined();
       expect(response.body.password.length).toBeGreaterThan(0);
+
+      // The reset must terminate the target user's active sessions (#6074).
+      expect((DatabaseService as any).deleteSessionsByUserIdAsync).toHaveBeenCalledWith(userId);
     });
 
     it('should deny regular user from resetting passwords', async () => {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { Suspense, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 // Popup and Polyline moved to useTraceroutePaths hook
 // Recharts imports moved to useTraceroutePaths hook
@@ -7,28 +7,33 @@ import 'leaflet/dist/leaflet.css';
 import './App.css';
 import './components/map/leafletDefaultIcon';
 
-import InfoTab from './components/InfoTab';
-import SettingsTab from './components/SettingsTab';
-import ConfigurationTab from './components/ConfigurationTab';
-import MqttBridgeConfigurationView from './components/MQTT/MqttBridgeConfigurationView';
+// Every tab is its own lazy chunk (rendered under the <Suspense> around the
+// tab <Routes> below); see appTabs.ts.
+import {
+  InfoTab,
+  SettingsTab,
+  ConfigurationTab,
+  MqttBridgeConfigurationView,
+  NotificationsTab,
+  UsersTab,
+  AuditLogTab,
+  SecurityTab,
+  AdminCommandsTab,
+  Dashboard,
+  NodesTab,
+  MessagesTab,
+  ChannelsTab,
+  PacketMonitorPanel,
+  MqttPacketMonitorView,
+  AutomationTab,
+} from './appTabs';
 import { canOpenSourceSettings } from './components/nav/sourceSettingsAccess';
-import NotificationsTab from './components/NotificationsTab';
-import UsersTab from './components/UsersTab';
-import AuditLogTab from './components/AuditLogTab';
-import { SecurityTab } from './components/SecurityTab';
-import AdminCommandsTab from './components/AdminCommandsTab';
-import Dashboard from './components/Dashboard';
-import NodesTab from './components/NodesTab';
-import MessagesTab from './components/MessagesTab';
-import ChannelsTab from './components/ChannelsTab';
-import PacketMonitorPanel from './components/PacketMonitorPanel';
-import MqttPacketMonitorView from './components/MQTT/MqttPacketMonitorView';
-import AutomationTab from './components/AutomationTab';
 import { ToastProvider, useToast } from './components/ToastContainer';
 import { shouldShowQuickStatus } from './components/QuickStatus/quickStatusGate';
 import DeviceNotificationToaster from './components/DeviceNotificationToaster';
 import { RebootModal } from './components/RebootModal';
 import { AppBanners } from './components/AppBanners';
+import ConnectionErrorPanel from './components/ConnectionErrorPanel';
 import { AppHeader } from './components/AppHeader';
 import { PurgeDataModal } from './components/PurgeDataModal';
 import { PositionOverrideModal } from './components/PositionOverrideModal';
@@ -44,7 +49,7 @@ import { type TemperatureUnit } from './utils/temperature';
 import { DeviceInfo, Channel } from './types/device';
 import { MeshMessage } from './types/message';
 import { isMqttBridgeMessage } from './utils/messageFilters';
-import { NodeFilters } from './types/ui';
+import { usePersistedNodeFilters } from './hooks/usePersistedNodeFilters';
 import { getHashTabRedirectTarget, getRetiredTabRedirectTarget } from './utils/tabHashRedirect';
 import { ResourceType } from './types/permission';
 import api, { type ChannelDatabaseEntry } from './services/api';
@@ -68,6 +73,7 @@ import { MapProvider, useMapContext } from './contexts/MapContext';
 import type { PositionHistoryItem } from './contexts/MapContext';
 import { DataProvider, useData } from './contexts/DataContext';
 import { MessagingProvider, useMessaging } from './contexts/MessagingContext';
+import { useComposeDraftStore } from './contexts/composeDraftStore';
 import { UIProvider, useUI } from './contexts/UIContext';
 import { AutomationProvider, useAutomation } from './contexts/AutomationContext';
 import { useAuth } from './contexts/AuthContext';
@@ -80,7 +86,7 @@ import { useHealth } from './hooks/useHealth';
 import { useTxStatus } from './hooks/useTxStatus';
 import { useVersionCheck } from './hooks/useVersionCheck';
 import { useQueryClient } from '@tanstack/react-query';
-import { usePoll, type PollData, fetchPollData, sourcePollQueryKey } from './hooks/usePoll';
+import { usePoll, type PollData } from './hooks/usePoll';
 import { useCsrfFetch } from './hooks/useCsrfFetch';
 import { useNodes, useChannels, setNodeFieldInCache } from './hooks/useServerData';
 import { useSourceView } from './hooks/useSourceView';
@@ -92,6 +98,8 @@ import LoginPage from './components/LoginPage';
 import { SaveBarProvider, SaveBarGroup } from './contexts/SaveBarContext';
 import { SaveBar } from './components/SaveBar';
 import ErrorBoundary from './components/common/ErrorBoundary';
+import PollErrorNotice from './components/PollErrorNotice';
+import RouteLoading from './components/RouteLoading/RouteLoading';
 
 // Pending favorite/ignored/hide-from-map toggle tracking lives in
 // src/utils/pendingToggles.ts as module-level singletons. Favorite/
@@ -110,20 +118,18 @@ import TracerouteHistoryModal from './components/TracerouteHistoryModal';
 import RouteSegmentTraceroutesModal from './components/RouteSegmentTraceroutesModal';
 import { hopLimitSettingValue } from './utils/hopLimitOverride';
 import { resolveAutoAckMaxResponses } from './utils/autoAckMaxResponses';
+import {
+  cannotConnectMessage,
+  fetchConnectionStatus,
+  formatNodeAddress,
+  mergeConnectionIntoPollCache,
+  refreshPollCache,
+} from './hooks/connectionCheck';
+import { useConnectionCheckLoop } from './hooks/useConnectionCheckLoop';
+import { useMqttNativeSendStatus } from './hooks/useMqttNativeSendStatus';
 
 // Icons and helpers are now imported from utils/
 
-/**
- * `staleTime` for `checkConnectionStatus`'s `fetchQuery` read of the poll
- * cache. Short enough that the 5s "not connected" loop, the post-reboot
- * reconnect wait (3s cadence), and the Retry button all get a live fetch
- * rather than an arbitrarily old cached snapshot — `usePoll()` itself is
- * disabled whenever `connectionStatus !== 'connected'`, so nothing else
- * refreshes this cache entry while any of those three are the ones calling.
- * Still long enough to dedupe a call that lands within the same tick as
- * another mount-time observer reading the same query key.
- */
-const POLL_STATUS_STALE_TIME_MS = 3000;
 
 function App() {
   const { t } = useTranslation();
@@ -170,6 +176,10 @@ function App() {
   const [channelInfoModal, setChannelInfoModal] = useState<number | null>(null);
   const [showPsk, setShowPsk] = useState(false);
   const [showRebootModal, setShowRebootModal] = useState(false);
+  const [rebootExpectation, setRebootExpectation] = useState<'always' | 'possible'>('always');
+  // Read by the reboot handler, which "Save All" can call several times from
+  // one stale closure, so it can't rely on `showRebootModal` (#5823).
+  const rebootModalOpenRef = useRef(false);
   const [configRefreshTrigger, setConfigRefreshTrigger] = useState(0);
   const [showTracerouteHistoryModal, setShowTracerouteHistoryModal] = useState(false);
   const [showPurgeDataModal, setShowPurgeDataModal] = useState(false);
@@ -204,53 +214,7 @@ function App() {
 
   // Node list filter options (shared between Map and Messages pages)
   // Load from localStorage on initial render
-  const [nodeFilters, setNodeFilters] = useState<NodeFilters>(() => {
-    const savedFilters = localStorage.getItem('nodeFilters');
-    if (savedFilters) {
-      try {
-        const parsed = JSON.parse(savedFilters);
-        // Add filterMode if it doesn't exist (backward compatibility)
-        if (!parsed.filterMode) {
-          parsed.filterMode = 'show';
-        }
-        // Add channels if it doesn't exist (backward compatibility)
-        if (!parsed.channels) {
-          parsed.channels = [];
-        }
-        // Add deviceRoles if it doesn't exist (backward compatibility)
-        if (!parsed.deviceRoles) {
-          parsed.deviceRoles = [];
-        }
-        // Add showIgnored if it doesn't exist (backward compatibility)
-        if (parsed.showIgnored === undefined) {
-          parsed.showIgnored = false;
-        }
-        if (parsed.showFavoriteLocked === undefined) {
-          parsed.showFavoriteLocked = false;
-        }
-        return parsed;
-      } catch (e) {
-        logger.error('Failed to parse saved node filters:', e);
-      }
-    }
-    return {
-      filterMode: 'show' as 'show' | 'hide',
-      showMqtt: false,
-      showTelemetry: false,
-      showEnvironment: false,
-      powerSource: 'both' as 'powered' | 'battery' | 'both',
-      showPosition: false,
-      minHops: 0,
-      maxHops: 10,
-      showPKI: false,
-      showRemoteAdmin: false,
-      showUnknown: false,
-      showIgnored: false,
-      showFavoriteLocked: false,
-      deviceRoles: [] as number[], // Empty array means show all roles
-      channels: [] as number[],
-    };
-  });
+  const [nodeFilters, setNodeFilters] = usePersistedNodeFilters('nodeFilters');
 
   const hasSelectedInitialChannelRef = useRef<boolean>(false);
   const selectedChannelRef = useRef<number>(-1);
@@ -284,7 +248,7 @@ function App() {
   // `isTxDisabled` already accounts for the UDP-broadcast relay path: a radio
   // with TX off but UDP Broadcast on can still send, and reports isUdpRelay
   // instead so the banner stays honest about how packets leave (#4394).
-  const { isTxDisabled, isUdpRelay } = useTxStatus({ baseUrl, sourceId });
+  const { isTxDisabled, isUdpRelay, isTransparentMode } = useTxStatus({ baseUrl, sourceId });
   // MQTT-bridge sources are never gated (different transport, not affected by radio TX state)
   // MQTT broker/bridge sources have no local radio, so every send is gated.
   // The server refuses them with SOURCE_NOT_MESHTASTIC rather than sending
@@ -417,16 +381,36 @@ function App() {
     setNodeAddress,
   } = useData();
 
+  // MQTT-native send (#4305): an MQTT source with the feature on may send with
+  // no radio, as its own generated node. It then gets the normal composer, its
+  // sends go to the MQTT-native route, and its node id is "our" node id so DM
+  // conversations line up.
+  const mqttNative = useMqttNativeSendStatus(sourceId, isMqtt);
+  const mqttNativeEnabled = isMqtt && !!mqttNative?.enabled;
+  const mqttNativeNodeId = mqttNativeEnabled ? mqttNative?.identity?.nodeId ?? null : null;
+  useEffect(() => {
+    if (!mqttNativeNodeId) return;
+    localNodeIdRef.current = mqttNativeNodeId;
+    setCurrentNodeId(mqttNativeNodeId);
+  }, [mqttNativeNodeId, setCurrentNodeId]);
+  // Endpoint for a text send: the MQTT-native route on an MQTT source, else the radio route.
+  const textSendEndpoint = isMqtt && sourceId
+    ? `${baseUrl}/api/sources/${encodeURIComponent(sourceId)}/mqtt/native/send`
+    : `${baseUrl}/api/messages/send`;
+
   // nodes/channels sourced from the poll query cache (#3962 5.4 PR8).
   // queryClient backs the optimistic toggleIgnored/toggleHideFromMap writes
   // below (setNodeFieldInCache) — the query-cache-native replacement for the
   // old DataContext setNodes(...) writes.
-  const { nodes } = useNodes();
+  // `pollError`: the poll's last read failed. Shown on the Nodes and Channels
+  // pages when their list is empty because of it (#6342).
+  const { nodes, error: pollError } = useNodes();
   const { channels } = useChannels();
   const queryClient = useQueryClient();
-  // Used only by checkConnectionStatus below, to read /api/poll through the
-  // same query-cache entry usePoll() uses (see fetchPollData) instead of a
-  // bare fetch the cache never sees.
+  // Used by checkConnectionStatus and the Retry button: /api/connection, and
+  // the one /api/poll read on reconnect through the same query-cache entry
+  // usePoll() uses (see refreshPollCache) instead of a bare fetch the cache
+  // never sees.
   const csrfFetch = useCsrfFetch();
 
   // Telemetry availability Sets (nodesWithTelemetry/nodesWithWeatherTelemetry/
@@ -556,7 +540,6 @@ function App() {
     setSelectedDMNode,
     selectedChannel,
     setSelectedChannel,
-    newMessage,
     setNewMessage,
     openDmWithDraft,
     openDmForCompose,
@@ -575,6 +558,9 @@ function App() {
     markMessagesAsRead,
     unreadCountsData,
   } = useMessaging();
+  // The compose draft is read only at send time — App does not subscribe to
+  // it, so typing doesn't re-render App (see composeDraftStore).
+  const composeDraftStore = useComposeDraftStore();
 
   // The unreadCountsData ref-bridge for the poll callback (App's
   // processPollData is memoized without unreadCountsData in its deps) moved
@@ -650,8 +636,11 @@ function App() {
     setAutoAckPreSendDelaySeconds,
     setAutoAckMaxAttempts,
     setAutoAckMaxResponses,
+    setHopEmojiZeroHop,
+    setHopEmojiMqtt,
     setAutoAckHopLimit,
     setAutoAnnounceHopLimit,
+    setAutoAnnounceSplitLongMessages,
     setAutoAckTestMessages,
     setAutoAnnounceEnabled,
     setAutoAnnounceIntervalHours,
@@ -801,6 +790,15 @@ function App() {
 
   // NeighborInfo request loading state
   const [neighborInfoLoading, setNeighborInfoLoading] = useState<string | null>(null);
+  // The viewed source's TCP port, from its own /api/config, for the
+  // connection error banner (#6353). A ref: checkConnectionStatus runs from
+  // timers that hold an older render's closure.
+  const nodePortRef = useRef<number | null>(null);
+  // The viewed source's host, mirrored from nodeAddress for the same reason:
+  // the first check runs right after /api/config resolves, before the
+  // setNodeAddress render lands, so the closure's nodeAddress is still empty
+  // and the banner showed no address until a later poll (#4173 review L21).
+  const nodeHostRef = useRef<string>('');
 
   // Telemetry request loading state
   const [telemetryRequestLoading, setTelemetryRequestLoading] = useState<string | null>(null);
@@ -1001,14 +999,22 @@ function App() {
         // mounts, and is what react-router's own BrowserRouter already
         // trusts for every route in this app.
         try {
-          const config = await api.getConfig();
-          setNodeAddress(config.meshtasticNodeIp);
+          // Scoped to the viewed source, so the address is that source's own
+          // host (or empty for a MeshCore/MQTT source), never the env default
+          // (#6353).
+          const config = await api.getConfig(sourceId);
+          const host = typeof config.meshtasticNodeIp === 'string' ? config.meshtasticNodeIp : '';
+          setNodeAddress(host);
+          nodeHostRef.current = host;
+          nodePortRef.current = host && typeof config.meshtasticTcpPort === 'number' ? config.meshtasticTcpPort : null;
         } catch (error) {
           logger.error('Failed to load config:', error);
           // Don't assert a hardcoded fallback address (#3611) — that would show
           // the wrong IP for a configured source. Leave it empty; the per-source
           // address arrives with the next poll (status.nodeIp).
           setNodeAddress('');
+          nodeHostRef.current = '';
+          nodePortRef.current = null;
         }
 
         // Load settings from server (per-source if a sourceId is active, so
@@ -1091,7 +1097,10 @@ function App() {
           }
           setAutoAckHopLimit(hopLimitSettingValue(settings.autoAckHopLimit));
           setAutoAckMaxResponses(resolveAutoAckMaxResponses(settings.autoAckMaxResponses));
+          setHopEmojiZeroHop(settings.hopEmojiZeroHop ?? '');
+          setHopEmojiMqtt(settings.hopEmojiMqtt ?? '');
           setAutoAnnounceHopLimit(hopLimitSettingValue(settings.autoAnnounceHopLimit));
+          setAutoAnnounceSplitLongMessages(settings.autoAnnounceSplitLongMessages === 'true');
 
           if (settings.autoAckTestMessages) {
             setAutoAckTestMessages(settings.autoAckTestMessages);
@@ -1260,6 +1269,7 @@ function App() {
         // Avoid asserting a hardcoded fallback address (#3611); leave empty so a
         // wrong IP never appears for a configured source.
         setNodeAddress('');
+        nodeHostRef.current = '';
         setError('Failed to load configuration');
       }
     };
@@ -1443,11 +1453,6 @@ function App() {
     }
   }, [selectedNodeId]);
 
-  // Save node filters to localStorage whenever they change
-  useEffect(() => {
-    localStorage.setItem('nodeFilters', JSON.stringify(nodeFilters));
-  }, [nodeFilters]);
-
   // Message scroll-position tracking / infinite-scroll pagination / auto-load
   // / mark-as-read effects (isScrolledNearBottom/isScrolledNearTop through
   // the DM mark-as-read effect) moved into useMessagingView (#3962 5.4 PR7)
@@ -1505,33 +1510,27 @@ function App() {
     previousUnreadTotal.current = totalUnread;
   }, [unreadCountsData, updateFavicon]);
 
-  // Connection status check (every 5 seconds when not connected)
-  // Note: Data polling is now handled by usePoll hook when connected
-  useEffect(() => {
-    const updateInterval = setInterval(() => {
-      // Use refs to get current values without adding to deps (prevents interval multiplication)
+  // Connection status check while not connected: reads the lightweight
+  // /api/connection, backing off from 5 s to 30 s while the status stays the
+  // same, and pausing while the tab is hidden (useConnectionCheckLoop). Data
+  // polling when connected is handled by usePoll.
+  useConnectionCheckLoop({
+    // Read through refs: the loop is created once.
+    shouldCheck: () => {
       const currentConnectionStatus = connectionStatusRef.current;
-      const currentShowRebootModal = showRebootModalRef.current;
-
       // Skip when user has manually disconnected or device is rebooting
       if (currentConnectionStatus === 'user-disconnected' || currentConnectionStatus === 'rebooting') {
-        return;
+        return false;
       }
-
       // Skip when RebootModal is active
-      if (currentShowRebootModal) {
-        return;
+      if (showRebootModalRef.current) {
+        return false;
       }
-
-      // Only check connection status when not connected
-      // Data polling when connected is handled by usePoll hook
-      if (currentConnectionStatus !== 'connected') {
-        void checkConnectionStatus();
-      }
-    }, 5000);
-
-    return () => clearInterval(updateInterval);
-  }, []); // Empty deps - interval created only once, uses refs for current values
+      return currentConnectionStatus !== 'connected';
+    },
+    // Called from a timer, after this render has defined checkConnectionStatus.
+    check: () => checkConnectionStatus(),
+  });
 
   // Scheduled node database refresh (every 60 minutes)
   useEffect(() => {
@@ -1630,17 +1629,25 @@ function App() {
     }
   };
 
-  const handleConfigChangeTriggeringReboot = () => {
-    logger.debug('⚙️ Config change sent, device will reboot to apply changes...');
+  // The firmware reboots on its own after most config saves (#5823). This only
+  // waits for it: it sends no reboot command and writes nothing to the node.
+  const handleConfigChangeTriggeringReboot = (expectation: 'always' | 'possible' = 'always') => {
+    logger.debug(`⚙️ Config change sent, device ${expectation === 'always' ? 'will' : 'may'} reboot to apply changes...`);
+    // "Save All" can save several sections in a row. While the modal is up,
+    // keep the stronger expectation: one certain reboot outweighs a possible one.
+    const alreadyOpen = rebootModalOpenRef.current;
+    setRebootExpectation((prev) => (alreadyOpen && prev === 'always' ? 'always' : expectation));
     setConnectionStatus('rebooting');
 
     // Show reboot modal
+    rebootModalOpenRef.current = true;
     setShowRebootModal(true);
   };
 
   const handleRebootModalClose = () => {
     logger.debug('✅ Device reboot complete and verified');
     console.log('[App] Reboot modal closing - will trigger config refresh');
+    rebootModalOpenRef.current = false;
     setShowRebootModal(false);
     setConnectionStatus('connected');
 
@@ -1677,59 +1684,36 @@ function App() {
     }
   };
 
-  const checkConnectionStatus = async () => {
+  const checkConnectionStatus = async (): Promise<string | null> => {
     try {
-      // Use consolidated polling endpoint to check connection status.
-      // When inside a SourceProvider (multi-source dashboard), pass sourceId
-      // so the server reads from the correct manager — otherwise the header
-      // would show the legacy singleton's status, which is "disconnected" in
-      // 4.0 multi-source mode.
-      //
-      // Read through queryClient.fetchQuery on usePoll's own query key/queryFn
-      // instead of a bare fetch, so it shares/dedupes with any other observer
-      // already fetching (or holding fresh data for) this same key — e.g.
-      // useNodes/useChannels/etc. in useServerData.ts fetch it at mount.
-      //
-      // staleTime is a short, few-second window (POLL_STATUS_STALE_TIME_MS),
-      // NOT Infinity. This function is also the only thing keeping this cache
-      // entry current while not connected: `usePoll()` itself is gated by
-      // `shouldPoll = connectionStatus === 'connected'`, so it is disabled for
-      // exactly the three callers that matter here — the 5s "not connected"
-      // poll loop, the post-reboot reconnect wait, and the Retry button. With
-      // `Infinity`, once any stale connection snapshot landed in the cache it
-      // would be treated as forever-fresh and never re-fetched, so none of
-      // those three paths could ever observe the node coming back. A short
-      // staleTime still dedupes calls that land within the same few seconds
-      // (the original mount-time-triple-fetch fix this replaced), while every
-      // call spaced further apart — which is every real caller here — gets a
-      // live fetch.
-      let pollData: PollData | undefined;
-      let pollOk = true;
+      // Reads the lightweight /api/connection, not the full /api/poll. This
+      // runs every few seconds while the source is not connected, and the full
+      // poll (nodes, messages, channels, traceroutes) was 4.7 MB per call on a
+      // large MQTT source. The full poll is read once, when the source comes
+      // back (below). When inside a SourceProvider, pass sourceId so the server
+      // reads from the correct manager.
+      let connection: PollData['connection'];
+      let statusOk = true;
       try {
-        pollData = await queryClient.fetchQuery({
-          queryKey: sourcePollQueryKey(sourceId),
-          queryFn: ({ signal }) => fetchPollData(csrfFetch, appBasename, sourceId, signal),
-          staleTime: POLL_STATUS_STALE_TIME_MS,
-        });
+        connection = await fetchConnectionStatus(csrfFetch, appBasename, sourceId);
       } catch {
-        pollOk = false;
+        statusOk = false;
       }
-      if (pollOk && pollData) {
-        const status = pollData.connection;
-
-        if (!status) {
-          logger.error('No connection status in poll response');
-          return;
-        }
+      if (statusOk && connection) {
+        // Keep pollData.connection current for its readers (useConnectionInfo,
+        // the firmware page) while the full poll is not being read.
+        mergeConnectionIntoPollCache(queryClient, sourceId, connection);
+        const status = connection;
 
         // Keep the displayed/error address in sync with the per-source address
-        // the server resolved for THIS poll (status.nodeIp comes from the active
+        // the server resolved for THIS check (status.nodeIp comes from the active
         // manager's own getConfig().nodeIp). This makes reconnects always show
         // the configured source's address instead of a stale value or the env
         // default (#3611). Anonymous users don't receive nodeIp — leave the
         // existing value untouched in that case.
         if (typeof status.nodeIp === 'string' && status.nodeIp) {
           setNodeAddress(status.nodeIp);
+          nodeHostRef.current = status.nodeIp;
         }
 
         logger.debug(
@@ -1742,15 +1726,15 @@ function App() {
           setConnectionStatus('user-disconnected');
 
           // Still fetch cached data from backend on page load. This ensures
-          // we show cached data even after refresh — poll data itself is
-          // already in the query cache from the fetchQuery call above, so
-          // only the (separately-cached) channel list needs an explicit fetch.
+          // we show cached data even after refresh — poll data itself is read
+          // on mount by usePoll()'s always-enabled observers (useNodes etc.),
+          // so only the (separately-cached) channel list needs an explicit fetch.
           try {
             await fetchChannels();
           } catch (error) {
             logger.error('Failed to fetch cached data while disconnected:', error);
           }
-          return;
+          return 'user-disconnected';
         }
 
         // Check if node is in initial config capture phase
@@ -1758,7 +1742,7 @@ function App() {
           logger.debug('⚙️  Node is downloading initial configuration');
           setConnectionStatus('configuring');
           setError(`Downloading initial configuration from node. The interface will be available shortly.`);
-          return;
+          return 'configuring';
         }
 
         // Check if server connected but node is not responsive
@@ -1768,7 +1752,7 @@ function App() {
           setError(
             `Connected to server, but Meshtastic node is not responding. Please check if the device is powered on and properly connected.`
           );
-          return;
+          return 'node-offline';
         }
 
         if (status.connected && status.nodeResponsive) {
@@ -1782,13 +1766,17 @@ function App() {
                 setConnectionStatus('configuring');
                 setError(null);
 
-                // Improved initialization sequence. Poll data itself is
-                // already in the query cache from the fetchQuery call above
-                // (or from usePoll's own always-enabled observers elsewhere) —
-                // an unconditional refetch here was the third of three
-                // redundant ~3MB /api/poll fetches firing within the first
-                // second of mount. usePoll()'s own query will pick up the
-                // cached data as soon as shouldPoll flips this hook enabled.
+                // The source just came back: read the full poll once. The
+                // connection check above read only /api/connection, and
+                // usePoll()'s observers do not poll while not connected.
+                // refreshPollCache shares a fetch with an observer that is
+                // running or finished within the last 3 s (the mount-time
+                // read), so this is not a second ~3MB /api/poll at mount.
+                try {
+                  await refreshPollCache(queryClient, csrfFetch, appBasename, sourceId);
+                } catch (pollError) {
+                  logger.error('❌ Poll refresh after reconnect failed:', pollError);
+                }
                 try {
                   await fetchChannels();
                   setConnectionStatus('connected');
@@ -1804,31 +1792,32 @@ function App() {
               return currentStatus;
             }
           });
+          return 'connected';
         } else {
           logger.debug('⚠️ Connection API returned connected=false');
           setConnectionStatus('disconnected');
           // Prefer the address the server just resolved for this source; fall
-          // back to the stored nodeAddress. Never interpolate an unresolved
-          // value (empty string / 'Loading...') — omit the address phrase
-          // entirely if it isn't known yet (#3611).
-          const resolvedAddress =
-            (typeof status.nodeIp === 'string' && status.nodeIp) ? status.nodeIp : nodeAddress;
-          setError(
-            resolvedAddress && resolvedAddress !== 'Loading...'
-              ? `Cannot connect to Meshtastic node at ${resolvedAddress}. Please ensure the node is reachable and has HTTP API enabled.`
-              : `Cannot connect to the Meshtastic node. Please ensure the node is reachable and has HTTP API enabled.`
-          );
+          // back to this source's own host from its /api/config (read from a
+          // ref, not the possibly stale nodeAddress closure). Never interpolate
+          // an unresolved value — omit the address phrase entirely if it isn't
+          // known (#3611, #6353).
+          const resolvedHost =
+            (typeof status.nodeIp === 'string' && status.nodeIp) ? status.nodeIp : nodeHostRef.current;
+          setError(cannotConnectMessage(formatNodeAddress(resolvedHost, nodePortRef.current)));
+          return 'disconnected';
         }
       } else {
         logger.debug('⚠️ Connection API request failed');
         setConnectionStatus('disconnected');
         setError('Failed to get connection status from server');
+        return 'request-failed';
       }
     } catch (err) {
       logger.debug('❌ Connection check error:', err);
       setConnectionStatus('disconnected');
       const errorMessage = err instanceof Error ? err.message : 'Unknown error';
       setError(`Server connection error: ${errorMessage}`);
+      return 'error';
     }
   };
 
@@ -2243,7 +2232,7 @@ function App() {
           // correctly, but on a LAN the round trip is milliseconds, so the
           // button just flashed and the user was told nothing.
           const toast = resolveNeighborInfoErrorToast(response.status, errorData, t('errors.unknown'));
-          showToast(t(toast.key, toast.params), toast.variant);
+          showToast(t(toast.key, toast.params ?? {}), toast.variant);
         }
         return;
       }
@@ -2325,6 +2314,7 @@ function App() {
   };
 
   const handleSendDirectMessage = async (destinationNodeId: string) => {
+    const newMessage = composeDraftStore.get();
     if (!newMessage.trim() || connectionStatus !== 'connected') {
       return;
     }
@@ -2385,7 +2375,7 @@ function App() {
     setReplyingTo(null);
 
     try {
-      const response = await authFetch(`${baseUrl}/api/messages/send`, {
+      const response = await authFetch(textSendEndpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2470,7 +2460,7 @@ function App() {
         };
       }
 
-      const response = await authFetch(`${baseUrl}/api/messages/send`, {
+      const response = await authFetch(textSendEndpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2754,6 +2744,7 @@ function App() {
   };
 
   const handleSendMessage = async (channel: number = 0) => {
+    const newMessage = composeDraftStore.get();
     if (!newMessage.trim() || connectionStatus !== 'connected') {
       return;
     }
@@ -2828,7 +2819,7 @@ function App() {
     setReplyingTo(null);
 
     try {
-      const response = await authFetch(`${baseUrl}/api/messages/send`, {
+      const response = await authFetch(textSendEndpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -3034,7 +3025,7 @@ function App() {
     try {
       // Use the same endpoint for both DMs and channel messages
       // DMs include a destination parameter, channel messages include a channel parameter
-      const endpoint = `${baseUrl}/api/messages/send`;
+      const endpoint = textSendEndpoint;
       const body = isDM
         ? { text: message.text, destination: destinationNodeId, sourceId: sourceId || undefined }
         : { text: message.text, channel: messageChannel, sourceId: sourceId || undefined };
@@ -3387,6 +3378,26 @@ function App() {
     }
   }, [setActiveTab, setSelectedDMNode, setSelectedChannel]);
 
+  // Security tab adapters (#6254 S6): the tab speaks `mt:<n>` keys, this shell
+  // speaks `!hex` DM node ids and a tab switch.
+  const securityNodeId = (nodeKey: string): string | null => {
+    if (!nodeKey.startsWith('mt:')) return null;
+    const num = Number(nodeKey.slice(3));
+    return Number.isFinite(num) ? `!${num.toString(16).padStart(8, '0')}` : null;
+  };
+  const openSecurityNode = useCallback((nodeKey: string) => {
+    const nodeId = securityNodeId(nodeKey);
+    if (!nodeId) return;
+    setSelectedDMNode(nodeId);
+    setActiveTab('messages');
+  }, [setSelectedDMNode, setActiveTab]);
+  const openSecurityDmWithDraft = useCallback((nodeKey: string, message: string) => {
+    const nodeId = securityNodeId(nodeKey);
+    if (!nodeId) return;
+    openDmWithDraft(nodeId, message);
+    setActiveTab('messages');
+  }, [openDmWithDraft, setActiveTab]);
+
   // On mobile the search modal opens over the bottom nav. Once the nav is
   // reachable again (#4774), tapping another nav item changes the active tab,
   // and the transient modal should get out of the way rather than linger over
@@ -3451,7 +3462,7 @@ function App() {
         onNodeClick={isMqtt ? undefined : handleNodeClick}
         sourceName={sourceName}
         onBackToSources={sourceId ? () => navigate('/', { state: { showList: true } }) : undefined}
-        mqttReadOnly={isMqttBridge}
+        mqttReadOnly={isMqttBridge && !mqttNativeEnabled}
         // Quick-status pill (#5616): Meshtastic device sources only, for a
         // signed-in user who may write that source's configuration, while the
         // node is connected.
@@ -3469,6 +3480,7 @@ function App() {
         // radio at all, so the disabled controls' tooltip explains it instead.
         isTxDisabled={isTxDisabled && !isMqtt}
         isUdpRelay={isUdpRelay}
+        isTransparentMode={isTransparentMode && !isMqtt && !isMeshCoreSource}
         isMeshCore={isMeshCoreSource}
         configIssues={configIssues}
         updateAvailable={updateAvailable}
@@ -3478,7 +3490,7 @@ function App() {
       />
 
       <LoginModal isOpen={showLoginModal} onClose={() => setShowLoginModal(false)} />
-      <RebootModal isOpen={showRebootModal} onClose={handleRebootModalClose} />
+      <RebootModal isOpen={showRebootModal} expectation={rebootExpectation} onClose={handleRebootModalClose} />
 
       {/* Emoji Picker Modal */}
       <EmojiPickerModal
@@ -3596,24 +3608,22 @@ function App() {
         onSearchClick={() => setIsSearchOpen(true)}
         onConfigSearchClick={() => openConfigSearchRef.current?.()}
         hasReadableVirtualChannels={channelDatabaseEntries.length > 0}
-        mqttReadOnly={isMqttBridge}
+        mqttReadOnly={isMqttBridge && !mqttNativeEnabled}
         hideDeviceConfig={isMqtt}
       />
 
       <main id="main-content" className="app-main">
         {error && (
-          <div className="error-panel">
-            <h3>Connection Error</h3>
-            <p>{error}</p>
-            <div className="error-actions">
-              <button onClick={() => checkConnectionStatus()} className="retry-btn">
-                Retry Connection
-              </button>
-              <button onClick={() => setError(null)} className="dismiss-error">
-                Dismiss
-              </button>
-            </div>
-          </div>
+          <ConnectionErrorPanel
+            error={error}
+            onRetry={() => {
+              // Manual retry: also re-read the full poll, which is not
+              // read on the timer while the source is down.
+              void refreshPollCache(queryClient, csrfFetch, appBasename, sourceId).catch(() => undefined);
+              void checkConnectionStatus();
+            }}
+            onDismiss={() => setError(null)}
+          />
         )}
 
         {/*
@@ -3629,6 +3639,9 @@ function App() {
           their messaging state machinery into `useMessagingView`
           (src/hooks/useMessagingView.ts) — see that file's doc comment.
         */}
+        {/* Tabs are lazy chunks (appTabs.ts): the pane shows a placeholder
+            while a tab's code loads, and the header and sidebar stay put. */}
+        <Suspense fallback={<RouteLoading variant="pane" />}>
         <Routes>
           <Route index element={<Navigate to="nodes" replace />} />
           <Route
@@ -3645,7 +3658,7 @@ function App() {
           />
           <Route
             path="security"
-            element={<ErrorBoundary fallbackTitle="Security failed to load"><SecurityTab onTabChange={setActiveTab} onSelectDMNode={setSelectedDMNode} openDmWithDraft={openDmWithDraft} /></ErrorBoundary>}
+            element={<ErrorBoundary fallbackTitle="Security failed to load"><SecurityTab onOpenNode={openSecurityNode} onOpenDmWithDraft={openSecurityDmWithDraft} /></ErrorBoundary>}
           />
           <Route
             path="admin"
@@ -3750,6 +3763,7 @@ function App() {
             path="nodes"
             element={
               <ErrorBoundary fallbackTitle="Nodes failed to load">
+                <PollErrorNotice error={pollError} empty={nodes.length === 0} />
                 <NodesTab
                   processedNodes={processedNodes}
                   agedOutAircraftNodes={agedOutAircraftNodes}
@@ -3868,6 +3882,7 @@ function App() {
             path="channels"
             element={
               <ErrorBoundary fallbackTitle="Channels failed to load">
+          <PollErrorNotice error={pollError} empty={channels.length === 0} />
           <ChannelsTab
             channels={channels}
             channelDatabaseEntries={channelDatabaseEntries}
@@ -3881,8 +3896,6 @@ function App() {
             selectedChannelRef={selectedChannelRef}
             showMqttMessages={showMqttMessages}
             setShowMqttMessages={setShowMqttMessages}
-            newMessage={newMessage}
-            setNewMessage={setNewMessage}
             replyingTo={replyingTo}
             setReplyingTo={setReplyingTo}
             unreadCounts={unreadCounts}
@@ -3911,7 +3924,7 @@ function App() {
             channelMessagesContainerRef={channelMessagesContainerRef}
             focusMessageId={focusMessageId}
             onFocusMessageHandled={() => setFocusMessageId(null)}
-            mqttReadOnly={isMqttBridge}
+            mqttReadOnly={isMqttBridge && !mqttNativeEnabled}
             txDisabled={txGated}
             txDisabledTooltip={txDisabledTooltip}
           />
@@ -3932,8 +3945,6 @@ function App() {
             setSelectedDMNode={setSelectedDMNode}
             pendingComposeFocus={pendingComposeFocus}
             clearComposeFocus={clearComposeFocus}
-            newMessage={newMessage}
-            setNewMessage={setNewMessage}
             replyingTo={replyingTo}
             setReplyingTo={setReplyingTo}
             unreadCountsData={unreadCountsData}
@@ -3985,7 +3996,7 @@ function App() {
             dmMessagesContainerRef={dmMessagesContainerRef}
             focusMessageId={focusMessageId}
             onFocusMessageHandled={() => setFocusMessageId(null)}
-            mqttReadOnly={isMqttBridge}
+            mqttReadOnly={isMqttBridge && !mqttNativeEnabled}
             txDisabled={txGated}
             txDisabledTooltip={txDisabledTooltip}
             toggleIgnored={toggleIgnored}
@@ -4023,6 +4034,7 @@ function App() {
               behavior for an unrecognized sub-path. */}
           <Route path="*" element={null} />
         </Routes>
+        </Suspense>
       </main>
 
       {/* Node Popup */}

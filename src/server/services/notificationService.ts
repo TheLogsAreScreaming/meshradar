@@ -4,6 +4,8 @@ import { pushNotificationService } from './pushNotificationService.js';
 import { appriseNotificationService, AppriseNotificationPayload } from './appriseNotificationService.js';
 import { desktopNotificationService } from './desktopNotificationService.js';
 import type { MessageTemplateContext } from '../../utils/notificationTemplate.js';
+import type { NotificationDedupSpec } from './notificationDedup.js';
+import type { NotificationMuteVenue } from '../utils/notificationFiltering.js';
 
 export interface NotificationPayload {
   title: string;
@@ -26,6 +28,30 @@ export interface NotificationPayload {
    * its filter decision; `title`/`body` above are then only a fallback.
    */
   message?: MessageTemplateContext;
+  /**
+   * Cross-source dedup (#5729). When set, a recipient gets ONE notification
+   * for this event however many sources raise it inside the window; see
+   * `notificationDedup.ts`. Leave it unset for anything that is about the
+   * source itself (source health), which must reach the user once per source.
+   */
+  dedup?: NotificationDedupSpec;
+  /**
+   * MeshCore keyed channel message (#5551): only recipients with access to this
+   * channel key get the event. Server-side input; never sent on the wire.
+   */
+  keyFingerprint?: string | null;
+  /**
+   * Venue of an event that follows a mute (a mention): a recipient who muted
+   * it is skipped. Server-side input; never sent on the wire.
+   */
+  muteVenue?: NotificationMuteVenue;
+  /**
+   * New-node alert (#5729, decision 5): sources where this node was already
+   * known before this source announced it. A recipient who can read any of
+   * them heard of the node from there first and is skipped. Server-side
+   * input; never sent on the wire.
+   */
+  knownOnSourceIds?: string[];
 }
 
 export interface NotificationFilterContext {
@@ -33,6 +59,12 @@ export interface NotificationFilterContext {
   channelId: number;
   isDirectMessage: boolean;
   viaMqtt?: boolean;
+  /** #5720: the packet is a protocol tapback (Meshtastic `emoji === 1`). */
+  isTapback?: boolean;
+  /** For DMs: the mute key (`mutedDMs.nodeUuid`): Meshtastic node id, MeshCore sender or room key. */
+  nodeUuid?: string;
+  /** MeshCore keyed channel message (#5551): recipient needs access to this key. */
+  keyFingerprint?: string | null;
   /** Phase B: source this notification originated from (required). */
   sourceId: string;
   /** Phase B: human-readable source name. */
@@ -90,7 +122,8 @@ class NotificationService {
               type: payload.type,
               sourceId: payload.sourceId,
               sourceName: payload.sourceName,
-              message: payload.message
+              message: payload.message,
+              dedup: payload.dedup
             } as AppriseNotificationPayload,
             filterContext
           )
@@ -105,7 +138,8 @@ class NotificationService {
               type: payload.type,
               sourceId: payload.sourceId,
               sourceName: payload.sourceName,
-              message: payload.message
+              message: payload.message,
+              dedup: payload.dedup
             },
             filterContext
           )
@@ -163,15 +197,19 @@ class NotificationService {
   public getServiceStatus(): {
     webPush: boolean;
     apprise: boolean;
+    desktop: boolean;
     anyAvailable: boolean;
   } {
     const webPush = pushNotificationService.isAvailable();
     const apprise = appriseNotificationService.isAvailable();
+    const desktop = desktopNotificationService.isAvailable();
 
     return {
       webPush,
       apprise,
-      anyAvailable: webPush || apprise
+      desktop,
+      // Desktop counts: a desktop-only install must still get messages.
+      anyAvailable: webPush || apprise || desktop
     };
   }
 
@@ -187,18 +225,34 @@ class NotificationService {
     hwModel: number | undefined,
     hopsAway: number | undefined,
     sourceId: string,
-    sourceName: string
+    sourceName: string,
+    /**
+     * #5729, decision 5: each source announces a node once; a user gets the
+     * alert from the first source THEY can read that heard it. `knownOnSourceIds`
+     * lists the sources that knew the node before this one.
+     */
+    opts: { nodeNum?: number; knownOnSourceIds?: string[] } = {},
   ): Promise<void> {
     try {
       const hopsText = hopsAway !== undefined ? ` (${hopsAway} ${hopsAway === 1 ? 'hop' : 'hops'} away)` : '';
       const hwModelText = hwModel !== undefined ? ` - ${getHardwareModelName(hwModel) || 'Unknown'}` : '';
       // #4845: title carries the service, body says which instance detected it.
+      const title = `New Meshtastic Node Detected`;
       const payload: NotificationPayload = {
-        title: `New Meshtastic Node Detected`,
+        title,
         body: `${longName} (${shortName}) detected by ${sourceName}${hwModelText}${hopsText}`,
         type: 'info',
         sourceId,
-        sourceName
+        sourceName,
+        ...(opts.knownOnSourceIds && opts.knownOnSourceIds.length > 0 ? { knownOnSourceIds: opts.knownOnSourceIds } : {}),
+        // Two sources completing the node at the same moment: one alert per
+        // recipient, naming both (the 5 s hold / silent push update).
+        ...(opts.nodeNum !== undefined ? {
+          dedup: {
+            key: `meshtastic-new-node:${opts.nodeNum >>> 0}`,
+            merged: (names: string[]) => ({ title, body: `${longName} (${shortName}) detected by ${names.join(', ')}${hwModelText}${hopsText}` }),
+          },
+        } : {}),
       };
 
       // Send to users with notifyOnNewNode enabled, scoped to this source
@@ -229,17 +283,30 @@ class NotificationService {
     displayName: string,
     deviceTypeLabel: string | undefined,
     sourceId: string,
-    sourceName: string
+    sourceName: string,
+    /** #6306: nodes the new-node alert gate dropped since the last alert (appended as "(+N more)"). */
+    suppressedCount?: number
   ): Promise<void> {
     try {
       const typeText = deviceTypeLabel ? ` - ${deviceTypeLabel}` : '';
+      const moreText = suppressedCount && suppressedCount > 0
+        ? ` (+${suppressedCount} more new nodes since the last alert)`
+        : '';
+      const title = `New MeshCore Device Detected`;
       // #4845: title carries the service, body says which instance detected it.
       const payload: NotificationPayload = {
-        title: `New MeshCore Device Detected`,
-        body: `${displayName} detected by ${sourceName}${typeText}`,
+        title,
+        body: `${displayName} detected by ${sourceName}${typeText}${moreText}`,
         type: 'info',
         sourceId,
-        sourceName
+        sourceName,
+        // #5729: each MeshCore source keeps its own "already announced" set,
+        // so two sources that hear the same advert both get here. The public
+        // key is the device's identity on every source.
+        dedup: {
+          key: `meshcore-new-node:${publicKey}`,
+          merged: (names) => ({ title, body: `${displayName} detected by ${names.join(', ')}${typeText}${moreText}` }),
+        },
       };
 
       // Send to users with notifyOnNewNode enabled, scoped to this source
@@ -268,8 +335,16 @@ class NotificationService {
     toNodeId: string,
     routeText: string,
     sourceId: string,
-    sourceName: string
+    sourceName: string,
+    /**
+     * An AUTOMATIC trace (MeshCore auto-pathfinding, scheduled traces,
+     * Automation Engine) goes only to users with `notifyOnAutoTrace` on
+     * (default off, 4.17.3 review M3). User-started traces keep
+     * `notifyOnTraceroute`.
+     */
+    opts: { automatic?: boolean } = {},
   ): Promise<void> {
+    const preferenceKey = opts.automatic ? 'notifyOnAutoTrace' : 'notifyOnTraceroute';
     try {
       const payload: NotificationPayload = {
         // Source once (#5593): on the body, where a long node pair in the
@@ -281,11 +356,11 @@ class NotificationService {
         sourceName
       };
 
-      // Send to users with notifyOnTraceroute enabled, scoped to this source
+      // Send to users with the matching preference enabled, scoped to this source
       await Promise.allSettled([
-        pushNotificationService.broadcastToPreferenceUsers('notifyOnTraceroute', payload, undefined, sourceId),
-        appriseNotificationService.broadcastToPreferenceUsers('notifyOnTraceroute', payload, undefined, sourceId),
-        desktopNotificationService.broadcastToPreferenceUsers('notifyOnTraceroute', payload, sourceId)
+        pushNotificationService.broadcastToPreferenceUsers(preferenceKey, payload, undefined, sourceId),
+        appriseNotificationService.broadcastToPreferenceUsers(preferenceKey, payload, undefined, sourceId),
+        desktopNotificationService.broadcastToPreferenceUsers(preferenceKey, payload, sourceId)
       ]);
 
       logger.info(`📤 Sent traceroute notification for ${fromNodeId} → ${toNodeId} on ${sourceId}`);
@@ -305,7 +380,7 @@ class NotificationService {
    * actually reached anyone, instead of firing-and-forgetting.
    */
   public async broadcastToPreferenceUsers(
-    preferenceKey: 'notifyOnNewNode' | 'notifyOnTraceroute' | 'notifyOnInactiveNode' | 'notifyOnLowBattery' | 'notifyOnServerEvents' | 'notifyOnWaypoint',
+    preferenceKey: 'notifyOnNewNode' | 'notifyOnTraceroute' | 'notifyOnInactiveNode' | 'notifyOnLowBattery' | 'notifyOnServerEvents' | 'notifyOnWaypoint' | 'notifyOnMention' | 'notifyOnAutoTrace',
     payload: NotificationPayload,
     targetUserId?: number
   ): Promise<{ sent: number; failed: number; filtered: number }> {

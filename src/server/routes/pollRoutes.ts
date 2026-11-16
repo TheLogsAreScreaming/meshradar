@@ -35,6 +35,9 @@ import { getEnvironmentConfig } from '../config/environment.js';
 import { mayViewSourceEndpointWith } from '../utils/sourceConfigRedaction.js';
 import { getMaxNodeAgeHours } from '../services/nodeDisplaySettings.js';
 import { holdsAnyGrantOn } from '../utils/sourcePermissions.js';
+import { pollDeltaTracker, serializePollReply } from '../services/pollDeltaTracker.js';
+import { fail } from '../utils/apiResponse.js';
+import { tracerouteNamesHiddenNode, dropMessagesNamingHiddenNodes } from '../utils/mqttConsentVisibility.js';
 
 const env = getEnvironmentConfig();
 const BASE_URL = env.baseUrl;
@@ -69,6 +72,19 @@ export const POLL_SECTION_GATES = {
 
 export type PollSection = keyof typeof POLL_SECTION_GATES;
 
+/**
+ * Keys an incremental reply adds (only when the caller sent `cursor`). They
+ * carry no data of their own: node numbers and section names of a reply the
+ * caller may already read. See `services/pollDeltaTracker.ts`.
+ */
+export const POLL_DELTA_KEYS = {
+  pollCursor: 'Send it back as `cursor` on the next poll.',
+  pollDelta: 'True when the reply holds only what changed since `cursor`.',
+  removedNodes: 'Delta: nodeNums gone from the `nodes` section since `cursor`.',
+  nodeOrder: 'Delta, when the order changed: every nodeNum of the `nodes` section, in order.',
+  unchangedSections: 'Delta: sections left out because the caller already holds them.',
+} as const;
+
 const DEVICE_CHANNEL_IDS = [0, 1, 2, 3, 4, 5, 6, 7] as const;
 const channelResource = (id: number): ResourceType => `channel_${id}` as ResourceType;
 
@@ -96,11 +112,26 @@ router.get('/poll', optionalAuth(), async (req, res) => {
     // The caller's grants, loaded ONCE (no query for an admin). Every check
     // below is answered from them in memory, for the source the data is from:
     // this route runs for every client every few seconds.
+    //
+    // Each section below fails on its own (#6342): one throw used to 500 the
+    // whole reply, and the client then showed no nodes AND no channels. A
+    // failed grant load falls back to the no-user access (computed in memory,
+    // so it cannot throw again): it fails closed, showing only what an
+    // anonymous caller may see.
+    const logSectionError = (section: string, error: unknown): void => {
+      logger.error(`[poll] section "${section}" failed for source ${pollSourceId ?? '(all)'}:`, error);
+    };
     const [access, readableVirtual] = await Promise.all([
-      loadNodeViewAccess(user),
+      loadNodeViewAccess(user).catch(async (error: unknown) => {
+        logSectionError('access', error);
+        return loadNodeViewAccess(null);
+      }),
       // Virtual (Channel Database) channels are gated by per-entry `canRead`
       // grants, not the channel_0..7 RBAC resources, and are global by design.
-      getUserReadableVirtualChannelIds(user, user?.isAdmin === true),
+      getUserReadableVirtualChannelIds(user, user?.isAdmin === true).catch((error: unknown) => {
+        logSectionError('virtualChannels', error);
+        return new Set<number>();
+      }),
     ]);
     const permissions = access.permissions;
     const isAdmin = access.isAdmin;
@@ -137,41 +168,51 @@ router.get('/poll', optionalAuth(), async (req, res) => {
     // False when the caller holds no node grant on the named source: its node
     // rows are then not read at all.
     const mayHoldNodes = isAdmin || !pollSourceId || access.sources === 'all' || access.sources.includes(pollSourceId);
-    if (!acrossPermitted) {
-      // One source, or an admin's unified view: one read, as before.
-      const allMemoryNodes = mayHoldNodes ? await activeManager.getAllNodesAsync(pollSourceId) : [];
-      visibleNodes = isAdmin
-        ? allMemoryNodes
-        : allMemoryNodes.filter((node) => access.canViewNode(pollSourceId, (node as { channel?: number }).channel));
-      canViewPrivate = access.canViewPrivate(pollSourceId);
-    } else {
-      // Rows the caller may not see are dropped, and a private override they
-      // may not see removed, BEFORE the per-node merge, so nothing from such a
-      // row is back-filled into the merged one (same as GET /api/nodes).
-      visibleNodes = await loadVisibleNodesAcrossSources(
-        access.sources === 'all' ? ALL_SOURCES : access.sources,
-        (row) => {
-          const rowSource = rowSourceId(row);
-          if (!rowSource || !access.canViewNode(rowSource, row.channel)) return null;
-          if (!visibleIdsBySource.has(rowSource)) {
-            visibleIdsBySource.set(rowSource, new Set());
-            visibleNumsBySource.set(rowSource, new Set());
-          }
-          visibleIdsBySource.get(rowSource)!.add(row.nodeId);
-          visibleNumsBySource.get(rowSource)!.add(Number(row.nodeNum));
-          if (row.positionOverrideIsPrivate && !access.canViewPrivate(rowSource)) {
-            return {
-              ...row,
-              positionOverrideEnabled: false,
-              latitudeOverride: undefined,
-              longitudeOverride: undefined,
-              altitudeOverride: undefined,
-            };
-          }
-          return row;
-        },
-      );
-      canViewPrivate = true;
+    try {
+      if (!acrossPermitted) {
+        // One source, or an admin's unified view: one read, as before.
+        const allMemoryNodes = mayHoldNodes ? await activeManager.getAllNodesAsync(pollSourceId) : [];
+        visibleNodes = isAdmin
+          ? allMemoryNodes
+          : allMemoryNodes.filter((node) => access.canViewNode(pollSourceId, (node as { channel?: number }).channel, node.nodeNum));
+        canViewPrivate = access.canViewPrivate(pollSourceId);
+      } else {
+        // Rows the caller may not see are dropped, and a private override they
+        // may not see removed, BEFORE the per-node merge, so nothing from such a
+        // row is back-filled into the merged one (same as GET /api/nodes).
+        visibleNodes = await loadVisibleNodesAcrossSources(
+          access.sources === 'all' ? ALL_SOURCES : access.sources,
+          (row) => {
+            const rowSource = rowSourceId(row);
+            if (!rowSource || !access.canViewNode(rowSource, row.channel, row.nodeNum)) return null;
+            if (!visibleIdsBySource.has(rowSource)) {
+              visibleIdsBySource.set(rowSource, new Set());
+              visibleNumsBySource.set(rowSource, new Set());
+            }
+            visibleIdsBySource.get(rowSource)!.add(row.nodeId);
+            visibleNumsBySource.get(rowSource)!.add(Number(row.nodeNum));
+            if (row.positionOverrideIsPrivate && !access.canViewPrivate(rowSource)) {
+              return {
+                ...row,
+                positionOverrideEnabled: false,
+                latitudeOverride: undefined,
+                longitudeOverride: undefined,
+                altitudeOverride: undefined,
+              };
+            }
+            return row;
+          },
+        );
+        canViewPrivate = true;
+      }
+    } catch (error) {
+      // The node read failed: no nodes this tick, every other section still
+      // answers. The per-source sets may be half filled, so clear them.
+      logSectionError('nodes.load', error);
+      visibleNodes = [];
+      canViewPrivate = false;
+      visibleIdsBySource.clear();
+      visibleNumsBySource.clear();
     }
     /** Node ids visible on one source (DM senders whose counts may be shown). */
     const visibleNodeIdsOn = (sourceId: string | undefined): Set<string> =>
@@ -215,7 +256,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
           result.connection = connectionStatus;
         }
       } catch (error) {
-        logger.error('Error getting connection status in poll:', error);
+        logSectionError('connection', error);
         result.connection = { error: 'Failed to get connection status' };
       }
     }
@@ -233,7 +274,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
       const signFlipCtx = await getCachedSignFlipContext(pollSourceId);
       result.nodes = enhanced.map(node => applySignFlipCorrection(node, signFlipCtx));
     } catch (error) {
-      logger.error('Error fetching nodes in poll:', error);
+      logSectionError('nodes.enhance', error);
       result.nodes = [];
     }
 
@@ -253,7 +294,12 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         // them out of message lists (they render from the `traceroutes`
         // table), so including them only wastes slots in the fixed-size
         // window and evicts real DMs (issue #2741).
-        const dbMessagesRaw = await databaseService.messages.getMessages(100, 0, pollSourceId, [PortNum.TRACEROUTE_APP]);
+        // #5156: an anonymous caller loses messages from/to consent-hidden nodes.
+        const dbMessagesRaw = dropMessagesNamingHiddenNodes(
+          await databaseService.messages.getMessages(100, 0, pollSourceId, [PortNum.TRACEROUTE_APP]),
+          access.hiddenByMqttConsent,
+          pollSourceId,
+        );
 
         let messages: MeshMessage[] = dbMessagesRaw.map(
           msg => transformDbMessageToMeshMessage(msg as any as DbMessage)
@@ -281,7 +327,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         result.messages = messages;
       }
     } catch (error) {
-      logger.error('Error fetching messages in poll:', error);
+      logSectionError('messages', error);
     }
 
     // 4. Unread counts (requires channels OR messages permission)
@@ -349,7 +395,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         result.unreadCounts = total;
       }
     } catch (error) {
-      logger.error('Error fetching unread counts in poll:', error);
+      logSectionError('unreadCounts', error);
     }
 
     // 5. Channels (filtered based on per-channel read permissions)
@@ -413,7 +459,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         return transformChannel(channel, { includePsk });
       });
     } catch (error) {
-      logger.error('Error fetching channels in poll:', error);
+      logSectionError('channels', error);
     }
 
     // 6. Telemetry availability (requires info:read permission, filtered by channel permissions)
@@ -428,7 +474,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         const allDbNodes = mayHoldNodes ? await databaseService.nodes.getAllNodes(nodeScope) : [];
         const dbNodes = isAdmin
           ? allDbNodes
-          : allDbNodes.filter((node) => access.canViewNode(rowSourceId(node) ?? pollSourceId, node.channel));
+          : allDbNodes.filter((node) => access.canViewNode(rowSourceId(node) ?? pollSourceId, node.channel, node.nodeNum));
         // Telemetry is read from the sources of the rows kept, so a node seen
         // on source A is not marked from telemetry only source B holds.
         const telemetrySources = [...new Set(dbNodes.map((node) => rowSourceId(node)).filter((id): id is string => !!id))];
@@ -502,7 +548,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         };
       }
     } catch (error) {
-      logger.error('Error checking telemetry availability in poll:', error);
+      logSectionError('telemetryNodes', error);
     }
 
     // 7. Config (always available with optionalAuth)
@@ -520,6 +566,12 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         // True when the node is reached via a bridge/proxy (no native IP) and
         // therefore cannot do OTA firmware updates. See isLocalNodeBridged().
         isBridged: deviceManager.isLocalNodeBridged(),
+        // #6157: DeviceMetadata.ble_address — included only when the node
+        // reports a non-empty address (firmware-develop only today).
+        ...(managerNodeInfo.bleAddress ? { bleAddress: managerNodeInfo.bleAddress } : {}),
+        // #6321: DeviceMetadata.bootloader_version (packed) — nRF52 only;
+        // included only when non-zero.
+        ...(managerNodeInfo.bootloaderVersion ? { bootloaderVersion: managerNodeInfo.bootloaderVersion } : {}),
       } : undefined;
 
       const pollLocalNodeInfo = managerNodeInfo ? {
@@ -550,7 +602,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         ...(mayViewDevice ? { deviceMetadata, localNodeInfo: pollLocalNodeInfo } : {}),
       };
     } catch (error) {
-      logger.error('Error in config section of poll:', error);
+      logSectionError('config', error);
       result.config = {
         ...(mayViewEndpoint ? { meshtasticNodeIp: env.meshtasticNodeIp } : {}),
         meshtasticTcpPort: env.meshtasticTcpPort,
@@ -579,7 +631,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         }
       }
     } catch (error) {
-      logger.error('Error fetching device config in poll:', error);
+      logSectionError('deviceConfig', error);
     }
 
     // 9. Recent traceroutes (for dashboard widget and node view)
@@ -613,6 +665,8 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         // `traceroute:read` on the row's source is already decided: the query
         // read only the sources the caller holds it on.
         const trSource = rowSourceId(tr) ?? pollSourceId;
+        // #5156: an anonymous caller loses routes naming a consent-hidden node.
+        if (tracerouteNamesHiddenNode(access.hiddenByMqttConsent, trSource, tr)) return false;
         // Channel-gate the way nodes are gated, so a route heard on a channel
         // the caller cannot view is not drawn (#3092). A row with no channel
         // recorded has no channel restriction.
@@ -645,26 +699,67 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         ? traceroutesWithHops.map(tr => applySignFlipToTraceroute(tr, signFlipCtxForTraceroutes))
         : await applySignFlipToTraceroutes(traceroutesWithHops);
     } catch (error) {
-      logger.error('Error fetching traceroutes in poll:', error);
+      logSectionError('traceroutes', error);
     }
 
     // 10. Device node numbers (nodes in the connected radio's local database)
     // For a caller who is not an admin: only the ones they may see as nodes
     // on that source. The full list used to go to every caller.
-    const deviceNodeNums = deviceManager ? deviceManager.getDeviceNodeNums() : [];
-    if (isAdmin) {
-      result.deviceNodeNums = deviceNodeNums;
-    } else {
-      const visibleNums = acrossPermitted
-        ? (deviceSourceId && visibleNumsBySource.get(deviceSourceId)) || new Set<number>()
-        : new Set(visibleNodes.map((node) => Number(node.nodeNum)));
-      result.deviceNodeNums = deviceNodeNums.filter((nodeNum) => visibleNums.has(Number(nodeNum)));
+    try {
+      const deviceNodeNums = deviceManager ? deviceManager.getDeviceNodeNums() : [];
+      if (isAdmin) {
+        result.deviceNodeNums = deviceNodeNums;
+      } else {
+        const visibleNums = acrossPermitted
+          ? (deviceSourceId && visibleNumsBySource.get(deviceSourceId)) || new Set<number>()
+          : new Set(visibleNodes.map((node) => Number(node.nodeNum)));
+        result.deviceNodeNums = deviceNodeNums.filter((nodeNum) => visibleNums.has(Number(nodeNum)));
+      }
+    } catch (error) {
+      logSectionError('deviceNodeNums', error);
+      result.deviceNodeNums = [];
     }
 
-    res.json(result);
+    // Incremental reply (opt-in): a caller that sends `cursor` (empty on its
+    // first poll) gets only what changed since the reply that cursor names.
+    // The reply above is built in full either way, so every gate is applied
+    // exactly as before; the tracker only leaves out what the caller holds.
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
+    if (cursor === null) {
+      res.json(result);
+      return;
+    }
+    let body: string;
+    try {
+      const { nodes, ...sections } = result;
+      const nodeList: Array<{ nodeNum: unknown }> = Array.isArray(nodes) ? nodes : [];
+      const sectionsJson: Record<string, string | undefined> = {};
+      for (const [name, value] of Object.entries(sections)) sectionsJson[name] = JSON.stringify(value);
+      const delta = pollDeltaTracker.apply(`${userId ?? 'anon'}|${pollSourceId ?? '*'}`, cursor, {
+        nodesJson: nodeList.map((node) => JSON.stringify(node)),
+        nodeNums: nodeList.map((node) => Number(node.nodeNum)),
+        sectionsJson,
+      });
+      for (const name of delta.unchangedSections ?? []) sectionsJson[name] = undefined;
+      body = serializePollReply(sectionsJson, delta.nodesJson, {
+        pollCursor: delta.cursor ?? undefined,
+        pollDelta: delta.delta || undefined,
+        removedNodes: delta.removedNodes,
+        nodeOrder: delta.nodeOrder,
+        unchangedSections: delta.unchangedSections,
+      });
+    } catch (error) {
+      // The incremental reply failed: send the full one. It carries no
+      // `pollCursor`, so the client drops its base and asks for a full
+      // reply (empty cursor) next time, which resets the tracker.
+      logSectionError('delta', error);
+      res.json(result);
+      return;
+    }
+    res.type('application/json').send(body);
   } catch (error) {
     logger.error('Error in consolidated poll endpoint:', error);
-    res.status(500).json({ error: 'Failed to fetch polling data' });
+    fail(res, 500, 'INTERNAL_ERROR', 'Failed to fetch polling data');
   }
 });
 

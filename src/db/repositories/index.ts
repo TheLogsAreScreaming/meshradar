@@ -8,7 +8,7 @@ export { BaseRepository, ALL_SOURCES } from './base.js';
 export type { DrizzleDatabase, SQLiteDrizzle, PostgresDrizzle, SourceScope, SourceSetScope } from './base.js';
 export { SettingsRepository } from './settings.js';
 export { ChannelsRepository, type ChannelInput } from './channels.js';
-export { NodesRepository, type NodesCacheHook, type AircraftAgeOutCandidate } from './nodes.js';
+export { NodesRepository, type NodesCacheHook, type AircraftAgeOutCandidate, type AircraftManualMarkWrite } from './nodes.js';
 export { MessagesRepository } from './messages.js';
 export type { MessageSourceScope, MessageChannelScope } from './messages.js';
 export { TelemetryRepository, type TelemetryCadenceAggregate } from './telemetry.js';
@@ -73,6 +73,8 @@ export type {
 } from './automationVariables.js';
 export { AutomationHomeAnchorsRepository } from './automationHomeAnchors.js';
 export type { AutomationHomeAnchor } from './automationHomeAnchors.js';
+export { AutomationFireStateRepository } from './automationFireState.js';
+export type { AutomationFireStateRow, AutomationFireStateKind } from './automationFireState.js';
 export { SavedRegionsRepository, normalizeRegionName } from './savedRegions.js';
 export type { SavedRegion } from './savedRegions.js';
 export { PrivacyDocumentsRepository } from './privacyDocuments.js';
@@ -100,10 +102,14 @@ export { AutoFavoriteTargetsRepository } from './autoFavoriteTargets.js';
 export type { AutoFavoriteTargetInput } from './autoFavoriteTargets.js';
 export { SourcePkiKeysRepository } from './sourcePkiKeys.js';
 export type { DbSourcePkiKey } from './sourcePkiKeys.js';
+export { MqttNativeIdentitiesRepository } from './mqttNativeIdentities.js';
+export type { DbMqttNativeIdentity } from './mqttNativeIdentities.js';
 export { MeshCoreObserverKeysRepository } from './meshcoreObserverKeys.js';
 export type { DbMeshCoreObserverKey } from './meshcoreObserverKeys.js';
 export { MeshCoreObserverCredentialsRepository } from './meshcoreObserverCredentials.js';
 export type { DbMeshCoreObserverCredential } from './meshcoreObserverCredentials.js';
+export { MeshCoreSourcePkiKeysRepository } from './meshcoreSourcePkiKeys.js';
+export type { DbMeshCoreSourcePkiKey } from './meshcoreSourcePkiKeys.js';
 export { MessageEventsRepository } from './messageEvents.js';
 export type {
   MessageEventRow,
@@ -116,6 +122,27 @@ export type {
   DbMeshtasticHeardRepeater,
   RecordMeshtasticHeardRepeaterParams,
 } from './meshtasticHeardRepeaters.js';
+export { PkiExchangeStateRepository } from './pkiExchangeState.js';
+export { MapMarkersRepository } from './mapMarkers.js';
+export { MeshCoreHopSnrRepository } from './meshcoreHopSnr.js';
+export type { MeshCoreHopSnrRow } from './meshcoreHopSnr.js';
+export { MeshCoreTraceRunsRepository } from './meshcoreTraceRuns.js';
+export type { MeshCoreTraceRunRow, MeshCoreTraceRunStatus, MeshCoreTraceRunOrigin } from './meshcoreTraceRuns.js';
+export { NodeNameHistoryRepository, NODE_NAME_HISTORY_CAP } from './nodeNameHistory.js';
+export type { NodeNameHistoryRow, NodeNameProtocol } from './nodeNameHistory.js';
+export { MeshCoreCliHistoryRepository } from './meshcoreCliHistory.js';
+export type { MeshCoreCliHistoryRow, MeshCoreCliHistoryScope, MeshCoreCliHistoryQuery, MeshCoreCliTargetKind, MeshCoreCliOrigin, MeshCoreCliOutcome } from './meshcoreCliHistory.js';
+export { MqttBrokerPresetsRepository } from './mqttBrokerPresets.js';
+export type { MqttBrokerPreset, MqttBrokerPresetInput } from './mqttBrokerPresets.js';
+export { MeshCoreAdminSessionsRepository } from './meshcoreAdminSessions.js';
+export type { MeshCoreAdminSessionRow } from './meshcoreAdminSessions.js';
+export { PasskeysRepository, PASSKEY_NICKNAME_MAX } from './passkeys.js';
+export type { PasskeySummary, DbPasskey, CreatePasskeyInput } from './passkeys.js';
+export type {
+  PkiExchangeStateRow,
+  PkiExchangeStateValue,
+  PkiFailureReason,
+} from './pkiExchangeState.js';
 export { CoverageReceptionsRepository } from './coverageReceptions.js';
 export type {
   DbCoverageReception,
@@ -131,6 +158,8 @@ export type {
 export { CoverageSurveysRepository } from './coverageSurveys.js';
 export { CrossSourceLinksRepository } from './crossSourceLinks.js';
 export type { DbCrossSourceLink, RecordCrossSourceHearingParams } from './crossSourceLinks.js';
+export { DirectRfContactsRepository, directRfDayBucket, DIRECT_RF_DAY_MS } from './directRfContacts.js';
+export type { DirectRfContactDelta, DirectRfContactSummary, DirectRfContactDailyPoint, DirectRfProtocol } from './directRfContacts.js';
 export type {
   DbCoverageSurvey,
   CreateCoverageSurveyParams,
@@ -151,6 +180,8 @@ export type {
   FlightMatchStatus,
   FlightMatchResultWrite,
   FlightMatchLookupWrite,
+  FlightMatchRecheckWrite,
+  FlightMatchLookupPoint,
 } from './aircraftFlightMatches.js';
 export { MeshCoreFiltersRepository } from './meshcoreFilters.js';
 export type {

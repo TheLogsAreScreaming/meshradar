@@ -31,7 +31,10 @@ import {
   POSITION_BROADCAST_FLOOR_SECS,
 } from '../../utils/broadcastIntervalFloor.js';
 import { isTxDisabledError } from '../errors/txDisabledError.js';
+import { isModuleConfigNotAppliedError, isModuleConfigUnverifiedError } from '../errors/moduleConfigVerifyError.js';
 import { safeJson } from '../utils/redactSecrets.js';
+import { fillDeviceMqttFromPreset } from '../services/mqttBrokerPresetFill.js';
+import { checkMqttRootSave, failInvalidMqttRoot } from '../utils/mqttRootGuard.js';
 
 const env = getEnvironmentConfig();
 const BASE_URL = env.baseUrl;
@@ -74,9 +77,19 @@ router.get('/', optionalAuth(), async (req, res) => {
       const currentNode = await databaseService.nodes.getNode(localNodeNum, configSourceId);
 
       if (currentNode) {
+        // #6157: DeviceMetadata.ble_address lives only in the live manager's
+        // in-memory local-node state (it is not persisted to the nodes row), so
+        // read it from the resolved source manager. Omitted when empty/absent.
+        // #6321: DeviceMetadata.bootloader_version follows the same path.
+        const managerNodeInfo = resolveOwnMeshtasticManager(configSourceId ?? null)
+          ?.getLocalNodeInfo();
+        const bleAddress = managerNodeInfo?.bleAddress;
+        const bootloaderVersion = managerNodeInfo?.bootloaderVersion;
         deviceMetadata = {
           firmwareVersion: currentNode.firmwareVersion,
           rebootCount: currentNode.rebootCount,
+          ...(bleAddress ? { bleAddress } : {}),
+          ...(bootloaderVersion ? { bootloaderVersion } : {}),
         };
 
         localNodeInfo = {
@@ -239,7 +252,13 @@ router.post('/position', requireDeviceSourcePermission('configuration', 'write',
 router.post('/mqtt', requireDeviceSourcePermission('configuration', 'write', 'body'), async (req, res) => {
   try {
     const { sourceId: _sourceId, ...config } = req.body;
+    // A saved broker preset's login, for a caller who was not shown it (#5794).
+    const presetErr = await fillDeviceMqttFromPreset(config);
+    if (presetErr) return fail(res, presetErr.status, presetErr.code, presetErr.message);
     const { manager: cfgMqttManager } = getDeviceSourceTarget(req);
+    // Refuse a bad root, but only when it changes (#6338).
+    const rootErr = checkMqttRootSave(config.root, cfgMqttManager.getActualModuleConfig?.()?.mqtt?.root);
+    if (rootErr) return failInvalidMqttRoot(res, rootErr, 'root');
     await cfgMqttManager.setMQTTConfig(config);
     res.json({ success: true, message: 'MQTT configuration sent' });
   } catch (error) {
@@ -372,9 +391,26 @@ router.post('/module/:moduleType', requireDeviceSourcePermission('configuration'
       return res.json({ success: true, message: `${moduleType} configuration sent` });
     }
 
+    // The Status Message applies without a reboot and the firmware reports no
+    // error when it drops a write, so read it back before saying "saved"
+    // (#5745). Worst case is two 5 s reads, well inside the socket timeout.
+    // No other module is read back.
+    if (moduleType === 'statusmessage') {
+      await cfgModManager.setGenericModuleConfig(moduleType, config, { verify: true });
+      return res.json({ success: true, message: `${moduleType} configuration sent` });
+    }
+
     await cfgModManager.setGenericModuleConfig(moduleType, config);
     res.json({ success: true, message: `${moduleType} configuration sent` });
   } catch (error) {
+    if (isModuleConfigNotAppliedError(error)) {
+      logger.warn(`Node did not apply the ${req.params.moduleType} config (read-back differs)`);
+      return fail(res, 502, 'STATUSMESSAGE_NOT_APPLIED', 'The node did not apply the status message.');
+    }
+    if (isModuleConfigUnverifiedError(error)) {
+      logger.warn(`Node did not confirm the ${req.params.moduleType} config (no read-back answer)`);
+      return fail(res, 504, 'STATUSMESSAGE_UNVERIFIED', 'The node did not confirm the status message in time. It may not have been saved.');
+    }
     logger.error(`Error setting ${req.params.moduleType} config:`, error);
     return fail(res, 500, 'MODULE_CONFIG_FAILED', `Failed to set ${req.params.moduleType} configuration`);
   }

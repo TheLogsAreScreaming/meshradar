@@ -445,6 +445,25 @@ export function modemPresetChannelName(modemPreset: number | undefined | null): 
 export const CHANNEL_DB_OFFSET = 100;
 
 /**
+ * `want_config_id` nonces (ToRadio.want_config_id). The node echoes the nonce
+ * back as FromRadio.config_complete_id when it finishes the stream.
+ *
+ * - WANT_CONFIG_NONCE_FULL: our normal request — the full config plus the
+ *   whole NodeDB dump. Any value other than the two special ones below does
+ *   the same thing.
+ * - WANT_CONFIG_NONCE_ONLY_CONFIG: firmware `SPECIAL_NONCE_ONLY_CONFIG`
+ *   (src/mesh/PhoneAPI.h). MyInfo, own NodeInfo, metadata, channels, config and
+ *   module config, then config_complete_id — no other NodeInfos. The session
+ *   then goes live, so mesh packets flow (#5974).
+ * - WANT_CONFIG_NONCE_ONLY_NODES: firmware `SPECIAL_NONCE_ONLY_NODES` — the
+ *   NodeDB without config. MeshRadar never sends it; the Virtual Node server
+ *   answers it.
+ */
+export const WANT_CONFIG_NONCE_FULL = 0xFFFFFFFF;
+export const WANT_CONFIG_NONCE_ONLY_CONFIG = 69420;
+export const WANT_CONFIG_NONCE_ONLY_NODES = 69421;
+
+/**
  * Maximum number of packets to process in a single retroactive decryption batch.
  * This can be overridden via environment variable RETROACTIVE_DECRYPTION_BATCH_SIZE.
  */
@@ -518,6 +537,28 @@ export function resolveHopLimit(configured: number | undefined | null): number {
  * `0xFFFFFFFF` itself is the broadcast address.
  */
 export const MAX_NODE_NUM = 0xFFFFFFFF; // 4,294,967,295
+
+/** `MeshPacket.to` for a broadcast. */
+export const BROADCAST_NODE_NUM = 0xFFFFFFFF;
+
+/**
+ * `meshtastic.HardwareModel.PRIVATE_HW`: what a software-only node reports in
+ * its NodeInfo. The MQTT-native identity (#4305) has no radio, so it says so.
+ */
+export const HW_MODEL_PRIVATE_HW = 255;
+
+/** `meshtastic.Config.DeviceConfig.Role.CLIENT_MUTE`: a node that never relays. */
+export const DEVICE_ROLE_CLIENT_MUTE = 1;
+
+/**
+ * `ServiceEnvelope.channel_id` and topic segment firmware uses for
+ * PKI-encrypted DMs on MQTT (`{root}/2/e/PKI/{gatewayId}`). Firmware gateways
+ * subscribe to `{root}/2/e/PKI/+` when they downlink any channel.
+ */
+export const MQTT_PKI_CHANNEL_ID = 'PKI';
+
+/** `Data.bitfield` bit 0: the originator allows its packet to be uplinked to MQTT. */
+export const DATA_BITFIELD_OK_TO_MQTT = 0x01;
 
 /**
  * Returns true if `n` is a safe-integer in the 32-bit unsigned `nodeNum` range.

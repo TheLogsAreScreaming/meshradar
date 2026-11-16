@@ -2,8 +2,8 @@
  * @vitest-environment jsdom
  */
 import React from 'react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import MapAnalysisCanvas from './MapAnalysisCanvas';
@@ -67,7 +67,24 @@ vi.mock('../VectorTileLayer', () => ({
 // FollowController's own behavior (Follow/Auto-zoom/pause) is covered by its
 // dedicated FollowController.test.tsx; here it's a no-op so this suite can
 // keep useMap() -> null (required by the spiderfier no-op path above).
+// #5685: stands in for the Leaflet click. While placement is armed it renders
+// a button that "clicks the map" at a fixed spot; unarmed it renders nothing,
+// which is how the tests see that the canvas armed (or did not arm) the map.
+vi.mock('../map/LocalMarkerPlacementBridge', () => ({
+  default: ({ placing, onPick }: { placing: boolean; onPick: (lat: number, lon: number) => void }) =>
+    placing ? <button type="button" data-testid="map-click" onClick={() => onPick(12.5, 34.5)}>map</button> : null,
+}));
+
 vi.mock('./FollowController', () => ({
+  default: () => null,
+}));
+// Same reason: it calls useMap(). Covered by its own picker tests.
+vi.mock('./SitePlannerOriginController', () => ({
+  default: () => null,
+}));
+// Same reason (its picker calls useMap().getContainer()); covered by
+// LinkProfileController's own tests. The drawer it pairs with stays real.
+vi.mock('./LinkProfileController', () => ({
   default: () => null,
 }));
 
@@ -113,7 +130,17 @@ vi.mock('../../hooks/useDashboardData', () => ({
     isLoading: false,
     isError: false,
   }),
+  // #5685: usePinAuthoring reads each sending source's own node number.
+  useSourceStatuses: () => new Map(),
   UNIFIED_SOURCE_ID: '__unified__',
+}));
+
+// #5685: who may add a pin (usePinAuthoring). Mutable per-test.
+let pinSourcesMock: { waypointSources: Array<{ id: string; name: string }>; markerSources: Array<{ id: string; name: string }> } = {
+  waypointSources: [], markerSources: [],
+};
+vi.mock('../../hooks/usePinSources', () => ({
+  usePinSources: () => pinSourcesMock,
 }));
 
 // Mutable so the vector-fallback test (#3826 Phase 2 WP-D) can swap in a
@@ -334,9 +361,33 @@ function ToggleGnssDop() {
   );
 }
 
+/** Opens tool panels through the context, as the toolbar does. */
+function OpenTools({ link = false }: { link?: boolean }) {
+  const { setSitePlannerMode, setGnssDopMode, setLinkProfileMode } = useMapAnalysisCtx();
+  React.useEffect(() => {
+    if (link) setLinkProfileMode(true);
+    else setSitePlannerMode(true);
+    setGnssDopMode(true);
+  }, [link, setSitePlannerMode, setGnssDopMode, setLinkProfileMode]);
+  return null;
+}
+
+/** Arms pin placement through the context, as the toolbar's Tools entry does. */
+function ArmPin({ kind }: { kind: 'waypoint' | 'marker' }) {
+  const { setPinPlaceMode } = useMapAnalysisCtx();
+  React.useEffect(() => { setPinPlaceMode(kind); }, [kind, setPinPlaceMode]);
+  return null;
+}
+
+function PinModeProbe() {
+  const { pinPlaceMode } = useMapAnalysisCtx();
+  return <div data-testid="pin-mode-probe">{String(pinPlaceMode)}</div>;
+}
+
 describe('MapAnalysisCanvas', () => {
   beforeEach(() => {
     localStorage.clear();
+    pinSourcesMock = { waypointSources: [], markerSources: [] };
     mapTilesetMock = 'osm';
     customTilesetsMock = [];
     terrainCapabilitiesMock = { enabled: true, terrainTiles: true, isLoading: false };
@@ -366,6 +417,55 @@ describe('MapAnalysisCanvas', () => {
   });
 
   // #4729: GNSS DOP overlay panel is off by default and shows once toggled on.
+  describe('pin authoring wiring (#5685)', () => {
+    const RADIO = { id: 'a', name: 'A Radio' };
+
+    it('does not arm the map, show a hint or open an editor by default', () => {
+      render(<MapAnalysisCanvas />, { wrapper });
+      expect(screen.queryByTestId('map-click')).toBeNull();
+      expect(screen.queryByTestId('pin-placement-hint')).toBeNull();
+      expect(screen.queryByText('New Waypoint')).toBeNull();
+    });
+
+    it('arms the map for a waypoint, and the map click opens the editor at that spot with the one sending source', () => {
+      pinSourcesMock = { waypointSources: [RADIO], markerSources: [RADIO] };
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      render(<><ArmPin kind="waypoint" /><PinModeProbe /><MapAnalysisCanvas /></>, { wrapper });
+      expect(screen.getByTestId('pin-placement-hint')).toBeInTheDocument();
+      const writesBefore = fetchSpy.mock.calls.filter(([, init]) => init?.method && init.method !== 'GET').length;
+
+      fireEvent.click(screen.getByTestId('map-click'));
+      expect(screen.getByTestId('pin-mode-probe')).toHaveTextContent('null');
+      expect(screen.queryByTestId('map-click')).toBeNull();
+      expect(screen.getByText('New Waypoint')).toBeInTheDocument();
+      expect(screen.getByTestId('pin-source-fixed')).toHaveTextContent('A Radio');
+      const lat = document.querySelector('input[type="number"][step="0.000001"]') as HTMLInputElement;
+      expect(lat.value).toBe('12.5');
+      // Arming, clicking the map and opening the editor write nothing.
+      expect(fetchSpy.mock.calls.filter(([, init]) => init?.method && init.method !== 'GET')).toHaveLength(writesBefore);
+      expect(writesBefore).toBe(0);
+      fetchSpy.mockRestore();
+    });
+
+    it('arms the map for a local marker and opens the local-marker editor, not the waypoint one', () => {
+      pinSourcesMock = { waypointSources: [], markerSources: [RADIO] };
+      render(<><ArmPin kind="marker" /><MapAnalysisCanvas /></>, { wrapper });
+      fireEvent.click(screen.getByTestId('map-click'));
+      expect(screen.getByText('New local marker')).toBeInTheDocument();
+      expect(screen.queryByText('New Waypoint')).toBeNull();
+    });
+
+    it('does not arm the 3D map, and drops the armed tool', () => {
+      pinSourcesMock = { waypointSources: [RADIO], markerSources: [RADIO] };
+      localStorage.setItem('mapAnalysis.config.v1', JSON.stringify({ version: 1, viewMode: '3d' }));
+      render(<><ArmPin kind="waypoint" /><PinModeProbe /><MapAnalysisCanvas /></>, { wrapper });
+      expect(screen.getByTestId('base-3d-map')).toBeInTheDocument();
+      expect(screen.queryByTestId('map-click')).toBeNull();
+      expect(screen.queryByTestId('pin-placement-hint')).toBeNull();
+      expect(screen.getByTestId('pin-mode-probe')).toHaveTextContent('null');
+    });
+  });
+
   describe('GNSS DOP overlay wiring', () => {
     it('does not render the DOP panel by default', () => {
       render(<MapAnalysisCanvas />, { wrapper });
@@ -385,6 +485,129 @@ describe('MapAnalysisCanvas', () => {
       expect(screen.getByTestId('gnss-dop-panel')).toBeInTheDocument();
       fireEvent.click(screen.getByTestId('toggle-gnss-dop'));
       expect(screen.queryByTestId('gnss-dop-panel')).toBeNull();
+    });
+  });
+
+  // The tool panels move beside the open Map controls panel through CSS
+  // sibling selectors (`.map-sidebar ~ .toolColumn` / `~ .clearOfControls`,
+  // MapToolPanels.module.css). jsdom does not lay out CSS, so pin the DOM shape
+  // those rules depend on: one parent, controls panel first.
+  describe('tool panels beside the Map controls panel', () => {
+    it('stacks the Site Planner and GNSS DOP panels in one column', () => {
+      render(<><OpenTools /><MapAnalysisCanvas /></>, { wrapper });
+      const column = screen.getByTestId('map-tool-column');
+      expect(column.className).toContain('toolColumn');
+      expect(screen.getByTestId('site-planner-panel').parentElement).toBe(column);
+      expect(screen.getByTestId('gnss-dop-panel').parentElement).toBe(column);
+    });
+
+    it('renders the open controls panel as an earlier sibling of the column and the Link Profile drawer', () => {
+      render(<><OpenTools link /><MapAnalysisCanvas /></>, { wrapper });
+      const column = screen.getByTestId('map-tool-column');
+      const drawer = screen.getByTestId('link-profile-drawer');
+      expect(drawer.className).toContain('clearOfControls');
+      const sidebar = document.querySelector('.map-sidebar');
+      expect(sidebar).not.toBeNull();
+      for (const el of [column, drawer]) {
+        expect(sidebar!.parentElement).toBe(el.parentElement);
+        expect(sidebar!.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+    });
+
+    // `.map-sidebar ~ .slider` (TimeSliderControl.module.css) centres the
+    // time slider left of the open controls panel.
+    it('renders the open controls panel as an earlier sibling of the time slider', () => {
+      localStorage.setItem(
+        'mapAnalysis.config.v1',
+        JSON.stringify({ version: 1, timeSlider: { enabled: true } }),
+      );
+      render(<MapAnalysisCanvas />, { wrapper });
+      const slider = screen.getByTestId('time-slider');
+      expect(slider.className).toContain('slider');
+      const sidebar = document.querySelector('.map-sidebar');
+      expect(sidebar).not.toBeNull();
+      expect(sidebar!.parentElement).toBe(slider.parentElement);
+      expect(sidebar!.compareDocumentPosition(slider) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it('renders no .map-sidebar while the controls are collapsed, so the panels keep their corner', () => {
+      localStorage.setItem('mm-map-sidebar-collapsed', 'true');
+      render(<><OpenTools /><MapAnalysisCanvas /></>, { wrapper });
+      expect(screen.getByTestId('site-planner-panel')).toBeInTheDocument();
+      expect(document.querySelector('.map-sidebar')).toBeNull();
+      expect(document.querySelector('.map-sidebar-toggle')).not.toBeNull();
+    });
+  });
+
+  // Resizing across the phone/desktop boundary left the tool panels mounted
+  // all along, but the open Map controls column turned into a sheet over the
+  // whole map and covered them, so they looked closed. Drive the real
+  // `useIsMobileLayoutViewport` through a controllable matchMedia.
+  describe('tool panels across a layout switch', () => {
+    let mobile = false;
+    const listeners = new Set<(e: { matches: boolean }) => void>();
+    const originalMatchMedia = window.matchMedia;
+
+    beforeEach(() => {
+      mobile = false;
+      listeners.clear();
+      window.matchMedia = ((query: string) => ({
+        get matches() { return mobile; },
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: (_: string, fn: (e: { matches: boolean }) => void) => { listeners.add(fn); },
+        removeEventListener: (_: string, fn: (e: { matches: boolean }) => void) => { listeners.delete(fn); },
+        dispatchEvent: () => false,
+      })) as unknown as typeof window.matchMedia;
+    });
+    afterEach(() => {
+      window.matchMedia = originalMatchMedia;
+    });
+
+    const setMobile = (next: boolean) => {
+      act(() => {
+        mobile = next;
+        for (const fn of [...listeners]) fn({ matches: next });
+      });
+    };
+
+    it('keeps the Site Planner and GNSS DOP panels, and what was typed, both ways', () => {
+      render(<><OpenTools /><MapAnalysisCanvas /></>, { wrapper });
+      const planner = screen.getByTestId('site-planner-panel');
+      const gnss = screen.getByTestId('gnss-dop-panel');
+      fireEvent.change(screen.getByTestId('site-planner-txHeightM'), { target: { value: '27' } });
+      fireEvent.change(screen.getByTestId('gnss-dop-mask'), { target: { value: '15' } });
+      expect(document.querySelector('.map-sidebar')).not.toBeNull();
+
+      setMobile(true);
+      // Same nodes, not remounted copies, and the controls sheet folded away.
+      expect(screen.getByTestId('site-planner-panel')).toBe(planner);
+      expect(screen.getByTestId('gnss-dop-panel')).toBe(gnss);
+      expect((screen.getByTestId('site-planner-txHeightM') as HTMLInputElement).value).toBe('27');
+      expect((screen.getByTestId('gnss-dop-mask') as HTMLInputElement).value).toBe('15');
+      expect(document.querySelector('.map-sidebar')).toBeNull();
+      expect(document.querySelector('.map-sidebar-toggle')).not.toBeNull();
+
+      setMobile(false);
+      expect(screen.getByTestId('site-planner-panel')).toBe(planner);
+      expect(screen.getByTestId('gnss-dop-panel')).toBe(gnss);
+      expect((screen.getByTestId('site-planner-txHeightM') as HTMLInputElement).value).toBe('27');
+      expect((screen.getByTestId('gnss-dop-mask') as HTMLInputElement).value).toBe('15');
+      // Desktop gets its controls column back.
+      expect(document.querySelector('.map-sidebar')).not.toBeNull();
+    });
+
+    it('keeps the Link Profile drawer and its inputs', () => {
+      render(<><OpenTools link /><MapAnalysisCanvas /></>, { wrapper });
+      const drawer = screen.getByTestId('link-profile-drawer');
+      fireEvent.change(screen.getByLabelText(/Frequency \(MHz\)/), { target: { value: '868' } });
+
+      setMobile(true);
+      setMobile(false);
+      expect(screen.getByTestId('link-profile-drawer')).toBe(drawer);
+      expect((screen.getByLabelText(/Frequency \(MHz\)/) as HTMLInputElement).value).toBe('868');
     });
   });
 

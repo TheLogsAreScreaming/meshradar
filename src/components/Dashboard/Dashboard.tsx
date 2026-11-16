@@ -14,6 +14,8 @@ import { type DashboardProps } from './types';
 import { meshtasticDashboardSource } from './dataSources';
 import { useSettings } from '../../contexts/SettingsContext';
 import { useSource } from '../../contexts/SourceContext';
+import { CHART_Y_RANGE_SETTING, withChartYRange, type ChartYRange } from '../../utils/chartYRange';
+import { SourceNotConnectedNotice } from '../common/SourceNotConnectedNotice';
 
 const Dashboard: React.FC<DashboardProps> = React.memo(
   ({
@@ -49,8 +51,11 @@ const Dashboard: React.FC<DashboardProps> = React.memo(
       setCustomWidgets,
       solarVisibility,
       setSolarVisibility,
+      chartYRanges,
+      setChartYRanges,
       loading,
       error,
+      notConnected,
     } = useDashboardData({ dataSource });
 
     // Get solar visibility for a specific chart (uses type-based default if not set)
@@ -86,6 +91,27 @@ const Dashboard: React.FC<DashboardProps> = React.memo(
         logger.error('Error saving solar visibility:', err);
       }
     }, [solarVisibility, setSolarVisibility, csrfFetch, baseUrl, sourceQuery]);
+
+    // Fixed Y-axis range per chart widget (#6348), keyed like solar visibility.
+    const getYRange = useCallback(
+      (nodeId: string, telemetryType: string): ChartYRange | null =>
+        chartYRanges[`${nodeId}-${telemetryType}`] ?? null,
+      [chartYRanges],
+    );
+
+    const handleYRangeChange = useCallback(async (nodeId: string, telemetryType: string, range: ChartYRange | null) => {
+      const next = withChartYRange(chartYRanges, `${nodeId}-${telemetryType}`, range);
+      setChartYRanges(next);
+      try {
+        await csrfFetch(`${baseUrl}/api/settings${sourceQuery}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ [CHART_Y_RANGE_SETTING]: JSON.stringify(next) }),
+        });
+      } catch (err) {
+        logger.error('Error saving chart Y-axis range:', err);
+      }
+    }, [chartYRanges, setChartYRanges, csrfFetch, baseUrl, sourceQuery]);
 
     // Filters hook
     const {
@@ -234,6 +260,10 @@ const Dashboard: React.FC<DashboardProps> = React.memo(
       return <div className="dashboard-loading">{t('dashboard.loading')}</div>;
     }
 
+    if (notConnected) {
+      return <SourceNotConnectedNotice />;
+    }
+
     if (error) {
       return <div className="dashboard-error">{t('dashboard.error', { error })}</div>;
     }
@@ -247,11 +277,12 @@ const Dashboard: React.FC<DashboardProps> = React.memo(
           favoritesCount={favorites.length}
           daysToView={daysToView}
           onAddWidgetClick={() => setShowAddWidgetModal(true)}
-          showAddWidget={dataSource.showCustomWidgets}
+          showAddWidget={dataSource.widgets.supported.size > 0}
         />
 
-        {dataSource.showCustomWidgets && (
+        {dataSource.widgets.supported.size > 0 && (
           <AddWidgetModal
+            supported={dataSource.widgets.supported}
             isOpen={showAddWidgetModal}
             onClose={() => setShowAddWidgetModal(false)}
             onAddWidget={addWidget}
@@ -306,9 +337,13 @@ const Dashboard: React.FC<DashboardProps> = React.memo(
             favoritesCount={favorites.length}
             filteredCount={filteredAndSortedFavorites.length}
             canEdit={canEdit}
+            sourceKind={dataSource.kind}
+            voltageFallback={dataSource.widgets.voltageFallback}
             solarMonitoringEnabled={solarMonitoringEnabled}
             getSolarVisibility={getSolarVisibility}
             onToggleSolar={handleToggleSolar}
+            getYRange={getYRange}
+            onYRangeChange={handleYRangeChange}
           />
         )}
 
