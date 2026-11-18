@@ -9,6 +9,7 @@ import {
 } from '../utils/aircraftClassification';
 import { DEFAULT_AIRCRAFT_TRAIL_HOURS, clampAircraftTrailHours } from '../components/map/aircraftTrails';
 import { readShowAgedOutAircraft, writeShowAgedOutAircraft } from '../components/map/agedOutAircraft';
+import { MapViewContext, createMapViewStore } from './mapViewStore';
 
 export interface PositionHistoryItem {
   latitude: number;
@@ -79,6 +80,24 @@ interface MapContextType {
   spreadNodes: boolean;
   setSpreadNodes: (value: boolean) => void;
   /**
+   * #6125: when on (default off), draw a per-source coloured ring around each
+   * node marker on cross-source (Unified) maps so the arriving source is
+   * visible at a glance. Reuses `getSourceColor` so the ring matches the colour
+   * that source already uses in Unified Messages/Telemetry, flight lines, and
+   * legends. Single-source views ignore it.
+   */
+  colorNodesBySource: boolean;
+  setColorNodesBySource: (value: boolean) => void;
+  /**
+   * #6175: colour each node's marker ring by the GATEWAY it was last relayed
+   * through, on cross-source (Unified) maps. The gateway analogue of
+   * `colorNodesBySource` — the two are the non-off states of one 3-state UI
+   * control and are kept mutually exclusive by their setters. localStorage-only
+   * (opt-in, default false); single-source views ignore it.
+   */
+  colorNodesByGateway: boolean;
+  setColorNodesByGateway: (value: boolean) => void;
+  /**
    * Likely-aircraft display mode for the map (#5364/#5365 Phase 1 WP4):
    * 'show' (no badge, no filtering), 'mark' (badge only, default), or 'hide'
    * (marker suppressed, except favourites). Persisted server-side via
@@ -138,18 +157,31 @@ interface MapContextType {
   /** #5561: cross-source "heard here" edges. Per-browser (localStorage), default off. */
   showCrossSourceLinks: boolean;
   setShowCrossSourceLinks: (show: boolean) => void;
+  /** #4835: live packet traffic ("packet flights"). Per-browser (localStorage), default off. */
+  showPacketFlights: boolean;
+  setShowPacketFlights: (show: boolean) => void;
+  /** #4835: most packet flights drawn per second; 0 = all. Per-browser, default all. */
+  packetFlightRate: number;
+  setPacketFlightRate: (rate: number) => void;
   /** #5580: traceroute-confirmed reciprocal links, a sub-toggle of the one
    *  above (drawn only while both are on). Per-browser, default ON. */
   showTracerouteConfirmedLinks: boolean;
   setShowTracerouteConfirmedLinks: (show: boolean) => void;
+  /** #5686: local map markers (planning notes, never transmitted). Per-browser, default ON. */
+  showLocalMarkers: boolean;
+  setShowLocalMarkers: (show: boolean) => void;
+  /** #5734: tropospheric ducting overlay. Per-browser (localStorage), default off. */
+  showDucting: boolean;
+  setShowDucting: (show: boolean) => void;
+  /** #5734: the forecast step on view, hours ahead (0..72, 3 h steps). Not persisted. */
+  ductingHoursAhead: number;
+  setDuctingHoursAhead: (hours: number) => void;
   animatedNodes: Set<string>;
   triggerNodeAnimation: (nodeId: string) => void;
   mapCenterTarget: [number, number] | null;
   setMapCenterTarget: (target: [number, number] | null) => void;
-  mapCenter: [number, number] | null;
-  setMapCenter: (center: [number, number] | null) => void;
-  mapZoom: number;
-  setMapZoom: (zoom: number) => void;
+  // The live map centre/zoom are NOT on this context: they change on every
+  // pan/zoom and would re-render every consumer. See `./mapViewStore`.
   traceroutes: DbTraceroute[];
   setTraceroutes: (traceroutes: DbTraceroute[]) => void;
   neighborInfo: EnrichedNeighborInfo[];
@@ -205,6 +237,18 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabledState] = useState<boolean>(true);
   // #5177: default true = preserve the existing within-cell offset behaviour.
   const [spreadNodes, setSpreadNodesState] = useState<boolean>(true);
+  // #6125: default false = opt-in per-source ring around node markers.
+  const [colorNodesBySource, setColorNodesBySourceState] = useState<boolean>(false);
+  // #6175: default false = opt-in per-gateway ring. localStorage-only (no
+  // migration): the colour-by mode is a 3-state Off / By source / By gateway in
+  // the UI, and these two booleans are kept mutually exclusive by the setters.
+  const [colorNodesByGateway, setColorNodesByGatewayState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('meshmonitor-colorNodesByGateway') === 'true';
+    } catch {
+      return false;
+    }
+  });
   // #5364/#5365 Phase 1 WP4: localStorage-first (validated), else 'mark',
   // overridden by the server preference once it loads (see the loader below).
   const [aircraftDisplayMode, setAircraftDisplayModeState] = useState<AircraftDisplayMode>(() => {
@@ -243,6 +287,21 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
       return false;
     }
   });
+  const [showPacketFlights, setShowPacketFlightsState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('showPacketFlights') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [packetFlightRate, setPacketFlightRateState] = useState<number>(() => {
+    try {
+      const n = Number(localStorage.getItem('packetFlightRate'));
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch {
+      return 0;
+    }
+  });
   // #5580: default ON, so only an explicit 'false' turns it off.
   const [showTracerouteConfirmedLinks, setShowTracerouteConfirmedLinksState] = useState<boolean>(() => {
     try {
@@ -251,29 +310,28 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
       return true;
     }
   });
+  // #5686: default ON, so only an explicit 'false' turns it off.
+  const [showLocalMarkers, setShowLocalMarkersState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('showLocalMarkers') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  // #5734: default off, so only an explicit 'true' turns it on.
+  const [showDucting, setShowDuctingState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('showDucting') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [ductingHoursAhead, setDuctingHoursAhead] = useState<number>(0);
   const [animatedNodes, setAnimatedNodes] = useState<Set<string>>(new Set());
   const [mapCenterTarget, setMapCenterTarget] = useState<[number, number] | null>(null);
-  const [mapCenter, setMapCenter] = useState<[number, number] | null>(() => {
-    const saved = localStorage.getItem('mapCenter');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  });
-  const [mapZoom, setMapZoom] = useState<number>(() => {
-    const saved = localStorage.getItem('mapZoom');
-    if (saved) {
-      const zoom = parseFloat(saved);
-      if (!isNaN(zoom)) {
-        return zoom;
-      }
-    }
-    return 13; // Default zoom level for initial view (city/neighborhood level)
-  });
+  // Centre/zoom live in an external store (one per provider) so a pan or
+  // zoom doesn't re-render every MapContext consumer.
+  const [mapViewStore] = useState(() => createMapViewStore());
   const [traceroutes, setTraceroutes] = useState<DbTraceroute[]>([]);
   const [neighborInfo, setNeighborInfo] = useState<EnrichedNeighborInfo[]>([]);
   const [positionHistory, setPositionHistory] = useState<PositionHistoryItem[]>([]);
@@ -328,6 +386,30 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     setSpreadNodesState(value);
     void savePreferenceToServer({ spreadNodes: value });
   // eslint-disable-next-line react-hooks/exhaustive-deps -- #5177 same temporal-dead-zone reason as the sibling setters: `savePreferenceToServer` is declared below this callback
+  }, []);
+
+  const setColorNodesBySource = React.useCallback((value: boolean) => {
+    setColorNodesBySourceState(value);
+    // Mutual exclusivity (#6175): turning the source ring on clears the gateway
+    // ring so the UI's 3-state Off / By source / By gateway choice stays single.
+    if (value) {
+      setColorNodesByGatewayState(false);
+      try { localStorage.setItem('meshmonitor-colorNodesByGateway', 'false'); } catch { /* best-effort */ }
+    }
+    void savePreferenceToServer({ colorNodesBySource: value });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- #6125 same temporal-dead-zone reason as the sibling setters: `savePreferenceToServer` is declared below this callback
+  }, []);
+
+  const setColorNodesByGateway = React.useCallback((value: boolean) => {
+    setColorNodesByGatewayState(value);
+    try { localStorage.setItem('meshmonitor-colorNodesByGateway', String(value)); } catch { /* best-effort */ }
+    // Mutual exclusivity (#6175): the gateway ring and the source ring are the
+    // two non-off states of one control, so turning one on turns the other off.
+    if (value) {
+      setColorNodesBySourceState(false);
+      void savePreferenceToServer({ colorNodesBySource: false });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- #6175 same temporal-dead-zone reason as the sibling setters: `savePreferenceToServer` is declared below this callback
   }, []);
 
   const setAircraftDisplayMode = React.useCallback((value: AircraftDisplayMode) => {
@@ -405,10 +487,47 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     }
   }, []);
 
+  const setShowPacketFlights = React.useCallback((value: boolean) => {
+    setShowPacketFlightsState(value);
+    try {
+      localStorage.setItem('showPacketFlights', value.toString());
+    } catch {
+      // storage unavailable: the toggle still works for this session
+    }
+  }, []);
+
+  const setPacketFlightRate = React.useCallback((value: number) => {
+    const rate = Number.isFinite(value) && value > 0 ? value : 0;
+    setPacketFlightRateState(rate);
+    try {
+      localStorage.setItem('packetFlightRate', String(rate));
+    } catch {
+      // storage unavailable: the slider still works for this session
+    }
+  }, []);
+
   const setShowTracerouteConfirmedLinks = React.useCallback((value: boolean) => {
     setShowTracerouteConfirmedLinksState(value);
     try {
       localStorage.setItem('showTracerouteConfirmedLinks', value.toString());
+    } catch {
+      // storage unavailable: the toggle still works for this session
+    }
+  }, []);
+
+  const setShowLocalMarkers = React.useCallback((value: boolean) => {
+    setShowLocalMarkersState(value);
+    try {
+      localStorage.setItem('showLocalMarkers', value.toString());
+    } catch {
+      // storage unavailable: the toggle still works for this session
+    }
+  }, []);
+
+  const setShowDucting = React.useCallback((value: boolean) => {
+    setShowDuctingState(value);
+    try {
+      localStorage.setItem('showDucting', value.toString());
     } catch {
       // storage unavailable: the toggle still works for this session
     }
@@ -528,6 +647,9 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
             if (preferences.spreadNodes !== undefined) {
               setSpreadNodesState(preferences.spreadNodes);
             }
+            if (preferences.colorNodesBySource !== undefined) {
+              setColorNodesBySourceState(preferences.colorNodesBySource);
+            }
             if (preferences.showMeshCoreNodes !== undefined) {
               setShowMeshCoreNodesState(preferences.showMeshCoreNodes);
             }
@@ -584,18 +706,6 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     void loadServerPreferences();
   }, []); // Run once on mount
 
-  // Persist map center to localStorage
-  useEffect(() => {
-    if (mapCenter) {
-      localStorage.setItem('mapCenter', JSON.stringify(mapCenter));
-    }
-  }, [mapCenter]);
-
-  // Persist map zoom to localStorage
-  useEffect(() => {
-    localStorage.setItem('mapZoom', mapZoom.toString());
-  }, [mapZoom]);
-
   // Trigger animation for a node (lasts 1 second)
   const triggerNodeAnimation = React.useCallback((nodeId: string) => {
     if (!showAnimations) return;
@@ -630,6 +740,10 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     setUnreadIndicatorEnabled,
     spreadNodes,
     setSpreadNodes,
+    colorNodesBySource,
+    setColorNodesBySource,
+    colorNodesByGateway,
+    setColorNodesByGateway,
     pendingCenterNodeNum,
     setPendingCenterNodeNum,
     setShowRfNodes,
@@ -653,16 +767,22 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     setShowPolarGrid,
     showCrossSourceLinks,
     setShowCrossSourceLinks,
+    showPacketFlights,
+    setShowPacketFlights,
+    packetFlightRate,
+    setPacketFlightRate,
     showTracerouteConfirmedLinks,
     setShowTracerouteConfirmedLinks,
+    showLocalMarkers,
+    setShowLocalMarkers,
+    showDucting,
+    setShowDucting,
+    ductingHoursAhead,
+    setDuctingHoursAhead,
     animatedNodes,
     triggerNodeAnimation,
     mapCenterTarget,
     setMapCenterTarget,
-    mapCenter,
-    setMapCenter,
-    mapZoom,
-    setMapZoom,
     traceroutes,
     setTraceroutes,
     neighborInfo,
@@ -695,6 +815,8 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     showRfNodes, setShowRfNodes,
     unreadIndicatorEnabled, setUnreadIndicatorEnabled,
     spreadNodes, setSpreadNodes,
+    colorNodesBySource, setColorNodesBySource,
+    colorNodesByGateway, setColorNodesByGateway,
     pendingCenterNodeNum, setPendingCenterNodeNum,
     showMeshCoreNodes, setShowMeshCoreNodes,
     showWaypoints, setShowWaypoints,
@@ -706,11 +828,14 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     showAccuracyRegions, setShowAccuracyRegions,
     showPolarGrid, setShowPolarGrid,
     showCrossSourceLinks, setShowCrossSourceLinks,
+    showPacketFlights, setShowPacketFlights,
+    packetFlightRate, setPacketFlightRate,
     showTracerouteConfirmedLinks, setShowTracerouteConfirmedLinks,
+    showLocalMarkers, setShowLocalMarkers,
+    showDucting, setShowDucting,
+    ductingHoursAhead, setDuctingHoursAhead,
     animatedNodes, triggerNodeAnimation,
     mapCenterTarget, setMapCenterTarget,
-    mapCenter, setMapCenter,
-    mapZoom, setMapZoom,
     traceroutes, setTraceroutes,
     neighborInfo, setNeighborInfo,
     positionHistory, setPositionHistory,
@@ -726,7 +851,9 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
 
   return (
     <MapContext.Provider value={value}>
-      {children}
+      <MapViewContext.Provider value={mapViewStore}>
+        {children}
+      </MapViewContext.Provider>
     </MapContext.Provider>
   );
 };

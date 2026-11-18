@@ -21,7 +21,7 @@
  */
 import { createHash, createHmac, createDecipheriv, timingSafeEqual } from 'node:crypto';
 import { advertHasPosition } from '../../utils/meshcoreAdvertPosition.js';
-import { ChannelCrypto } from '@michaelhart/meshcore-decoder';
+import { ChannelCrypto, Ed25519SignatureVerifier } from '@michaelhart/meshcore-decoder';
 import databaseService from '../../services/database.js';
 import { ALL_SOURCES } from '../../db/repositories/base.js';
 import { decodeMeshCorePacket, type DecodedAdvert } from '../../utils/meshcorePacketDecode.js';
@@ -82,6 +82,37 @@ export const MESHCORE_KEYED_CHANNEL_BASE = 1000;
  */
 export function keyedChannelIndex(secretHex: string): number {
   return MESHCORE_KEYED_CHANNEL_BASE + parseInt(channelKeyFingerprint(secretHex).slice(0, 4), 16);
+}
+
+/**
+ * Fingerprint stamped on a legacy MQTT channel row whose decrypting key could
+ * not be recovered (#6308, migration 228). Not hex, so it never equals a real
+ * fingerprint. `resolveMeshcoreKeyAccess` never emits it, so the shared read
+ * gate shows such rows to admins only.
+ */
+export const MESHCORE_UNRESOLVED_KEY_FINGERPRINT = 'unresolved';
+
+/** Where a decrypted channel row files, and which key proves read access. */
+export interface KeyedFiling {
+  channelIdx: number;
+  keyFingerprint: string;
+  keySourceId: string | null;
+  keyChannelIdx: number | null;
+}
+
+/**
+ * The one filing rule for a frame decrypted with `key` (#6308). Every path that
+ * stores a decrypted group frame (Repeater RAW, Companion OTA, MQTT) files the
+ * row under the secret-derived index and stamps the key's provenance, so reads
+ * gate on the key rather than on a slot number that differs per source.
+ */
+export function keyedFilingFor(key: ChannelKeyCandidate): KeyedFiling {
+  return {
+    channelIdx: keyedChannelIndex(key.secretHex),
+    keyFingerprint: channelKeyFingerprint(key.secretHex),
+    keySourceId: key.sourceId,
+    keyChannelIdx: key.channelIdx,
+  };
 }
 
 /** True when `idx` is a keyed-channel index (see {@link keyedChannelIndex}). */
@@ -228,6 +259,26 @@ export async function decryptGroupTextFrame(
   return null;
 }
 
+/**
+ * True when any of `secretsHex` hashes to `channelHashHex` — i.e. the caller
+ * already holds a key for this frame's channel.
+ *
+ * The Companion OTA path (#6159) uses this as a double-store guard: a channel
+ * SET on the radio is delivered by the firmware as a normal channel message,
+ * so the raw-frame decrypt path must skip any frame whose channel hash it
+ * already holds a device key for. Pure computation, no I/O.
+ */
+export function anySecretMatchesChannelHash(
+  channelHashHex: string,
+  secretsHex: Iterable<string>,
+): boolean {
+  const want = channelHashHex.toLowerCase();
+  for (const secretHex of secretsHex) {
+    if (secretHex && ChannelCrypto.calculateChannelHash(secretHex) === want) return true;
+  }
+  return false;
+}
+
 /** A GRP_TXT or GRP_DATA body opened with one specific key. */
 export type OpenedGroupFrame =
   | {
@@ -343,6 +394,36 @@ export function frameChannelMessageId(
 }
 
 /**
+ * Content-derived id for a room-server post (#6246).
+ *
+ * A room server re-pushes a post on every login (an OpenHop timestamp-float bug
+ * resends the newest post forever, but any room server can resend after a lost
+ * ACK and retry). The device path gave each delivery a random id, so every sync
+ * added another copy of the same post. Keying the id on
+ * (room, author, post timestamp, text) lets `insertIgnore` collapse the repeat
+ * to one row.
+ *
+ * `authorPrefix` is the author's pubkey prefix, or '' when no raw frame was
+ * available to read it (#5774); an empty author still yields a stable id, so a
+ * post with an unknown author keyed on (room, timestamp, text) still dedupes.
+ * Includes `sourceId` so the same post heard on two sources keeps a row each.
+ * A clock-less room (timestamp 0) collapses two byte-identical posts — inherent.
+ */
+export function frameRoomPostId(
+  sourceId: string,
+  roomKey: string,
+  authorPrefix: string,
+  timestampSec: number,
+  text: string,
+): string {
+  const digest = createHash('sha256')
+    .update(`${roomKey}\u0000${authorPrefix}\u0000${timestampSec}\u0000${text}`)
+    .digest('hex')
+    .slice(0, 24);
+  return `room_${sourceId}_${digest}`;
+}
+
+/**
  * Create or update a node on `sourceId` from an ADVERT frame.
  *
  * Signatures are decoded but not enforced — the same trade-off the MQTT path
@@ -356,17 +437,87 @@ export function frameChannelMessageId(
  * Returns the decoded advert when a node was written, else null. Throws on a
  * DB failure; callers are best-effort and catch.
  */
+/** Global opt-in for cross-source hop resolution (#5909). */
+export const CROSS_SOURCE_HOP_RESOLUTION_SETTING = 'meshcoreCrossSourceHopResolution';
+
+/** Check an advert's Ed25519 signature. Never throws: a throw counts as invalid. */
+export async function verifyAdvertSignature(advert: DecodedAdvert): Promise<boolean> {
+  try {
+    return await Ed25519SignatureVerifier.verifyAdvertisementSignature(
+      advert.publicKey,
+      advert.signature,
+      advert.timestamp,
+      advert.appDataHex ?? '',
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The `advertSignatureVerified` value to store for an advert (#5909, P7a #6254).
+ * Tri-state: `true` verified, `false` CHECKED and failed, `null` not checked.
+ *
+ * `'always'` (a Repeater's own RAW stream, where the Ed25519 verify is the
+ * only cost) always checks. `'toggle'` (MQTT, where adverts come from
+ * strangers, #5040) checks only while the cross-source hop toggle is on; with
+ * it off the marker is `null`, which clears a stale `true` from an older
+ * advert and is never shown as "failed".
+ */
+async function advertSignatureMarker(
+  advert: DecodedAdvert,
+  mode: 'always' | 'toggle',
+): Promise<boolean | null> {
+  if (mode === 'always') return verifyAdvertSignature(advert);
+  let enabled: boolean;
+  try {
+    enabled = await databaseService.settings.getSettingAsBoolean(CROSS_SOURCE_HOP_RESOLUTION_SETTING, false);
+  } catch {
+    enabled = false;
+  }
+  return enabled ? verifyAdvertSignature(advert) : null;
+}
+
+/** What {@link ingestAdvertFrame} did with an advert (#6306). */
+export interface IngestedAdvert {
+  advert: DecodedAdvert;
+  /** The advert created this source's row (the key was new to the source). */
+  inserted: boolean;
+  /** The Ed25519 signature was checked and verified. */
+  signatureVerified: boolean;
+}
+
 export async function ingestAdvertFrame(
   rawHex: string,
   sourceId: string,
-  opts: { lastHeardMs: number | 'advert'; skipPublicKey?: string | null },
-): Promise<DecodedAdvert | null> {
+  opts: {
+    lastHeardMs: number | 'advert';
+    skipPublicKey?: string | null;
+    /**
+     * #5909 / P7a #6254: store whether the advert's signature verified.
+     * `'always'` verifies every advert (Repeater RAW stream); `'toggle'`
+     * verifies only while the cross-source hop toggle is on and otherwise
+     * stores null = unchecked (meshcore_mqtt). Omitted leaves the stored
+     * marker untouched.
+     */
+    verifySignature?: 'always' | 'toggle';
+    /**
+     * #6220: relays this advert passed through before WE heard it (0 = heard
+     * direct), written to `pathLen`. Only a caller that is itself the receiver
+     * may pass it (the repeater RAW stream); an MQTT observer's hop count is
+     * relative to that observer. Undefined/null keeps the stored value —
+     * `pathLen` treats an incoming null as "clear", so null is never sent.
+     */
+    heardHops?: number | null;
+  },
+): Promise<IngestedAdvert | null> {
   const packet = decodeMeshCorePacket(rawHex);
   const advert = packet?.payload?.advert;
   if (!advert?.publicKey) return null;
   if (opts.skipPublicKey && advert.publicKey.toLowerCase() === opts.skipPublicKey.toLowerCase()) return null;
+  const advertSignatureVerified = opts.verifySignature ? await advertSignatureMarker(advert, opts.verifySignature) : undefined;
 
-  await databaseService.meshcore.upsertNode(
+  const upserted = await databaseService.meshcore.upsertNode(
     {
       publicKey: advert.publicKey,
       name: advert.name ?? undefined,
@@ -381,9 +532,19 @@ export async function ingestAdvertFrame(
       // coordinates stay, so this is the one record that the node's latest
       // advert had no position.
       lastAdvertHadPosition: advertHasPosition(advert.latitude, advert.longitude),
+      // #5909: undefined (no verifySignature) keeps the stored value; null clears it (unchecked).
+      advertSignatureVerified,
       lastHeard: opts.lastHeardMs === 'advert' ? advertLastHeardMs(advert.timestamp) : opts.lastHeardMs,
+      ...(typeof opts.heardHops === 'number' && Number.isInteger(opts.heardHops) && opts.heardHops >= 0
+        ? { pathLen: opts.heardHops }
+        : {}),
     },
     sourceId,
   );
-  return advert;
+  return {
+    advert,
+    inserted: upserted?.inserted === true,
+    // Only a CHECKED and passing signature counts; null/false/undefined do not.
+    signatureVerified: advertSignatureVerified === true,
+  };
 }

@@ -30,6 +30,9 @@ import type { DeviceInfo, Channel, LocalNodeInfo } from '../types/device';
 import { appBasename } from '../init';
 import { useWebSocketConnected } from '../contexts/WebSocketContext';
 import { useSource } from '../contexts/SourceContext';
+import { useOptionalConnectionStatus } from '../contexts/dataContextState';
+import { POLL_QUERY_KEY, sourcePollQueryKey } from './pollQueryKey';
+import { getPollBase, setPollBase, mergePollReply, PollDeltaMismatchError, type PollReply } from './pollDelta';
 
 /**
  * Connection status from the server
@@ -84,6 +87,12 @@ export interface PollConfig {
     // True when the node is reached via a serial/BLE-to-TCP bridge and cannot
     // be flashed over the air. Gates the OTA firmware update UI.
     isBridged?: boolean;
+    // #6157: DeviceMetadata.ble_address — the BLE MAC the node advertises.
+    // Present only when non-empty (firmware-develop only today).
+    bleAddress?: string;
+    // #6321: DeviceMetadata.bootloader_version, packed major<<16|minor<<8|patch.
+    // Present only when non-zero (nRF52 only).
+    bootloaderVersion?: number;
   };
   localNodeInfo?: LocalNodeInfo;
 }
@@ -200,27 +209,15 @@ interface UsePollOptions {
 const WEBSOCKET_POLL_INTERVAL = 30000;
 /** Polling interval when WebSocket is disconnected (5 seconds for real-time updates) */
 const DEFAULT_POLL_INTERVAL = 5000;
-
 /**
- * Query key for the poll endpoint.
- *
- * Use this when you need to:
- * - Invalidate the poll cache: `queryClient.invalidateQueries({ queryKey: POLL_QUERY_KEY })`
- * - Manually refetch: `queryClient.refetchQueries({ queryKey: POLL_QUERY_KEY })`
- * - Set up custom query observers
- *
- * For accessing cached data, prefer the helper functions in useServerData.ts:
- * `getNodesFromCache()`, `getChannelsFromCache()`, `getCurrentNodeIdFromCache()`
+ * Retry interval while the source is not connected and the query holds no
+ * reply (or its last read failed). Without it a failed first read left the
+ * Nodes and Channels pages blank until the source came back (#6342).
  */
-export const POLL_QUERY_KEY = ['poll'] as const;
+export const NOT_CONNECTED_RETRY_INTERVAL = 15000;
 
-/**
- * Build a per-source poll query key. Use this when invalidating/reading cache
- * for a specific source rather than the global poll.
- */
-export function sourcePollQueryKey(sourceId: string | null) {
-  return sourceId ? (['poll', sourceId] as const) : POLL_QUERY_KEY;
-}
+// Poll query keys live in ./pollQueryKey (no imports) and are re-exported here.
+export { POLL_QUERY_KEY, sourcePollQueryKey };
 
 /**
  * Fetch the /api/poll payload for a given source. This is usePoll()'s own
@@ -242,13 +239,37 @@ export async function fetchPollData(
   const url = sourceId
     ? `${baseUrl}/api/poll?sourceId=${encodeURIComponent(sourceId)}`
     : `${baseUrl}/api/poll`;
-  const response = await authFetch(url, undefined, signal);
 
-  if (!response.ok) {
-    throw new Error(`Poll request failed: ${response.status}`);
+  // Incremental read: send the cursor of the last reply merged for this URL
+  // and merge the delta onto that same reply (see ./pollDelta). An empty
+  // cursor asks for the full reply and opts in to deltas after it.
+  const read = async (useBase: boolean): Promise<PollData> => {
+    const base = useBase ? getPollBase(url) : null;
+    const cursor = base?.cursor ?? '';
+    const response = await authFetch(
+      `${url}${url.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}`,
+      undefined,
+      signal,
+    );
+
+    if (!response.ok) {
+      throw new Error(`Poll request failed: ${response.status}`);
+    }
+
+    const reply = (await response.json()) as PollReply;
+    const data = mergePollReply(base?.data ?? null, reply);
+    setPollBase(url, reply.pollCursor, data);
+    return data;
+  };
+
+  try {
+    return await read(true);
+  } catch (error) {
+    // A delta that does not fit the held reply: drop it and read in full.
+    if (!(error instanceof PollDeltaMismatchError)) throw error;
+    setPollBase(url, undefined, {});
+    return read(false);
   }
-
-  return response.json();
 }
 
 /**
@@ -300,6 +321,19 @@ export function usePoll({
   // When disconnected, poll frequently (5s) for real-time updates
   const effectiveInterval = pollInterval ?? (isWsConnected ? WEBSOCKET_POLL_INTERVAL : DEFAULT_POLL_INTERVAL);
 
+  // Inside App, a source that is not connected is App's to watch: its
+  // connection check reads the lightweight /api/connection and reads this
+  // query once when the source comes back. Every always-enabled observer here
+  // (useNodes, useChannels, ...) used to keep re-reading the full poll on its
+  // own timer and on window focus as well, for data that does not change while
+  // the source is down. They still read it once on mount. Outside a
+  // DataProvider there is no such check, so polling is unchanged there.
+  // One exception: while the query holds no reply, or its last read failed,
+  // it keeps retrying slowly (NOT_CONNECTED_RETRY_INTERVAL) so a failed
+  // mount read does not leave the page blank. It stops once a read succeeds.
+  const appConnectionStatus = useOptionalConnectionStatus();
+  const sourceLinkUp = appConnectionStatus === undefined || appConnectionStatus === 'connected';
+
   return useQuery({
     queryKey: sourceId ? ['poll', sourceId] : POLL_QUERY_KEY,
     // Pass the AbortSignal to allow TanStack Query to cancel in-flight requests
@@ -311,11 +345,15 @@ export function usePoll({
       if (query.state.fetchStatus === 'fetching') {
         return false; // Skip this interval, wait for current request to complete
       }
+      if (!sourceLinkUp) {
+        const needsData = query.state.data === undefined || query.state.status === 'error';
+        return needsData ? NOT_CONNECTED_RETRY_INTERVAL : false;
+      }
       return effectiveInterval;
     },
     staleTime: effectiveInterval - 1000, // Consider stale just before next poll
     gcTime: 5 * 60 * 1000, // Keep in cache for 5 minutes
     // Only refetch on window focus when WebSocket is disconnected
-    refetchOnWindowFocus: !isWsConnected,
+    refetchOnWindowFocus: !isWsConnected && sourceLinkUp,
   });
 }

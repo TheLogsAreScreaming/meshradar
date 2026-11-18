@@ -15,6 +15,11 @@
  * branch routing, resolved action params, simulated variable writes) and writes
  * NO run-log row. The live event-bus path (automationEngineService) is untouched.
  */
+import { planMeshCoreTextParts } from '../../utils/meshcoreSplitPlan.js';
+import { planAutomatedTextParts } from '../../utils/automatedTextSplit.js';
+import { MESHTASTIC_MAX_TEXT_BYTES } from '../../../utils/messageSplitLimits.js';
+import { sourceManagerRegistry } from '../../sourceManagerRegistry.js';
+import { isMeshtasticManager } from '../../sourceManagerTypes.js';
 import {
   categoryOf,
   stepOutputNameOf,
@@ -74,6 +79,8 @@ export interface SimEventInput {
   snr?: number;
   rssi?: number;
   viaMqtt?: boolean;
+  /** Sender set the Meshtastic is_automation bit (#6449). */
+  isAutomation?: boolean;
   // node
   nodeNum?: number;
   changed?: string[];
@@ -187,10 +194,23 @@ function recordingDeps(
       const previous = Boolean(row.enabled);
       return { sourceId: row.id, sourceName: row.name, previous, enabled: mode === 'toggle' ? !previous : Boolean(enabled) };
     },
-    async sendMessage(a) { return { action: 'sendMessage', ...a }; },
+    async sendMessage(a) {
+      // #6316/#6330: report how many parts a split would send. Nothing is sent.
+      let plannedParts: number | undefined;
+      if (a.splitLongMessages) {
+        const m = a.sourceId ? sourceManagerRegistry.getManager(a.sourceId) : undefined;
+        const meshtastic = typeof a.destination === 'number' || (m !== undefined && isMeshtasticManager(m));
+        plannedParts = meshtastic
+          ? planAutomatedTextParts(a.text, { maxBytes: MESHTASTIC_MAX_TEXT_BYTES, split: true }).parts.length
+          : planMeshCoreTextParts(a.text, { isDm: typeof a.destination === 'string', split: true }).parts.length;
+      }
+      return { action: 'sendMessage', ...a, ...(plannedParts !== undefined ? { plannedParts } : {}) };
+    },
     async sendTapback(a) { return { action: 'tapback', ...a }; },
     async manageNode(a) { return { action: 'nodeManage', ...a }; },
     async requestData(a) { return { action: 'requestData', ...a }; },
+    // Dry-run must never trace or use up a path's interval: report the path only.
+    async runScheduledTrace(a) { return { action: 'tracePathSchedule', sourceId: a.sourceId, publicKey: a.path.publicKey, label: a.path.label, intervalMinutes: a.path.intervalMinutes, hashBytes: a.path.hashBytes, autoReturn: a.autoReturn, dryRun: true }; },
     // Dry-run must never actually reboot a device — report the resolved params.
     async rebootDevice(a) { return { action: 'deviceReboot', ...a }; },
     async notify(a) { return { action: 'notify', ...a }; },
@@ -229,6 +249,11 @@ function stubData(
     },
     async getSourceProtocol(sourceId) {
       return live?.getSourceProtocol ? live.getSourceProtocol(sourceId).catch(() => null) : null;
+    },
+    // Read-only: the Test panel reports a send the airtime cutoff would hold
+    // back right now. Fails open like the live engine.
+    async getAirtimeGate(sourceId) {
+      return live?.getAirtimeGate ? live.getAirtimeGate(sourceId).catch(() => null) : null;
     },
   };
 }
@@ -299,6 +324,7 @@ function synthMessage(ev: SimEventInput, sourceId: string | null): DbMessage {
     rxSnr: ev.snr,
     rxRssi: ev.rssi,
     viaMqtt: ev.viaMqtt,
+    isAutomation: ev.isAutomation === true ? true : undefined,
     timestamp: 0,
     createdAt: 0,
   } as unknown as DbMessage;
@@ -498,6 +524,7 @@ export async function simulateAutomation(opts: SimulateOptions): Promise<SimResu
   const evalCtx: EngineEvalContext = {
     trigger: ctx, vars, data, varCtx: varContextFromTrigger(ctx), now, automationId: opts.automationId,
     stepOutputs: createStepOutputs(),
+    dryRun: true,
   };
 
   // #5636: a "Run a script" step that stores a run output "prints" its sample.

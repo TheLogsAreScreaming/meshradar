@@ -24,17 +24,15 @@ import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
 import { isMeshCoreManager, isMeshCoreMqttManager, isAnyMeshCoreManager } from '../sourceManagerTypes.js';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
+import { redactCliCommand } from '../utils/meshcoreCliRedact.js';
 import { fail } from '../utils/apiResponse.js';
+import { SOURCE_NOT_CONNECTED_CODE } from '../../utils/sourceNotConnected.js';
 import { TX_DISABLED_CODE, isTxDisabledError } from '../errors/txDisabledError.js';
 import { MESHCORE_RECEIVE_ONLY_MESSAGE } from '../constants/meshcoreTx.js';
 import {
-  MESHCORE_MAX_MESSAGE_BYTES_CHANNEL,
-  MESHCORE_MAX_MESSAGE_BYTES_CHANNEL_SCOPED,
   MESHCORE_MAX_MESSAGE_BYTES_DM,
 } from '../constants/meshcoreMessageLimits.js';
 import { CONTACT_NOT_ON_DEVICE_MESSAGE } from '../meshcoreDeviceContactErrors.js';
-import { hasPermission } from '../auth/authMiddleware.js';
-import type { User } from '../../types/auth.js';
 
 /**
  * Resolve the manager for a request. Mounted only under
@@ -57,6 +55,11 @@ export function managerFor(_req: Request, res: Response): MeshCoreManager {
  * must have a registered manager. This lets every handler call
  * `managerFor` without null-checking at each call-site.
  */
+/** 404 SOURCE_NOT_CONNECTED: no manager is registered for this source (#4173 N5). */
+function notConnected(res: Response, sourceId: string) {
+  return fail(res, 404, SOURCE_NOT_CONNECTED_CODE, `No MeshCore manager for source ${sourceId}`);
+}
+
 export function meshcoreRouteGuard(req: Request, res: Response, next: NextFunction) {
   const sourceId = (req.params as { id?: string }).id;
   if (!sourceId) {
@@ -66,14 +69,22 @@ export function meshcoreRouteGuard(req: Request, res: Response, next: NextFuncti
     });
   }
   const _guardMgr = sourceManagerRegistry.getManager(sourceId);
-  if (!_guardMgr || !isMeshCoreManager(_guardMgr)) {
+  if (!_guardMgr) {
+    // No running manager: the source is not connected (enabled with
+    // autoConnect off, or never started). The client shows a "not connected"
+    // empty state off the code (#4173 review N5). Same 404 and message as
+    // before; this guard runs ahead of the permission checks, so it does not
+    // look the source up to tell "not connected" from "no such source".
+    return notConnected(res, sourceId);
+  }
+  if (!isMeshCoreManager(_guardMgr)) {
     // A `meshcore_mqtt` source (#5040) IS MeshCore, but has no device — it
     // ingests from an analyzer broker. `isMeshCoreManager` excludes it by
     // construction, which is what we want for this whole router (it is all
     // device lifecycle, local-node status and advert). Say so specifically
     // rather than claiming no MeshCore manager exists, which would send an
     // operator hunting for a registration bug that isn't there.
-    const isMqttIngest = _guardMgr !== undefined && isMeshCoreMqttManager(_guardMgr);
+    const isMqttIngest = isMeshCoreMqttManager(_guardMgr);
     return res.status(404).json({
       success: false,
       error: isMqttIngest
@@ -114,7 +125,8 @@ export function anyMeshCoreRouteGuard(req: Request, res: Response, next: NextFun
     });
   }
   const mgr = sourceManagerRegistry.getManager(sourceId);
-  if (!mgr || !isAnyMeshCoreManager(mgr)) {
+  if (!mgr) return notConnected(res, sourceId);
+  if (!isAnyMeshCoreManager(mgr)) {
     return res.status(404).json({
       success: false,
       error: `No MeshCore manager for source ${sourceId}`,
@@ -208,12 +220,13 @@ export function failContactNotOnDevice(res: Response): void {
 export const VALIDATION = {
   /** MeshCore public keys are 64-character hex strings (32 bytes) */
   PUBLIC_KEY_LENGTH: 64,
-  /** Maximum message byte limits per context (UTF-8 byte count, not char count) */
-  MAX_MESSAGE_BYTES_CHANNEL: MESHCORE_MAX_MESSAGE_BYTES_CHANNEL,
-  MAX_MESSAGE_BYTES_CHANNEL_SCOPED: MESHCORE_MAX_MESSAGE_BYTES_CHANNEL_SCOPED,
+  /**
+   * DM byte limit (UTF-8 bytes, not chars). A channel limit depends on the
+   * source's node name: use `meshcoreMessageByteCap` (#6303).
+   */
   MAX_MESSAGE_BYTES_DM: MESHCORE_MAX_MESSAGE_BYTES_DM,
   /** Legacy fallback — keep for safety ceiling in shared validation path */
-  MAX_MESSAGE_LENGTH: 150,
+  MAX_MESSAGE_LENGTH: MESHCORE_MAX_MESSAGE_BYTES_DM,
   /** Maximum device name length */
   MAX_NAME_LENGTH: 32,
   /** Maximum message history limit */
@@ -249,8 +262,9 @@ export const VALIDATION = {
  * The trailing `(?!\.)` excludes danger words used as the prefix of a
  * dotted config key (e.g. `get reboot.interval`, `set clkreboot.retries 3`)
  * — those are read/write config-path operations, not the standalone verb.
+ * `set prv.key <hex>` replaces the radio's identity (#6255); `get prv.key` is a read.
  */
-export const DANGER_COMMAND_PATTERN = /\b(reboot|erase|clkreboot|factory)\b(?!\.)/i;
+export const DANGER_COMMAND_PATTERN = /\b(reboot|erase|clkreboot|factory|poweroff|shutdown)\b(?!\.)|\bset\s+prv\.key\b/i;
 
 /**
  * Resolve the effective CLI reply-timeout (ms) for a MeshCore console command
@@ -284,24 +298,9 @@ export async function resolveCliTimeoutMs(timeoutMs?: number): Promise<number | 
 // Moved to a leaf module so the WebSocket gate can strip positions without
 // importing the route layer.
 export { stripPositions } from '../utils/meshcorePositions.js';
-import { stripPositions } from '../utils/meshcorePositions.js';
 
-/**
- * Strip `latitude`/`longitude` from contact/node rows when the caller lacks
- * `nodes:viewOnMap` on this source (#4559). `nodes:read` makes the contact
- * list available; publishing positions additionally requires `viewOnMap` —
- * mirrors the gate `buildSourceNodes()` applies to the same data for the
- * Dashboard/Unified/Map Analysis maps. Admins and any caller with the grant
- * pass through unchanged.
- */
-export async function maskContactPositionsForViewOnMap<T extends { latitude?: number; longitude?: number }>(
-  items: T[],
-  user: User | null | undefined,
-  sourceId: string,
-): Promise<T[]> {
-  const canViewOnMap = user ? await hasPermission(user, 'nodes', 'viewOnMap', sourceId) : false;
-  return canViewOnMap ? items : stripPositions(items);
-}
+// Moved to a leaf util (WP1 of #6263) so the v1 API and metrics share it.
+export { maskContactPositionsForViewOnMap } from '../utils/meshcoreViewOnMapMask.js';
 
 export function isValidPublicKey(key: string | undefined): boolean {
   if (!key || typeof key !== 'string') return false;
@@ -329,10 +328,16 @@ export function auditMeshcoreEvent(
   resource: 'remote_admin' | 'configuration' | 'messages',
   details: Record<string, unknown>,
 ): void {
-  const userId = req.session?.userId ?? null;
+  // API-token callers have no session; fall back to the authenticated user.
+  const userId = req.session?.userId ?? (req as Request & { user?: { id?: number } }).user?.id ?? null;
   const ip = req.ip || req.socket?.remoteAddress || null;
+  // #5892: a CLI line can carry a password or key (`password <new>`,
+  // `set guest.password ...`, `set prv.key ...`). Never store it in clear.
+  const safeDetails = typeof details.command === 'string'
+    ? { ...details, command: redactCliCommand(details.command) }
+    : details;
   databaseService
-    .auditLogAsync(userId, action, resource, JSON.stringify(details), ip)
+    .auditLogAsync(userId, action, resource, JSON.stringify(safeDetails), ip)
     .catch((err) => logger.error('[API] audit write failed:', err));
 }
 

@@ -1,10 +1,32 @@
 import { logger } from '../../utils/logger.js';
 import databaseService from '../../services/database.js';
-import { getUserNotificationPreferencesAsync, getUsersWithServiceEnabledAsync, shouldFilterNotificationAsync, applyNodeNamePrefixAsync, resolveAppriseTargetAsync, renderMessagePayloadForUserAsync } from '../utils/notificationFiltering.js';
+import { getUserNotificationPreferencesAsync, getUsersWithServiceEnabledAsync, shouldFilterNotificationAsync, applyNodeNamePrefixAsync, messageReadableByUserAsync, payloadBlockedForUserAsync, userReadsAnySourceAsync, type NotificationMuteVenue, resolveAppriseTargetAsync, renderMessagePayloadForUserAsync } from '../utils/notificationFiltering.js';
 import type { MessageTemplateContext } from '../../utils/notificationTemplate.js';
-import { fallbackManager } from '../meshtasticManager.js';
-import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
-import { getPrimaryMeshtasticManager } from '../sourceManagerTypes.js';
+import { resolveLocalNodeNameForSource } from '../utils/localNodeNameForSource.js';
+import { notificationDedup, notificationHold, joinSourceNames, type DedupSource, type NotificationDedupSpec } from './notificationDedup.js';
+import { assertSafeUrl } from '../utils/ssrfGuard.js';
+
+/**
+ * SSRF options for every outbound call to the operator-configured Apprise API
+ * server (SSRF-03, issue #6078). The bundled Apprise server ships on
+ * `http://localhost:8000` inside the Docker image, so loopback is permitted and
+ * RFC1918 is allowed (non-strict) for LAN / docker-network deployments — but
+ * cloud-metadata, link-local, multicast and the IPv4-mapped IPv6 bypass are
+ * blocked. A stolen settings:write token can therefore no longer aim Apprise
+ * notifications at an IMDS endpoint.
+ */
+const APPRISE_SSRF_OPTS = { strict: false, allowLoopback: true } as const;
+
+/**
+ * Validate an Apprise API server URL against the SSRF guard, then fetch it.
+ * Passes the original string to `fetch` (not a parsed URL) so the egress
+ * contract is unchanged for callers and tests; a blocked target throws
+ * SsrfBlockedError before any socket is opened.
+ */
+async function appriseGuardedFetch(url: string, init: RequestInit): Promise<Response> {
+  await assertSafeUrl(url, APPRISE_SSRF_OPTS);
+  return fetch(url, init);
+}
 
 export interface AppriseNotificationPayload {
   title: string;
@@ -19,6 +41,28 @@ export interface AppriseNotificationPayload {
    * renders each recipient's title/body template from. Never sent to Apprise.
    */
   message?: MessageTemplateContext;
+  /** Cross-source dedup (#5729); see `notificationDedup.ts`. Never sent to Apprise. */
+  dedup?: NotificationDedupSpec;
+  /**
+   * MeshCore keyed channel message (#5551): only recipients with access to this
+   * channel key get the event. Server-side input; never sent to Apprise.
+   */
+  keyFingerprint?: string | null;
+  /**
+   * Venue of an event that follows a mute (a mention): a recipient who muted
+   * it is skipped. Server-side input; never sent to Apprise.
+   */
+  muteVenue?: NotificationMuteVenue;
+  /** New-node alert (#5729): skip a recipient who can read any of these sources. Server-side input. */
+  knownOnSourceIds?: string[];
+}
+
+/**
+ * Dedup recipient for Apprise (#5729): the user, since a user's Apprise URLs
+ * are that user's one delivery target.
+ */
+function appriseDedupRecipient(userId: number): string {
+  return `apprise:${userId}`;
 }
 
 interface AppriseConfig {
@@ -79,6 +123,11 @@ export function appriseNotifyEndpoint(baseUrl: string): string {
   }
   return `${baseUrl.slice(0, end)}/notify`;
 }
+
+// Each send builds a fresh Apprise instance and then reaches the target: about
+// 4 s on a Raspberry Pi, more on the first send. With 10 s the first Room post
+// was logged as failed while Apprise was still sending it.
+const APPRISE_NOTIFY_TIMEOUT_MS = 30000;
 
 class AppriseNotificationService {
   private initialized = false;
@@ -156,7 +205,7 @@ class AppriseNotificationService {
     }
 
     try {
-      const response = await fetch(`${config.url}/health`, {
+      const response = await appriseGuardedFetch(`${config.url}/health`, {
         method: 'GET',
         signal: AbortSignal.timeout(5000)
       });
@@ -196,7 +245,7 @@ class AppriseNotificationService {
     }
 
     try {
-      const response = await fetch(`${config.url}/config`, {
+      const response = await appriseGuardedFetch(`${config.url}/config`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -261,7 +310,7 @@ class AppriseNotificationService {
 
     try {
       // Apprise API supports sending to specific URLs via the 'urls' parameter
-      const response = await fetch(appriseNotifyEndpoint(config.url), {
+      const response = await appriseGuardedFetch(appriseNotifyEndpoint(config.url), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -272,7 +321,7 @@ class AppriseNotificationService {
           body: payload.body,
           type: payload.type || 'info'
         }),
-        signal: AbortSignal.timeout(10000)
+        signal: AbortSignal.timeout(APPRISE_NOTIFY_TIMEOUT_MS)
       });
 
       if (!response.ok) {
@@ -328,11 +377,11 @@ class AppriseNotificationService {
     try {
       const reqBody: Record<string, unknown> = { title: payload.title, body: payload.body, type };
       if (cleanUrls.length > 0) reqBody.urls = cleanUrls;
-      const response = await fetch(appriseNotifyEndpoint(config.url), {
+      const response = await appriseGuardedFetch(appriseNotifyEndpoint(config.url), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(reqBody),
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(APPRISE_NOTIFY_TIMEOUT_MS),
       });
       if (!response.ok) {
         const detail = await response.text().catch(() => '');
@@ -360,6 +409,12 @@ class AppriseNotificationService {
       channelId: number;
       isDirectMessage: boolean;
       viaMqtt?: boolean;
+      /** #5720: the packet is a protocol tapback (Meshtastic `emoji === 1`). */
+      isTapback?: boolean;
+      /** MeshCore keyed channel message (#5551): recipient needs access to this key. */
+      keyFingerprint?: string | null;
+      /** DM / room mute key (`mutedDMs.nodeUuid`), so a per-DM mute applies. */
+      nodeUuid?: string;
       sourceId: string;
       sourceName: string;
     }
@@ -390,10 +445,8 @@ class AppriseNotificationService {
       return { sent: 0, failed: 0, filtered: 0 };
     }
 
-    // Get local node name for prefix
-    const mgr = getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
-    const localNodeInfo = mgr.getLocalNodeInfo();
-    const localNodeName = localNodeInfo?.longName || null;
+    // Prefix names the node of the source this message arrived on (#6251).
+    const localNodeName = await resolveLocalNodeNameForSource(filterContext.sourceId);
 
     // Per-user filtering and sending to user-specific URLs
     for (const userId of users) {
@@ -416,15 +469,42 @@ class AppriseNotificationService {
       }
 
       // Render AFTER the filter decision (#5593): the user's templates shape
-      // the text only, never whether a notification is sent.
-      const rendered = await renderMessagePayloadForUserAsync(userId, payload, filterContext.sourceId, filterContext.sourceName);
+      // the text only, never whether a notification is sent. `sources` names
+      // every source that heard it; the first source's templates, prefix and
+      // URLs are used.
+      const urls = prefs.appriseUrls;
+      const sendFor = async (sources: DedupSource[]): Promise<boolean> => {
+        const shownName = joinSourceNames(sources);
+        const renderInput = payload.message
+          ? { ...payload, message: { ...payload.message, sourceName: shownName } }
+          : payload;
+        const rendered = await renderMessagePayloadForUserAsync(userId, renderInput, filterContext.sourceId, shownName, 'apprise');
+        // Apply node name prefix if user has it enabled (per-source prefs)
+        const body = await applyNodeNamePrefixAsync(userId, rendered.body, localNodeName, filterContext.sourceId);
+        const notificationPayload: AppriseNotificationPayload = { ...payload, title: rendered.title, body };
+        return this.sendNotificationToUrls(notificationPayload, urls);
+      };
 
-      // Apply node name prefix if user has it enabled (per-source prefs)
-      const body = await applyNodeNamePrefixAsync(userId, rendered.body, localNodeName, filterContext.sourceId);
-      const notificationPayload: AppriseNotificationPayload = { ...payload, title: rendered.title, body };
+      // Cross-source dedup (#5729), AFTER this source's permission, filter and
+      // URL checks passed for this user. Apprise cannot change a message once
+      // delivered, so the first copy starts a 5 s hold and later copies inside
+      // it only add their source; then ONE message lists every source.
+      const source: DedupSource = { sourceId: filterContext.sourceId, sourceName: filterContext.sourceName };
+      if (payload.dedup) {
+        const recipient = appriseDedupRecipient(userId);
+        const claim = notificationDedup.claim(recipient, payload.dedup.key, source);
+        if (claim.outcome === 'first') {
+          notificationHold.start(recipient, payload.dedup.key, source, sendFor);
+          sent++;
+        } else {
+          if (claim.outcome === 'additional') notificationHold.join(recipient, payload.dedup.key, source);
+          filtered++;
+        }
+        continue;
+      }
 
       // Send to user's specific URLs
-      const success = await this.sendNotificationToUrls(notificationPayload, prefs.appriseUrls);
+      const success = await sendFor([source]);
       if (success) {
         sent++;
       } else {
@@ -432,7 +512,7 @@ class AppriseNotificationService {
       }
     }
 
-    logger.info(`📢 Apprise broadcast: ${sent} sent, ${failed} failed, ${filtered} filtered`);
+    logger.info(`📢 Apprise broadcast: ${sent} sent or held, ${failed} failed, ${filtered} filtered`);
     return { sent, failed, filtered };
   }
 
@@ -464,19 +544,19 @@ class AppriseNotificationService {
       channelId: number;
       isDirectMessage: boolean;
       viaMqtt?: boolean;
+      /** #5720: the packet is a protocol tapback (Meshtastic `emoji === 1`). */
+      isTapback?: boolean;
+      /** MeshCore keyed channel message (#5551): recipient needs access to this key. */
+      keyFingerprint?: string | null;
+      /** DM / room mute key (`mutedDMs.nodeUuid`), so a per-DM mute applies. */
+      nodeUuid?: string;
       sourceId: string;
       sourceName: string;
     }
   ): Promise<boolean> {
-    // Phase B: permission check
-    try {
-      const allowed = await databaseService.checkPermissionAsync(userId, 'messages', 'read', filterContext.sourceId);
-      if (!allowed) {
-        logger.debug(`🔒 User ${userId} lacks messages:read on source ${filterContext.sourceId}`);
-        return true;
-      }
-    } catch (error) {
-      logger.error(`Permission check failed for user ${userId}:`, error);
+    // Phase B: permission check, plus key access for a keyed MeshCore message.
+    if (!(await messageReadableByUserAsync(userId, filterContext.sourceId, filterContext.keyFingerprint))) {
+      logger.debug(`🔒 User ${userId} cannot read this message on source ${filterContext.sourceId}`);
       return true;
     }
 
@@ -496,7 +576,7 @@ class AppriseNotificationService {
    * Used for special notifications like new nodes, traceroutes, and inactive nodes
    */
   public async broadcastToPreferenceUsers(
-    preferenceKey: 'notifyOnNewNode' | 'notifyOnTraceroute' | 'notifyOnInactiveNode' | 'notifyOnLowBattery' | 'notifyOnServerEvents' | 'notifyOnWaypoint',
+    preferenceKey: 'notifyOnNewNode' | 'notifyOnTraceroute' | 'notifyOnInactiveNode' | 'notifyOnLowBattery' | 'notifyOnServerEvents' | 'notifyOnWaypoint' | 'notifyOnMention' | 'notifyOnAutoTrace',
     payload: AppriseNotificationPayload,
     targetUserId?: number,
     sourceId?: string
@@ -516,25 +596,9 @@ class AppriseNotificationService {
     const users = targetUserId !== undefined ? [targetUserId] : await getUsersWithServiceEnabledAsync('apprise');
     logger.debug(`📢 Broadcasting ${preferenceKey} notification to ${users.length} Apprise users${targetUserId ? ` (target user: ${targetUserId})` : ''}`);
 
-    // Get local node name for prefix
-    // First try the live connection, then fall back to database (for startup before connection)
-    let localNodeName: string | null = null;
-    const mgr = getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
-    const localNodeInfo = mgr.getLocalNodeInfo();
-    if (localNodeInfo?.longName) {
-      localNodeName = localNodeInfo.longName;
-    } else {
-      // Fall back to database - get localNodeNum from settings and look up the node
-      const localNodeNumStr = await databaseService.settings.getLocalNodeNumForSource(mgr.sourceId);
-      if (localNodeNumStr) {
-        const localNodeNum = parseInt(localNodeNumStr, 10);
-        const localNode = await databaseService.nodesRepo?.getNode(localNodeNum, mgr.sourceId);
-        if (localNode?.longName) {
-          localNodeName = localNode.longName;
-          logger.debug(`📢 Using node name from database for Apprise prefix: ${localNodeName}`);
-        }
-      }
-    }
+    // Prefix names the node of the source the notification is about, not
+    // the primary Meshtastic source (#6251).
+    const localNodeName = await resolveLocalNodeNameForSource(effectiveSourceId);
 
     for (const userId of users) {
       // Phase C: per-source permission check
@@ -550,6 +614,18 @@ class AppriseNotificationService {
           filtered++;
           continue;
         }
+      }
+
+      // Keyed MeshCore message / muted venue (mentions): a gate on the payload.
+      if ((payload.keyFingerprint || payload.muteVenue) && await payloadBlockedForUserAsync(userId, effectiveSourceId, payload)) {
+        filtered++;
+        continue;
+      }
+
+      // New node already known on a source this user reads (#5729).
+      if (await userReadsAnySourceAsync(userId, payload.knownOnSourceIds)) {
+        filtered++;
+        continue;
       }
 
       let urls: string[];
@@ -598,6 +674,33 @@ class AppriseNotificationService {
       const notificationPayload = bodyToSend !== payload.body
         ? { ...payload, body: bodyToSend }
         : payload;
+
+      // Cross-source dedup (#5729), after every gate above passed for this
+      // user: the first copy starts a 5 s hold, later copies add their source,
+      // then one message goes out. An event with a `merged` text names every
+      // source; without one it keeps the first copy's text.
+      if (payload.dedup) {
+        const dedup = payload.dedup;
+        const recipient = appriseDedupRecipient(userId);
+        const dedupSourceId = effectiveSourceId ?? '';
+        const source: DedupSource = { sourceId: dedupSourceId, sourceName: payload.sourceName ?? dedupSourceId };
+        const claim = notificationDedup.claim(recipient, dedup.key, source);
+        if (claim.outcome === 'first') {
+          notificationHold.start(recipient, dedup.key, source, async (sources) => {
+            if (sources.length < 2 || !dedup.merged) {
+              return this.sendNotificationToUrls(notificationPayload, urls);
+            }
+            const merged = dedup.merged(sources.map(s => s.sourceName));
+            const mergedBody = prefixWithNodeName && localNodeName ? `[${localNodeName}] ${merged.body}` : merged.body;
+            return this.sendNotificationToUrls({ ...notificationPayload, title: merged.title, body: mergedBody }, urls);
+          });
+          sent++;
+        } else {
+          if (claim.outcome === 'additional') notificationHold.join(recipient, dedup.key, source);
+          filtered++;
+        }
+        continue;
+      }
 
       // Send to user's specific URLs
       const success = await this.sendNotificationToUrls(notificationPayload, urls);

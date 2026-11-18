@@ -23,10 +23,13 @@
 
 import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
 import { isMeshCoreManager, isReticulumManager } from '../sourceManagerTypes.js';
+import { getMqttNativeNodeNums } from '../services/mqttNative/mqttNativeState.js';
 
 /**
  * Every local node number MeshRadar currently owns, across all registered
- * sources. Sources with no local identity (MQTT bridges) contribute nothing.
+ * sources. Sources with no local identity (MQTT bridges) contribute nothing,
+ * except the generated node an MQTT source sends as when MQTT-native send has
+ * given it one (#4305).
  */
 export function getOwnNodeNums(): number[] {
   const nums: number[] = [];
@@ -40,6 +43,10 @@ export function getOwnNodeNums(): number[] {
     if (nodeNum == null) continue;
     const n = Number(nodeNum);
     if (Number.isFinite(n) && !nums.includes(n)) nums.push(n);
+  }
+  // #4305: an MQTT source that sends with no radio owns a generated node.
+  for (const n of getMqttNativeNodeNums()) {
+    if (!nums.includes(n)) nums.push(n);
   }
   return nums;
 }
@@ -82,6 +89,17 @@ export function isOwnPublicKey(pubkey: string | null | undefined): boolean {
 }
 
 /**
+ * Like {@link isOwnPublicKey}, but for the key PREFIX a received MeshCore DM
+ * carries (`pubkey_prefix`, usually 6 bytes). Prefixes under 4 bytes never
+ * match, so a short or empty value cannot claim to be ours by accident.
+ */
+export function isOwnPublicKeyPrefix(prefix: string | null | undefined): boolean {
+  if (!prefix || prefix.length < 8) return false;
+  const lower = prefix.toLowerCase();
+  return getOwnPublicKeys().some((k) => k.startsWith(lower));
+}
+
+/**
  * Every local LXMF destination hash MeshRadar currently owns, across all
  * registered Reticulum sources (#3960 Phase 2 WP3). Mirrors
  * {@link getOwnPublicKeys}. Non-Reticulum managers contribute nothing.
@@ -110,4 +128,25 @@ export function getOwnReticulumAddresses(): string[] {
 export function isOwnReticulumAddress(hash: string | null | undefined): boolean {
   if (!hash) return false;
   return getOwnReticulumAddresses().includes(hash.toLowerCase());
+}
+
+/**
+ * True when `name` (trimmed, case-insensitive) is the local node name of ANY
+ * registered MeshCore source. A channel reaction carries only the reactor's
+ * display name, so this is the self check for our own reactions (#5763).
+ */
+export function isOwnMeshCoreName(name: string | null | undefined): boolean {
+  const wanted = name?.trim().toLowerCase();
+  if (!wanted) return false;
+  for (const manager of sourceManagerRegistry.getAllManagers()) {
+    if (!isMeshCoreManager(manager)) continue;
+    let own: unknown;
+    try {
+      own = manager.getLocalNode()?.name;
+    } catch {
+      continue; // a manager mid-connect must never break the caller
+    }
+    if (typeof own === 'string' && own.trim().toLowerCase() === wanted) return true;
+  }
+  return false;
 }

@@ -83,7 +83,8 @@ export default function AutomationTester({ getConfig, variables, sources }: Prop
         return { ...base, text: ev.text ?? '', from: numOrUndef(ev.from), channel: numOrUndef(ev.channel),
           channelName: ev.channelName || undefined,
           hopStart: numOrUndef(ev.hopStart), hopLimit: numOrUndef(ev.hopLimit), packetId: numOrUndef(ev.packetId) ?? 1,
-          snr: numOrUndef(ev.snr), rssi: numOrUndef(ev.rssi), viaMqtt: ev.viaMqtt === 'true' ? true : undefined };
+          snr: numOrUndef(ev.snr), rssi: numOrUndef(ev.rssi), viaMqtt: ev.viaMqtt === 'true' ? true : undefined,
+          isAutomation: ev.isAutomation === 'true' ? true : undefined };
       case 'telemetry':
         return { ...base, nodeNum: numOrUndef(ev.nodeNum), telemetryType: ev.telemetryType || 'batteryLevel', value: numOrUndef(ev.value) };
       case 'meshBeacon':
@@ -331,6 +332,12 @@ function renderEventInputs(
             <input type="checkbox" checked={ev.viaMqtt === 'true'} onChange={(e) => set('viaMqtt', e.target.checked ? 'true' : '')} /> received over MQTT
           </label>
         </div>
+        <div className="ae-field">
+          <label className="ae-field-label">Sent by an automation</label>
+          <label className="ae-switch" style={{ paddingTop: '0.35rem' }}>
+            <input type="checkbox" checked={ev.isAutomation === 'true'} onChange={(e) => set('isAutomation', e.target.checked ? 'true' : '')} /> sender set the is_automation flag
+          </label>
+        </div>
       </>;
     case 'telemetry':
       return <>{f('Node #', 'nodeNum', 'number')}{sel('Metric', 'telemetryType', TELEMETRY_METRIC_OPTIONS, 'batteryLevel')}{f('Value', 'value', 'number')}</>;
@@ -395,6 +402,11 @@ function renderEventInputs(
   }
 }
 
+/** A percent for display: one decimal place, '?' when not a number. */
+function roundPct(v: unknown): string {
+  return typeof v === 'number' && Number.isFinite(v) ? String(Math.round(v * 10) / 10) : '?';
+}
+
 /** Human-readable "what would be sent" for one simulated action. */
 function ActionView({ a }: { a: SimResult['actions'][number] }) {
   const p = (a.resolvedParams ?? {}) as Record<string, unknown>;
@@ -402,7 +414,24 @@ function ActionView({ a }: { a: SimResult['actions'][number] }) {
   let sent: ReactNode = null;
   // #5636: an empty send that was held back. Nothing would be transmitted.
   const held = p.emptySend === true ? String(p.reason ?? '') : null;
-  if (held !== null) {
+  // The source is over its airtime cutoff right now, so a live run would not
+  // send. One target, or every target of a multi-source action.
+  const airtimeSkips = (Array.isArray(a.resolvedParams) ? a.resolvedParams : [a.resolvedParams])
+    .filter((r): r is Record<string, unknown> =>
+      r != null && typeof r === 'object' && (r as Record<string, unknown>).airtimeCutoff === true);
+  const airtimeNote = airtimeSkips.length > 0
+    ? airtimeSkips.map((r) =>
+        `would be skipped now on ${String(r.sourceId ?? '')}: airtime ${roundPct(r.channelUtilization)}% > ${roundPct(r.threshold)}%`,
+      ).join('; ')
+    : null;
+  const airtimeAll = airtimeSkips.length > 0
+    && (!Array.isArray(a.resolvedParams) || airtimeSkips.length === a.resolvedParams.length);
+  if (airtimeAll) {
+    headline = `${a.type.replace('action.', '')}: ${airtimeNote}`;
+    // Still show what would go out once the channel clears.
+    const texts = airtimeSkips.map((r) => r.text).filter((t): t is string => typeof t === 'string');
+    if (texts.length > 0) sent = <div className="ae-test-sent">{texts[0]}</div>;
+  } else if (held !== null) {
     const what = a.type === 'action.tapback' ? 'Tapback' : a.type === 'action.notify' ? 'Notify (Apprise)' : 'Send message';
     headline = `${what}: not sent`;
     sent = <div className="ae-test-note">Skipped: {held}.</div>;
@@ -471,6 +500,7 @@ function ActionView({ a }: { a: SimResult['actions'][number] }) {
   return (
     <div className={`ae-test-action ${a.ok ? '' : 'is-err'}`}>
       <strong>{headline}</strong>
+      {airtimeNote && !airtimeAll && <div className="ae-test-note">Partly sent: {airtimeNote}.</div>}
       {a.error
         ? <span className="ae-test-badge ae-test-badge--err" style={{ marginLeft: '0.4rem' }}>{a.error}</span>
         : <>

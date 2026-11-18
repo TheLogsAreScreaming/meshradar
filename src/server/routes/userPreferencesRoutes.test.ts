@@ -259,4 +259,114 @@ describe('userPreferencesRoutes', () => {
       expect(get.body.preferences.aircraftTrailHours).toBe(168);
     });
   });
+  /**
+   * #5824: "Show MQTT/Bridge Messages" is stored per source, so flipping it on
+   * one source must not change another, and the value must survive a fresh
+   * browser (i.e. come back from GET).
+   */
+  describe('per-source showMqttMessages (#5824)', () => {
+    it('stores one value per source and leaves other sources alone', async () => {
+      const agent = await harness.loginAs(harness.limited);
+
+      let res = await agent.post('/map-preferences').send({ showMqttMessages: true, sourceId: harness.sourceA });
+      expect(res.status).toBe(200);
+      res = await agent.post('/map-preferences').send({ showMqttMessages: false, sourceId: harness.sourceB });
+      expect(res.status).toBe(200);
+
+      let getRes = await agent.get('/map-preferences');
+      expect(getRes.body.preferences.showMqttMessagesBySource).toEqual({
+        [harness.sourceA]: true,
+        [harness.sourceB]: false,
+      });
+
+      res = await agent.post('/map-preferences').send({ showMqttMessages: false, sourceId: harness.sourceA });
+      expect(res.status).toBe(200);
+      getRes = await agent.get('/map-preferences');
+      expect(getRes.body.preferences.showMqttMessagesBySource).toEqual({
+        [harness.sourceA]: false,
+        [harness.sourceB]: false,
+      });
+    });
+
+    it('keeps the map when other preferences are saved', async () => {
+      const agent = await harness.loginAs(harness.limited);
+      await agent.post('/map-preferences').send({ showMqttMessages: true, sourceId: harness.sourceA });
+      await agent.post('/map-preferences').send({ showPaths: true });
+
+      const getRes = await agent.get('/map-preferences');
+      expect(getRes.body.preferences).toMatchObject({
+        showPaths: true,
+        showMqttMessagesBySource: { [harness.sourceA]: true },
+      });
+    });
+
+    it('reads an empty map for a user who never toggled it', async () => {
+      const agent = await harness.loginAs(harness.limited);
+      await agent.post('/map-preferences').send({ showPaths: true });
+
+      const getRes = await agent.get('/map-preferences');
+      expect(getRes.body.preferences.showMqttMessagesBySource).toEqual({});
+    });
+
+    it('400s on a non-boolean value or a missing sourceId', async () => {
+      const agent = await harness.loginAs(harness.limited);
+
+      let res = await agent.post('/map-preferences').send({ showMqttMessages: 'yes', sourceId: harness.sourceA });
+      expect(res.status).toBe(400);
+      res = await agent.post('/map-preferences').send({ showMqttMessages: true });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('MISSING_SOURCE_ID');
+    });
+
+    it('404s an unknown source and stores nothing', async () => {
+      const agent = await harness.loginAs(harness.limited);
+      const res = await agent.post('/map-preferences').send({ showMqttMessages: true, sourceId: 'no-such-source' });
+      expect(res.status).toBe(404);
+
+      const getRes = await agent.get('/map-preferences');
+      expect(getRes.body.preferences?.showMqttMessagesBySource ?? {}).toEqual({});
+    });
+  });
+
+  /**
+   * #6125: opt-in per-source ring toggle. Boolean-validated, round-trips, and
+   * defaults to FALSE for a user who never saved it (the ring is opt-in).
+   */
+  describe('colorNodesBySource (#6125)', () => {
+    it('saves and returns colorNodesBySource=true', async () => {
+      const agent = await harness.loginAs(harness.limited);
+
+      const post = await agent.post('/map-preferences').send({ colorNodesBySource: true });
+      expect(post.status).toBe(200);
+
+      const get = await agent.get('/map-preferences');
+      expect(get.body.preferences).toMatchObject({ colorNodesBySource: true });
+    });
+
+    it('400s (INVALID_PREFERENCE) on a non-boolean value', async () => {
+      const agent = await harness.loginAs(harness.limited);
+      const res = await agent.post('/map-preferences').send({ colorNodesBySource: 'yes' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('INVALID_PREFERENCE');
+    });
+
+    it('defaults to false for a user who never saved it', async () => {
+      const agent = await harness.loginAs(harness.limited);
+      await agent.post('/map-preferences').send({ showPaths: true });
+
+      const get = await agent.get('/map-preferences');
+      expect(get.body.preferences.colorNodesBySource).toBe(false);
+    });
+
+    it('leaves colorNodesBySource untouched when a save omits it', async () => {
+      const agent = await harness.loginAs(harness.limited);
+
+      await agent.post('/map-preferences').send({ colorNodesBySource: true });
+      await agent.post('/map-preferences').send({ showPaths: true });
+
+      const get = await agent.get('/map-preferences');
+      expect(get.body.preferences).toMatchObject({ colorNodesBySource: true, showPaths: true });
+    });
+  });
 });

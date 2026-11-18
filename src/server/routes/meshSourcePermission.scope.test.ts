@@ -52,6 +52,7 @@ const DEVICE_METHODS = [
   'userReconnect',
   'refreshNodeDatabase',
   'getAirtimeCutoffStatus',
+  'getAirtimeCutoffCandidates',
   'getLocalNodeInfo',
   'setChannelConfig',
   'beginEditSettings',
@@ -93,6 +94,7 @@ function fakeManager(sourceId: string, sourceType = 'meshtastic_tcp'): FakeManag
     previewAnnouncementMessage: vi.fn().mockResolvedValue(`preview from ${sourceId}`),
     userReconnect: vi.fn().mockResolvedValue(true),
     getAirtimeCutoffStatus: vi.fn().mockResolvedValue({ active: false, source: sourceId }),
+    getAirtimeCutoffCandidates: vi.fn().mockResolvedValue([{ nodeNum: 1, source: sourceId }]),
     getLocalNodeInfo: vi.fn().mockReturnValue({ nodeNum: localNodeNum, nodeId: `!${localNodeNum.toString(16)}` }),
   } as unknown as FakeManager;
 }
@@ -171,6 +173,12 @@ const CASES: RouteCase[] = [
     router: 'status', method: 'get', route: '/automation/airtime-status', resource: 'automation', action: 'read', from: 'query', gate: 'device',
     device: 'getAirtimeCutoffStatus',
     reached: (body, target) => expect(body.source).toBe(target.sourceId),
+  },
+  {
+    router: 'status', method: 'get', route: '/automation/airtime-candidates', resource: 'automation', action: 'read', from: 'query', gate: 'device',
+    device: 'getAirtimeCutoffCandidates',
+    reached: (body, target) =>
+      expect((body.data as { candidates: Array<{ source: string }> }).candidates[0].source).toBe(target.sourceId),
   },
 ];
 
@@ -512,8 +520,11 @@ describe('single-source routes: permission is checked on the target source', () 
 
     const channelCases: ChannelCase[] = [
       {
+        // Export returns the raw AES PSK, so it requires channel_N:WRITE, not
+        // :read (MISC-03 / #6059). The source-B 403 case below still proves the
+        // per-source scoping of that write gate.
         name: 'GET /channels/:id/export',
-        grants: [['channel_1', 'read']],
+        grants: [['channel_1', 'write']],
         send: (agent, sourceId) => agent.get('/channels/1/export').query({ sourceId }),
       },
       {

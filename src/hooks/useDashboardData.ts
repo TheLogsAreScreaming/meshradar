@@ -5,6 +5,7 @@
  * with automatic polling every 15 seconds.
  */
 
+import { useMemo, useRef } from 'react';
 import { useQuery, useQueries } from '@tanstack/react-query';
 import { appBasename } from '../init';
 import { useAuth } from '../contexts/AuthContext';
@@ -72,6 +73,8 @@ export interface SourceStatus {
    * connect clears it.
    */
   authStopped?: boolean;
+  /** Embedded MeshCore MQTT broker (#6197): observers connected right now. */
+  clientCount?: number;
   /**
    * MQTT bridge only: how many per-gateway publishers gave up the same way.
    * The bridge itself can still be connected.
@@ -79,6 +82,15 @@ export interface SourceStatus {
   authStoppedGatewayCount?: number;
   /** Their `!<8-hex>` ids. Present only when the viewer may read the source's nodes. */
   authStoppedGateways?: string[];
+  /**
+   * MQTT bridge only (#5893): the subscriber gave up reconnecting after
+   * repeated evictions (another client holds its Client ID or login). The
+   * reason text arrives as `permissionMessage`. A save or a manual connect
+   * clears it.
+   */
+  evictionStopped?: boolean;
+  /** MQTT bridge only (#5893): per-gateway publishers that stopped the same way. */
+  evictionStoppedGatewayCount?: number;
   /** Total nodes heard by this source — populated by GET /api/sources/:id/status. */
   nodeCount?: number;
   /**
@@ -126,6 +138,42 @@ export interface SourceDashboardBundle {
   traceroutes: unknown[];
   neighborInfo: unknown[];
   channels: unknown[];
+  /** Node rows before the server's age cut; present only with `ageWindow`. */
+  nodeCount?: number;
+  /**
+   * Per-`(node, gateway)` membership for "colour nodes by gateway" (#6175).
+   * Present only for MQTT sources whose packet log is enabled and that the
+   * viewer can read; absent/empty otherwise.
+   */
+  gatewayMembership?: MqttGatewayMembershipRow[];
+}
+
+/**
+ * One `(node, gateway)` membership row from the server bundle (#6175). Mirrors
+ * `MqttNodeGatewayRow` on the backend, carried per source so the unified merge
+ * can attach a deduped per-node `gateways` list.
+ */
+export interface MqttGatewayMembershipRow {
+  sourceId: string;
+  fromNode: number;
+  fromNodeId: string | null;
+  gatewayId: string;
+  gatewayNodeNum: number | null;
+  receptionCount: number;
+  lastHeard: number;
+}
+
+/**
+ * Options for the dashboard data hooks.
+ *
+ * `ageWindow`: ask the server to leave out nodes the Dashboard map hides by
+ * age (`?ageWindow=settings`). The server uses the widest node-age setting
+ * across every source, keeps favourites, aged-out aircraft and local nodes,
+ * and keeps every row of a node that any source heard inside the window. Only
+ * DashboardPage sets it: Map Analysis draws nodes of any age.
+ */
+export interface DashboardDataOptions {
+  ageWindow?: boolean;
 }
 
 /** Default poll interval for dashboard data (15 seconds) */
@@ -147,6 +195,25 @@ async function fetchJson<T>(url: string): Promise<T> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json() as Promise<T>;
 }
+
+/**
+ * Auth state for the auth-keyed dashboard queries. Their keys include
+ * `isAuthenticated` so a login/logout refetches with the new session, but
+ * until `/api/auth/status` answers that flag reads `false` for everyone. A
+ * query that ran then would fetch once as anonymous and again once auth
+ * resolves, so they wait for `authResolved` (two fetches of the full unified
+ * dashboard on every signed-in load otherwise).
+ */
+function useDashboardAuthGate(): { isAuthenticated: boolean; authResolved: boolean } {
+  const { authStatus, loading } = useAuth();
+  return {
+    isAuthenticated: authStatus?.authenticated ?? false,
+    // `loading` is true only until the first auth status lands.
+    authResolved: loading !== true,
+  };
+}
+
+const EMPTY: unknown[] = [];
 
 /**
  * Hook to fetch the list of all configured sources
@@ -174,12 +241,12 @@ export function useDashboardSources() {
  * @returns Map from source ID to SourceStatus (or null on error)
  */
 export function useSourceStatuses(sourceIds: string[]): Map<string, SourceStatus | null> {
-  const { authStatus } = useAuth();
-  const isAuthenticated = authStatus?.authenticated ?? false;
+  const { isAuthenticated, authResolved } = useDashboardAuthGate();
   const results = useQueries({
     queries: sourceIds.map((id) => ({
       queryKey: ['dashboard', 'status', id, isAuthenticated],
       queryFn: () => fetchJson<SourceStatus>(`${appBasename}/api/sources/${id}/status`),
+      enabled: authResolved,
       refetchInterval: DASHBOARD_POLL_INTERVAL,
       retry: false,
     })),
@@ -217,11 +284,11 @@ export interface UnifiedStatus {
  * polls on the same cadence as the per-source status calls.
  */
 export function useUnifiedStatus(): UnifiedStatus | null {
-  const { authStatus } = useAuth();
-  const isAuthenticated = authStatus?.authenticated ?? false;
+  const { isAuthenticated, authResolved } = useDashboardAuthGate();
   const result = useQuery<UnifiedStatus>({
     queryKey: ['dashboard', 'unified-status', isAuthenticated],
     queryFn: () => fetchJson<UnifiedStatus>(`${appBasename}/api/unified/status`),
+    enabled: authResolved,
     refetchInterval: DASHBOARD_POLL_INTERVAL,
     retry: false,
   });
@@ -237,6 +304,8 @@ export interface DashboardSourceData {
   neighborInfo: unknown[];
   channels: unknown[];
   status: SourceStatus | null;
+  /** The source's node rows before the age cut (single source + `ageWindow` only). */
+  nodeCount?: number;
   isLoading: boolean;
   isError: boolean;
 }
@@ -250,18 +319,24 @@ export interface DashboardSourceData {
  * @param sourceId - The selected source ID, or null for no selection
  * @returns Combined data object with loading/error state
  */
-export function useDashboardSourceData(sourceId: string | null): DashboardSourceData {
-  const { authStatus } = useAuth();
-  const isAuthenticated = authStatus?.authenticated ?? false;
+export function useDashboardSourceData(
+  sourceId: string | null,
+  options?: DashboardDataOptions,
+): DashboardSourceData {
+  const ageWindow = options?.ageWindow === true;
+  const { isAuthenticated, authResolved } = useDashboardAuthGate();
   const enabled = sourceId !== null;
 
   // One bundled request for nodes+traceroutes+neighborInfo+channels instead of
   // four separate GETs per poll (#3735). Status stays its own lightweight query
   // (cheap COUNT(*)s) and is also polled per-source by the sidebar.
   const dashboardQuery = useQuery({
-    queryKey: ['dashboard', 'source-dashboard', sourceId, isAuthenticated],
-    queryFn: () => fetchJson<SourceDashboardBundle>(`${appBasename}/api/sources/${sourceId}/dashboard`),
-    enabled,
+    queryKey: ['dashboard', 'source-dashboard', sourceId, isAuthenticated, ageWindow],
+    queryFn: () =>
+      fetchJson<SourceDashboardBundle>(
+        `${appBasename}/api/sources/${sourceId}/dashboard${ageWindow ? '?ageWindow=settings' : ''}`,
+      ),
+    enabled: enabled && authResolved,
     retry: false,
     refetchInterval: DASHBOARD_POLL_INTERVAL,
   });
@@ -269,7 +344,7 @@ export function useDashboardSourceData(sourceId: string | null): DashboardSource
   const statusQuery = useQuery({
     queryKey: ['dashboard', 'status', sourceId, isAuthenticated],
     queryFn: () => fetchJson<SourceStatus>(`${appBasename}/api/sources/${sourceId}/status`),
-    enabled,
+    enabled: enabled && authResolved,
     retry: false,
     refetchInterval: DASHBOARD_POLL_INTERVAL,
   });
@@ -290,11 +365,12 @@ export function useDashboardSourceData(sourceId: string | null): DashboardSource
   const isError = dashboardQuery.isError || statusQuery.isError;
 
   return {
-    nodes: dashboardQuery.data?.nodes ?? [],
-    traceroutes: dashboardQuery.data?.traceroutes ?? [],
-    neighborInfo: dashboardQuery.data?.neighborInfo ?? [],
-    channels: dashboardQuery.data?.channels ?? [],
+    nodes: dashboardQuery.data?.nodes ?? EMPTY,
+    traceroutes: dashboardQuery.data?.traceroutes ?? EMPTY,
+    neighborInfo: dashboardQuery.data?.neighborInfo ?? EMPTY,
+    channels: dashboardQuery.data?.channels ?? EMPTY,
     status: statusQuery.data ?? null,
+    nodeCount: dashboardQuery.data?.nodeCount,
     isLoading,
     isError,
   };
@@ -380,6 +456,9 @@ function mergeNodeRecords(records: any[]): any {
         // same classification, so they come from the same record too.
         k === 'aircraftAgedOutAt' ||
         k === 'aircraftFixedAt' ||
+        k === 'aircraftManualMark' ||
+        k === 'aircraftManualMarkAt' ||
+        k === 'aircraftManualMarkBy' ||
         // #5363: the sign-flip flag and reported pair describe one record's
         // fix, so they travel with the chosen position too.
         k === 'positionSignFlipCorrected' ||
@@ -471,6 +550,9 @@ function mergeNodeRecords(records: any[]): any {
     merged.heightAboveGround = withPosition.heightAboveGround ?? null;
     merged.aircraftAgedOutAt = withPosition.aircraftAgedOutAt ?? null;
     merged.aircraftFixedAt = withPosition.aircraftFixedAt ?? null;
+    merged.aircraftManualMark = withPosition.aircraftManualMark ?? null;
+    merged.aircraftManualMarkAt = withPosition.aircraftManualMarkAt ?? null;
+    merged.aircraftManualMarkBy = withPosition.aircraftManualMarkBy ?? null;
     // #5363: from the same record, or absent, never spliced from another.
     if (withPosition.positionSignFlipCorrected === true) {
       merged.positionSignFlipCorrected = true;
@@ -504,6 +586,20 @@ export interface NodeSourceRef {
 }
 
 /**
+ * Describes one gateway that relayed a node, attached to each merged Unified
+ * node (#6175). Carries `sourceId` so the popup can nest gateway chips under
+ * their owning MQTT source, and `lastHeard` so the map can ring a multi-gateway
+ * node by its most-recently-heard gateway. Deduped by `(sourceId, gatewayId)`.
+ */
+export interface NodeGatewayRef {
+  sourceId: string;
+  gatewayId: string;
+  gatewayNodeNum: number | null;
+  receptionCount: number;
+  lastHeard: number;
+}
+
+/**
  * One source's data bundle plus its identifying metadata. The metadata is
  * optional so legacy callers (and tests) that only pass data still work — when
  * absent, merged nodes simply carry no `sources` array.
@@ -516,6 +612,31 @@ export interface UnifiedSourceBundle {
   traceroutes: unknown[];
   neighborInfo: unknown[];
   channels: unknown[];
+  /** Per-`(node, gateway)` membership for this source (#6175); MQTT-only. */
+  gatewayMembership?: MqttGatewayMembershipRow[];
+}
+
+interface CachedNodeMerge {
+  inputs: unknown[];
+  sourceSig: string;
+  /** Signature of the node's gateway membership (#6175); a change re-merges. */
+  gatewaySig: string;
+  merged: unknown;
+}
+
+/**
+ * Per-node merge results from the previous `mergeUnifiedSourceData` call, so an
+ * unchanged node keeps the same merged object (and the node array keeps its
+ * reference when nothing changed). Hold one per consumer, e.g. in a ref.
+ */
+export interface UnifiedMergeCache {
+  byKey: Map<string, CachedNodeMerge>;
+  nodes: unknown[] | null;
+  discard: boolean | null;
+}
+
+export function createUnifiedMergeCache(): UnifiedMergeCache {
+  return { byKey: new Map(), nodes: null, discard: null };
 }
 
 /**
@@ -534,7 +655,17 @@ export interface UnifiedSourceBundle {
  */
 export function mergeUnifiedSourceData(
   perSource: UnifiedSourceBundle[],
+  cache?: UnifiedMergeCache,
 ): { nodes: unknown[]; traceroutes: unknown[]; neighborInfo: unknown[]; channels: unknown[] } {
+  // A change to the discard-invalid-positions toggle changes how positions
+  // merge, so nothing merged under the old value may be reused.
+  const discard = getDiscardInvalidPositions();
+  if (cache && cache.discard !== discard) {
+    cache.byKey = new Map();
+    cache.nodes = null;
+    cache.discard = discard;
+  }
+  const nextByKey = new Map<string, CachedNodeMerge>();
   // Keys are stringified and namespaced (`mt:`/`mc:`) so MeshCore contacts
   // (which carry no meshtastic nodeNum) don't collapse into the nodeNum=0
   // bucket. MeshCore nodes key on publicKey so the same physical node merges
@@ -542,6 +673,12 @@ export function mergeUnifiedSourceData(
   // node record with the source it came from so we can rebuild `sources` after
   // the field-level merge collapses the records.
   const recordsByKey = new Map<string, Array<{ node: any; source: NodeSourceRef | null }>>();
+  // #6175: gateway membership per `(sourceId, fromNode)`, assembled from every
+  // per-source bundle, so each merged node can be given a deduped `gateways`
+  // list. MQTT-only; non-MQTT/disabled sources carry no membership, so this map
+  // is simply empty for them and the node gets no `gateways` field.
+  const gatewayBySourceNode = new Map<string, MqttGatewayMembershipRow[]>();
+  const gatewayKey = (sourceId: string, fromNode: number) => `${sourceId}\u0001${fromNode}`;
   const traceroutes: unknown[] = [];
   const neighborInfo: unknown[] = [];
   // Tracks canonical (min,max) nodeNum pairs already added to neighborInfo so the
@@ -601,15 +738,74 @@ export function mergeUnifiedSourceData(
     if (channels.length === 0 && ps.channels.length > 0) {
       channels = ps.channels;
     }
+    // #6175: index this source's gateway membership by (sourceId, fromNode).
+    for (const row of ps.gatewayMembership ?? []) {
+      if (row == null || row.gatewayId == null) continue;
+      const k = gatewayKey(row.sourceId, Number(row.fromNode));
+      const bucket = gatewayBySourceNode.get(k);
+      if (bucket) bucket.push(row);
+      else gatewayBySourceNode.set(k, [row]);
+    }
   }
 
-  const nodes = Array.from(recordsByKey.values()).map((entries) => {
-    const merged = mergeNodeRecords(entries.map((e) => e.node));
+  const nodes = Array.from(recordsByKey.entries()).map(([key, entries]) => {
+    const inputs = entries.map((e) => e.node);
+    const sourceSig = entries
+      .map((e) => (e.source ? `${e.source.sourceId}\u0001${e.source.sourceName}\u0001${e.source.protocol}` : ''))
+      .join('\u0002');
+    // #6175: this node's gateway membership across every source that heard it,
+    // deduped by (sourceId, gatewayId), newest gateway first. The server
+    // already collapses to one row per (sourceId, fromNode, gatewayId), so the
+    // dedup here only guards against a node reported by multiple sources.
+    const gatewaySeen = new Map<string, NodeGatewayRef>();
+    for (const e of entries) {
+      if (!e.source) continue;
+      const nodeNum = Number(e.node?.nodeNum);
+      if (!Number.isFinite(nodeNum)) continue;
+      for (const row of gatewayBySourceNode.get(gatewayKey(e.source.sourceId, nodeNum)) ?? []) {
+        const dk = `${row.sourceId}\u0001${row.gatewayId}`;
+        const existing = gatewaySeen.get(dk);
+        if (!existing || row.lastHeard > existing.lastHeard) {
+          gatewaySeen.set(dk, {
+            sourceId: row.sourceId,
+            gatewayId: row.gatewayId,
+            gatewayNodeNum: row.gatewayNodeNum ?? null,
+            receptionCount: row.receptionCount,
+            lastHeard: row.lastHeard,
+          });
+        }
+      }
+    }
+    const nodeGateways = Array.from(gatewaySeen.values()).sort(
+      (a, b) => b.lastHeard - a.lastHeard || a.gatewayId.localeCompare(b.gatewayId),
+    );
+    const gatewaySig = nodeGateways
+      .map((g) => `${g.sourceId}\u0001${g.gatewayId}\u0001${g.lastHeard}\u0001${g.receptionCount}`)
+      .join('\u0002');
+    // Reuse last merge's object when this node's input records are the same
+    // objects as last time (TanStack's structural sharing keeps an unchanged
+    // record's reference across polls). That keeps an unchanged node's
+    // identity stable, so per-node memos and marker components downstream
+    // can skip it. The gateway signature is part of the key so a membership
+    // change forces a fresh merge even when the node records are unchanged.
+    const prev = cache?.byKey.get(key);
+    if (
+      prev &&
+      prev.sourceSig === sourceSig &&
+      prev.gatewaySig === gatewaySig &&
+      prev.inputs.length === inputs.length &&
+      prev.inputs.every((r, i) => r === inputs[i])
+    ) {
+      nextByKey.set(key, prev);
+      return prev.merged;
+    }
+    const merged = mergeNodeRecords(inputs);
     const seen = new Map<string, NodeSourceRef>();
     for (const e of entries) {
       if (e.source && !seen.has(e.source.sourceId)) seen.set(e.source.sourceId, e.source);
     }
     if (seen.size > 0) merged.sources = Array.from(seen.values());
+    if (nodeGateways.length > 0) merged.gateways = nodeGateways;
     // Union of transport classes across every per-source record so the map's
     // RF/UDP/MQTT toggles are additive — a node heard via RF on one source and
     // MQTT on another stays visible under "Show RF" even with "Show MQTT" off.
@@ -639,11 +835,23 @@ export function mergeUnifiedSourceData(
       for (const c of getNodeTransportClasses(e.node)) classes.add(c);
     }
     merged.transportClasses = Array.from(classes);
+    nextByKey.set(key, { inputs, sourceSig, gatewaySig, merged });
     return merged;
   });
 
+  let stableNodes: unknown[] = nodes;
+  if (cache) {
+    // Every node reused in the same order: hand back last call's array too.
+    const prevNodes = cache.nodes;
+    if (prevNodes && prevNodes.length === nodes.length && prevNodes.every((n, i) => n === nodes[i])) {
+      stableNodes = prevNodes;
+    }
+    cache.byKey = nextByKey;
+    cache.nodes = stableNodes;
+  }
+
   return {
-    nodes,
+    nodes: stableNodes,
     traceroutes,
     neighborInfo,
     channels,
@@ -660,70 +868,96 @@ export function mergeUnifiedSourceData(
 export function useDashboardUnifiedData(
   sources: Array<string | DashboardSource>,
   enabled: boolean,
+  options?: DashboardDataOptions,
 ): DashboardSourceData {
-  const { authStatus } = useAuth();
-  const isAuthenticated = authStatus?.authenticated ?? false;
+  const { isAuthenticated, authResolved } = useDashboardAuthGate();
+  const ageWindow = options?.ageWindow === true;
   // Accept either bare source-id strings (MapAnalysis layers, which never use
   // the per-node `sources` field) or full DashboardSource objects (the Unified
   // dashboard map, which needs source names + protocol for the popup).
-  const sourceList = sources.map((s) => (typeof s === 'string' ? { id: s } : s));
-  const sourceIds = sourceList.map((s) => s.id);
+  // Callers usually pass a fresh array each render, so everything below keys
+  // on a string of the fields the merge reads rather than on `sources` itself.
+  const sourceMetaKey = JSON.stringify(
+    sources.map((s) =>
+      typeof s === 'string'
+        ? [s]
+        : [s.id, s.name, isAnyMeshCoreSourceType(s.type) ? 'MeshCore' : 'Meshtastic'],
+    ),
+  );
+  const sourceMeta = useMemo(
+    () => JSON.parse(sourceMetaKey) as Array<[string] | [string, string, 'MeshCore' | 'Meshtastic']>,
+    [sourceMetaKey],
+  );
+  const sourceIds = sourceMeta.map((m) => m[0]);
 
   // ONE request for the whole unified view instead of four GETs per source per
   // poll (#3735). The endpoint returns a per-source bundle array; we re-key it
   // by sourceId and stamp the caller's name/protocol metadata back on so the
   // merge can attribute each node to its source.
   const sourcesKey = sourceIds.join(',');
+  const active = enabled && sourceIds.length > 0;
   const query = useQuery({
-    queryKey: ['dashboard', 'unified-dashboard', sourcesKey, isAuthenticated],
+    queryKey: ['dashboard', 'unified-dashboard', sourcesKey, isAuthenticated, ageWindow],
     queryFn: () =>
       fetchJson<SourceDashboardBundle[]>(
-        `${appBasename}/api/unified/dashboard?sources=${encodeURIComponent(sourcesKey)}`,
+        `${appBasename}/api/unified/dashboard?sources=${encodeURIComponent(sourcesKey)}${ageWindow ? '&ageWindow=settings' : ''}`,
       ),
-    enabled: enabled && sourceIds.length > 0,
+    enabled: active && authResolved,
     retry: false,
     refetchInterval: DASHBOARD_POLL_INTERVAL,
   });
 
-  if (!enabled || sourceIds.length === 0) {
-    return {
-      nodes: [],
-      traceroutes: [],
-      neighborInfo: [],
-      channels: [],
-      status: null,
-      isLoading: false,
-      isError: false,
-    };
-  }
+  // The merge is expensive on a large mesh (100+ ms), so it runs only when the
+  // fetched data, the source metadata or the position-discard toggle changes,
+  // not on every render of the consumer. The cache keeps unchanged nodes'
+  // merged objects (and the array itself) referentially stable across polls.
+  const mergeCacheRef = useRef<UnifiedMergeCache | null>(null);
+  const discardInvalid = getDiscardInvalidPositions();
+  const merged = useMemo(() => {
+    if (!active) return null;
+    // A toggle of discard-invalid-positions changes how positions merge, so
+    // start a fresh cache rather than reuse nodes merged under the old value.
+    if (!mergeCacheRef.current || mergeCacheRef.current.discard !== discardInvalid) {
+      mergeCacheRef.current = createUnifiedMergeCache();
+    }
+    const bundlesById = new Map<string, SourceDashboardBundle>(
+      (query.data ?? []).map((b: SourceDashboardBundle): [string, SourceDashboardBundle] => [b.sourceId, b]),
+    );
+    // Re-attach id/name/protocol so the merge can stamp `sources` onto every node
+    // (MeshCore source types map to the MeshCore protocol; everything else is
+    // Meshtastic). Bare-string callers carry no metadata, so merged nodes get no
+    // `sources` field — matching the previous behavior.
+    const perSource: UnifiedSourceBundle[] = sourceMeta.map((m) => {
+      const b = bundlesById.get(m[0]);
+      return {
+        sourceId: m.length > 1 ? m[0] : undefined,
+        sourceName: m.length > 1 ? m[1] : undefined,
+        protocol: m.length > 1 ? m[2] : undefined,
+        nodes: b?.nodes ?? [],
+        traceroutes: b?.traceroutes ?? [],
+        neighborInfo: b?.neighborInfo ?? [],
+        channels: b?.channels ?? [],
+        gatewayMembership: b?.gatewayMembership ?? [],
+      };
+    });
+    return mergeUnifiedSourceData(perSource, mergeCacheRef.current);
+  }, [active, query.data, sourceMeta, discardInvalid]);
 
-  const bundlesById = new Map<string, SourceDashboardBundle>(
-    (query.data ?? []).map((b: SourceDashboardBundle): [string, SourceDashboardBundle] => [b.sourceId, b]),
+  const isLoading = query.isLoading;
+  const isError = query.isError;
+  return useMemo<DashboardSourceData>(
+    () =>
+      merged
+        ? { ...merged, status: null, isLoading, isError }
+        : {
+            nodes: EMPTY,
+            traceroutes: EMPTY,
+            neighborInfo: EMPTY,
+            channels: EMPTY,
+            status: null,
+            isLoading: false,
+            isError: false,
+          },
+    [merged, isLoading, isError],
   );
-
-  // Re-attach id/name/protocol so the merge can stamp `sources` onto every node
-  // (MeshCore source types map to the MeshCore protocol; everything else is
-  // Meshtastic). Bare-string callers carry no metadata, so merged nodes get no
-  // `sources` field — matching the previous behavior.
-  const perSource: UnifiedSourceBundle[] = sourceList.map((s) => {
-    const b = bundlesById.get(s.id);
-    return {
-      sourceId: 'name' in s ? s.id : undefined,
-      sourceName: 'name' in s ? s.name : undefined,
-      protocol: 'type' in s ? (isAnyMeshCoreSourceType(s.type) ? 'MeshCore' : 'Meshtastic') : undefined,
-      nodes: b?.nodes ?? [],
-      traceroutes: b?.traceroutes ?? [],
-      neighborInfo: b?.neighborInfo ?? [],
-      channels: b?.channels ?? [],
-    };
-  });
-
-  const merged = mergeUnifiedSourceData(perSource);
-
-  return {
-    ...merged,
-    status: null,
-    isLoading: query.isLoading,
-    isError: query.isError,
-  };
 }

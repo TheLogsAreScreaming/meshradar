@@ -1,0 +1,122 @@
+/* Analyzer Observer broker list editor (#5831; moved from the Dashboard
+ * source modal, #5014 Phase 2). Role tokens only, no fallbacks (#4909). */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-top: 0.6rem;
+  max-width: 600px;
+}
+
+.shortInput {
+  max-width: 10rem;
+}
+
+.help {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--color-text-subtle);
+}
+
+.brokerList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.brokerRow {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem 0.75rem;
+}
+
+.brokerHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.removeButton {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-error);
+  padding: 0.15rem 0.4rem;
+  cursor: pointer;
+}
+
+.removeButton:hover {
+  background: var(--color-surface-hover);
+}
+
+/* Verify-TLS toggle (#6250). Qualified with .field so it beats the global
+ * `.meshcore-form-view label { display: block }` rule. */
+.field .checkboxLabel {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+
+.warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35rem;
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--color-warning);
+}
+
+/* Owner claims (#6454): key input plus the "use this companion's key" button. */
+.inputRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.inputRow .monoInput {
+  flex: 1 1 18rem;
+  min-width: 0;
+}
+
+.monoInput {
+  font-family: var(--font-mono);
+}
+
+.inlineButton {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  color: var(--color-text);
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+}
+
+.inlineButton:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+}
+
+.inlineButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.fieldError {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--color-error);
+}

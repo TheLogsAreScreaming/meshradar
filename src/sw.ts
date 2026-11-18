@@ -107,6 +107,7 @@ registerRoute(
 
 // Navigation data + deep-link URL construction (shared with the app and tests)
 import { buildNotificationUrl, type NotificationNavigationData } from './utils/notificationUrl';
+import { renewPushSubscription } from './utils/pushRenewal';
 
 // Handle push events (background notifications)
 self.addEventListener('push', event => {
@@ -122,6 +123,11 @@ self.addEventListener('push', event => {
     icon: defaultIcon,
     badge: defaultIcon,
     tag: undefined as string | undefined, // Will be set uniquely per notification
+    // #5729: a later copy of the same event (another source heard the packet)
+    // arrives with the same tag, `renotify: false` and `silent: true`, so it
+    // replaces the shown notification without alerting the user again.
+    renotify: false,
+    silent: false,
     data: undefined as NotificationNavigationData | undefined, // Navigation data for click handling
   };
 
@@ -135,6 +141,9 @@ self.addEventListener('push', event => {
         icon: data.icon || notificationData.icon,
         badge: data.badge || notificationData.badge,
         tag: data.tag, // Use tag from payload, or undefined for unique notifications
+        // `renotify: true` without a tag throws, so it needs both.
+        renotify: data.renotify === true && typeof data.tag === 'string' && data.tag.length > 0,
+        silent: data.silent === true,
         data: data.data, // Navigation data (channelId, messageId, senderNodeId)
       };
     } catch (error) {
@@ -154,6 +163,8 @@ self.addEventListener('push', event => {
       icon: notificationData.icon,
       badge: notificationData.badge,
       tag: finalTag,
+      renotify: notificationData.renotify,
+      silent: notificationData.silent,
       data: notificationData.data, // Attach navigation data to notification
       requireInteraction: false, // Allow notifications to auto-dismiss
     } as NotificationOptions)
@@ -206,57 +217,28 @@ self.addEventListener('notificationclick', event => {
   );
 });
 
-// Handle push subscription changes (e.g., subscription expired)
+// Handle push subscription changes (endpoint rotated or expired). The server
+// moves this browser's rows to the new endpoint (#5863).
 self.addEventListener('pushsubscriptionchange', event => {
   console.log('[Service Worker] Push subscription changed:', event);
-
   event.waitUntil(
-    self.registration.pushManager
-      .subscribe(event.oldSubscription?.options || { userVisibleOnly: true })
-      .then(subscription => {
-        console.log('[Service Worker] Re-subscribed:', subscription);
-
-        const p256dh = subscription.getKey('p256dh');
-        const auth = subscription.getKey('auth');
-
-        if (!p256dh || !auth) {
-          throw new Error('Missing subscription keys');
+    renewPushSubscription(event, {
+      scope: self.registration.scope,
+      pushManager: self.registration.pushManager,
+      fetch: (input, init) => fetch(input, init),
+    })
+      .then(result => {
+        if (result.status === 'no-old-endpoint') {
+          console.warn('[Service Worker] No old subscription to renew from; re-subscribe from the Notifications tab');
+        } else {
+          console.log(`[Service Worker] Renewed ${result.renewed} subscription row(s), skipped ${result.skipped}`);
         }
-
-        // Send new subscription to backend. Resolve against the registration
-        // scope — a root-absolute '/api/...' misses the server entirely under
-        // a BASE_URL sub-path deployment, silently losing the re-subscription.
-        return fetch(new URL('api/push/subscribe', self.registration.scope).href, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            subscription: {
-              endpoint: subscription.endpoint,
-              keys: {
-                p256dh: arrayBufferToBase64(p256dh),
-                auth: arrayBufferToBase64(auth),
-              },
-            },
-          }),
-        });
       })
       .catch(error => {
         console.error('[Service Worker] Re-subscription failed:', error);
       })
   );
 });
-
-// Helper function to convert ArrayBuffer to Base64
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
 
 console.log('[Service Worker] MeshRadar service worker with push notifications loaded');
 

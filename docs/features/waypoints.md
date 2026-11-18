@@ -38,7 +38,7 @@ The unified "all sources" dashboard renders waypoints from every source you can 
 
 ### Map Analysis
 
-The Map Analysis canvas exposes a **Waypoints** layer in the toolbar. Toggle it to overlay every visible waypoint on top of the existing analysis layers (heatmap, traceroutes, etc.).
+The Map Analysis canvas exposes a **Waypoints** layer in the toolbar. Toggle it to overlay every visible waypoint on top of the existing analysis layers (heatmap, traceroutes, etc.). You can also add, edit and delete waypoints there; see [From Map Analysis](#from-map-analysis).
 
 ### Showing and hiding waypoints
 
@@ -46,25 +46,70 @@ The **Map Features** panel on both the per-source dashboard map and the Nodes ma
 
 ## Creating, editing, and deleting waypoints
 
-Authoring is available on the per-source dashboard map for users with `waypoints:write`.
+Authoring is available on a source's own map and in Map Analysis, for users with `waypoints:write` on the source.
 
 ### Create
 
 1. Open a source's dashboard map.
-2. Open the **Map Features** dropdown and click **➕ Waypoint** (or right-click the map for the same shortcut).
+2. Open the **Map Features** dropdown and click **+ Waypoint** (or right-click the map for the same shortcut).
 3. The cursor switches to a crosshair — click the map at the desired location, or press **Esc** to cancel.
 4. Fill in the waypoint editor:
    - **Name** and **Description**
    - **Icon** — pick an emoji from the picker (rendered with VS-16 forcing so it shows as an emoji on every platform)
-   - **Lock to me** — only your node can edit this waypoint after broadcast
+   - **Lock to this node**: only your node can edit this waypoint after broadcast
    - **Expires** — toggle on to set an expiry timestamp; off means "never expires"
    - **Hop limit** — how many hops the waypoint may travel. Blank uses the node's own hop limit. A value is capped at that limit, so it can only shorten reach.
    - **Channel** — which of the source's channels the waypoint is broadcast on. The list comes from the waypoint's own source, so you only ever see channels that source can transmit on. Leave it alone and the waypoint goes out on Primary (slot 0), the channel every waypoint used before this option existed. The picker is disabled for virtual waypoints, which are never transmitted.
-5. Click **Save**. MeshMonitor allocates a waypoint id (Python-style id allocation), persists the row, and broadcasts a WAYPOINT_APP packet to the mesh.
+5. Optional: set a **Geofence** (see [Geofence](#geofence)).
+6. Click **Save**. MeshMonitor allocates a waypoint id (Python-style id allocation), persists the row, and broadcasts a WAYPOINT_APP packet to the mesh.
+
+### Geofence
+
+A waypoint can carry a geofence: an area the waypoint watches. The **Geofence** section of the editor sets it.
+
+![Waypoint editor with a rectangle geofence](/images/features/5922-waypoint-geofence-editor.png)
+
+- **Shape** — **None**, **Circle (radius)**, **Rectangle (bounding box)**, or **Circle and rectangle** (shown when a waypoint from another app has both).
+- **Radius (metres)** — from 160 m to 16 km (0.1 to 10 mi), the range the Apple app offers.
+- **Bounding box** — drawn on a small map centred on the waypoint, with **North**, **South**, **West** and **East** fields you can edit. West must lie left of east, and south below north.
+- **Alert when a node enters**, **Alert when a node leaves** and **Only for favourite nodes** — flags that travel with the waypoint.
+
+**MeshMonitor raises no alerts for a geofence.** It stores the geofence, sends it with the waypoint, and draws it. Each node that receives the waypoint watches the area itself and alerts its user.
+
+::: warning Alerts happen on every receiving device
+Every node that receives the waypoint alerts its user when a node crosses the edge. A busy area can mean many alerts on many devices. **Only for favourite nodes** limits each device to its own favourites.
+:::
+
+A geofence adds a few bytes to the waypoint packet (a radius takes 2 to 3, a box 22, each flag 2). MeshMonitor sends it only where it sent the waypoint before. A waypoint without a geofence is byte-for-byte as before.
+
+Geofences round-trip with the Apple and Android apps. A waypoint made there keeps its geofence here. A waypoint you edit or rebroadcast from MeshMonitor keeps it on the mesh. A waypoint packet is the whole waypoint, so a sender that sends none clears the one you stored.
+
+On the map, the region shows as a dashed shape under the pin. It ignores clicks, so it never blocks a click meant for a node. The pin's popup adds a summary line.
+
+![Geofence regions on the map](/images/features/5922-waypoint-geofence-map.png)
+
+![Waypoint popup with a geofence summary](/images/features/5922-waypoint-geofence-popup.png)
 
 ### Edit
 
 Click the waypoint marker, then **Edit** in the popup. Editing is suppressed when the waypoint is locked to another node.
+
+### From Map Analysis
+
+Map Analysis shows many sources at once, so it asks which one sends.
+
+1. Open **Tools** and click **Add Waypoint**. The Waypoints layer turns on if it was off.
+2. Click the map at the spot, or press **Esc** to cancel. This sends nothing.
+3. In the editor, pick the **Sending source**. That source's radio broadcasts the waypoint.
+   - Only Meshtastic radio sources you hold `waypoints:write` on are listed. MQTT, MeshCore and Reticulum sources cannot send a waypoint, and a disabled source has no radio to send with.
+   - With one such source it is chosen for you and shown as text.
+   - With several you must choose. If the map's source filter leaves exactly one of them, that one is chosen for you. **Create** stays off until a source is set.
+   - The **Channel** list and **Lock to this node** follow the source you pick. Changing the source puts both back to their defaults, because slot 1 on one radio is not slot 1 on another.
+4. Click **Create**. The waypoint is saved and broadcast once, the same single send as on a source's own map. Nothing goes on air before this click.
+
+**Add Waypoint** is hidden if you have `waypoints:write` on no source. It shows greyed out, with the reason, if you can write only to sources that have no radio, and in the 3D view.
+
+**Edit** and **Delete** appear in a waypoint's popup when its source is a radio source you can write to. They act on the waypoint's own source, and the editor names it. Both are greyed out for a waypoint locked to another node. Delete asks first and names the sending source.
 
 ### Delete
 
@@ -76,9 +121,9 @@ Waypoints are exposed on the v1 source-scoped routes, gated by `waypoints:read|w
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET`    | `/api/sources/:id/waypoints` | List waypoints (supports `?bbox=` and `?include_expired=`) |
+| `GET`    | `/api/sources/:id/waypoints` | List waypoints (supports `?bbox=` and `?includeExpired=true`) |
 | `POST`   | `/api/sources/:id/waypoints` | Create a local waypoint and broadcast it |
-| `PATCH`  | `/api/sources/:id/waypoints/:waypointId` | Update name/description/icon/expiry/lock/channel |
+| `PATCH`  | `/api/sources/:id/waypoints/:waypointId` | Update name/description/icon/expiry/lock/channel/geofence |
 | `DELETE` | `/api/sources/:id/waypoints/:waypointId` | Delete locally and broadcast a tombstone |
 
 All mutations require the standard `X-CSRF-Token` header. Mutations on a waypoint with `locked_to` set to another node return `403`.
@@ -86,6 +131,8 @@ All mutations require the standard `X-CSRF-Token` header. Mutations on a waypoin
 `POST` and `PATCH` accept an optional `channel` field — an integer device channel slot `0`-`7`. Anything else returns `400`. Omit it and the waypoint stays on slot 0.
 
 `POST` and `PATCH` also accept `hop_limit` (or `hopLimit`): an integer `0`-`7`, or `null` to use the node's configured hop limit. Anything else returns `400` with code `INVALID_HOP_LIMIT`. The stored value is what you asked for; at send time it is capped at the node's own hop limit. `GET` returns it as `hopLimit`.
+
+`POST` and `PATCH` also accept the geofence fields: `geofence_radius_m` (an integer from `160` to `16000`, or `null`), `bounding_box` (`{ "west", "south", "east", "north" }` with west < east and south < north, or `null`), and the booleans `notify_on_enter`, `notify_on_exit` and `notify_favorites_only`. A bad value returns `400` with code `INVALID_GEOFENCE`. `PATCH` changes only the keys you send.
 
 ## Database
 
@@ -95,7 +142,9 @@ Migrations **054** / **055** seed the new `waypoints:read` / `waypoints:write` p
 
 Migration **130** adds the `channel` column that records which slot a waypoint is broadcast on. Rows created before it read back as `NULL`, which every send site treats as slot 0 — the same channel they always used.
 
-Migration **183** adds `hop_limit` (`NULL` = the node's configured hop limit, which every earlier row gets), plus `automation_key` and `broadcast_fingerprint`, used by the Automation Engine's [Broadcast a waypoint](/features/automation-engine#broadcast-a-waypoint) action.
+Migration **183** adds `hop_limit` (`NULL` = the node's configured hop limit, which every earlier row gets), plus `automation_key` and `broadcast_fingerprint`, used by the Automation Engine's [Broadcast a waypoint](/features/automation-engine-reference#broadcast-a-waypoint) action.
+
+Migration **216** adds the geofence columns (`geofence_radius_m`, `bbox_west`, `bbox_south`, `bbox_east`, `bbox_north`, `notify_on_enter`, `notify_on_exit`, `notify_favorites_only`). Existing rows have no geofence and every flag off.
 
 Waypoints used to go out at a fixed hop limit of 3. They now use the node's configured LoRa hop limit unless the waypoint sets its own.
 
@@ -110,6 +159,10 @@ Migration **165** adds the four preference columns (`notify_on_waypoint`, `waypo
 ## Limitations and follow-ups
 
 - **Rebroadcast scheduler is not yet wired**. The `rebroadcast_interval_s` column is persisted and accepted by the API, but no timer fires it. Waypoints you create are broadcast once on save; resends rely on the stock Meshtastic firmware behaviour at this time.
-- **Automation hooks** for the waypoint message type are not yet available — Auto-Responders and Geofence Triggers do not currently match on waypoint events.
+- **No trigger fires on a waypoint.** Auto-Responders and automation triggers do not match on waypoint events. An automation can send one, with the [Broadcast a waypoint](/features/automation-engine-reference#broadcast-a-waypoint) action.
 
 Both are tracked as follow-ups; see [#2936](https://github.com/Yeraze/meshmonitor/issues/2936) for the umbrella issue.
+
+## Local markers
+
+To mark a spot on the map without sending anything to the mesh, use a [local marker](./local-markers.md) instead.

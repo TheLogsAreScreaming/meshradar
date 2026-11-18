@@ -3,7 +3,7 @@
 The Packet Monitor is a diagnostic tool that displays raw Meshtastic packets as they are received from the mesh network. It provides visibility into the low-level packet traffic for debugging and analysis purposes.
 
 ::: tip MeshCore Packet Monitor
-MeshCore sources have their own equivalent — the **OTA Packet Monitor** accessible from the **Packets** tab in the MeshCore source page. It captures raw OTA frames from the companion's `LogRxData` push (route type, payload type, relay chain, SNR/RSSI, and a full hex dump). See the [MeshCore documentation](/features/meshcore#packet-monitor) for details.
+MeshCore sources have their own equivalent — the **OTA Packet Monitor** accessible from the **Packet Monitor** tab in the MeshCore source page. It captures raw OTA frames (route type, payload type, relay chain, SNR/RSSI, and a full hex dump) from a companion's `LogRxData` push, from a repeater's serial packet log (this needs a firmware build with `MESH_PACKET_LOGGING=1`), or from a MeshCore MQTT ingest feed. Its **Packet Decode** view can decrypt channel packets with keys the server holds. See the [MeshCore documentation](/features/meshcore#packet-monitor) for details.
 :::
 
 ::: tip MQTT Packet Monitor
@@ -53,8 +53,8 @@ The Packet Monitor is a "radio sniffer": most rows are packets your node heard f
 | ATAK_PLUGIN_V2 (78) | ATAK V2 (firmware 2.8+ rich CoT, zstd-compressed) — shown as `[ATAK V2 (not decoded), N bytes]`; decoding is a planned follow-up |
 | ATAK_FORWARDER (257) | Third-party ATAK Forwarder packets — identified by name, not decoded |
 
-::: tip Signed-packet shield (firmware 2.8 early preview)
-Packets carrying a firmware-verified **XEdDSA signature** (Meshtastic's new packet-signing scheme, not yet in an official release) show a small shield icon next to the entry. This only reflects what the connected node itself reported as verified — MeshMonitor doesn't re-verify the signature.
+::: tip Signed-packet shield
+Packets carrying a firmware-verified **XEdDSA signature** (Meshtastic's packet-signing scheme, firmware 2.8 and later) show a small shield icon next to the entry. This only reflects what the connected node itself reported as verified — MeshMonitor doesn't re-verify the signature.
 :::
 
 ### Packets That Do NOT Appear
@@ -68,6 +68,10 @@ The following packets are not logged to the Packet Monitor:
 These internal packets are filtered to reduce noise and keep the log focused on actual mesh traffic. ADMIN and ROUTING packets between remote nodes on the mesh are still logged.
 
 This is by design - the Packet Monitor shows mesh network traffic, not local device management.
+
+**Firmware 2.8 NodeDB replays:**
+- When MeshMonitor connects, firmware 2.8 and later replays stored positions, telemetry and node status as if they were new packets. These are not mesh traffic, so MeshMonitor drops them from the log.
+- MeshMonitor spots a replay by recomputing the packet id the firmware would give it. An RF packet with no receive time and no RSSI also counts as a replay.
 
 ## Filtering Packets
 
@@ -120,7 +124,7 @@ Each packet entry shows:
 
 ### Access Permission
 
-Viewing the Packet Monitor requires the `packetmonitor:read` permission. This is granted by default to all users (including Anonymous). Administrators can revoke it per-user in **Settings > Users**. The Packet Monitor permission is read-only — there is no write mode.
+Viewing the Packet Monitor requires the `packetmonitor:read` permission. This is granted by default to all users (including Anonymous). Administrators can revoke it per-user in **Settings > Users**. The Packet Monitor permission is read-only: the Users page offers no write grant for it, so only an administrator can clear a packet log, on Meshtastic and MeshCore sources alike.
 
 ### Packet Filtering by Permission
 
@@ -327,7 +331,7 @@ maximum packet count in Settings to cover the full window.
 
 It needs `packetmonitor:read` on the source, and non-admin users only count
 packets on channels they can read, the same rule as the packet list.
-Meshtastic sources only for now; MeshCore dashboards do not offer it.
+MeshCore sources offer the widget too. It reads the MeshCore packet log, so turn on the MeshCore packet monitor for the source (**Packet Monitor** tab). Senders show by public key. A packet that carries only a one-byte sender hash, and matches no known node, counts under unresolved packets instead of a row.
 
 ## Cross-source tags (Unified Packet Monitor)
 

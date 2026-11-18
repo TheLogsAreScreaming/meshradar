@@ -1,9 +1,14 @@
-import React, { useRef, useMemo, useCallback } from 'react';
+import React, { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { UiIcon } from '../icons';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
+import { ConfigSection } from '../shared/config/ConfigSection';
 
 interface NodeIdentitySectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
+  /** Bumped when the page reloads config from the node (#5797). */
+  configVersion?: number;
   longName: string;
   shortName: string;
   isUnmessagable: boolean;
@@ -13,10 +18,13 @@ interface NodeIdentitySectionProps {
   setIsUnmessagable: (value: boolean) => void;
   setIsLicensed: (value: boolean) => void;
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
 }
 
 const NodeIdentitySection: React.FC<NodeIdentitySectionProps> = ({
+  canWrite = true,
+  configVersion,
   longName,
   shortName,
   isUnmessagable,
@@ -30,38 +38,22 @@ const NodeIdentitySection: React.FC<NodeIdentitySectionProps> = ({
 }) => {
   const { t } = useTranslation();
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
-    longName, shortName, isUnmessagable, isLicensed
-  });
+  // What the node holds; moves on a successful save or a reload (#5797)
+  const values = { longName, shortName, isUnmessagable, isLicensed };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values, { reseedKey: configVersion });
 
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      longName !== initial.longName ||
-      shortName !== initial.shortName ||
-      isUnmessagable !== initial.isUnmessagable ||
-      isLicensed !== initial.isLicensed
-    );
-  }, [longName, shortName, isUnmessagable, isLicensed]);
-
-  // Reset to initial values (for SaveBar dismiss)
+  // Reset to saved values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setLongName(initial.longName);
-    setShortName(initial.shortName);
-    setIsUnmessagable(initial.isUnmessagable);
-    setIsLicensed(initial.isLicensed);
-  }, [setLongName, setShortName, setIsUnmessagable, setIsLicensed]);
+    setLongName(baseline.longName);
+    setShortName(baseline.shortName);
+    setIsUnmessagable(baseline.isUnmessagable);
+    setIsLicensed(baseline.isLicensed);
+  }, [baseline, setLongName, setShortName, setIsUnmessagable, setIsLicensed]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      longName, shortName, isUnmessagable, isLicensed
-    };
-  }, [onSave, longName, shortName, isUnmessagable, isLicensed]);
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Register with SaveBar
   useSaveBar({
@@ -74,23 +66,7 @@ const NodeIdentitySection: React.FC<NodeIdentitySectionProps> = ({
   });
 
   return (
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('node_identity.title')}
-        <a
-          href="https://meshmonitor.org/features/device#node-identity"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('node_identity.view_docs')}
-        >
-          <UiIcon name="help" />
-        </a>
-      </h3>
+    <ConfigSection canWrite={canWrite} title={t('node_identity.title')} docsUrl="https://meshmonitor.org/features/device#node-identity">
       <div className="setting-item">
         <label htmlFor="longName">
           {t('node_identity.long_name')}
@@ -151,7 +127,7 @@ const NodeIdentitySection: React.FC<NodeIdentitySectionProps> = ({
           </div>
         </label>
       </div>
-    </div>
+    </ConfigSection>
   );
 };
 

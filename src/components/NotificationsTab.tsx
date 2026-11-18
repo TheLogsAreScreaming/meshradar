@@ -5,6 +5,7 @@ import { logger } from '../utils/logger';
 import { Channel } from '../types/device';
 import { useToast } from './ToastContainer';
 import SectionNav from './SectionNav';
+import sectionNavLayout from './SectionNav.module.css';
 import { NumberInput } from './common/NumberInput';
 import { NumberInputScope } from './common/NumberInputScope';
 import { useNumberInputScope } from './common/numberInputScopeContext';
@@ -17,8 +18,11 @@ import {
 } from './monitoredNodes';
 import { UiIcon } from './icons';
 import NotificationFormatSection from './NotificationFormatSection';
+import NotificationScopePanel from './NotificationScopePanel';
 import styles from './NotificationsTab.module.css';
 import { defaultNotificationPreferences } from '../utils/notificationDefaults';
+import { notificationCapabilities, loadNotificationChannels } from '../utils/notificationCapabilities';
+import { NEW_NODE_LEARN_HOURS, NEW_NODE_CAP_PER_HOUR } from '../utils/newNodeAlertLimits';
 
 type StatusTone = 'info' | 'success' | 'warning' | 'error';
 interface StatusFeedback {
@@ -51,6 +55,8 @@ interface NotificationPreferences {
   lowBatteryThreshold: number;
   lowBatteryVoltageThreshold: number;
   notifyOnWaypoint: boolean;
+  notifyOnMention: boolean;
+  notifyOnAutoTrace: boolean;
   waypointRadiusKm: number;
   waypointCenterLat: number | null;
   waypointCenterLon: number | null;
@@ -63,6 +69,9 @@ interface NotificationPreferences {
   // #5593: message-notification templates; null = the built-in default.
   messageTitleTemplate: string | null;
   messageBodyTemplate: string | null;
+  // #6278: message text length per service; null = the default of 100.
+  messageTextMaxPush: number | null;
+  messageTextMaxApprise: number | null;
 }
 
 // The fields this tab edits. Saves send only these: the server merges them
@@ -82,6 +91,8 @@ const EDITED_PREFERENCE_FIELDS: ReadonlyArray<keyof NotificationPreferences> = [
   'lowBatteryThreshold',
   'lowBatteryVoltageThreshold',
   'notifyOnWaypoint',
+  'notifyOnMention',
+  'notifyOnAutoTrace',
   'waypointRadiusKm',
   'waypointCenterLat',
   'waypointCenterLon',
@@ -93,6 +104,8 @@ const EDITED_PREFERENCE_FIELDS: ReadonlyArray<keyof NotificationPreferences> = [
   'appriseUrls',
   'messageTitleTemplate',
   'messageBodyTemplate',
+  'messageTextMaxPush',
+  'messageTextMaxApprise',
 ];
 
 function editedPreferenceFields(prefs: NotificationPreferences): Partial<NotificationPreferences> {
@@ -105,17 +118,17 @@ function editedPreferenceFields(prefs: NotificationPreferences): Partial<Notific
 
 interface NotificationsTabProps {
   isAdmin: boolean;
+  /** MeshCore device type (1 Companion, 2 Repeater); decides which controls show. */
+  meshcoreDeviceType?: number | null;
 }
 
-const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
+const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin, meshcoreDeviceType }) => {
   const { t } = useTranslation();
   const { showToast } = useToast();
   const { sourceId: currentSourceId, sourceType, sourceName: currentSourceName } = useSource();
-  // MeshCore sources expose a different capability set than Meshtastic: they
-  // report battery as a voltage (mV) rather than a percentage, and they do not
-  // surface channel/DM/emoji/MQTT/traceroute/new-node notifications (those
-  // events never reach the notification service for MeshCore). Gate the
-  // Meshtastic-only controls so a MeshCore source only shows what actually works.
+  // One capability table decides which controls a source shows (P11 S8):
+  // Meshtastic, MeshCore Companion and MeshCore Repeater differ.
+  const caps = notificationCapabilities(sourceType, meshcoreDeviceType);
   const isMeshCore = sourceType === 'meshcore';
   const [vapidStatus, setVapidStatus] = useState<VapidStatus | null>(null);
   // Subscribed on THIS source (a push_subscriptions row exists for it), not
@@ -144,6 +157,20 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
   // Nothing is saved for this source yet: the values shown are the built-in
   // defaults, not another source's settings. The first save creates the row.
   const [usingDefaults, setUsingDefaults] = useState(false);
+  // This source has its own settings, overriding the mesh-wide default (#5729).
+  const [isOverride, setIsOverride] = useState(false);
+  // A region feed lists only channels it has seen, so a saved id can be missing
+  // from the list. Show it too, so the user can untick it and a save never drops
+  // it unseen (#6307).
+  const pickerChannels: Channel[] =
+    caps.unsupportedHint === 'ingest'
+      ? [
+          ...channels,
+          ...preferences.enabledChannels
+            .filter(id => !channels.some(c => c.id === id))
+            .map(id => ({ id, name: '', uplinkEnabled: false, downlinkEnabled: false }) as Channel),
+        ].sort((a, b) => a.id - b.id)
+      : channels;
   const [whitelistText, setWhitelistText] = useState('');
   const [blacklistText, setBlacklistText] = useState('');
   const [isSavingPreferences, setIsSavingPreferences] = useState(false);
@@ -311,12 +338,11 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
 
   const loadChannels = async () => {
     try {
-      const channelsQs = currentSourceId ? `?sourceId=${encodeURIComponent(currentSourceId)}` : '';
-      const response = await api.get<Channel[]>(`/api/channels${channelsQs}`);
-      const channelList = Array.isArray(response) ? response : [];
+      const channelList = await loadNotificationChannels(currentSourceId, sourceType);
       setChannels(channelList);
 
-      if (preferences.enabledChannels.length === 0 && channelList.length > 0) {
+      // A region feed (MeshCore MQTT) can be very busy: never pre-tick its channels.
+      if (preferences.enabledChannels.length === 0 && channelList.length > 0 && caps.unsupportedHint !== 'ingest') {
         setPreferences(prev => ({
           ...prev,
           enabledChannels: channelList.map(c => c.id)
@@ -330,10 +356,11 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
   const loadPreferences = async () => {
     try {
       const qs = currentSourceId ? `?sourceId=${encodeURIComponent(currentSourceId)}` : '';
-      const { usingDefaults: responseUsingDefaults, ...response } =
-        await api.get<NotificationPreferences & { usingDefaults?: boolean }>(`/api/push/preferences${qs}`);
+      const { usingDefaults: responseUsingDefaults, isOverride: responseIsOverride, usingMeshDefault: _usingMesh, ...response } =
+        await api.get<NotificationPreferences & { usingDefaults?: boolean; isOverride?: boolean; usingMeshDefault?: boolean }>(`/api/push/preferences${qs}`);
 
       setUsingDefaults(responseUsingDefaults === true);
+      setIsOverride(responseIsOverride === true);
       setPreferences(prev => ({ ...prev, ...response }));
       setWhitelistText(response.whitelist.join('\n'));
       setBlacklistText(response.blacklist.join('\n'));
@@ -398,6 +425,8 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
       });
       setPreferences(prefs);
       setUsingDefaults(false);
+      // A save on a source creates (or updates) its override (#5729).
+      if (currentSourceId) setIsOverride(true);
       logger.info('Notification preferences saved');
       showToast(t('notifications.preferences_saved'), 'success');
     } catch (error) {
@@ -676,12 +705,23 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
     <div className={`tab-content ${styles.root}`}>
       <h2>{t('notifications.title')}</h2>
 
+      {/* Picker + settings share one flex row on a landscape phone (#6211): the
+          picker becomes a left rail so the form keeps the full usable height. */}
+      <div className={sectionNavLayout.shell}>
       <SectionNav
         searchable
         searchPlaceholder={t('config_search.filter_notifications', 'Search notification settings...')}
         searchLabel={t('config_search.filter_notifications', 'Search notification settings...')}
         noMatchesLabel={t('config_search.no_sections', 'No matching sections')}
         items={notificationsNavItems(t)}
+      />
+      <div className={sectionNavLayout.body}>
+
+      {/* Mesh-wide default + this source's override state (#5729). */}
+      <NotificationScopePanel
+        sourceId={currentSourceId ?? null}
+        isOverride={isOverride}
+        onChanged={() => { void loadPreferences(); }}
       />
 
       {usingDefaults && currentSourceId && (
@@ -691,7 +731,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
           style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', margin: '0 0 16px', padding: '10px 12px', borderRadius: '6px', fontSize: '14px' }}
         >
           <UiIcon name="info" size={16} />
-          <span>{t(isMeshCore ? 'notifications.using_defaults_notice_meshcore' : 'notifications.using_defaults_notice')}</span>
+          <span>{t(!caps.dm ? 'notifications.using_defaults_notice_no_dm' : isMeshCore ? 'notifications.using_defaults_notice_meshcore' : 'notifications.using_defaults_notice')}</span>
         </p>
       )}
 
@@ -779,7 +819,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
 
               {/* Direct Messages Toggle — Meshtastic only (MeshCore message
                   events don't reach the notification service) */}
-              {!isMeshCore && (
+              {caps.dm && (
               <div className={styles.row} style={{
                 padding: '12px',
                 borderRadius: '6px',
@@ -797,13 +837,13 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                     }}
                     style={{ width: '18px', height: '18px' }}
                   />
-                  <span style={{ fontWeight: '500' }}><UiIcon name="messages" /> {t('notifications.direct_messages')}</span>
+                  <span style={{ fontWeight: '500' }}><UiIcon name="messages" /> {t(isMeshCore ? 'notifications.direct_messages_meshcore' : 'notifications.direct_messages')}</span>
                 </label>
               </div>
               )}
 
               {/* Emoji Reactions Toggle — Meshtastic only */}
-              {!isMeshCore && (
+              {caps.emoji && (
               <div className={styles.row} style={{
                 padding: '12px',
                 borderRadius: '6px',
@@ -827,7 +867,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
               )}
 
               {/* MQTT Messages Toggle — Meshtastic only */}
-              {!isMeshCore && (
+              {caps.mqtt && (
               <div className={styles.row} style={{
                 padding: '12px',
                 borderRadius: '6px',
@@ -852,6 +892,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
 
               {/* New Node Toggle — supported on both Meshtastic (node DB) and
                   MeshCore (contact-advert discovery). */}
+              {caps.newNode === 'on' ? (
               <div className={styles.row} style={{
                 padding: '12px',
                 borderRadius: '6px',
@@ -871,10 +912,24 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                   />
                   <span style={{ fontWeight: '500' }}><UiIcon name="sparkles" /> {t('notifications.new_nodes')}</span>
                 </label>
+                {caps.newNodeNote === 'repeater_learning' && (
+                  <div className={styles.muted} style={{ fontSize: '12px', marginTop: '6px' }}>
+                    {t('notifications.new_nodes_repeater_note', {
+                      hours: NEW_NODE_LEARN_HOURS,
+                      cap: NEW_NODE_CAP_PER_HOUR,
+                    })}
+                  </div>
+                )}
               </div>
+              ) : null}
+              {caps.unsupportedHint && (
+              <div className={styles.muted} style={{ fontSize: '12px', marginBottom: '16px' }}>
+                {t(caps.unsupportedHint === 'ingest' ? 'notifications.ingest_unsupported_hint' : 'notifications.repeater_unsupported_hint')}
+              </div>
+              )}
 
               {/* Traceroute Success Toggle — Meshtastic only (no MeshCore equivalent) */}
-              {!isMeshCore && (
+              {caps.traceroute && (
               <div className={styles.row} style={{
                 padding: '12px',
                 borderRadius: '6px',
@@ -892,15 +947,72 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                     }}
                     style={{ width: '18px', height: '18px' }}
                   />
-                  <span style={{ fontWeight: '500' }}><UiIcon name="route" /> {t('notifications.traceroutes')}</span>
+                  <span style={{ fontWeight: '500' }}><UiIcon name="route" /> {t(isMeshCore ? 'notifications.traceroutes_meshcore' : 'notifications.traceroutes')}</span>
                 </label>
+              </div>
+              )}
+
+              {/* Automatic traces (M3): MeshCore Companion only. Auto-pathfinding
+                  and scheduled traces alert only when this is on (default off). */}
+              {caps.autoTrace && (
+              <div className={styles.row} style={{
+                padding: '12px',
+                borderRadius: '6px',
+                marginBottom: '16px'
+              }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', margin: 0 }}>
+                  <input
+                    type="checkbox"
+                    data-testid="notify-on-auto-trace"
+                    checked={preferences.notifyOnAutoTrace}
+                    onChange={(e) => {
+                      setPreferences(prev => ({
+                        ...prev,
+                        notifyOnAutoTrace: e.target.checked
+                      }));
+                    }}
+                    style={{ width: '18px', height: '18px' }}
+                  />
+                  <span style={{ fontWeight: '500' }}><UiIcon name="route" /> {t('notifications.notify_on_auto_trace')}</span>
+                </label>
+                <div className={styles.muted} style={{ fontSize: '12px', marginTop: '4px' }}>
+                  {t('notifications.notify_on_auto_trace_help')}
+                </div>
+              </div>
+              )}
+
+              {/* Mentions Toggle: MeshCore only. Fires when a channel message
+                  or room post names this source's own node as @[Name]. */}
+              {caps.mention && (
+              <div className={styles.row} style={{
+                padding: '12px',
+                borderRadius: '6px',
+                marginBottom: '16px'
+              }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', margin: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={preferences.notifyOnMention}
+                    onChange={(e) => {
+                      setPreferences(prev => ({
+                        ...prev,
+                        notifyOnMention: e.target.checked
+                      }));
+                    }}
+                    style={{ width: '18px', height: '18px' }}
+                  />
+                  <span style={{ fontWeight: '500' }}><UiIcon name="messages" /> {t('notifications.notify_on_mention')}</span>
+                </label>
+                <div className={styles.muted} style={{ fontSize: '12px', marginTop: '4px' }}>
+                  {t('notifications.notify_on_mention_help')}
+                </div>
               </div>
               )}
 
               {/* Waypoint Arrival Toggle — Meshtastic only (#4750). MeshCore has
                   no waypoint concept, so the whole block is gated like
                   traceroutes above. */}
-              {!isMeshCore && (
+              {caps.waypoint && (
               <div className={styles.row} style={{
                 padding: '12px',
                 borderRadius: '6px',
@@ -1034,7 +1146,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                   <span style={{ fontWeight: '500' }}><UiIcon name="battery" /> {t('notifications.notify_on_low_battery')}</span>
                 </label>
 
-                {preferences.notifyOnLowBattery && !isMeshCore && (
+                {preferences.notifyOnLowBattery && caps.batteryUnit === 'percent' && (
                   <div style={{ marginLeft: '28px', marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <label htmlFor="lowBatteryThreshold" style={{ margin: 0, fontSize: '0.9em', color: 'var(--color-text-subtle)' }}>
                       {t('notifications.low_battery_threshold_label')}
@@ -1059,7 +1171,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                   </div>
                 )}
 
-                {preferences.notifyOnLowBattery && isMeshCore && (
+                {preferences.notifyOnLowBattery && caps.batteryUnit === 'voltage' && (
                   <div style={{ marginLeft: '28px', marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <label htmlFor="lowBatteryVoltageThreshold" style={{ margin: 0, fontSize: '0.9em', color: 'var(--color-text-subtle)' }}>
                       {t('notifications.low_battery_voltage_threshold_label')}
@@ -1087,7 +1199,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
 
                 {preferences.notifyOnLowBattery && (
                   <p style={{ marginLeft: '28px', marginTop: '6px', marginBottom: 0, fontSize: '0.8em', color: 'var(--color-text-subtle)', fontStyle: 'italic' }}>
-                    {isMeshCore
+                    {caps.batteryUnit === 'voltage'
                       ? t('notifications.low_battery_threshold_hint_voltage', 'MeshCore nodes report battery as a voltage (mV) rather than a percentage.')
                       : t('notifications.low_battery_threshold_hint_percent', 'Meshtastic nodes report battery as a percentage of full charge.')}
                   </p>
@@ -1279,8 +1391,18 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                       listStyleType: 'disc'
                     }}>
                       <li>{t('notifications.server_events_startup')}</li>
-                      <li>{t('notifications.server_events_disconnect')}</li>
-                      <li>{t('notifications.server_events_reconnect')}</li>
+                      {caps.connectionEvents === 'radio' && (
+                        <>
+                          <li>{t('notifications.server_events_disconnect')}</li>
+                          <li>{t('notifications.server_events_reconnect')}</li>
+                        </>
+                      )}
+                      {caps.connectionEvents === 'broker' && (
+                        <>
+                          <li>{t('notifications.server_events_disconnect_broker')}</li>
+                          <li>{t('notifications.server_events_reconnect_broker')}</li>
+                        </>
+                      )}
                     </ul>
                   </div>
                 )}
@@ -1323,31 +1445,41 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                 )}
               </div>
 
-              {/* Message notification format (#5593) — message notifications
-                  don't fire for MeshCore, so there is nothing to format there. */}
-              {!isMeshCore && (
+              {/* Message notification format (#5593, #6278) — shown for every
+                  source type that sends message notifications (Meshtastic and
+                  MeshCore share it); gated by caps.messageFilters. */}
+              {caps.messageFilters && (
                 <NotificationFormatSection
                   titleTemplate={preferences.messageTitleTemplate}
                   bodyTemplate={preferences.messageBodyTemplate}
                   sourceName={currentSourceName}
                   prefixWithNodeName={preferences.prefixWithNodeName}
+                  textMaxPush={preferences.messageTextMaxPush}
+                  textMaxApprise={preferences.messageTextMaxApprise}
+                  showApprise={preferences.enableApprise}
                   onChange={(next) => setPreferences(prev => ({ ...prev, ...next }))}
+                  onTextMaxChange={(next) => setPreferences(prev => ({ ...prev, ...next }))}
                 />
               )}
 
               {/* Channel Selection — Meshtastic only (channel message
                   notifications don't fire for MeshCore) */}
-              {!isMeshCore && (
+              {caps.channels && (
               <div className={styles.channelBox} style={{
                 borderRadius: '6px',
                 padding: '12px'
               }}>
                 <div style={{ fontWeight: '600', marginBottom: '8px' }}>{t('notifications.channels')}:</div>
-                {channels.length === 0 ? (
+                {caps.unsupportedHint === 'ingest' && (
+                  <p className={styles.muted} style={{ fontSize: '12px', margin: '0 0 8px' }}>
+                    {t('notifications.ingest_channels_warning')}
+                  </p>
+                )}
+                {pickerChannels.length === 0 ? (
                   <p className={styles.muted} style={{ fontSize: '14px', margin: 0 }}>{t('notifications.no_channels')}</p>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    {channels.map(channel => (
+                    {pickerChannels.map(channel => (
                       <label
                         key={channel.id}
                         style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}
@@ -1365,7 +1497,11 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
                           }}
                           style={{ width: '16px', height: '16px' }}
                         />
-                        <span style={{ fontSize: '14px' }}>{channel.name || t('notifications.channel_number', { id: channel.id })}</span>
+                        <span style={{ fontSize: '14px' }}>
+                          {(channel as { legacy?: boolean }).legacy
+                            ? t('notifications.channel_legacy', { id: channel.id, defaultValue: 'Channel {{id}} (older messages)' })
+                            : channel.name || t('notifications.channel_number', { id: channel.id })}
+                        </span>
                       </label>
                     ))}
                   </div>
@@ -1377,7 +1513,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
 
           {/* Keyword Filtering — Meshtastic only (filters message notifications,
               which don't fire for MeshCore) */}
-          {!isMeshCore && (
+          {caps.messageFilters && (
           <div>
             <div className={styles.panel} style={{
               padding: '20px',
@@ -1450,7 +1586,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
         </div>
 
         {/* Filter Priority Info — Meshtastic only (explains message-filter ordering) */}
-        {!isMeshCore && (
+        {caps.messageFilters && (
         <div className={styles.infoBox} style={{
           borderRadius: '8px',
           padding: '16px',
@@ -1781,6 +1917,8 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
 
       </div>
       )}
+      </div>
+      </div>
     </div>
     </NumberInputScope>
   );

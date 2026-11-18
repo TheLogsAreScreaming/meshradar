@@ -4,6 +4,10 @@
 The embedded MQTT broker and bidirectional bridges shipped in MeshMonitor 4.6 (PR [#3053](https://github.com/Yeraze/meshmonitor/pull/3053), follow-up client-proxy bridge in PR [#3054](https://github.com/Yeraze/meshmonitor/pull/3054), resolving [issue #3003](https://github.com/Yeraze/meshmonitor/issues/3003)). **Standalone bridges** (no parent broker required) were added in a later release ([issue #3134](https://github.com/Yeraze/meshmonitor/issues/3134)).
 :::
 
+::: tip Setting one up?
+The [MQTT Setup Guide](/features/mqtt-setups) walks through the common setups step by step: one node to an upstream server, several nodes, and one node to several servers. To pick a root topic for a server, see [Finding a root topic](/features/mqtt-setups#finding-a-root-topic). This page is the reference for every option.
+:::
+
 MeshMonitor can run its own MQTT broker inside the same container, so your Meshtastic devices (and any other MQTT clients on your network) can publish directly to MeshMonitor — and MeshMonitor can relay that traffic, with **filtering rules**, to public upstream brokers like `mqtt.meshtastic.org`.
 
 ## What problem does this solve?
@@ -89,10 +93,10 @@ The field is stored in the bridge's `config.mode` JSON field; omitting it (or st
 | **Connects to an upstream broker?** | No (it _is_ the broker) | Yes (one per bridge) | Yes (one per bridge) |
 | **Locally-connected MQTT clients (devices, LAN apps)?** | Yes, many | Via the parent broker | No |
 | **Multiple upstream brokers?** | n/a | Yes — N bridges, each independent | Yes — N bridges, each independent |
-| **Per-source filter pipeline (topic / channel / node / portnum / geo)?** | No (broker is dumb relay) | **Yes** — downlink _and_ uplink | **Yes** — downlink only |
+| **Per-source filter pipeline (topic / channel / node / portnum / geo)?** | No (broker is dumb relay) | **Yes** — downlink _and_ uplink (geo is downlink only) | **Yes** — downlink only; a node linked straight to it skips the uplink filters |
 | **Topic rewriting (cross-root bridging)?** | No | **Yes** — `downlinkTopicRewrite` + `uplinkTopicRewrite` ([details](#topic-rewriting)) | No (requires parent broker) |
 | **Server-side ingestion of decoded packets?** | Yes — under broker `sourceId` | Yes — under bridge `sourceId` (downlink) | Yes — under bridge `sourceId` (downlink) |
-| **Echo suppression (no feedback loops)?** | n/a | Yes (60s `topic+packetId` cache) | Yes |
+| **Echo suppression (no feedback loops)?** | n/a | Yes (60s `topic+packetId` cache; never uplinks another bridge's downlink unless **Relay traffic from other bridges** is on) | Yes |
 | **Hop-limit rewrite on delivery?** | Yes — clamp `0`–`7` and/or raise `1`–`3` ([details](#hop-limit-on-delivery)) | n/a | n/a |
 | **Synthetic gateway identity for outbound publishes?** | Yes (auto-generated at create) | Inherited from parent broker | n/a (no outbound until used as proxy target) |
 | **Default-deny authentication on the listener?** | Yes | n/a | n/a |
@@ -106,9 +110,9 @@ The field is stored in the bridge's `config.mode` JSON field; omitting it (or st
 
 - **"Filtered window onto the public Meshtastic broker."** Create one **standalone bridge** to `mqtt://mqtt.meshtastic.org` with a topic pattern and geo bbox that matches your region. No broker needed. You get a sidebar source whose nodes / messages / positions are sourced from upstream, filtered before ingestion.
 - **"My devices on the LAN should fan out to each other, plus selectively reach a public broker."** Create one **broker** + one **attached bridge**. Devices connect to the broker (direct TCP or client-proxy). The bridge applies a filter pipeline in both directions and forwards the selected slice upstream.
-- **"My BLE-only node should publish MQTT through MeshMonitor straight to a public broker, no embedded broker required."** Create one **standalone bridge** pointed at the public broker. On the Meshtastic source, set `mqttLink → <bridge>` (Sources → Edit → "Bridge MQTT proxy to", or use the Quick Configure dropdown on Device Configuration → MQTT). Enable `proxy_to_client_enabled` on the firmware. Device Configuration → MeshMonitor (over BLE/serial) → bridge → upstream.
+- **"My BLE-only node should publish MQTT through MeshMonitor straight to a public broker, no embedded broker required."** Create one **standalone bridge** pointed at the public broker. On the Meshtastic source, set `mqttLink → <bridge>` with the **Quick configure from a MeshMonitor MQTT source** dropdown on Device Configuration → MQTT Module. (The **Bridge MQTT proxy to** field under Sources → Edit lists only embedded brokers.) Note that a node linked straight to a bridge skips the bridge's uplink filters and `ok_to_mqtt` check; only **Don't uplink MeshMonitor automation traffic** applies. Use a broker with an attached bridge if you need filtering. Enable `proxy_to_client_enabled` on the firmware. Device Configuration → MeshMonitor (over BLE/serial) → bridge → upstream.
 - **"Same as above, plus I want a Home Assistant box on the LAN to subscribe to my devices."** Create one **broker** + one **attached bridge**. Devices use client-proxy mode pointing at the broker; Home Assistant subscribes to the broker on port 1883. Bridge handles the upstream fan-out.
-- **"Two upstream brokers, one regional and one global, with different filters per upstream."** Create one **broker** + **two attached bridges**, each with its own topic/geo/portnum rules. Devices publish once; each bridge independently decides what to forward.
+- **"Two upstream brokers, one regional and one global, with different filters per upstream."** Create one **broker** + **two attached bridges**, each with its own topic/geo/portnum rules. Devices publish once; each bridge independently decides what to forward. Each bridge uplinks only traffic that started on your side, never what the other bridge brought down (see [Bridges do not relay each other](#bridges-do-not-relay-each-other)).
 - **"Cross-mesh routing between two MQTT roots (e.g. our LA mesh on `msh/US/LA` and the Houston mesh on `msh/US/TX`)."** Create one **broker** + one **attached bridge** to the foreign upstream. Set the bridge's downlink rewrite `msh/US/TX → msh/US/LA` and uplink rewrite `msh/US/LA → msh/US/TX` so the foreign-root traffic appears under your local root (and vice versa). See [Topic rewriting](#topic-rewriting) below for the details and caveats (PSK match, hop-limit cap, loop suppression).
 
 ## Three ways a device can reach MQTT through MeshMonitor
@@ -117,7 +121,7 @@ The field is stored in the bridge's `config.mode` JSON field; omitting it (or st
 |---|---|---|---|
 | **Direct TCP to broker** | `mqtt.enabled = true`, `address = <host>:1883`, `proxy_to_client_enabled = false`, credentials match | Create an `mqtt_broker` source; expose port 1883 in `docker-compose.yml` | Devices with reliable WiFi/Ethernet that can reach the MeshMonitor host on the LAN |
 | **Client-proxy → broker** | `mqtt.enabled = true`, `proxy_to_client_enabled = true`, credentials/address still set on firmware (mostly decorative in proxy mode) | Create an `mqtt_broker` source; set the Meshtastic source's `mqttLink` to the broker (Sources → Edit → "Bridge MQTT proxy to") | Devices without WiFi (Serial/BLE-attached), behind NAT, or on networks where port 1883 isn't reachable — and you also want **other LAN clients** to subscribe to the embedded broker |
-| **Client-proxy → standalone bridge** | Same firmware setup as above (`proxy_to_client_enabled = true`) | Create a **standalone** `mqtt_bridge` (no parent broker); set the Meshtastic source's `mqttLink` to the **bridge** | Same connectivity scenarios as client-proxy → broker, but you don't need a local broker — device traffic goes straight upstream through the bridge ([issue #3134](https://github.com/Yeraze/meshmonitor/issues/3134)) |
+| **Client-proxy → standalone bridge** | Same firmware setup as above (`proxy_to_client_enabled = true`) | Create a **standalone** `mqtt_bridge` (no parent broker); link the Meshtastic source to the **bridge** with **Quick configure** on Device Configuration → MQTT Module | Same connectivity scenarios as client-proxy → broker, but you don't need a local broker — device traffic goes straight upstream through the bridge ([issue #3134](https://github.com/Yeraze/meshmonitor/issues/3134)) |
 
 In proxy mode, the firmware uses Meshtastic's [`MqttClientProxyMessage`](https://github.com/meshtastic/protobufs/blob/master/meshtastic/mesh.proto) protocol: the device hands every outbound publish off as a `FromRadio.mqttClientProxyMessage` over its existing TCP/serial connection to MeshMonitor, and MeshMonitor publishes on its behalf. Inbound messages from the linked target (broker or bridge) are wrapped as `ToRadio.MqttClientProxyMessage` and injected back to the device. This is the same mechanism the Meshtastic mobile apps use when proxying.
 
@@ -158,13 +162,57 @@ For each upstream broker (e.g. `mqtt.meshtastic.org`, regional community brokers
 | Field | Notes |
 |---|---|
 | Parent broker (optional) | Pick the `mqtt_broker` source from step 1 to make this an **attached** bridge, or leave as **"None — standalone client proxy"** for a pure upstream client. See [Two source types](#two-source-types) for which to pick. |
-| Upstream URL | `mqtt://mqtt.meshtastic.org` (or `mqtts://...:8883` for TLS) |
+| Upstream URL | `mqtt://mqtt.meshtastic.org:1883` (or `mqtts://mqtt.meshtastic.org:8883` for TLS) |
 | Username / Password | Whatever the upstream needs (e.g. `meshdev / large4cats` for `mqtt.meshtastic.org`) |
 | Upstream topics | One per line, MQTT wildcards allowed (e.g. `msh/US/FL/#`) |
-| Block topics | Optional — drop publishes matching these patterns (e.g. `msh/CA/QC/#`) |
-| Geographic bounding box | Optional — drop position packets outside the box |
+
+The Add Source form holds only these connection basics. Mode, forwarding, **Block specific topics** (drop publishes matching patterns such as `msh/CA/QC/#`), **Restrict to geographic bounding box** (drop position packets outside the box) and topic rewrites are on the bridge's **Settings** page, under **MQTT Bridge Configuration**. The **Bridge settings** button in the form opens it.
+
+Once the bridge exists, its **Settings** page has a **Broker preset** chooser above the Upstream URL:
+
+| Preset | Upstream URL | Username / Password |
+|---|---|---|
+| Meshtastic Official | `mqtt://mqtt.meshtastic.org:1883` | `meshdev` / `large4cats` |
+| Meshtastic Official (TLS) | `mqtts://mqtt.meshtastic.org:8883` | `meshdev` / `large4cats` |
+| Custom… | leaves the fields as typed | |
+
+Choosing one only edits the form; nothing is saved until you press Save. It fills the username and password only when they are empty. If a password is already stored for the bridge, the password field stays blank (blank means "keep the stored one") and a note gives you the public password to type in. Topics, mode and filters are not touched. The same chooser is on the device MQTT settings; see [Broker Preset](/features/device#broker-preset).
+
+#### Saved presets
+
+An admin can save any broker as a preset and reuse it in every MQTT form: the bridge **Settings** page, the device MQTT settings, and remote admin. Under the built-in chips, admins get two buttons:
+
+- **Save as preset** saves the form's current host, port, TLS, login and root topic under a name. The bridge form never shows a stored password, so type it into the dialog if the preset should include it.
+- **Manage saved presets** edits, renames, duplicates and deletes them.
+
+Saved presets appear in a second row, **My saved presets**. Picking one fills the broker address, TLS and login, the same as a built-in preset. If the preset has a root topic, it also fills the device's root topic, or sets the bridge's subscription to `<root>/#`.
+
+Presets are copied in, not linked. Editing or deleting a preset changes no source or radio that already uses its values; pick it again to apply the new ones.
+
+Only admins see a preset's username and password. Anyone else who can edit a source or a device's config sees the preset without its login. When they pick it, the login fields stay blank and a note says the login is added when they save: the server copies it in, but only if the address still points at the preset's host, port and TLS setting. Once a password is written to a radio, anyone who can read that device's MQTT config can read it, as with any device MQTT password.
+
+Sources for the official broker: the [MQTT module docs](https://meshtastic.org/docs/configuration/module/mqtt/#mqtt-module-config-client-availability) list `mqtt.meshtastic.org`, `meshdev` and `large4cats` as the defaults; the firmware uses port 1883, or 8883 when TLS is on. A new preset needs its operator's consent.
 
 A standalone bridge is the right starting point when you have **no embedded broker** (pure upstream monitoring) or when you plan to wire a Meshtastic source's `mqttLink` directly at the bridge for client-proxy traffic — both are also covered in [Use-case recipes](#use-case-recipes) above.
+
+#### Scope your subscriptions
+
+The **Upstream topics** you subscribe to decide how much traffic MeshMonitor takes in. On a public broker, a broad topic is a firehose. MeshMonitor can usually keep up; the radios behind it and your node list often cannot.
+
+Meshtastic topics narrow from left to right: `msh/<region>/<state>/<city>/…`. Subscribe as deep as you can.
+
+| Topic | What you get |
+|---|---|
+| `msh/#` | Every node on the broker, worldwide. Never use this on a public broker. |
+| `msh/US/#` | Every US node: thousands. |
+| `msh/US/NY/#` | One state: hundreds to low thousands. |
+| `msh/US/NY/NY/#` | One city. About right for a city operator. |
+
+- **Pick the narrowest topic that still covers your community.** You can list several narrow topics, one per line.
+- **It matters most with a parent broker and radios behind it.** Filters (block topics, bounding box) run after the subscription, so a broad subscription still means more to decode, more nodes in the node list and more position history, and anything that passes the filters can be handed to your radios.
+- **Public brokers zero-hop what they deliver.** `mqtt.meshtastic.org` sends every packet with `hop_limit` 0, so it stays off the air locally unless you raise it. See [Raising packets from mqtt.meshtastic.org](#raising-packets-from-mqtt-meshtastic-org).
+
+Operators of a private broker on their own network can subscribe to `msh/#` safely; nothing here is enforced.
 
 ### 3. Configure your Meshtastic devices
 
@@ -187,7 +235,7 @@ A standalone bridge is the right starting point when you have **no embedded brok
 | Username / Password | Decorative in proxy mode |
 | `proxy_to_client_enabled` | **true** (firmware hands every publish off via the TCP API) |
 
-Then on the Meshtastic source in MeshMonitor (**Dashboard → Sources → Edit → Bridge MQTT proxy to**), pick either an embedded broker or a bridge as the target. The **Quick Configure** dropdown on the Device Configuration → MQTT page does all three of these things (firmware flag, firmware fields, source link) in one click and shows the target type next to the name.
+Then link the Meshtastic source in MeshMonitor to its target. **Device Configuration → MQTT Module → Quick configure from a MeshMonitor MQTT source** lists both embedded brokers and bridges; **Dashboard → Sources → Edit → Bridge MQTT proxy to** lists embedded brokers only. The **Quick Configure** dropdown on the Device Configuration → MQTT page does all three of these things (firmware flag, firmware fields, source link) in one pick and one **Save**, and shows the target type next to the name. Nothing is written until you save; **Dismiss** undoes the pick.
 
 - Picking a **broker** routes the device's MQTT traffic into the embedded broker (and from there, optionally onward via any attached bridge). Other LAN clients connected to the broker also see this traffic.
 - Picking a **bridge** (typically a standalone one) routes the device's MQTT traffic straight to that bridge's upstream connection with no embedded broker in between. Useful when you have no other local MQTT clients.
@@ -236,18 +284,32 @@ Filters run on the original (pre-rewrite) topic; the rewrite only changes what g
 
 ### Loop suppression
 
-Echo suppression is keyed on the **post-rewrite** topic — so an inbound TX packet republished to the parent broker as `msh/US/LA/...` is recorded under that rewritten topic. When the parent broker re-emits the same packet through the uplink path, the bridge sees `msh/US/LA/...` + the same packetId in the downlink echo cache and suppresses the uplink. The reverse direction works the same way. The existing 60-second `(topic, packetId)` cache covers it; no new infrastructure was needed.
+Echo suppression is keyed on the **post-rewrite** topic — so an inbound TX packet republished to the parent broker as `msh/US/LA/...` is recorded under that rewritten topic. When the parent broker re-emits the same packet through the uplink path, the bridge sees `msh/US/LA/...` + the same packetId in the downlink echo cache and suppresses the uplink. The reverse direction works the same way. The 60-second `(topic, packetId)` cache covers it.
+
+The bridge records the echo **before** it hands the packet to the broker, because the broker passes the packet back to the uplink side at once. Before 4.17.1 it recorded it afterwards, and a bridge could send its own downlinked packet back upstream once. A bridge also never sends the same packet upstream, or hands the same packet to the broker, twice within that minute.
 
 ### Caveats
 
 ::: warning Read before deploying
 - **PSKs must match.** Topic rewriting moves bytes, not encryption. If the two meshes use different channel PSKs, the relayed packets arrive at devices on the other side as undecodable noise.
 - **Filter the firehose first.** Without a topic block-list, channel allow-list, portnum allow-list, or **geographic bounding box** in the downlink filter, dropping the entire `msh/US/TX/#` into a local mesh can saturate RF.
-- **Pair with a hop-limit cap of `0`** on the broker. Without it, inbound foreign-mesh packets arrive carrying their original `hop_limit` and devices on the receiving side will re-broadcast them over RF — re-flooding the foreign mesh's traffic across your local airwaves. Enabling the *raise* here does that on purpose; don't.
+- **Pair with a hop-limit cap of `0`** on the broker. Without it, inbound foreign-mesh packets arrive carrying their original `hop_limit` and devices on the receiving side will re-broadcast them over RF — re-flooding the foreign mesh's traffic across your local airwaves. Enabling the *raise* here does that on purpose; don't. If the same broker also has a trusted bridge you *do* want raised, tick **Skip raise on packets from this bridge** on the foreign one (see [below](#skip-raise-for-one-bridge)).
 - **Standalone bridges cannot rewrite.** A bridge without a parent broker has no parent-broker republish path (downlink) and no `local-packet` event source (uplink), so rewriting would silently do nothing. The validator rejects rewrite fields on standalone bridges.
 - **No wildcards.** `from` / `to` are literal prefixes only. `msh/US/+` is rejected by the validator.
 - **Single rule per direction.** v1 supports one `{from, to}` per direction. Folding multiple foreign roots into one local root (`msh/US/TX/* → msh/US/LA/*` AND `msh/CA/QC/* → msh/US/LA/*`) would need separate bridges today.
 :::
+
+## Bridges do not relay each other
+
+The bridge's **MQTT Bridge Configuration** has a **Forwarding** group with these options:
+
+![Bridge Forwarding options](/images/features/5013-mqtt-bridge-forwarding.png)
+
+When two or more bridges share one parent broker, each upstream's traffic lands in the broker, and the broker offers every packet to every bridge's uplink. Before 4.17.1 that meant upstream A's packets were published to upstream B (and, in per-gateway mode, under the foreign gateway's client ID). Two upstreams that already share traffic could then pass the same packet back and forth without end.
+
+Now a bridge **does not uplink a packet another bridge on the same broker brought down** in the last minute. It still uplinks everything that started on your side: your nodes, client-proxy devices and other local MQTT clients. Each skipped packet adds one to `uplinkBridgeRelayDrops` in `/api/sources/:id/status`, shown on the bridge's **Settings → MQTT Bridge Configuration** page as **Not relayed so far**.
+
+To relay one upstream into another on purpose, tick **Relay traffic from other bridges** on the bridge that should carry it (stored as `relayOtherBridges: true`). Off by default. Even then, a bridge never sends the same packet upstream twice within a minute, so two bridges cannot loop a packet between them.
 
 ## Keep automation traffic off the upstream broker
 
@@ -318,10 +380,29 @@ This is a managed-infrastructure knob: enable it when you have a specific backha
 :::
 
 - **Target** — `1`–`3`. Deliberately capped well below the protocol maximum; backhaul is local injection into the receiving cluster, not a wide-area flood.
-- **Packet types** — Position, Telemetry, NodeInfo, NeighborInfo, chosen individually. These are exactly the four firmware hop scaling operates on. Text, direct messages and traceroutes are routing-layer traffic and cannot be raised.
-- **Encrypted packets are never raised.** Without a readable packet type there is no way to know the raise applies, so it does not fire.
+- **Packet types** — Position, Telemetry, NodeInfo, NeighborInfo and Text messages, chosen individually. The first four are the ones firmware hop scaling lowers, so raising them undoes that scaling. **Text messages** (channel text and DMs, which share one packet type) are there for a different reason: to undo an upstream broker's zero-hop delivery (see the next section). Traceroutes cannot be raised, because a raised traceroute would no longer measure the real path.
+- **Encrypted packets need a matching channel key.** A phone's MQTT client proxy uplinks packets encrypted, so the broker reads their packet type with the keys in the [channel database](/features/channel-database) (server-side decryption must be on). The packet goes out still encrypted; only its hop limit changes. A packet none of those keys opens has no readable type, so it is never raised (the clamp still applies).
 
 Typical uses: a dense urban site whose NodeInfo is scaled to 1 hop needs 2 hops of spread at a rural peer site; MQTT-observed nodes from a neighbouring valley need to reach gateways a couple of hops into the local mesh.
+
+::: warning Raising text is loud
+Every text message and DM the broker hands to a radio then floods up to the target number of hops on your local mesh, and text packets are larger than position or telemetry. Raise text only if you really want that traffic on your air. Watch channel utilisation and turn it off if it climbs.
+:::
+
+#### Raising packets from mqtt.meshtastic.org
+
+The official Meshtastic broker rewrites `hop_limit` to `0` on every packet it delivers. Together with the raise, that gives an asymmetry:
+
+- **What you send up is not raised for anyone else.** The raise only changes what this broker hands to *your* radios. Bridges uplink the `hop_limit` a packet arrived with, and the official broker sets it to 0 again before delivering it to its other subscribers.
+- **What comes down is raised for you.** Packets from the official broker arrive at 0. With the raise on for a packet type, they reach your radios at the target, so you undo the official broker's zero-hop rule on your own mesh.
+
+That can be exactly what you want (nearby nodes get a few hops of spread) or exactly what you don't (foreign traffic re-flooding your air). It applies to every bridge attached to this broker unless you skip it per bridge.
+
+#### Skip raise for one bridge
+
+To raise traffic from a trusted backhaul but not from a public upstream on the same broker, open the public bridge's **Settings → MQTT Bridge Configuration** and tick **Skip raise on packets from this bridge** (stored as `skipRaise: true`). Packets that bridge brings in are never raised; the **clamp still applies** to them, because it is airtime protection. Other bridges, and devices publishing to the broker directly, are raised as before. Off by default, so upgrading changes nothing.
+
+The broker recognises the bridge's packets by sender and packet id for 60 seconds after the bridge hands them over, on both delivery paths (MQTT subscribers and TCP-linked devices). A copy of the same packet that arrives through another route within that minute is not raised either.
 
 ### When both are on
 
@@ -431,8 +512,8 @@ To fix it:
 
 1. If you have no MQTT source yet, add one: **Dashboard → Sources → Add Source**, then pick **MQTT Bridge (forward to/from an upstream broker)** for an outside broker, or **Embedded MQTT Broker (devices connect here)** to host one. See [Quick setup](#quick-setup).
 2. Open the node's source and go to **Device Configuration → MQTT Module**.
-3. In **Quick configure from a MeshMonitor MQTT source**, pick the bridge or broker. This links the two sources at once and fills in the form.
-4. Save, so the node gets the new MQTT settings.
+3. In **Quick configure from a MeshMonitor MQTT source**, pick the bridge or broker. This fills in the form and stages the link between the two sources.
+4. Save. MeshMonitor sends the node its new MQTT settings, then links the sources. **Dismiss** instead undoes both.
 5. Check that the channel has **Downlink Enabled** and that **Ignore MQTT** is off.
 6. Send a test packet from a node that reaches the broker only over MQTT.
 
@@ -466,7 +547,7 @@ If a source is linked and the packet is still missing, set `LOG_LEVEL=debug` and
 ### "Client proxy is enabled but no broker is linked" (yellow banner on Device Configuration → MQTT)
 
 `proxy_to_client_enabled` is set on the firmware, but the Meshtastic source has no `mqttLink` to an existing, enabled MQTT source. The source's dashboard card shows **MQTT not linked** for the same reason. MeshMonitor will silently drop the proxy publishes, and the node gets nothing from the broker, unless:
-1. You pick an embedded broker or a bridge from the **Quick Configure** dropdown on Device Configuration → MQTT (one click — also stamps the link via PUT); **or**
+1. You pick an embedded broker or a bridge from the **Quick Configure** dropdown on Device Configuration → MQTT and save (the save also stamps the link); **or**
 2. You have the [MQTT Proxy Sidecar](/add-ons/mqtt-proxy) attached to this source's Virtual Node Server, which publishes to its own configured upstream.
 
 See [Why don't I see MQTT traffic?](#why-no-mqtt-traffic) for the full list of causes and a test that tells them apart.
@@ -492,7 +573,7 @@ Most upstream traffic and most device-publish traffic is encrypted at the channe
 
 ### Bridge reports `lastError: "Bad username or password"`
 
-The credentials configured on the bridge don't match what the upstream accepts for an MQTT subscriber. For `mqtt.meshtastic.org`, the public subscriber credentials are `meshdev / large4cats` ([Meshtastic public MQTT docs](https://meshtastic.org/docs/configuration/module/mqtt/#default-public-server)). Other community brokers may use uplink-only credentials that don't work for raw MQTT subscribers; check with the operator.
+The credentials configured on the bridge don't match what the upstream accepts for an MQTT subscriber. For `mqtt.meshtastic.org`, the public subscriber credentials are `meshdev / large4cats` ([Meshtastic public MQTT docs](https://meshtastic.org/docs/configuration/module/mqtt/#connect-to-the-default-public-server)). Other community brokers may use uplink-only credentials that don't work for raw MQTT subscribers; check with the operator.
 
 ### Bridge shows "Login rejected", or "N gateways rejected"
 
@@ -505,7 +586,28 @@ A stopped connection drops the uplink packets it would have carried. They are co
 
 To start again, fix the credentials or the broker's rules and save the source, or click **Connect** / **Retry**. Either gives each stopped connection five fresh attempts; connections that are working are left alone. A save that changes nothing (a rename, say) does not restart the bridge. A restart of MeshMonitor also gives five fresh attempts: the count is kept in memory, not in the database.
 
-Any other failure — broker down, network drop, TLS error — keeps retrying on the normal backoff (1 second, doubling to 60 seconds) and never stops.
+A broker that keeps evicting a connection also stops it (see the next section). Any other failure — broker down, network drop, TLS error — keeps retrying on the normal backoff (1 second, doubling to 60 seconds) and never stops.
+
+### Bridge shows "Stopped: evicted", or the logs say "duplicate Client ID signature"
+
+An eviction is a session the upstream broker closes within seconds of accepting it, with no error on MeshMonitor's side. It almost always means another client holds the same Client ID or login, and the broker drops one session each time the other connects. The two then take turns evicting each other for ever. Likely causes:
+
+- **Another bridge source** on the same parent broker and upstream URL, in `per_gateway` mode. Both connect under the same `!<hex>` Client IDs. The bridge settings page warns when it sees this.
+- **A per-username connection cap** on the broker. `per_gateway` mode opens one connection for the bridge plus one for each local gateway that sends a packet, all with the same login. If the broker allows one connection per user, switch to **Single** and set a **Client ID** (below).
+- **The gateway node itself**, if its own MQTT module publishes to the same broker.
+- **Another MeshMonitor instance** using the same Client ID.
+
+After **5 evictions in 10 minutes** a connection stops reconnecting. The subscriber connection reads **Stopped: evicted** on the card, with a **Connect** button; a gateway publisher stops on its own and the bridge keeps running. Remove the other client, then save the source or click **Connect** / **Retry**. A restart of MeshMonitor also starts a fresh count.
+
+### Upstream Client ID in Single mode
+
+Some community brokers accept only Client IDs of the form `!xxxxxxxx` (8 hex digits) and refuse MeshMonitor's default `mm-bridge-…` ID with CONNACK 4. In **Single** mode the bridge settings page has an optional **Upstream Client ID** field for this. MeshMonitor uses it as typed, with no random suffix, so the broker sees one connection from MeshMonitor. **Use the parent broker's gateway ID** fills in the gateway ID shown on the parent broker source.
+
+The ID must not match one that another client uses on that broker (your radio's own MQTT module, another MeshMonitor, or another bridge source), or the broker evicts one of them. Leave it blank to keep the default.
+
+### Uplink packets dropped while disconnected
+
+A packet that should go upstream while the bridge's upstream connection is down is dropped, not queued. The count shows on the bridge settings page as **Dropped while the upstream connection was down** (`uplinkDisconnectedDrops` on the status), and the log notes it once each time the connection goes down. If this number climbs, check the card and the logs for an eviction loop or a broker that is down.
 
 ### Deleting the broker source
 

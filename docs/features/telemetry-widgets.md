@@ -81,6 +81,19 @@ All mode and range preferences are stored in your browser's local storage. They 
 
 To reset a widget's mode, click the `~` (Chart) button. To reset a gauge range, type in the desired values in the min/max inputs.
 
+## Fixed Y-Axis Range {#fixed-y-axis-range}
+
+By default a chart scales its Y axis to the data. A fixed range keeps the scale steady, so two charts compare at a glance or one spike does not flatten the rest.
+
+1. Switch the widget to **Chart** mode.
+2. Click the ruler button in the widget header (**Y-axis range**).
+3. Enter **Y min**, **Y max** or both. Leave a field blank to auto-scale that end.
+4. Click **Apply**. Click **Reset to auto** to remove the range.
+
+Y min must be less than Y max. Values outside the range are clipped. Enter values in the unit the chart shows; MeshMonitor stores them in the base unit (for example Celsius), so a unit change does not move your range. The ruler button gets an accent colour while a range is active.
+
+Unlike gauge ranges, Y-axis ranges save on the server per source (the `dashboardChartYRange` setting), so every viewer of that dashboard sees them. Only users who can edit the dashboard see the ruler button.
+
 ## Clean Telemetry Outliers
 
 A faulty sensor can log a spike that flattens the rest of a chart. **Clean outliers** removes those readings and keeps the rest of the history. Only admins see it.
@@ -98,6 +111,32 @@ A faulty sensor can log a spike that flattens the rest of a chart. **Clean outli
 2. Click **Delete N readings…** and confirm. Deletion is permanent.
 
 If telemetry changed after the preview, MeshMonitor asks you to run the preview again. Each purge is written to the audit log.
+
+## Unified Telemetry Dashboard
+
+**Unified Telemetry** (in the dashboard sidebar) shows telemetry across every source you can read. It has two views: **Graphs** and **Latest**.
+
+![Unified Telemetry](/images/features/unified-telemetry.png)
+
+### Graphs
+
+- The page draws a chart for each favorited reading. It takes the union of each source's favorites, and counts a favorite only on a source where you can see its node.
+- Each chart covers one node and one telemetry type.
+- Some types depend on who heard the packet: SNR, RSSI, channel utilization, air TX, LocalStats packet counters, MeshMonitor's per-source series and clock offset. These keep one line per source, each labelled **heard by <source>**.
+- Every other type is a reading the node takes itself, such as battery, voltage or temperature. When more than one source holds it, the chart draws **one merged line**, so a reading one source missed fills the other's gap:
+  - A reading that two sources both received plots once, not twice. Two sources' points in the same time bucket, or less than a minute apart for unaveraged types, count as one reading.
+  - If those sources' values differ, the point shows their average. The tooltip names the sources behind each point.
+  - **Split by source** on the chart brings back one line per source, so you can see where each one has gaps. The page does not remember this choice.
+- Charts sit in the same category sections as a source's own Telemetry Dashboard.
+- The **Time range** presets run from 15 minutes to 7 days, and the page remembers your pick. A source filter narrows the lines, and **Refresh** reloads. The page loads on open, on a range change and on refresh. It does not poll.
+- **Export CSV** on each chart saves what the chart shows, with a `Source` column. A merged line lists every source behind a reading, separated by `; `.
+- With no favorites yet, the page says so. Star a reading on the **Latest** view, or a graph on a source's Telemetry Dashboard.
+
+### Latest
+
+**Latest** shows the newest reading of each node for each source, as cards you can search, filter by source and type, and sort. The star on a reading adds it to, or removes it from, **that source's** favorites. The star shows only where you hold `settings:write` on that source. The view refreshes every 60 seconds.
+
+Visibility follows the per-source rules for node telemetry: the source needs `nodes:read`, a Meshtastic node needs its channel's map visibility, and the position readings of a private node need the private-position permission.
 
 ## Limitations
 

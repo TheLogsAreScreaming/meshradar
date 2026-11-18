@@ -6,574 +6,47 @@ MeshCore support is still **new and basic**. The core capabilities are stable an
 
 ## Overview
 
-[MeshCore](https://meshcore.co) is an alternative LoRa mesh networking protocol that runs on much of the same hardware as Meshtastic. In MeshMonitor 4.5+, each MeshCore device is a first-class **source** — it lives in the Sources sidebar next to your Meshtastic nodes, has its own per-source permissions, its own page, its own telemetry, and contributes contacts with valid coordinates to the unified dashboard map.
+[MeshCore](https://meshcore.co) is a LoRa mesh protocol that runs on much of the same hardware as Meshtastic. In MeshMonitor each MeshCore radio is a **source**: it sits in the Sources sidebar next to your Meshtastic nodes, with its own permissions, page and telemetry, and its contacts with a position appear on the dashboard map.
 
-A single MeshMonitor deployment can run multiple MeshCore sources alongside multiple Meshtastic sources and gate access to each one independently. MeshCore sources are added from the UI and support both USB (Companion or Repeater) and TCP (Companion) transports.
+One MeshMonitor can run several MeshCore and Meshtastic sources side by side. A MeshCore source can be a **Companion** (USB or TCP) or a **Repeater** (USB only). A Room Server connects as a Companion.
 
-When a MeshCore source is connected, you get:
+## Start here {#start-here}
 
-- **Per-source MeshCore page** — Nodes, Channels, Node Details, Configuration, and a Node Info page in a single multi-pane layout
-- **Dashboard integration** — MeshCore sources appear as styled cards in the dashboard sidebar with their own logo, status, and node count
-- **Unified map** — MeshCore contacts with GPS appear on the dashboard map alongside Meshtastic nodes
-- **Local-node telemetry** — Battery, radio stats, packet rates, and duty-cycle graphs from the connected companion
-- **Per-node remote telemetry** — Scheduled cross-mesh telemetry pulls from other MeshCore nodes, written into the same telemetry store as Meshtastic
-- **Radio preset selector** — Pick from the official MeshCore preset list instead of hand-tuning freq/bw/sf/cr
-- **Contact-detail panel** — Hops, RSSI/SNR, last heard, position, and the full public key shown next to DM threads
-- **Contact management** — Remove contacts from the device, export as `meshcore://` URLs for sharing, import from pasted URLs or hex blobs
-- **Repeater neighbour list** — Query a repeater's neighbour table with SNR and last-heard timestamps, with results rendered on the map
-- **Path visualization** — Show route lines on the map colored by hop count, with Discover Path buttons for manual route establishment
-- **Position history** — Per-node movement trails on the map, with a configurable retention window
-- **Auto-pathfinding** — Scheduled path discovery and neighbor collection across your entire mesh
-- **Region / scope tagging** — Stamp outgoing flood traffic with a named region so meshes that drop un-scoped packets (e.g. `region denyf *`) forward it; per-channel, per-source default, and per-message override
-- **Room server support** — Login, post, and auto-sync with MeshCore room servers (BBS-style message boards)
-- **@mention highlighting** — Messages mentioning your name are visually highlighted
-- **Delivery status** — Sent DMs show pending/confirmed/failed indicators
-- **Clickable contact names** — Names in messages navigate to that contact's DM thread
-- **Mobile-responsive layout** — Full MeshCore page works on mobile with list/detail toggle
-- **Device time sync** — One-click RTC sync from the Node Info page
-- **Device management** — Reboot device, backup/restore Ed25519 private key (danger-gated with confirmation)
-- **Telemetry-mode configuration** — Toggle base / location / environment telemetry on the device itself
-- **UI permission gating** — Write controls are disabled (not just rejected) for users without the right permission
+Connect a Companion radio and send your first channel message:
 
-## Source Types
+1. Flash the radio with MeshCore **Companion** firmware. Use a USB build, or a WiFi/Ethernet build to connect over TCP.
+2. **USB:** map the port into the container with `devices:` (for example `/dev/ttyACM0`). **TCP:** note the radio's LAN IP; WiFi and Ethernet builds listen on port `5000`.
+3. On the dashboard, open the **Sources** sidebar (admins only) and click **+ Add**.
+4. Set **Type** to **MeshCore**, pick the **Transport** (**USB / Serial** or **TCP**) and enter the port or host, set **Device Type** to **Companion**, and save. The source connects at once; no restart needed.
+5. Click the source to open its page. Contacts fill the **Map** as their adverts arrive. To let nearby nodes find you, send **Advert (nearby, zero-hop)** from the status bar.
+6. Open **Channels**, pick **Public**, type a message and press **Send**.
 
-MeshCore sources are added through the UI. The Sources sidebar lets you pick a device type of **Companion** (native JS backend via meshcore.js) or **Repeater** (direct serial), and a transport of **USB** or **TCP**.
+For a **Repeater**, pick **USB / Serial** and **Repeater** in step 4. A Repeater source reads the radio's console and sends no messages; see [What a Repeater Source Shows](/features/meshcore-remote-admin#what-a-repeater-source-shows).
 
-::: tip Room Server
-**Room Server** devices use the same Companion path — when present they're auto-detected on connection. There's no Room Server option in the device-type selector; pick Companion and the device will be identified correctly.
-:::
+## Guides
 
-## Requirements
-
-1. **A MeshCore device** — A LoRa device flashed with MeshCore firmware (Companion, Repeater, or Room Server)
-2. **Serial port access** — If connecting via USB serial, the device must be mapped into the container with `devices:`. MeshMonitor opens it as the unprivileged `node` user; the entrypoint grants that user the device's group automatically. See [USB serial devices and the non-root user](/configuration/production#usb-serial-devices-and-the-non-root-user) if you run the container with `user:`.
-
-## Adding a MeshCore Source
-
-Add MeshCore sources from the UI — they hot-connect immediately without a restart.
-
-1. Open the **Sources sidebar** on the dashboard (admin only)
-2. Click the **+** button next to the Sources header
-3. Pick **MeshCore** as the source type
-4. Choose the transport — **USB** (enter the serial port, e.g. `/dev/ttyACM0`) or **TCP** (enter the host and port; see [TCP Transport](#tcp-transport) below)
-5. Pick the **device type** — **Companion** for full-featured devices, **Repeater** for direct-serial repeaters (USB only)
-6. *(Optional)* Set a **Heartbeat** interval in seconds (0 = off). When set, MeshMonitor periodically probes the node and automatically reconnects with exponential backoff if the link drops — the same setting Meshtastic sources have. It works for Companion and Repeater devices. On a Repeater the probe is a `clock` command on the serial console: it uses no airtime, and three missed replies in a row reopen the port. A Repeater whose serial port closes (USB unplug, device reset) reconnects on its own even with the heartbeat off.
-7. Save — the source connects immediately if **Auto-connect** is on
-
-Sources you create from the UI are wired into the per-source MeshCore manager registry the same way Meshtastic TCP sources are, so create / update / delete / connect / disconnect all work without a process restart.
-
-### TCP Transport
-
-Added in 4.5.1. MeshCore Companions can now be reached over TCP directly from the UI — no env-var bootstrap, no container restart. Pick **TCP** in the transport selector when adding or editing a MeshCore source.
-
-| Field | Default | Notes |
-|---|---|---|
-| Host | (none) | Hostname or IP of the device or proxy reachable from the MeshMonitor container |
-| Port | `5000` | Where the companion listens. WiFi and Ethernet builds use `5000`. Change it for a native-TCP build (`4403`) or a `ser2net`/`esp-link` proxy. |
-
-Common ways to put a MeshCore Companion on TCP:
-
-- **WiFi / Ethernet firmware** — the common case, and what the port field expects. These builds listen on `5000`. Put the device on your network and point MeshMonitor at it.
-- **Native TCP firmware** — a different Companion build that speaks the binary protocol straight over TCP. It listens on `4403`, so change the port when you add the source.
-- **`ser2net`** — Bridge a serial-attached MeshCore device on another host to a TCP port. Useful when the companion is plugged into a Pi or workstation that isn't running MeshMonitor.
-- **`esp-link`** — ESP8266/ESP32-based serial-to-WiFi adapter wired to the companion's UART. The same binary protocol flows transparently over the link.
-
-::: tip Container networking
-TCP sources connect from inside the MeshMonitor container, so the host must be reachable from there — use the device's LAN IP (or your gateway hostname), not `localhost` or `127.0.0.1`. If the companion is on the same host as MeshMonitor, use `host.docker.internal` (already configured in `docker-compose.dev.yml`) or the host's LAN IP.
-:::
-
-::: warning Companion only
-TCP is a Companion-class feature. Repeater devices are still USB-only — pick the **USB** transport when adding a Repeater source.
-:::
-
-### Tuning Environment Variables
-
-A couple of background-scheduler tuning knobs are still environment-driven:
-
-| Variable | Default | Description |
-|---|---|---|
-| `MESHCORE_TELEMETRY_INTERVAL_MS` | `300000` | How often (ms) to poll the **local** companion for telemetry. Default 5 minutes. |
-| `MESHCORE_REMOTE_TELEMETRY_TICK_MS` | `30000` | How often (ms) the remote-telemetry scheduler walks each source and picks an eligible node. |
-
-::: warning Removed in 4.6
-The 3.x `MESHCORE_ENABLED`, `MESHCORE_SERIAL_PORT`, `MESHCORE_BAUD_RATE`, `MESHCORE_TCP_HOST`, `MESHCORE_TCP_PORT`, and `MESHCORE_FIRMWARE_TYPE` env-var bootstrap was removed when MeshCore became a first-class source type. Add a MeshCore source from the Sources sidebar instead.
-:::
-
-::: tip
-`ENABLE_VIRTUAL_NODE` is a separate Meshtastic feature for proxying the Meshtastic protocol to mobile apps — it has **no relation** to MeshCore connectivity and is ignored by MeshCore sources.
-:::
-
-## Device Types
-
-MeshMonitor automatically detects the device type on connection:
-
-| Device Type | Description | Connection Method |
-|---|---|---|
-| **Companion** | Full-featured device with binary protocol support | Native JS backend (meshcore.js, serial or TCP) |
-| **Repeater** | Lightweight relay with text CLI interface | Direct serial |
-| **Room Server** | Chat room server for group messaging | Native JS backend (meshcore.js) |
-
-## The MeshCore Page
-
-Each MeshCore source has its own multi-pane page accessible by clicking the source in the dashboard sidebar. The page has a sub-toolbar with these views:
-
-### Nodes
-
-A map of every contact with valid coordinates, plus a styled row list aligned to the same visual vocabulary as the Meshtastic nodes view. The map honours zoom-based label visibility and falls through to the dashboard map when the source is selected at the dashboard level. A search/filter bar lets you quickly find contacts by name or public key prefix.
-
-On **mobile**, the node list and the map occupy the same area; a toggle button switches between them so the map is always reachable without first selecting a node. On desktop, a collapse button collapses the list to a thin sidebar (preference persisted to `localStorage`).
-
-### Channels
-
-The device's channels with the most recent message stream. Channel-message senders are now extracted from the `"Name: body"` prefix that MeshCore embeds in the text body, so the sender column and the message body are no longer collapsed into one string.
-
-**Unread indicators** — channels with messages newer than the last time you opened them show an unread dot and a **bold name** in the channel list. A header badge counts how many channels currently have unread messages, and an optional **"unread first"** sort toggle (persisted) floats those channels to the top. Opening a channel marks it read up to the newest visible message. MeshCore read state is tracked **client-side in `localStorage`, scoped by `sourceId`** — there's no server-side MeshCore read table, so read markers are per-browser rather than per-account.
-
-**Reply** — received channel messages carry a **Reply** button. Clicking it prefills the composer with the sender's MeshCore mention (`@[Sender]: `) and sends the reply **on the scope the original message arrived on**, so a threaded answer stays in the same region. The button appears only on incoming channel messages — not on your own messages, and not in 1:1 DMs.
-
-**Heard repeaters** — outgoing channel posts show a **📡 N** badge with an expandable list of the repeaters that re-flooded the message and the SNR each was heard at. This is populated best-effort by **self-echo correlation**: when a repeater re-floods your `GRP_TXT` packet, MeshMonitor hears it inbound and attributes the relay hashes to the most recent matching channel send within a ~30-second window. Channel sends carry no protocol ACK, so this is a heuristic, not a delivery receipt. Correlation runs on the raw inbound packet before the opt-in packet-monitor gate, so it works **regardless of whether the packet monitor is enabled**. Relay hashes are resolved to repeater names where known; otherwise the raw hash is shown.
-
-**Sent to radio** — a channel post that no repeater has been heard relaying shows **Sent to radio** in place of the badge. It means your radio accepted the message for sending, and no more. A MeshCore radio does not tell MeshMonitor when it transmits, so the mark does not prove the message went out on the air, and it says nothing about who heard it. If a repeater is heard relaying the post, the mark gives way to the **📡 N** badge. A send that the radio refuses, or that receive-only mode blocks, shows an error and adds no message at all. Click the mark to open [Delivery Details](/features/delivery-diagnostics).
-
-**Resend** — if no repeater was heard relaying one of your channel posts, a **Resend** button appears next to it 30 seconds after you sent it. Click it and confirm to send the same packet again. The resend carries the original text and the original timestamp, so a repeater that already relayed the first copy drops the resend, and recipients never see the message twice. The resend adds no new message to the stream, and it fires no automations or notifications. If a repeater relays the resend, the **📡 N** badge appears on the original message.
-
-Limits, to protect the mesh:
-
-- At most **3 resends** per message.
-- **30 seconds** between the send and the first resend, and between resends.
-- Only messages under **1 hour** old.
-- The button stays hidden while the automatic channel retry is still waiting on that message, and on messages sent before MeshMonitor stored send timestamps (older than this feature).
-- You need **Messages: write** on the source, and the button is hidden while the source is in receive-only mode.
-
-The resend count lives in the database, so restarting MeshMonitor does not reset it. Direct messages don't get this button: they already retry on their own until the recipient acknowledges them.
-
-### Channel order
-
-The Channels page has a **Sort channels by** dropdown with four choices: **Device order**, **Channel name**, **Last message** and **Custom**. Pick **Custom** and click **Reorder** to drag channels (or use the arrows) into the order you want. MeshMonitor saves the sort choice and the custom order in your browser, per source. This changes only how MeshMonitor lists the channels. The slots on the device stay as they are.
-
-#### Reordering channel slots on the companion
-
-To change the slots stored on the device, open the source's **Device Configuration** tab, go to **Channels**, and click **Reorder slots on device**. Drag channels into the order you want, then click **Save order to device**.
-
-- MeshMonitor packs channels into slots 1, 2, 3 and so on, which closes empty slots. Public stays in slot 0.
-- It writes each slot over the serial or TCP link and reads it back to check it. It sends nothing over the radio. Keep the device connected until it finishes.
-- If a write fails, MeshMonitor writes the original layout back. If it cannot confirm the undo, it tells you to reconnect the device and run the reorder again.
-- Message history, unread markers, scopes, per-channel permissions, and the auto-ack, auto-announce, auto-responder and timer settings follow each channel to its new slot. A channel that moves to slot 8 or higher loses its per-channel permission grants, because those slots have none.
-- Apps connected through the Virtual Node disconnect, so they reload the new channel list.
-- Automations that name a raw channel number are not changed. MeshMonitor lists them so you can check that they still point at the right channel.
-
-### Node Details
-
-Per-contact DM view (renamed from "Direct Messages" to reflect that it also surfaces node details, not just DMs) with a **contact-detail panel** that mirrors the Meshtastic NodeDetailsBlock. It surfaces:
-
-- Contact name and type (companion / repeater / room server)
-- Hops away (`pathLen`)
-- RSSI and SNR
-- Last heard and last advert
-- Position (if known)
-- Full public key
-- **Discover Path** button — triggers firmware CMD 52 to establish/refresh the route to a companion contact
-- **Define Path** editor — manually set the route to a contact when you already know the relay hops, instead of probing for it. Add hops in order and pick the per-hop **hash width** (1, 2, or 3 bytes) — the selector is pre-filled from the current path, and changing the width clears the hop list since the encoding differs. The hop count is capped at 63. Use this when Discover Path can't reach the contact but you know the topology.
-- **Delivery status** — sent DMs show pending / confirmed / failed indicators with timestamp tooltips
-
-Toggling a contact's ⭐ **favorite** syncs to the firmware's favourite bit on
-the device, in both directions. MeshMonitor is the source of truth: to
-un-favourite a contact, do it in MeshMonitor rather than on the device.
-
-Contact names in messages are **clickable** — clicking a name navigates directly to that contact's DM thread. Messages containing **@YourName** are visually highlighted.
-
-The panel is collapsible with state persisted to localStorage.
-
-The **per-node remote-telemetry config** panel hangs off the contact-detail panel (see [Per-Node Remote Telemetry](#per-node-remote-telemetry) below).
-
-::: warning Repeaters have no DM composer
-MeshCore repeaters (`advType=2`) can't hold a conversation, so they no longer expose a message composer. The 💬 button is hidden on repeater rows, and selecting a repeater shows its node detail and telemetry/graphs instead of an (empty) conversation pane. The repeater stays listed in the contact sidebar — only the chat surface is dropped. The Meshtastic side does the same for nodes flagged unmessagable.
-:::
-
-### Message route line
-
-Received channel and DM messages show a route line beneath the body, derived from the packet's relay path:
-
-- **📍 direct** — heard with zero hops (direct RF).
-- **🛰 N hops · a3 → 7f → 02** — relayed; the chain lists each relay's hash in order.
-
-**Clicking the hash chain** opens a route-detail popup with the message's reception details (sender, time, hops, scope, text) and the route expanded per hop into **repeater / room-server names** from the contact list. Only relay infrastructure ever appears in a MeshCore path — each forwarder appends the leading bytes of its public key at the hash width the original sender chose (1–3 bytes) — so matching is limited to those contacts. Unknown hashes stay as raw hex; when several repeaters share a hash prefix, the popup best-guesses the one closest to the neighbouring hops' positions and labels it as such.
-
-When **every** relay hop resolves to a contact with a known position, the popup also shows a **Packet flow** mini map: a dashed line tracing the packet geospatially across the relays, each hop marked and labeled (`#1 Hilltop`, `#2 Downtown`, …). The sender and your local node are added as endpoints when their positions are known. If any hop is unknown or unpositioned the map is omitted entirely — a partial line would misrepresent the path.
-
-Room-server posts and messages with no recoverable path show no route line.
-
-### Send bar
-
-Below every MeshCore composer (channel and DM) a live **`<bytes>/<limit>`** counter shows how much of the packet budget the current draft uses. Counting is **UTF-8 byte-accurate**, not character-based, so emoji and CJK characters cost more than one byte each. Limits are per-context:
-
-| Context | Limit |
+| Page | What it covers |
 |---|---|
-| Channel message | 130 bytes |
-| Channel message with a scope/region | 120 bytes |
-| Direct message | 150 bytes |
+| [Set up a MeshCore source](/features/meshcore-setup) | USB and TCP links, env vars for headless installs, Virtual Node, connection troubleshooting |
+| [Use the MeshCore page](/features/meshcore-using) | Map, channels, direct messages, contacts, reactions, rooms, Packet Monitor, notifications |
+| [Configure a MeshCore source](/features/meshcore-configuration) | Device and radio settings, backups, telemetry, the radio's contact list, permissions, API |
+| [Paths, discovery and regions](/features/meshcore-paths) | Route lines, traces, neighbours, node discovery, adverts, regions and scopes |
+| [Repeaters and remote admin](/features/meshcore-remote-admin) | Repeater sources, repeater settings, remote settings, remote and local consoles |
+| [Receive-Only Mode](/features/meshcore-receive-only) | Block every transmission from a source |
+| [Analyzer Observer](/features/meshcore-analyzer-observer) | Publish what your radio hears to MeshCore Analyzer brokers |
+| [MQTT Ingest](/features/meshcore-mqtt-ingest) and [MQTT Broker](/features/meshcore-mqtt-broker) | MeshCore sources with no radio |
 
-The counter appears only once the draft is non-empty, turns **yellow at 90%** of the limit and **red when over**, and the **Send button is disabled while over the limit** (the backend rejects an over-budget send as well).
+## Automations
 
-### Node Info
+The source's **Automations** tab holds the built-in automations below. Auto-Pathfinding is on [Paths, discovery and regions](/features/meshcore-paths#auto-pathfinding).
 
-A dashboard-style view of the connected local companion. It graphs the data collected by the local-telemetry poller (see [Local-Node Telemetry](#local-node-telemetry) below) across 1h / 6h / 24h / 3d / 7d ranges, plus identity (firmware version, build, model), current radio settings, current health, and cumulative counters.
+## Auto Ping
 
-This view is only available when the page is mounted from a per-source URL — the legacy app-shell mount path does not have a `sourceId` and hides the Node Info entry.
-
-### Configuration
-
-Where you change the device's settings:
-
-- **Identity** — Name and advert
-- **Location** — Position and advert-location policy
-- **Radio** — Frequency, bandwidth, spreading factor, coding rate (now with a preset selector)
-- **Telemetry mode** — Which telemetry classes the device emits (see [Telemetry Modes](#telemetry-modes))
-- **Default path hash size** and **Default region / scope** — separate sections after Telemetry
-- **Radio contact list** and **Device actions** — contact list, adverts, and node discovery
-
-## Telemetry
-
-MeshMonitor collects three kinds of telemetry from MeshCore sources, all written into the same `telemetry` table the Meshtastic side uses (just with `mc_*` type names) so the graphing UI works the same way.
-
-### Local-Node Telemetry
-
-A module-level singleton polls every connected companion every `MESHCORE_TELEMETRY_INTERVAL_MS` (default 5 minutes). It calls `GetStats core / radio / packets`, `GetDeviceTime`, and `DeviceQuery` — **none of which transmit on the air** — and writes batched rows stamped with `sourceId` and prefixed `mc_`. tx/rx duty-cycle and packet rates are computed as deltas vs the prior sample.
-
-This drives the [Node Info](#node-info) view.
-
-### Telemetry Modes
-
-You can toggle which telemetry classes the device itself emits over the air:
-
-- **base** — Battery, voltage, uptime
-- **loc** — Position
-- **env** — Environmental sensors (where supported by the hardware)
-
-Set these from the Configuration view; the device-side flag is persisted on the companion.
-
-### Per-Node Remote Telemetry
-
-Each row in `meshcore_nodes` can opt in to periodic `req_telemetry_sync` requests with a per-node interval. The remote-telemetry scheduler walks every registered manager every `MESHCORE_REMOTE_TELEMETRY_TICK_MS` (default 30s), picks at most one most-overdue eligible node per source, decodes the LPP response, and writes `mc_<lpp-type-name>` rows into the same `telemetry` table.
-
-A global 60-second minimum spacing between any two scheduled mesh ops on the same source is enforced through `MeshCoreManager.lastMeshTxAt`, so future scheduled operations on the same manager (auto-traceroute, periodic adverts, etc.) coordinate against a single field instead of each owning their own throttle.
-
-You configure this from the contact-detail panel in the Node Details view:
-
-1. Open the DM with the target contact
-2. Open the contact-detail panel
-3. Toggle **Remote telemetry** on
-4. Set the **interval** (minutes)
-5. Save
-
-The config requires `configuration:write` on the source. Read-only users see the panel with controls disabled and a banner explaining why.
-
-#### On-demand polling
-
-Alongside the scheduled config, the panel has two buttons to pull telemetry from a node right now instead of waiting for its interval:
-
-- **Poll Status** — requests battery / uptime / counters (repeater- and room-server-oriented).
-- **Poll Environment (LPP)** — requests a Cayenne-LPP environment reading (companion-oriented).
-
-Both transmit on the mesh, so they share the per-source **60-second mesh-TX gate** — if another scheduled or manual op fired too recently the request is refused with **HTTP 429 and a `Retry-After`**, surfaced as a throttle message on the button. Each button shows a pending state and reports how many telemetry rows were written. On-demand polling requires only **`nodes:read`** on the source (and returns 409 if the source isn't connected).
-
-The composite primary key on `meshcore_nodes` is `(sourceId, publicKey)`, so the same device advertising under two different sources is tracked independently.
-
-## Regions / Scopes
-
-Some MeshCore meshes restrict which flood traffic their repeaters forward. A repeater running `region denyf *` **drops any un-scoped flood packet** — so a message MeshMonitor sends without a scope simply never propagates past those repeaters. The Germany mesh is the most common example.
-
-A **scope** (also called a **region**) is just a named tag — e.g. `germany` or `muenchen` — that MeshMonitor stamps onto outgoing flood traffic. Repeaters configured to allow that region then forward it. The wire value is derived purely from the name (a hash of `#<name>`), so two operators only have to agree on the text of the region name to interoperate; there's no shared key to exchange.
-
-::: warning One global scope on the device
-The MeshCore companion firmware exposes only a **single, global flood scope**, not a per-channel one. MeshMonitor owns the per-channel/per-source scope mapping itself and asserts the right scope on the device immediately before each send, serializing those operations per source. If the scope can't be asserted, the send is aborted rather than leaked un-scoped.
-:::
-
-### Setting a scope
-
-There are three layers, resolved most-specific-first (**channel scope → source default scope → unscoped**):
-
-- **Per-channel Region / Scope** — each channel's settings has a **Region / Scope** field. Traffic on that channel is stamped with this scope.
-- **Per-source default scope** — the MeshCore **Device Configuration** page has a default-scope section (after Default path hash size) backed by the `meshcoreDefaultScope` setting. Channels without their own scope fall back to this, so you can scope a whole source with one value.
-- **Unscoped** — leave both blank and MeshMonitor asserts a **truly unscoped** flood (companion firmware v12+ accepts a raw `SetFloodScope` payload that clears the device's default), so the packet leaves your radio with no region tag regardless of any default the device itself has configured. On older firmware that lacks the raw form, MeshMonitor falls back to the node's default; upgrade the companion firmware if you rely on unscoped sends from a source whose device is set to a default region.
-
-Channel-settings and the per-message override both offer a region-picker **datalist** drawn from your saved + discovered regions (see below); free typing is still allowed. Region names are normalized (leading `#` stripped; letters, digits, and hyphens kept).
-
-### What gets scoped
-
-Originated flood traffic is scoped end-to-end. That covers channel messages, DM messages, **adverts**, **remote-admin login**, **remote telemetry requests**, and **remote CLI commands**. Operations that are never flood-forwarded — node discovery (zero-hop), local/config-only commands, and direct-routed traffic — are intentionally left alone.
-
-### Discover Regions
-
-In the default-scope section of MeshCore **Device Configuration**, the **Discover regions from repeaters** button asks nearby repeaters which regions they serve:
-
-- It runs a **0-hop sweep first** and queries **only the repeaters (and room servers) that answer in direct RF range**, in arrival order — not every repeater you've ever heard.
-- If the first sweep finds nothing it **retries once**.
-- It distinguishes the two empty cases: **no nearby (0-hop) repeaters were found** vs. **repeaters answered but reported no regions**.
-
-Discovered region names render as chips you can click to fill the scope field, and each chip has a save (**＋**, **✓** once saved) button to add it to the catalog.
-
-::: tip Why 0-hop
-A repeater only answers a regions query over a direct route, so MeshMonitor installs a zero-hop path to each responder before asking. A benign `set_out_path` ack-timeout during this step is expected and logged at debug level — it doesn't mean the discovery failed.
-:::
-
-### Per-message scope override
-
-Next to the channel compose box is an optional one-off **scope/region override**. It applies to that single message and is **never persisted** to the channel — your next normal send re-asserts the channel/default scope. It defaults to the channel's resolved scope, offers the same discovered/saved-region datalist, and resets when you switch channels. Leave it blank/whitespace to send that one message explicitly unscoped.
-
-### Scope of sent and received messages
-
-Channel and DM messages show a scope line so you can tell which region a message used — on **both** received messages (how it reached you) and your **own sent** messages (which scope it went out on). MeshMonitor recovers the scope by recomputing each of your known region names against the packet (the raw name can't be reversed out of the wire value):
-
-- **🔒 muenchen** — scoped to a region you know; the name is shown.
-- **🔒 #a3f2** — scoped, but to a region not in your known set; the raw code is shown as hex.
-
-Un-scoped messages show **no scope line at all** — the absence of a badge is itself the signal that the message flooded without a region.
-
-### Saved regions catalog
-
-The MeshCore **Settings** view has a **Saved regions** section — a catalog of region names (with optional notes) you've saved, so you don't have to retype them. The catalog is **global** (shared across all MeshCore sources, not per-source). Saved regions feed the region-picker datalists on the channel scope field and on the per-message override (the override list is the de-duplicated union of saved + discovered regions). Add regions inline (or via the **＋** on a discovered-region chip) and delete them per-item.
-
-## Radio contact table vs MeshMonitor
-
-A MeshCore companion radio and MeshMonitor each keep their own list of nodes, and the two can drift apart:
-
-- **MeshMonitor's node list** holds every node MeshMonitor has heard about on this source: adverts, messages, packets, and contacts read from the radio. Favourites live here.
-- **The radio's contact table** is stored on the device itself and holds a limited number of contacts (the firmware reports the limit). The radio can only **log in to, poll telemetry from, request status from, or message** a node in this table. A node missing from it fails at once; nothing goes on the air.
-
-### Auto-add contacts
-
-The firmware setting `manual_add_contacts` decides whether the radio saves the nodes it hears:
-
-- **Auto-add on** (bit 0 clear, the usual default): the radio stores each node it hears advertising, until the table fills.
-- **Auto-add off** (bit 0 set): the radio stores only contacts added by hand. Nodes it hears still show up in MeshMonitor, but the radio never saves them.
-
-**MeshCore → Device Configuration → Radio contact list** shows the current state (**Auto-add contacts: On / Off**) and a **Turn on / Turn off** button (needs `configuration:write`). The button changes only bit 0. The higher bits (per-type auto-add flags) and the telemetry and advert-location settings sent in the same firmware command stay as they were. It is a local write over the serial or TCP link; nothing is transmitted.
-
-### Symptoms when the two are out of step
-
-- MeshMonitor shows the node, even marked as a favourite, but logging in to it is refused with "not in the radio's contact list".
-- Telemetry and status requests to it do nothing, while the radio still hears its adverts.
-- The server log at connect says `N locally-favourited node(s) not in the device contact table`. When auto-add is off the message says so.
-- The Device Configuration page shows a banner: **N favourite(s) are not in the radio's contact list**.
-
-### Two fixes
-
-1. **Turn auto-add on.** The radio then stores nodes as it hears their next advert. Nodes it already missed come back only when they advert again.
-2. **Push to radio.** The **Push to radio** button in the same section (needs `nodes:write`) copies MeshMonitor's nodes into the radio's table straight away, in this order: favourites first (most recently heard first), then the other nodes by most recently heard. It fills **free slots only**: it never replaces a contact already on the radio. It skips the local node, nodes whose type is not known yet (wait for an advert), and nodes on the Ignore / Block list. If the radio's capacity can't be read, it pushes favourites only. A summary lists what was added, what was already there, what was skipped and why, and how many free slots remain. Like auto-add, this is a local write; nothing is transmitted.
-
-To add a single node, open it in **Node Details** and use **Add to radio** on the "Not in the radio's contact list" notice.
-
-## Remote Administration
-
-::: tip Added in 4.7
-The MeshCore Remote-Administration console ships in 4.7 — gated on the new per-source `remote_admin` permission. See [the internal architecture doc](https://github.com/Yeraze/meshmonitor/blob/main/docs/internal/dev-notes/MESHCORE_REMOTE_ADMIN.md) (`docs/internal/dev-notes/MESHCORE_REMOTE_ADMIN.md` in the repo) for the protocol-level architecture; this section is the operator-facing summary.
-:::
-
-MeshCore's remote-admin protocol is **CLI text sent as an encrypted DM** — the same `PAYLOAD_TYPE_TXT_MSG` packet a chat message uses, distinguished by a single `txt_type` byte (`CliData = 1` vs `Plain = 0`). The remote node dispatches the text into its `CommonCLI::handleCommand` handler and replies with one packet of text. MeshMonitor wraps the wire-level traffic behind two consoles.
-
-### Remote console (per contact)
-
-For any Repeater (advType=2) or Room Server (advType=3) contact in your MeshCore source, the contact-detail panel surfaces a **Remote administration** section. The user with `remote_admin:write` on that source can:
-
-- **Log in** with the node's admin password (or blank for guest access). Optionally tick "Remember this password" — see *Credential store* below.
-- **Send arbitrary CLI commands** (e.g. `ver`, `stats`, `neighbors`, `set radio …`) and see the reply inline in the transcript.
-- **Click quick-action buttons** that pre-fill the input for the most-common commands. `Reboot` is flagged danger — see *Danger commands* below.
-- **Read live stats** in a structured panel (battery, queue, packet counts, air time, last SNR / RSSI) auto-refreshed every 30 s while logged in.
-- **Manage the ACL** via a `setperm` form: paste a 64-char hex pubkey, pick **Remove / Guest / ReadWrite / Admin**, click Apply. The built command (`setperm <pubkey> <level>`) lands in the same transcript as free-typed commands.
-
-The console only renders for Repeater / Room Server advTypes since Companion firmware doesn't expose a remote-admin surface. Replies are single-packet (≈130 – 180 byte MTU) and there is no chunking — long output is truncated at the firmware level.
-
-#### Login timing and retries
-
-A login to a repeater or room server can take a while on a busy mesh. MeshMonitor waits for a reply for twice the firmware's time estimate, but never less than 10 s and never more than 90 s. If a login gets no reply, the admin buttons try again, up to 3 attempts in all, with a 2 s pause between them. At the 10 s floor, three silent attempts take about 34 s; a slow path with a larger estimate takes longer, so give a reverse proxy a generous timeout.
-
-MeshMonitor never retries when the node **refuses the password**. It shows the refusal at once, because sending the same password again cannot help.
-
-Every login screen (remote console, contact details, direct messages and rooms) shows live progress, such as "Attempt 2 of 3: waiting for a reply (14 s left)". Click **Cancel** to stop the login.
-
-### Local console (Configuration view)
-
-The Device Configuration tab gets a **Device console** for the locally connected node. Dispatch depends on the firmware:
-
-| Local firmware | Console behavior |
-|---|---|
-| Repeater / Room Server | Forwards to the device's native serial CLI via `sendRepeaterCommand`. Same command set as a remote Repeater. |
-| Companion | A small synthetic interpreter on the server side maps `ver` / `stats [core\|radio\|packets]` / `clock` / `advert.zerohop` / `advert` / `help` to existing companion-protocol bridge commands and formats the response as text. Mutating verbs (`set name`, `set radio` …) are intentionally NOT in the synthetic CLI — the existing form fields on the same Device Configuration tab handle those with proper validation. |
-
-No login flow: the connection is physical (USB serial or direct TCP), so there's no admin password concept. Gated on the existing `configuration:write` permission.
-
-### Credential store
-
-When the user ticks "Remember this password" at login, the plaintext is encrypted with **AES-256-GCM** using a key derived from `SESSION_SECRET` via HKDF and stored in `meshcore_nodes.adminCredential` (added by migration 070). Each envelope includes a 4-byte `kid` fingerprint of the current secret; on subsequent visits the console silently logs in using the saved password if `kid` matches. If `SESSION_SECRET` rotates, the mismatched `kid` triggers a yellow banner asking the user to re-enter the password — never a silent auth-tag failure.
-
-::: warning Capability gating
-When `SESSION_SECRET` was auto-generated rather than explicitly configured, the "Remember password" checkbox is disabled with a tooltip explanation. Persisting against an ephemeral key would lose every saved password on every restart, which is worse than re-prompting. Set `SESSION_SECRET=$(openssl rand -hex 32)` in your environment to enable credential persistence.
-:::
-
-**Security boundary**: the credential store defends against a DB-file-only exfil (someone grabs `meshmonitor.db` without the host environment). It does **not** defend against a host compromise — anyone running code on the host has `SESSION_SECRET` and the DB. Same posture as the existing channel-PSK storage. The plaintext password **never** leaves the server process: the auto-login route reads the encrypted envelope, decrypts in-process, and calls `loginToNode(pubkey, plaintext)` without echoing the password to the client. A test canary in `meshcoreRoutes.test.ts` walks every audit-emitting login code path and asserts the plaintext is absent from each response body and audit row.
-
-### Danger commands
-
-Destructive verbs matching `/(reboot|erase|clkreboot|factory)/i` are gated by a typed-name confirmation modal: the user must type the contact name (or local device name) exactly to enable the Confirm button. The same regex is mirrored server-side — `POST /admin/cli` and `POST /cli` both reject without `confirm: true` in the body with `code: DANGER_CONFIRM_REQUIRED`. Mirrored deliberately so a script bypassing the modal still gets the prompt-as-requirement.
-
-### Audit log
-
-Every CLI command, login outcome, and credential mutation writes an `audit_log` row through a new `auditMeshcoreEvent` helper. Distinct `action` values per outcome:
-
-| Action | When |
-|---|---|
-| `meshcore_remote_login` / `_failed` | manual `/admin/login` success / auth failure |
-| `meshcore_remote_login_saved` / `_failed` | auto-login via saved credential (failures carry the specific code) |
-| `meshcore_remote_cli` / `_failed` / `_blocked` | per-CLI command on a remote node |
-| `meshcore_local_cli` / `_failed` / `_blocked` | per-CLI command on the local node |
-| `meshcore_credential_forget` | `DELETE /admin/credentials/:pubkey` |
-
-The `details` JSON captures `sourceId`, `publicKey` (where relevant), command text, reply length, and elapsed milliseconds. **The plaintext password never appears in audit details**, verified by the canary test referenced above.
-
-## Analyzer Observer
-
-::: tip Added in 4.14 (#4457)
-A Companion source can publish the packets it hears to a MeshCore Analyzer MQTT broker (FL Mesh, LetsMesh, or compatible), so your node shows up as a regional observer.
-:::
-
-It's observation-only — MeshMonitor never subscribes to the broker or transmits on your behalf. Enable it in the source's edit modal, then fetch or paste the signing key on the Configuration page. See the [MeshCore Analyzer Observer guide](/features/meshcore-analyzer-observer) for setup, a troubleshooting table, and what data leaves your network.
-
-## Path Visualization
-
-The MeshCore map can render **route lines** between your local node and each contact, colored by hop count:
-
-- **Green** — direct (1 hop)
-- **Orange** — 2-3 hops
-- **Red** — 4+ hops
-
-Toggle path visibility from the map toolbar. Paths are populated by the **Discover Path** button in the contact-detail panel (sends firmware CMD 52) or automatically by the [Auto-Pathfinding](#auto-pathfinding) scheduler. When the firmware responds with path discovery results (push code 0x8D), the route is stored and rendered immediately.
-
-## Position History
-
-The MeshCore map can render a per-node movement trail, mirroring the Meshtastic Position History feature:
-
-- **Show Position History** toggle and a **history length slider** (1h–7d, default 24h) in the map toolbar, persisted per-browser.
-- Trails render as a gradient polyline per node, oldest fix to newest.
-- **Keep history (days)** — a retention control (default **7 days**) wired to the shared `/api/settings` endpoint; a scheduled hourly sweep prunes fixes older than the configured window.
-
-Points come entirely from existing MeshCore GPS sources — contact adverts and the [remote telemetry](#per-node-remote-telemetry) poll — recording only fixes that actually moved (sub-epsilon jitter and Null Island are dropped), so stationary nodes don't accumulate noise. No firmware changes are involved.
-
-## Ignore and Block
-
-MeshCore firmware has no block or mute, so MeshMonitor filters messages in the server. You can filter by node or by text pattern. Each entry has one of two modes:
-
-| Mode | What happens |
-|---|---|
-| **Ignore** | MeshMonitor stores the message but does nothing else with it. It sends no notification and runs no automation, auto-ack or auto-responder. It does not forward the message or relay it to Virtual Node apps. The message list folds a run of ignored messages into one row, such as "3 ignored messages", that you can expand. |
-| **Block** | MeshMonitor drops the message when it arrives and never stores it. |
-
-If a message matches both an Ignore and a Block entry, Block wins.
-
-### Ignoring nodes
-
-Open a contact's detail panel in the direct messages view and use the **Ignore / Block** row. Pick **Ignore** or **Block**, or remove the entry. Block asks you to confirm first.
-
-The **Ignored and blocked nodes** section in the MeshCore source's **Settings** lists every entry with its mode, hit count and last hit. You can remove entries there.
-
-::: warning Channel messages match by name
-A channel message carries only a sender name, not a key. MeshMonitor matches it to the node by advert name. Anyone can use any name, and two nodes can share one. Direct messages match by key.
-:::
-
-### Text rules
-
-The **Message filters** section in the MeshCore source's **Settings** holds text rules. Each rule has:
-
-- **Pattern** (up to 256 characters)
-- **Match type**: *Exact*, *Wildcard* or *Regex*
-- **Checks**: *Sender name*, *Message text*, or *Name and text*
-- **Mode**: Ignore or Block
-- **Case sensitive** and **Enabled** switches
-
-Exact and wildcard patterns must match the whole field. In a wildcard, `*` matches any run of characters and `?` matches one character. A regex matches anywhere in the field. Regexes run on RE2, so lookaround and backreferences are not supported, and MeshMonitor rejects them when you save.
-
-Each rule shows how often it matched and when it last matched. Counts save to the database about every 30 s, so a crash can lose a few.
-
-Ignore and Block send nothing over the radio. Saving a list never triggers a send.
-
-## Neighbor Discovery
-
-Repeaters maintain a neighbor table of other repeaters heard via zero-hop adverts. MeshMonitor can query this table and display the results:
-
-- **Contact-detail panel** — a "Get Neighbours" button appears for repeater contacts. Results show each neighbor's name (resolved from pubkey prefix), SNR, and last-heard time.
-- **Map rendering** — neighbor links appear on the map as dashed lines between repeaters.
-- **Map Analysis** — the inspector panel in Map Analysis mode includes a MeshCore neighbor links layer with transport-type filtering (RF / UDP / unknown).
-- **Database persistence** — neighbor data is stored in `meshcore_neighbor_info` and survives page refreshes.
-
-Neighbor queries require authentication to the repeater (guest or admin login). See [the MeshCore protocol details](/features/meshcore#remote-administration) for auth requirements.
-
-### Fetching the whole table
-
-A repeater sends at most 10 neighbours per reply, and its table can hold 50. The **Contact Details** neighbour button and **Poll Neighbours** fetch up to 5 pages, so you see the whole table.
-
-- MeshMonitor logs in once before page 1. Later pages skip the login.
-- Each page waits 60 s after the last radio send, so the fetch cannot flood the mesh. A full 5-page fetch takes about 4 minutes.
-- A progress line shows the page, the neighbours collected so far, and the wait for the next page.
-- **Cancel** stops the fetch. Neighbours you already have stay stored, and the pages that arrived update them.
-- If a page gets no reply, MeshMonitor shows the neighbours it has and keeps the stored list.
-
-The scheduled autopoll fetches 1 page, strongest signal first. It merges the result into the stored list, so the list never shrinks.
-
-## Active Node Discovery
-
-Beyond passively reading a repeater's neighbor table, MeshMonitor can actively probe the airwaves for nearby MeshCore devices (added in 4.8.3). The MeshCore **Device Configuration** page, under **Device actions** → **Discover nodes**, exposes two buttons:
-
-- **Discover Nearby Nodes** — sweep for any MeshCore node in zero-hop (direct RF) range, matching the mobile app's discovery behaviour. Responders are added/refreshed as contacts.
-- **Discover Repeaters** — the same sweep scoped to repeater-class devices.
-
-Discovery is direct-range only (zero-hop) — it surfaces devices you can hear without relaying. MeshMonitor is also **discoverable** in the other direction: it answers inbound discovery requests from peers, so your source shows up when another node runs the same sweep.
-
-## Auto-Pathfinding
-
-The **Automation** view (accessible from the MeshCore page sub-toolbar) provides scheduled path discovery and neighbor collection:
-
-- **Path Discovery** — periodically sends Discover Path requests to all companion contacts to keep route information fresh.
-- **Neighbors for Repeaters** — periodically queries the neighbor list from all repeater contacts and persists results to the database for map rendering.
-- **Configurable schedule** — set the delay between individual requests (default: 5 minutes) and how often the full cycle repeats (default: every 24 hours).
-- **Independent toggles** — enable/disable path discovery and neighbor collection independently.
-- **RF-aware throttling** — requests are spaced by the configured interval to avoid flooding the mesh. A global 60-second minimum spacing between any two scheduled mesh operations on the same source is also enforced.
-
-Retrieved neighbor data is automatically resolved (pubkey prefixes mapped to full contact records) and persisted to `meshcore_neighbor_info` for map rendering and the Map Analysis inspector panel.
-
-### Target filtering
-
-By default Auto-Pathfinding processes **every** Companion and Repeater contact each cycle. On a large contact list that spends mesh airtime and cycle time on nodes you may not care about. Enable **Filter target contacts** to narrow which contacts are targeted — it is fully opt-in, so leaving it off keeps the original "everything" behavior. A single filter list covers both sub-features (path discovery still targets companions, neighbor queries still target repeaters).
-
-The filter combines several optional controls, each independently toggleable:
-
-- **Limit to selected contacts** — a searchable checklist (with Select All / Deselect All and a running count) of the specific contacts to include.
-- **Filter by name (regex)** — include contacts whose name matches a regular expression.
-- **Limit by last heard** — only contacts heard within the last N hours.
-- **Limit by hop range** — only contacts whose cached route hop-count falls within a min–max range. Contacts with an unknown route (i.e. the next send would flood) are excluded while this is on.
-- **Limit by signal quality** — only contacts at or above a minimum RSSI (dBm) and/or SNR (dB). Leave a threshold at its floor value to ignore it.
-
-The controls combine intuitively: **last heard**, **hop range** and **signal quality** first *narrow* the pool of contacts, then the **selected-contacts** list and **name regex** *include* any contact matching either of them. If you turn the filter on without configuring a selected-contacts list or a name regex, every contact surviving the narrowing filters is targeted. A live **matching targets** preview shows how many contacts the current settings would target, updating as you edit. All settings are per-source and saved from the shared MeshCore Automations save bar.
-
-## Adverts
-
-An advert announces this node so others can add it as a contact. MeshMonitor sends two kinds:
-
-- **Zero-hop** reaches only nodes in direct radio range. No repeater forwards it, so it costs one transmission (roughly 0.4–1.3 s of channel time).
-- **Flood** is forwarded by every repeater within 8 hops. With 20 repeaters in reach that is about 9 s (US presets) or 25 s (EU presets) of shared channel time for a single advert.
-
-The status bar and **Device Configuration → Device actions** offer **Advert (nearby, zero-hop)** as the main button. **Flood advert** sits beside it and asks you to confirm, stating the cost, before it sends. In the device console, `advert.zerohop` sends a zero-hop advert and `advert` sends a flood; the console's quick-action button sends the zero-hop one.
-
-Repeater firmware that predates the `advert.zerohop` CLI verb floods when asked for a zero-hop advert. MeshMonitor spots this from the repeater's reply, reports that a flood went out, and refuses further zero-hop requests to that repeater until it reconnects. Update the repeater firmware to fix it.
-
-### Automated flood limit
-
-Automated adverts (the auto-announce advert burst, timer triggers, and the automation **Announce self (advert)** action) can pick zero-hop or flood. New settings default to zero-hop. Settings saved before this choice existed keep flooding, as they always did.
-
-Automated floods are limited to **one per hour per source**. The time of the last flood lives in the database, so restarting MeshMonitor or saving settings does not reset it. Any flood counts toward the hour, including a manual one. When an automated flood falls inside the hour, MeshMonitor skips it (it does not send a zero-hop advert instead) and logs why; a timer trigger records the reason as its last error, and an automation step fails with it. Zero-hop adverts have no such limit, and a manual flood is never blocked.
+On a **Companion** source, the **Automations** view also has an **Auto Ping** section: a contact DMs `ping N` and the companion pings it back N times, recording each ping's round trip, timeout, and whether it went direct or by flood. Repeater sources do not have it. See [Auto Ping on MeshCore](/features/automation#auto-ping-meshcore).
 
 ## Auto-Announce
 
-The **Automation** view also hosts a per-source Auto-Announce that periodically broadcasts a status message to one or more MeshCore channels:
+The **Automations** view also hosts a per-source Auto-Announce that periodically broadcasts a status message to one or more MeshCore channels:
 
 - **Scheduling** — choose either a simple interval (every N hours, 1–168) or a standard 5-field cron expression. An optional *announce on connection* fires a single message whenever the source reconnects.
 - **Message template** — the message body supports token expansion. Available tokens: `{VERSION}`, `{DURATION}`, `{CONTACTCOUNT}`, `{COMPANIONCOUNT}`, `{REPEATERCOUNT}`, `{ROOMCOUNT}`, `{NODE_NAME}`, `{NODE_ID}`. A live preview shows the rendered text, and clickable token buttons insert at the cursor.
@@ -585,10 +58,12 @@ The **Automation** view also hosts a per-source Auto-Announce that periodically 
 
 Auto-Responder matches incoming messages against operator-defined patterns and replies automatically:
 
-- **Per-trigger pattern** — match incoming text via a regular expression, with per-channel filtering, DM listening, and a per-sender cooldown to avoid loops.
+- **Per-trigger pattern** — match incoming text with per-channel filtering, DM listening, and a per-sender cooldown to avoid loops. Each trigger has a **Match mode**, the same as on Meshtastic (see [Match mode](/features/automation#match-mode-pattern-or-regex)): **Pattern** (the Meshtastic syntax, whole message, `{name}` captures that fill the reply and reach a script as `PARAM_<name>`) or **Regex** (case-insensitive, matches anywhere in the message, `(?<name>…)` captures). New triggers start as Pattern; triggers saved before match modes existed stay Regex. Both modes take emoji and other non-ASCII text.
 - **Per-trigger pre-send delay** — wait a configurable number of seconds (0–120, `0` = immediate) after a match before replying, so a relaying repeater can finish its own transmission before your reply floods. Mirrors the Auto-Acknowledge pre-send delay; the wait applies once per fire, ahead of both text and script responses.
 - **Two actions** — reply with a **text response** (same token expansion as Auto-Announce) or **run a script** (with token-expanded script args). Script execution reuses the shared script runner, with `MESHCORE_*` environment variables injected so a script can branch on which stack invoked it.
 - **Reply scope/region** — choose which region the reply floods to: **Inherit** the channel/source default, **Match the triggering message's scope** (answer back on the same region it arrived on), send **Unscoped**, or pick **a specific region**. This mirrors the MeshCore scope control in the [Automation Engine](/features/automation-engine#actions).
+
+Triggers work the same way as on Meshtastic: each one is a card with its own on/off switch, a summary and tags. Click **Add trigger** or **Edit** to open a card, then **Done**, then **Save**. **Delete** asks first. The **Test a message** box shows which triggers a sample message fires, each in its own match mode, and their reply text with captured values filled in and tokens such as `{VERSION}` left as written. It sends nothing and does not apply channel filters.
 
 ### Route tokens
 
@@ -601,6 +76,8 @@ Auto-Acknowledge and Auto-Responder templates can quote the path the triggering 
 | `{HASH_SIZE}` | Per-hop path-hash width in bytes (1–3), as the sender stamped it | `1` |
 
 A hop MeshMonitor cannot resolve stays as raw hex. When several repeaters share a hash prefix, MeshMonitor picks the one closest to the neighbouring hops' positions — a best guess, not a certainty. The same resolution backs the clickable route line on a received message (see [Message route line](#message-route-line)).
+
+Auto-Responder **scripts** get the same values as environment variables: `HOPS`, `ROUTE`, `ROUTE_NAMES`, `HASH_SIZE` and `SCOPE`. Each holds exactly what the matching `{TOKEN}` would render, including `—` when the value is unknown (for example, `HASH_SIZE` on a direct message, which carries no relay hops).
 
 ## Forwarding
 
@@ -616,53 +93,27 @@ Timer Triggers schedule recurring actions independent of incoming traffic:
 
 ## Automated Channel-Send Auto-Retry
 
-MeshCore channel (broadcast) messages are unacked, fire-and-forget floods — unlike a direct message, there is no firmware ACK to confirm delivery. MeshMonitor instead listens for nearby repeaters re-flooding your own packet (the "heard repeaters" signal, see [Message route line](#message-route-line)). When **no** repeater is heard, the message likely reached no one.
+MeshCore channel (broadcast) messages are unacked, fire-and-forget floods — unlike a direct message, there is no firmware ACK to confirm delivery. MeshMonitor instead listens for nearby repeaters re-flooding your own packet (the "heard repeaters" signal, see [Channels](#channels)). When **no** repeater is heard, the message likely reached no one.
 
 The **MeshCore Messaging** section of global **Settings** hosts an opt-in toggle, **Auto-retry automated MeshCore channel sends** (default **off**). When enabled:
 
 - An **automated** channel send that hears **zero** repeaters within **30 seconds** is resent **exactly once**.
 - It applies only to automated senders: the [Automation Engine](/features/automation-engine) `Send message` action, Auto-Acknowledge, the [Auto-Responder](#auto-responder), [Auto-Announce](#auto-announce), and [Timer Triggers](#timer-triggers).
-- **User-initiated sends are never retried** — a message you type into the send bar goes out once regardless of this setting.
+- **User-initiated sends are never retried automatically** — a message you type into the send bar goes out once regardless of this setting. To send it again yourself, use the **Resend** button (see [Channels](#channels)).
 - It is **one-shot**: the resend is never itself retried, so at most one extra transmission ever occurs per logical send.
 - The resend does **not** create a second message bubble and does **not** re-enter the automation event bus, so it can never trigger a fresh automation.
 
-A split Auto-Acknowledge reply (see [Long Replies on MeshCore](/features/automation#meshcore-long-replies)) counts as one automated send per part, so each part can be resent once.
+A split Auto-Acknowledge reply (see [Long Replies on MeshCore](/features/automation#meshcore-long-replies); Auto Responder, Timer, Auto Announce and Automation Engine splits work the same way) counts as one automated send per part, so each part can be resent once.
 
 This is **distinct from the direct-message retry**, which is always on and follows the firmware's own same-path/flood ACK cadence. Because a channel send has no delivery ACK, the retry can only guess from the heard-repeater signal — so with this enabled you may occasionally see a duplicate on the mesh if a late echo arrives right around the 30-second mark. Leave it off if duplicates are unacceptable for your deployment.
 
-## Room Servers
+## Analyzer Observer
 
-Room servers (advType=3) are BBS-style MeshCore nodes that store posts and push-sync them to connected clients. The **Rooms** view in the MeshCore page lists discovered room servers and provides:
+::: tip Added in 4.14 (#4457)
+A Companion source can publish the packets it hears to one or more MeshCore Analyzer MQTT brokers, so your node shows up as a regional observer. One-click presets cover MeshMapper, LetsMesh, meshcore.ca and RF Lab; any compatible broker works too.
+:::
 
-- **Login / auto-login** — enter a password to join a room, or save credentials for automatic login on future visits. Login retries up to 3 times automatically to handle RF packet loss.
-- **Post stream** — read and send posts in the room's message board.
-- **Auto-sync** — configure periodic re-login to fetch new posts on a schedule (1h to 24h intervals). The auto-sync setting is persisted per-room and loaded when the room is selected.
-- **Credential persistence** — saved room passwords are AES-256-GCM encrypted via the same credential store used for remote admin passwords.
-
-## Multi-Source Dashboard
-
-MeshCore sources appear as styled cards in the dashboard sidebar — same visual language as Meshtastic sources, with a MeshCore logo and per-source status.
-
-The aggregate dashboard map and `/api/nodes` endpoint enumerate every connected MeshCore manager and include contacts that have valid `(latitude, longitude)` (zeros are rejected). Each contact gets a synthetic `nodeId` of `mc:<sourceId>:<pubkeyPrefix>` so cross-source duplicates don't collide on React keys, and `getNodeLatLng` resolves either the flat `{latitude, longitude}` shape or the nested `position` shape.
-
-## Permissions
-
-In 4.5 the global `meshcore` permission is gone. Migration 058 expanded every legacy `meshcore` grant into the per-source **sourcey** resource set, matching how Meshtastic resources are scoped:
-
-| Resource | Scope | Description |
-|---|---|---|
-| `connection` | Per-source | Connect/disconnect, status |
-| `configuration` | Per-source | Identity, radio, telemetry mode, location, per-node remote-telemetry config |
-| `nodes` | Per-source | Node list, contacts, map data |
-| `messages` | Per-source | Read and send DMs / channel messages |
-
-Anonymous users can view MeshCore data on sources where the anonymous user has the relevant `*:read` permission. Sending messages, changing config, and toggling remote telemetry all require `configuration:write` (or `messages:write` for sends).
-
-### UI Permission Gating
-
-Write controls in the MeshCore UI are now **disabled in place** for users without the right permission — not just rejected on submit. The Configuration view, Channels view, DM compose box, and remote-telemetry toggle all dim themselves and surface an explanatory banner, mirroring how the Meshtastic side handles permission gating.
-
-See [Per-Source Permissions](/features/per-source-permissions) for the full model.
+It's observation-only — MeshMonitor never subscribes to the broker or transmits on your behalf. Turn it on and pick its brokers on the source's **Device Configuration** page, then fetch or paste the signing key under **Credentials**. See the [MeshCore Analyzer Observer guide](/features/meshcore-analyzer-observer) for setup, a troubleshooting table, and what data leaves your network.
 
 ## Receive-Only Mode
 
@@ -675,101 +126,117 @@ on-device advert schedule configured outside MeshMonitor. See
 [MeshCore Receive-Only Mode](/features/meshcore-receive-only) for the full picture, including
 Virtual Node behavior and the firmware limitation.
 
-## Per-Source Settings
-
-Alongside the receive-only toggle, MeshCore **Settings** and **Device Configuration** expose a small set of per-source controls that shape how MeshMonitor talks to the mesh through that specific source:
-
-- **Default Path Hash Size** (on **Device Configuration**) — how many bytes of a route's next-hop identity to include when sending direct messages that carry a cached route. The default matches the companion firmware default; lower values shave a byte or two off each direct send, higher values reduce ambiguity on very dense networks. Leave it alone unless you have a specific reason to tune it.
-- **Maximum infrastructure node age (hours)** — a separate age window for repeaters and room servers. The main **Node list & map window** setting applies to all MeshCore nodes; this second slider lets you keep infrastructure nodes on the map for longer than mobile companions. Two views honor it: the map's node-list, and the neighbours summary. Set it to `0` to inherit the main age window.
-- **Telemetry time window** — the telemetry panel in a MeshCore node's details view exposes a time-window selector so you can flip the charts between the last hour, day, or week without leaving the panel.
-
-## Autopoll Neighbours
-
-Beyond the periodic **Auto-Pathfinding** neighbours cycle (see above), MeshMonitor also runs a **per-node retrieval scheduler** that keeps a specific repeater's neighbour list fresh on its own schedule instead of waiting for the next global cycle. This is helpful when you care about one link's health more than the full mesh and want its neighbours refreshed every few minutes.
-
-The scheduler shares the global 60-second minimum spacing between mesh operations on the same source, so a per-node autopoll never overlaps a hand-triggered send or an Auto-Pathfinding cycle. Enable it per contact from the contact detail panel.
-
-## Radio Configuration
-
-Use the Configuration view's **Preset** dropdown to pick from the official MeshCore preset list, or choose **Custom** to manually set:
-
-- **Frequency** (100-1000 MHz)
-- **Bandwidth** (125, 250, 500 kHz)
-- **Spreading Factor** (5-12)
-- **Coding Rate** (5-8)
-
-::: danger
-Changing radio parameters will disconnect you from nodes using different settings. Make sure all nodes in your mesh use the same radio configuration.
-:::
-
-Saved radio params are now persisted authoritatively: the backend propagates device-side errors back instead of silently returning success, and the manager optimistically updates `localNode.radio*` then refreshes from the device so the next snapshot reflects the real device state.
-
-## Packet Monitor
-
-The MeshCore page includes a **Packet Monitor** tab (sub-toolbar: **Packets**) that surfaces raw OTA frames captured from the companion's `LogRxData` (0x88) push. This is the MeshCore analogue of the Meshtastic [Packet Monitor](/features/packet-monitor).
-
-Capture is opt-in. The view exposes an **Enable** toggle and retention controls (max packet count, max age in hours) inline; no separate settings page is required. Once enabled, the monitor shows:
-
-- **Timestamp** — when the packet was received
-- **Route type** — direct / flood / etc. (decoded from the OTA frame)
-- **Payload type** — message type in human-readable form where known, raw hex otherwise
-- **Relay chain** — the relay-hash sequence from the packet
-- **Hop count**, **SNR**, and **RSSI**
-- **Raw hex dump** — the full OTA frame, accessible via the detail modal
-
-New packets stream in live over the existing Socket.io connection (no separate subscription is needed). The view can be **paused** and **exported** (`.jsonl` format) for offline analysis. Filtering by payload type and route type narrows the display.
-
-### Decoding channel packets
-
-Click a row to open **Packet Decode**. Adverts, ACKs and control packets decode in full. Channel packets (`GRP_TXT` and `GRP_DATA`) are encrypted, so the modal asks the server to open them:
-
-- The server tries every channel key it holds: this source's channels, channels on your other sources, and MeshCore entries in the [Channel Database](/features/channel-database).
-- A `GRP_TXT` packet shows the channel name, sender, the sender's timestamp and the text. A `GRP_DATA` packet shows the channel name, the data type and a hex + ASCII dump of the body.
-- The modal says where the key came from: **this source**, another source by name, or a **virtual channel**.
-- You see the plaintext only if you could read that channel's messages anyway (`channel_N:read` or `messages:read` on a source that holds the key, or **Read** on the virtual channel). Otherwise the modal shows **Unknown channel (hash 0xNN)**, the same as when the server has no matching key. Signed-out viewers always see that.
-
-Decryption happens when you open the modal. The packet list, the live feed and the `.jsonl` export stay ciphertext, no plaintext is stored in the packet log, and channel keys never leave the server.
-
-The `packetmonitor:write` permission is required to clear the log; `settings:write` is required to toggle capture on/off and adjust retention.
-
 ## Still Early
 
-MeshCore support has come a long way since 4.5 — remote administration, path visualization, neighbor discovery, auto-pathfinding, room servers, and a mobile-responsive layout are all shipping. But there are still gaps:
+Companion sources get most of the features. Known gaps:
 
-Known gaps and limitations:
+- A **Repeater** source is USB only, cannot send messages or traces, and cannot run the Analyzer Observer. Most of what it shows beyond neighbours and local telemetry needs a firmware build with packet logging (see [What a Repeater Source Shows](/features/meshcore-remote-admin#what-a-repeater-source-shows)).
+- The **telemetry mode** settings (Basic, Location, Environment) apply to Companions only.
 
-- **Repeater / Room Server per-source parity** is behind Companion. Repeater is selectable as a USB device type, but features like local telemetry polling and telemetry-mode toggles require a Companion connection on the source side.
-- **Notifications** for MeshCore events are minimal — apprise/push surfaces aren't yet first-class.
-- **Companion-only telemetry mode toggles** — Repeaters report what they report; the base/loc/env toggle is meaningful on Companions.
+## Sections that moved
 
-The roadmap is incremental: keep landing MeshCore features each release, keep aligning the UI vocabulary with Meshtastic, and gradually close the remaining parity gap.
+These sections now live on the guide pages above. Each heading keeps its old link.
 
-## Troubleshooting
+### Headless installs: first-boot env vars {#headless-installs-first-boot-env-vars}
 
-### MeshCore source can't be added or connection fails
-- For **USB** sources: Verify the serial port is accessible inside the container (check `devices:` mapping in docker-compose). The entrypoint auto-grants the `node` user access to mapped tty groups (look for `Granted node user access to /dev/...` in the container log); if you mounted a device after the container started, restart it. A `Permission denied` opening the port means the grant did not happen: see [USB serial devices and the non-root user](/configuration/production#usb-serial-devices-and-the-non-root-user).
-- For **TCP** sources: Verify the host is reachable from inside the container (the MeshMonitor process resolves it, not your browser). Use a LAN IP rather than `localhost`/`127.0.0.1`, or `host.docker.internal` when the device shares a host with MeshMonitor. **Check the port first — a wrong port is the usual reason a MeshCore TCP source never connects.** Use `5000` for a WiFi/Ethernet build, `4403` for a native-TCP build, or whatever port your `ser2net`/`esp-link` proxy uses.
-- Check MeshMonitor logs for `[MeshCore]` entries for detailed error messages.
+Create a MeshCore source on first boot with no clicks. See [Headless installs](/features/meshcore-setup#headless-installs-first-boot-env-vars).
 
-### Runtime-added MeshCore source idle until restart
-This is fixed in 4.5 — source create/update/delete/connect/disconnect endpoints all wire MeshCore into the per-source registry. If you're seeing this on an earlier 4.x version, restart the container as a workaround and upgrade.
+### Configuration {#configuration}
 
-### No nodes appearing
-- Verify your MeshCore device is properly flashed and operating.
-- Check that the radio frequency and parameters match other nodes in your mesh.
-- Try sending an advert to announce your presence on the network. A zero-hop advert reaches nodes in direct range; use a flood advert only if distant nodes need to find you.
+Change a Companion's name, position, radio and other settings: see [Device configuration](/features/meshcore-configuration#configuration). For a Repeater source, see [Repeater settings](/features/meshcore-remote-admin#repeater-settings).
 
-### Can't log in to or poll a node MeshMonitor shows
-The node is probably missing from the radio's own contact table, often because auto-add contacts is off on the radio. See [Radio contact table vs MeshMonitor](#radio-contact-table-vs-meshmonitor).
+### Radio Configuration {#radio-configuration}
 
-### Radio parameter changes "revert" on save
-Earlier 4.x versions had a hook-dependency bug where Phase 3 push events overwrote staged radio/location edits before Save fired. Fixed in 4.5.
+Pick a preset or set frequency, bandwidth, SF and CR. See [Radio Configuration](/features/meshcore-configuration#radio-configuration).
 
-## Reporting Issues
+### Companion Backups {#backups}
 
-If you hit a problem, please [open an issue](https://github.com/yeraze/meshmonitor/issues/new) with:
+Back up and restore a Companion's settings and channels. See [Companion Backups](/features/meshcore-configuration#backups).
 
-- Your MeshCore device type and firmware version
-- MeshMonitor version
-- Relevant log output (look for `[MeshCore]` prefixed messages)
-- Steps to reproduce the issue
+### Telemetry Modes {#telemetry-modes}
+
+Choose which telemetry the device shares. See [Telemetry Modes](/features/meshcore-configuration#telemetry-modes).
+
+### Radio contact table vs MeshMonitor {#radio-contact-table-vs-meshmonitor}
+
+Why a node MeshMonitor shows can still refuse a login, and how to fix it. See [Radio contact table vs MeshMonitor](/features/meshcore-configuration#radio-contact-table-vs-meshmonitor).
+
+### Per-Source Settings {#per-source-settings}
+
+Default path hash size, infrastructure node age and more. See [Per-Source Settings](/features/meshcore-configuration#per-source-settings).
+
+### Map {#nodes}
+
+The map and node list. See [Map](/features/meshcore-using#nodes).
+
+### Channels {#channels}
+
+Channel messages, unread markers, heard repeaters, delivery marks and Resend. See [Channels](/features/meshcore-using#channels).
+
+### Contact location override {#contact-location-override}
+
+Pin a contact to a position you choose. See [Contact location override](/features/meshcore-using#contact-location-override).
+
+### Message route line {#message-route-line}
+
+The relay path under each received message. See [Message route line](/features/meshcore-using#message-route-line).
+
+### Contact tokens (MeshCore One) {#contact-tokens}
+
+Share and import contacts inside messages. See [Contact tokens](/features/meshcore-using#contact-tokens).
+
+### Send under another name (API) {#api-sender-names}
+
+Let API callers post under names you list. See [Send under another name](/features/meshcore-using#api-sender-names).
+
+### Reactions {#reactions}
+
+Emoji reactions from MeshCore One and meshcore-open. See [Reactions](/features/meshcore-using#reactions).
+
+### Packet Monitor {#packet-monitor}
+
+Raw frames your radio hears. See [Packet Monitor](/features/meshcore-using#packet-monitor).
+
+### Decoding channel packets {#decoding-channel-packets}
+
+Open encrypted channel packets in Packet Decode. See [Decoding channel packets](/features/meshcore-using#decoding-channel-packets).
+
+### Trace SNR History {#trace-snr-history}
+
+Per-hop SNR from every trace your radio hears. See [Trace SNR History](/features/meshcore-paths#trace-snr-history).
+
+### Adverts {#adverts}
+
+Zero-hop and flood adverts and what they cost. See [Adverts](/features/meshcore-paths#adverts).
+
+### Automated flood limit {#automated-flood-limit}
+
+Automated flood adverts are capped at one per hour per source. See [Automated flood limit](/features/meshcore-paths#automated-flood-limit).
+
+### Regions / Scopes {#regions-scopes}
+
+Tag outgoing floods with a region so repeaters that drop unscoped traffic forward them. See [Regions / Scopes](/features/meshcore-paths#regions-scopes).
+
+### Setting a scope {#setting-a-scope}
+
+Per-channel, per-source and per-message scopes. See [Setting a scope](/features/meshcore-paths#setting-a-scope).
+
+### Remote settings {#remote-settings}
+
+Read and change a remote Repeater or Room Server's settings from a form. See [Remote settings](/features/meshcore-remote-admin#remote-settings).
+
+### Remote Administration {#remote-administration}
+
+Log in to repeaters and room servers and run CLI commands. See [Remote Administration](/features/meshcore-remote-admin#remote-administration).
+
+### Companion remote CLI {#companion-remote-cli}
+
+Run CLI commands on another Companion with no login. See [Companion remote CLI](/features/meshcore-remote-admin#companion-remote-cli).
+
+### Credential store {#credential-store}
+
+How MeshMonitor encrypts saved node passwords. See [Credential store](/features/meshcore-remote-admin#credential-store).
+
+### CLI command history {#cli-command-history}
+
+Every CLI command sent through MeshMonitor, with its reply. See [CLI command history](/features/meshcore-remote-admin#cli-command-history).

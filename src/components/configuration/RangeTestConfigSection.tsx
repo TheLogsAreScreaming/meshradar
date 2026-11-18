@@ -1,6 +1,7 @@
-import React, { useRef, useMemo, useCallback } from 'react';
+import React, { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
@@ -8,8 +9,11 @@ import { UiIcon } from '../icons';
 import styles from './RangeTestConfigSection.module.css';
 import ModuleAvailabilityNotice from './ModuleAvailabilityNotice';
 import { useModuleExcluded } from './moduleAvailabilityContext';
+import { ConfigSection } from '../shared/config/ConfigSection';
 
 interface RangeTestConfigSectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
   enabled: boolean;
   setEnabled: (value: boolean) => void;
   sender: number;
@@ -25,10 +29,12 @@ interface RangeTestConfigSectionProps {
    */
   isDisabled?: boolean;
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
 }
 
 const RangeTestConfigSection: React.FC<RangeTestConfigSectionProps> = ({
+  canWrite = true,
   enabled,
   setEnabled,
   sender,
@@ -45,36 +51,23 @@ const RangeTestConfigSection: React.FC<RangeTestConfigSectionProps> = ({
   // stays hidden: two notices saying the same thing read as noise.
   const gateExcluded = useModuleExcluded();
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // What the node holds; moves on a successful save (#5797)
+  const values = {
     enabled, sender, save
-  });
-
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      enabled !== initial.enabled ||
-      sender !== initial.sender ||
-      save !== initial.save
-    );
-  }, [enabled, sender, save]);
+  };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values);
 
   // Reset to initial values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setEnabled(initial.enabled);
-    setSender(initial.sender);
-    setSave(initial.save);
-  }, [setEnabled, setSender, setSave]);
+    setEnabled(baseline.enabled);
+    setSender(baseline.sender);
+    setSave(baseline.save);
+  }, [baseline, setEnabled, setSender, setSave]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      enabled, sender, save
-    };
-  }, [onSave, enabled, sender, save]);
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Register with SaveBar. A removed module must never offer a save — the
   // firmware would drop the admin message silently.
@@ -91,26 +84,7 @@ const RangeTestConfigSection: React.FC<RangeTestConfigSectionProps> = ({
 
   return (
     <NumberInputScope scope={numberScope}>
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('rangetest_config.title')}
-        <a
-          href="https://meshtastic.org/docs/configuration/module/range-test/"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('rangetest_config.view_docs')}
-        >
-          ?
-        </a>
-      </h3>
-      <ModuleAvailabilityNotice
-        detail={isDisabled ? t('rangetest_config.removed_in_28_detail', 'It was removed from Meshtastic firmware in 2.8.') : undefined}
-      />
+    <ConfigSection canWrite={canWrite} title={t('rangetest_config.title')} docsUrl="https://meshtastic.org/docs/configuration/module/range-test/" notice={<ModuleAvailabilityNotice detail={isDisabled ? t('rangetest_config.removed_in_28_detail', 'It was removed from Meshtastic firmware in 2.8.') : undefined} />}>
 
       {isDisabled && !gateExcluded && (
         <div className={styles.removedNotice} role="status">
@@ -185,7 +159,7 @@ const RangeTestConfigSection: React.FC<RangeTestConfigSectionProps> = ({
           </>
         )}
       </div>
-    </div>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

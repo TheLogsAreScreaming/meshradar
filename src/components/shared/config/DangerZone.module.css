@@ -1,0 +1,65 @@
+/*
+ * DangerZone (#5830). CSS module, per the CLAUDE.md CSS containment rule.
+ * Colours are role tokens only.
+ */
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+/* Three classes keep these above a page-wide `.x button` rule in every
+   state: MeshCore's `.meshcore-form-view button` (0,1,1; 0,2,1 on :hover and
+   :disabled) painted the danger buttons purple (#4173 review L27). The
+   buttons always sit in DangerZone > DangerZoneActions. */
+.body .actions .dangerButton,
+.body .actions .plainButton {
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.6rem 1.2rem;
+  border-radius: 4px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.body .actions .dangerButton {
+  background: transparent;
+  color: var(--color-error);
+  border: 1px solid var(--color-error);
+}
+
+.body .actions .dangerButton:hover:not(:disabled) {
+  background: var(--color-error);
+  color: var(--color-bg);
+}
+
+.body .actions .plainButton {
+  background: transparent;
+  color: var(--color-text);
+  border: 1px solid var(--color-surface-active);
+}
+
+.body .actions .plainButton:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+}
+
+.body .actions .dangerButton:disabled,
+.body .actions .plainButton:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.footer {
+  color: var(--color-text-subtle);
+  font-size: 0.9rem;
+}

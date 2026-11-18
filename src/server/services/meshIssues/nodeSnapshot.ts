@@ -22,6 +22,9 @@
  * what the WP2 zero-`databaseService`-import gate checks).
  */
 import { getEffectiveDbNodePosition } from '../../utils/nodeEnhancer.js';
+import { isBogusPosition, isValidLatLng } from '../../../utils/nullIsland.js';
+import { INFRA_ROLES } from './thresholds.js';
+import { nodeSubjectKey, meshcoreSubjectKey, type MeshIssueProtocol } from './types.js';
 
 export interface PooledNodeInput {
   nodeNum: number | string;
@@ -58,6 +61,34 @@ export interface PooledNodeInput {
   keySecurityIssueDetails?: string | null;
   isTimeOffsetIssue?: boolean | number | null;
   timeOffsetSeconds?: number | null;
+  /** This row is the source's own local node (#6279). */
+  isLocal?: boolean | null;
+}
+
+/** What a node last REPORTED (raw pair, overrides ignored): nothing, a usable fix, or junk. */
+export type ReportedPosition = 'none' | 'valid' | 'bogus';
+
+/**
+ * Classify a raw reported lat/lon pair (#6279). `'none'` when either axis is
+ * missing; `'bogus'` for an out-of-range or Null Island pair (precision-offset
+ * aware); otherwise `'valid'`.
+ */
+export function classifyReportedPosition(
+  lat: number | null | undefined,
+  lon: number | null | undefined,
+  precisionBits?: number | null,
+): ReportedPosition {
+  if (lat == null || lon == null) return 'none';
+  if (isBogusPosition(lat, lon, precisionBits)) return 'bogus';
+  return isValidLatLng(lat, lon) ? 'valid' : 'bogus';
+}
+
+/** Why a bogus pair is bogus, for A9 evidence (no coordinates leave the server). */
+export function bogusPositionKind(
+  lat: number | null | undefined,
+  lon: number | null | undefined,
+): 'null_island' | 'out_of_range' {
+  return isValidLatLng(lat, lon) ? 'null_island' : 'out_of_range';
 }
 
 export interface PooledNode {
@@ -82,6 +113,19 @@ export interface PooledNode {
    * asset as mobile; `mobile` itself stays the persisted heuristic value.
    */
   asset?: boolean;
+  /**
+   * Protocol family (#6263 S5). Absent means Meshtastic, so every pre-S5
+   * caller and fixture keeps its meaning. MeshCore nodes are pooled by
+   * lowercased public key in `meshcoreSnapshot.ts`; their `nodeNum` is a
+   * run-local negative handle for the rule maps, never persisted.
+   */
+  protocol?: MeshIssueProtocol;
+  /** MeshCore lowercased 64-hex public key. Set only when `protocol` is 'meshcore'. */
+  nodeKey?: string;
+  /** Explicit infra flag. Absent: derive from `role` (Meshtastic `INFRA_ROLES`). */
+  infra?: boolean;
+  /** MeshCore advert type (1 companion, 2 repeater, 3 room server). */
+  advType?: number | null;
   /** max across rows — the freshness proxy; see module header. */
   lastHeardMs: number | null;
   sourceIds: string[]; // sorted, deduped
@@ -105,6 +149,71 @@ export interface PooledNode {
   keySecurityIssueDetails: string | null;
   isTimeOffsetIssue: boolean;
   timeOffsetSeconds: number | null;
+  // Node-health fields (#6279). Optional so pre-existing fixtures keep compiling.
+  /** Freshest row's RAW reported pair (override ignored). Absent means 'none'. */
+  reportedPosition?: ReportedPosition;
+  /** Why the raw pair is bogus; null otherwise. Set with `reportedPosition`. */
+  bogusPositionKind?: 'null_island' | 'out_of_range' | null;
+  /** Any row has an enabled position override with coordinates. */
+  hasPositionOverride?: boolean;
+  /** MeshCore: freshest non-null `lastAdvertHadPosition`; null for Meshtastic. */
+  advertHadPosition?: boolean | null;
+  /** Any row is a source's own local node. */
+  isLocal?: boolean;
+}
+
+/** True for a MeshCore-pooled node. */
+export function isMeshCoreNode(node: PooledNode): boolean {
+  return node.protocol === 'meshcore';
+}
+
+/** Protocol of a pooled node; absent means Meshtastic. */
+export function protocolOf(node: PooledNode): MeshIssueProtocol {
+  return node.protocol ?? 'meshtastic';
+}
+
+/**
+ * Infrastructure node? `infra` wins when set (MeshCore: advType in {2,3});
+ * otherwise the Meshtastic role set decides.
+ */
+export function isInfraNode(node: PooledNode): boolean {
+  if (node.infra !== undefined) return node.infra;
+  return node.role != null && INFRA_ROLES.has(node.role);
+}
+
+/**
+ * Canonical finding subjectKey for a pooled node: `mc:<pk>` for MeshCore,
+ * `node:<nodeNum>` for Meshtastic.
+ */
+export function subjectKeyFor(node: PooledNode): string {
+  if (isMeshCoreNode(node) && node.nodeKey) return meshcoreSubjectKey(node.nodeKey);
+  return nodeSubjectKey(node.nodeNum);
+}
+
+/** `nodeNum` to persist on a finding: null for MeshCore (no real number). */
+export function persistedNodeNum(node: PooledNode): number | null {
+  return isMeshCoreNode(node) ? null : node.nodeNum;
+}
+
+/**
+ * Cut `nodes` to those whose protocol is in `protocols`. Returns the SAME map
+ * when nothing would be removed, so a Meshtastic-only run is untouched.
+ */
+export function nodesForProtocols(
+  nodes: Map<number, PooledNode>,
+  protocols: readonly MeshIssueProtocol[],
+): Map<number, PooledNode> {
+  let drop = false;
+  for (const n of nodes.values()) {
+    if (!protocols.includes(protocolOf(n))) {
+      drop = true;
+      break;
+    }
+  }
+  if (!drop) return nodes;
+  const out = new Map<number, PooledNode>();
+  for (const [k, n] of nodes) if (protocols.includes(protocolOf(n))) out.set(k, n);
+  return out;
 }
 
 /** `lastHeard` is unix seconds in this schema; below 1e12 it must be *1000. */
@@ -149,6 +258,32 @@ function effectivePositionPair(row: PooledNodeInput): { latitude: number; longit
   const eff = getEffectiveDbNodePosition(row);
   if (eff.latitude == null || eff.longitude == null) return null;
   return { latitude: eff.latitude, longitude: eff.longitude };
+}
+
+/** A row's enabled position override with both coordinates present. */
+export function rowHasPositionOverride(row: {
+  positionOverrideEnabled?: boolean | number | null;
+  latitudeOverride?: number | null;
+  longitudeOverride?: number | null;
+}): boolean {
+  return !!row.positionOverrideEnabled && row.latitudeOverride != null && row.longitudeOverride != null;
+}
+
+/** Classify the freshest row that carries a raw (non-override) lat/lon pair. */
+function reportedPositionOf(sorted: PooledNodeInput[]): {
+  reportedPosition: ReportedPosition;
+  bogusPositionKind: 'null_island' | 'out_of_range' | null;
+} {
+  for (const r of sorted) {
+    if (r.latitude != null && r.longitude != null) {
+      const reportedPosition = classifyReportedPosition(r.latitude, r.longitude, r.positionPrecisionBits);
+      return {
+        reportedPosition,
+        bogusPositionKind: reportedPosition === 'bogus' ? bogusPositionKind(r.latitude, r.longitude) : null,
+      };
+    }
+  }
+  return { reportedPosition: 'none', bogusPositionKind: null };
 }
 
 /** The non-null value with the greatest ABSOLUTE magnitude, or null when
@@ -247,6 +382,10 @@ export function buildPooledNodeSnapshot(rows: PooledNodeInput[]): Map<number, Po
       keySecurityIssueDetails: firstNonNull(sorted, (r) => r.keySecurityIssueDetails),
       isTimeOffsetIssue: groupRows.some((r) => !!r.isTimeOffsetIssue),
       timeOffsetSeconds: maxAbsValue(timeOffsetValues),
+      ...reportedPositionOf(sorted),
+      hasPositionOverride: groupRows.some(rowHasPositionOverride),
+      advertHadPosition: null,
+      isLocal: groupRows.some((r) => !!r.isLocal),
     });
   }
   return result;
@@ -267,6 +406,8 @@ export interface NodeTelemetrySeries {
   channelUtilization: TelemetrySample[];
   batteryLevel: TelemetrySample[];
   uptimeSeconds: TelemetrySample[];
+  /** Battery in millivolts, always mV (MeshCore volts are scaled on the way in). #6279 */
+  batteryMv: TelemetrySample[];
 }
 
 export const MESH_ISSUE_TELEMETRY_TYPES = [
@@ -275,10 +416,13 @@ export const MESH_ISSUE_TELEMETRY_TYPES = [
   'batteryLevel',
   'uptimeSeconds',
 ] as const;
-export type MeshIssueTelemetryType = (typeof MESH_ISSUE_TELEMETRY_TYPES)[number];
+/** Series keys the builder accepts: the Meshtastic DB types plus the always-mV
+ *  `batteryMv` the MeshCore adapter synthesises (#6279; not a DB telemetry type). */
+const SERIES_TELEMETRY_TYPES = [...MESH_ISSUE_TELEMETRY_TYPES, 'batteryMv'] as const;
+export type MeshIssueTelemetryType = (typeof SERIES_TELEMETRY_TYPES)[number];
 
 function emptySeries(): NodeTelemetrySeries {
-  return { airUtilTx: [], channelUtilization: [], batteryLevel: [], uptimeSeconds: [] };
+  return { airUtilTx: [], channelUtilization: [], batteryLevel: [], uptimeSeconds: [], batteryMv: [] };
 }
 
 export interface TelemetryRowInput {
@@ -305,7 +449,7 @@ export interface TelemetryRowInput {
  * to this module).
  */
 export function buildTelemetrySeries(rows: TelemetryRowInput[]): Map<number, NodeTelemetrySeries> {
-  const knownTypes: readonly string[] = MESH_ISSUE_TELEMETRY_TYPES;
+  const knownTypes: readonly string[] = SERIES_TELEMETRY_TYPES;
   const byNode = new Map<number, TelemetryRowInput[]>();
   for (const row of rows) {
     if (!knownTypes.includes(row.telemetryType)) continue;

@@ -32,8 +32,15 @@ interface MockChildProps {
   children?: ReactNode;
 }
 
+interface MockMarkerProps extends MockChildProps {
+  position?: [number, number];
+  icon?: { options?: { html?: string } };
+}
+
 vi.mock('react-leaflet', () => ({
-  Marker: (props: MockChildProps) => <div data-testid="marker">{props.children}</div>,
+  Marker: (props: MockMarkerProps) => (
+    <div data-testid="marker" data-html={props.icon?.options?.html ?? ''} data-position={String(props.position ?? '')}>{props.children}</div>
+  ),
   Tooltip: (props: MockChildProps) => <div data-testid="tooltip">{props.children}</div>,
   Popup: (props: MockChildProps) => <div data-testid="popup">{props.children}</div>,
   GeoJSON: () => <div data-testid="geojson" />,
@@ -463,5 +470,82 @@ describe('EmbedMap neighbor-link adapter (#4047 P7 §4.1)', () => {
     // Give any stray async fetch/render a tick, then assert it never rendered.
     await new Promise((r) => setTimeout(r, 0));
     expect(neighborLinksSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('EmbedMap MeshCore nodes (#5999)', () => {
+  it('draws two MeshCore nodes (nodeNum 0) as two markers next to a Meshtastic node, with the MeshCore role label', async () => {
+    mockFetchSequence({
+      nodes: [
+        { nodeNum: 111, nodeId: '!0000006f', user: { longName: 'Mesh Alpha', shortName: 'MA', hwModel: 9 },
+          position: { latitude: 40, longitude: -105 }, role: 0, channel: 0 },
+        { nodeNum: 0, nodeId: 'mc:aaaaaaaaaaaaaaaa', isMeshCore: true, advType: 2,
+          user: { longName: 'Core Repeater', shortName: 'Core' }, position: { latitude: 40.1, longitude: -105.1 } },
+        { nodeNum: 0, nodeId: 'mc:bbbbbbbbbbbbbbbb', isMeshCore: true, advType: 1,
+          user: { longName: 'Core Companion', shortName: 'Core' }, position: { latitude: 40.2, longitude: -105.2 } },
+      ],
+    });
+    const consoleError = vi.spyOn(console, 'error');
+    await renderEmbedMap();
+    await waitFor(() => expect(screen.getAllByTestId('marker')).toHaveLength(3));
+    // Keyed by their `mc:` ids, not the shared nodeNum 0.
+    expect(consoleError.mock.calls.some((c) => String(c[0]).includes('same key'))).toBe(false);
+    expect(screen.getByText('Repeater')).toBeInTheDocument();
+    expect(screen.getByText('Companion')).toBeInTheDocument();
+    // A MeshCore node has no channel: no "Ch" row in its popup.
+    expect(screen.getAllByText(/^Ch \d$/)).toHaveLength(1);
+  });
+});
+
+describe('EmbedMap Meshtastic role markers (#6008)', () => {
+  it('draws CLIENT_BASE as the base glyph and TRACKER with its corner badge', async () => {
+    mockFetchSequence({
+      nodes: [
+        { nodeNum: 201, nodeId: '!000000c9', user: { longName: 'Base', shortName: 'BS', hwModel: 9 },
+          position: { latitude: 40, longitude: -105 }, role: 12, channel: 0 },
+        { nodeNum: 202, nodeId: '!000000ca', user: { longName: 'Tracker', shortName: 'TR', hwModel: 9 },
+          position: { latitude: 40.1, longitude: -105.1 }, role: 5, channel: 0 },
+      ],
+    });
+    await renderEmbedMap();
+    await waitFor(() => expect(screen.getAllByTestId('marker')).toHaveLength(2));
+    const [base, tracker] = screen.getAllByTestId('marker').map((m) => m.getAttribute('data-html') ?? '');
+    // The white door rect is unique to the CLIENT_BASE glyph.
+    expect(base).toContain('<rect x="21" y="32" width="6" height="10" fill="white" />');
+    expect(base).not.toContain('data-role-badge');
+    expect(tracker).toContain('data-role-badge="tracker"');
+  });
+});
+
+describe('EmbedMap public-instance mode (#5156)', () => {
+  const publicInstance = {
+    enabled: true, hideLongNames: true, hidePublicKeys: true, roundTimestamps: true, hideMessageText: true,
+  };
+  // Two nodes in one coarse cell, heard 10 minutes ago.
+  const heard = Math.floor(Date.now() / 1000) - 600;
+  const pair = [
+    { nodeNum: 1, nodeId: '!00000001', user: { shortName: 'A' }, position: { latitude: 40, longitude: -105 }, lastHeard: heard },
+    { nodeNum: 2, nodeId: '!00000002', user: { shortName: 'B' }, position: { latitude: 40, longitude: -105 }, lastHeard: heard },
+  ];
+  const positions = () => (screen.getAllByTestId('marker') as HTMLElement[]).map((m) => m.dataset.position);
+
+  it('shows coarse ages and spreads same-cell markers when the mode is on', async () => {
+    mockFetchSequence({ config: baseConfig({ publicInstance }), nodes: pair });
+    await renderEmbedMap();
+    await waitFor(() => expect(screen.getAllByTestId('marker')).toHaveLength(2));
+    expect(screen.getAllByText('(within the last hour)').length).toBe(2);
+    const [a, b] = positions();
+    expect(a).not.toBe(b);
+  });
+
+  it('changes nothing when the mode is off or the server does not report it', async () => {
+    for (const cfg of [baseConfig({ publicInstance: { ...publicInstance, enabled: false } }), baseConfig()]) {
+      mockFetchSequence({ config: cfg, nodes: pair });
+      await renderEmbedMap();
+      await waitFor(() => expect(screen.getAllByTestId('marker')).toHaveLength(2));
+      expect(screen.getAllByText('(10m ago)').length).toBe(2);
+      expect(new Set(positions())).toEqual(new Set(['40,-105']));
+      cleanup();
+    }
   });
 });

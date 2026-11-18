@@ -11,7 +11,10 @@
  */
 
 import { HOP_LIMIT_OVERRIDE_MAX, parseHopLimitOverride } from '../utils/hopLimitOverride.js';
+import { tracePathScheduleParamErrors } from './tracePathSchedule.js';
+import { readScheduleWindow } from './scheduleWindow.js';
 import { isMeshCoreAdvertMode } from './meshcoreAdvert.js';
+import { parseClockThresholdSeconds, CLOCK_OUT_OF_SYNC_MIN_SECONDS, CLOCK_OUT_OF_SYNC_MAX_SECONDS } from '../utils/clockOutOfSync.js';
 
 export const AUTOMATION_CONFIG_VERSION = 1;
 
@@ -33,7 +36,9 @@ export type TriggerType =
   | 'trigger.nodeRebooted'
   | 'trigger.nodePowerChanged'
   | 'trigger.batteryTrend'
-  | 'trigger.becameLikelyAircraft';
+  | 'trigger.becameLikelyAircraft'
+  | 'trigger.clockOutOfSync'
+  | 'trigger.neighborAdded';
 
 export type ConditionType =
   | 'condition.always'
@@ -52,6 +57,7 @@ export type ActionType =
   | 'action.tapback'
   | 'action.nodeManage'
   | 'action.requestData'
+  | 'action.tracePathSchedule'
   | 'action.deviceReboot'
   | 'action.notify'
   | 'action.runScript'
@@ -89,7 +95,14 @@ export const TRIGGER_TYPES: readonly TriggerType[] = [
   'trigger.nodePowerChanged',
   'trigger.batteryTrend',
   'trigger.becameLikelyAircraft',
+  'trigger.neighborAdded',
+  'trigger.clockOutOfSync',
 ];
+
+/** `trigger.neighborAdded` confirmation window, in hours (#6274). */
+export const NEIGHBOR_CONFIRM_HOURS_DEFAULT = 72;
+export const NEIGHBOR_CONFIRM_HOURS_MIN = 6;
+export const NEIGHBOR_CONFIRM_HOURS_MAX = 336;
 
 export const CONDITION_TYPES: readonly ConditionType[] = [
   'condition.always',
@@ -109,6 +122,7 @@ export const ACTION_TYPES: readonly ActionType[] = [
   'action.tapback',
   'action.nodeManage',
   'action.requestData',
+  'action.tracePathSchedule',
   'action.deviceReboot',
   'action.notify',
   'action.runScript',
@@ -200,6 +214,35 @@ export type CooldownScope = (typeof COOLDOWN_SCOPES)[number];
  */
 export function parseCooldownScope(raw: unknown): CooldownScope {
   return COOLDOWN_SCOPES.includes(raw as CooldownScope) ? (raw as CooldownScope) : 'automation';
+}
+
+/**
+ * Floor on how often a `trigger.telemetry` automation may fire. Telemetry is
+ * the busiest event the engine sees (about 5 readings per device-metrics
+ * packet, every node, every source), and a saved cooldown defaults to 0, so
+ * without a floor one rule could act on every reading. The engine raises any
+ * shorter cooldown to this, per node. User decision, not a tuning knob.
+ */
+export const TELEMETRY_TRIGGER_MIN_COOLDOWN_SECONDS = 3600;
+
+/**
+ * The cooldown the engine actually applies to a `trigger.telemetry` automation.
+ *
+ * - Seconds: at least {@link TELEMETRY_TRIGGER_MIN_COOLDOWN_SECONDS}.
+ * - Scope: per node. `sourceNode` becomes `node` (one node heard on two sources
+ *   still fires once). `automation` is kept only when the user set a positive
+ *   cooldown, since one window for the whole rule is already stricter than one
+ *   per node; an unset cooldown parses to `automation` and becomes `node`.
+ */
+export function effectiveTelemetryCooldown(
+  cooldownSeconds: number,
+  scope: CooldownScope,
+): { cooldownSeconds: number; cooldownScope: CooldownScope } {
+  const seconds = Number.isFinite(cooldownSeconds) && cooldownSeconds > 0 ? cooldownSeconds : 0;
+  return {
+    cooldownSeconds: Math.max(seconds, TELEMETRY_TRIGGER_MIN_COOLDOWN_SECONDS),
+    cooldownScope: scope === 'automation' && seconds > 0 ? 'automation' : 'node',
+  };
 }
 
 /**
@@ -390,8 +433,9 @@ export interface ValidationResult {
   valid: boolean;
   errors: string[];
   /**
-   * Non-blocking findings (#5636): `{{ steps.* }}` references that will, or
-   * may, render empty. Present only when valid and there is something to say.
+   * Non-blocking findings: `{{ steps.* }}` references that will, or may,
+   * render empty (#5636), and actions whose text is empty (#5697). Present
+   * only when valid and there is something to say.
    */
   warnings?: string[];
   /** Present only when valid. */
@@ -607,6 +651,59 @@ export function analyzeStepOutputRefs(graph: Pick<AutomationGraph, 'nodes' | 'ed
   return out;
 }
 
+/** An action field left empty so the step sends nothing, or less than intended (#5697). */
+export interface EmptySendFinding {
+  /** Params that are empty. */
+  fields: string[];
+  /** true = the step sends nothing at all; false = it sends, but without this text. */
+  sendsNothing: boolean;
+  /** Builder copy, without the node prefix. */
+  detail: string;
+}
+
+const isBlankParam = (v: unknown): boolean => v == null || (typeof v === 'string' && v.trim() === '');
+
+/**
+ * What an action block will leave out because a text field is empty (#5697).
+ * Mirrors the engine's empty-send rule (#5636, actionExecutor): only literal
+ * emptiness is caught here; a template whose tokens render empty is the
+ * run-time rule's job. Absent params that the engine defaults (a notification
+ * title, a tapback emoji) are not empty.
+ */
+export function emptySendFinding(type: string, params: Record<string, unknown> | undefined): EmptySendFinding | undefined {
+  const p = params ?? {};
+  switch (type) {
+    case 'action.sendMessage':
+      return isBlankParam(p.text)
+        ? { fields: ['text'], sendsNothing: true, detail: 'the message is empty, so this step will send nothing' }
+        : undefined;
+    case 'action.notify': {
+      // An absent title falls back to "MeshRadar automation"; a blank one stays blank.
+      const titleBlank = typeof p.title === 'string' && p.title.trim() === '';
+      if (!isBlankParam(p.body)) return undefined;
+      return titleBlank
+        ? { fields: ['title', 'body'], sendsNothing: true, detail: 'the title and body are empty, so this step will send nothing' }
+        : { fields: ['body'], sendsNothing: false, detail: 'the body is empty, so the notification will carry only its title' };
+    }
+    case 'action.tapback':
+      return p.emojiMode !== 'hopCount' && typeof p.emoji === 'string' && p.emoji.trim() === ''
+        ? { fields: ['emoji'], sendsNothing: true, detail: 'the emoji is empty, so this step will send nothing' }
+        : undefined;
+    default:
+      return undefined;
+  }
+}
+
+/** Every action in `graph` with an empty text field (#5697), as save warnings. */
+export function analyzeEmptySends(graph: Pick<AutomationGraph, 'nodes'>): string[] {
+  const out: string[] = [];
+  for (const n of graph.nodes ?? []) {
+    const f = emptySendFinding(n.type, n.params);
+    if (f) out.push(`${n.type} "${n.id}": ${f.detail}`);
+  }
+  return out;
+}
+
 /**
  * Every source an action.setSourceForwardingEnabled block in `graph` targets
  * (#5537), deduped. Automations are global and run as the system, so the save
@@ -803,6 +900,11 @@ export function validateAutomationGraph(input: unknown): ValidationResult {
       // (which would silently miss any trigger type added later). Optional:
       // absent/unset = 'automation', the pre-4.14 behaviour every stored automation
       // depends on — same contract as action.tapback's emojiMode.
+      // Start/end window of a scheduled rule (#5515). Optional: a rule with no
+      // dates has no window, which is every rule saved before it existed.
+      if (n.type === 'trigger.schedule') {
+        for (const e of readScheduleWindow(p).errors) errors.push(`trigger.schedule "${n.id}": ${e}`);
+      }
       if (categoryOf(n.type) === 'trigger'
           && p.cooldownScope != null
           && !COOLDOWN_SCOPES.includes(p.cooldownScope as CooldownScope)) {
@@ -870,6 +972,11 @@ export function validateAutomationGraph(input: unknown): ValidationResult {
             errors.push(`action.requestData "${n.id}" requires params.advertMode ∈ {zero_hop,flood}`);
           }
           break;
+        case 'action.tracePathSchedule':
+          // #5723: per-path interval floor and path count are enforced at save
+          // (and again at run time, from persisted state).
+          for (const e of tracePathScheduleParamErrors(n.id, p)) errors.push(e);
+          break;
         case 'action.tapback':
           // Optional. Absent/unset = 'fixed' — every pre-existing stored automation
           // must keep validating and behaving exactly as before.
@@ -935,6 +1042,26 @@ export function validateAutomationGraph(input: unknown): ValidationResult {
           const dir = p.direction == null || p.direction === '' ? 'either' : String(p.direction);
           if (!['lost', 'restored', 'either'].includes(dir)) {
             errors.push(`trigger.nodePowerChanged "${n.id}" requires params.direction to be one of: lost, restored, either`);
+          }
+          break;
+        }
+        case 'trigger.neighborAdded': {
+          // Confirmed new neighbour (#6274). Blank means the default (72 h); a set
+          // value must be a whole number of hours inside the supported range.
+          if (p.confirmHours != null && p.confirmHours !== '') {
+            const h = Number(p.confirmHours);
+            if (!Number.isInteger(h) || h < NEIGHBOR_CONFIRM_HOURS_MIN || h > NEIGHBOR_CONFIRM_HOURS_MAX) {
+              errors.push(`trigger.neighborAdded "${n.id}" requires params.confirmHours to be a whole number from ${NEIGHBOR_CONFIRM_HOURS_MIN} to ${NEIGHBOR_CONFIRM_HOURS_MAX}`);
+            }
+          }
+          break;
+        }
+        case 'trigger.clockOutOfSync': {
+          // #6273. A blank threshold means the default (300 s); a value must be
+          // a whole number of seconds in the range the sampling can resolve.
+          const raw = p.thresholdSeconds;
+          if (raw != null && raw !== '' && parseClockThresholdSeconds(raw) == null) {
+            errors.push(`trigger.clockOutOfSync "${n.id}" requires params.thresholdSeconds to be a whole number from ${CLOCK_OUT_OF_SYNC_MIN_SECONDS} to ${CLOCK_OUT_OF_SYNC_MAX_SECONDS}`);
           }
           break;
         }
@@ -1033,6 +1160,10 @@ export function validateAutomationGraph(input: unknown): ValidationResult {
   const graph = input as unknown as AutomationGraph;
   // Non-blocking, like the builder's token hints: an empty reference is safe
   // (it renders '' and an empty message is not sent), so it must not stop a save.
-  const warnings = analyzeStepOutputRefs(graph).map((d) => d.message);
+  const warnings = [
+    ...analyzeStepOutputRefs(graph).map((d) => d.message),
+    // #5697: an empty message is allowed (the user may be drafting) but never silent.
+    ...analyzeEmptySends(graph),
+  ];
   return { valid: true, errors: [], ...(warnings.length > 0 ? { warnings } : {}), graph };
 }

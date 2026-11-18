@@ -13,20 +13,45 @@ import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
 import { requireAuth, optionalAuth, requirePermission } from '../auth/authMiddleware.js';
 import { validateAutoAckRegex } from '../utils/autoAckRegex.js';
+import { validateResponderTrigger } from '../utils/autoResponderMatcher.js';
+import { isResponderSyntax, resolveResponderSyntax } from '../../utils/responderTrigger.js';
 import { meshcoreDeviceLimiter } from '../middleware/rateLimiters.js';
 import { resolveAutoAckPreSendDelaySeconds } from '../autoAckDelay.js';
 import { compileUserRegex } from '../../utils/safeRegex.js';
 import { ok, fail } from '../utils/apiResponse.js';
+import { findSplitTimerTooFrequent, findTimerTooManyChannels } from '../utils/timerSplitGuard.js';
+import { MESHCORE_TIMER_MAX_CHANNELS } from '../../utils/messageSplitLimits.js';
+import { MESHCORE_SPLIT_TIMER_MIN_INTERVAL_MINUTES } from '../../utils/meshcoreMessageLimits.js';
+import { parseAutoPingSettingsUpdate, readAutoPingSettings } from '../utils/autoPingSettings.js';
+import { autoDeleteByDistanceService } from '../services/autoDeleteByDistanceService.js';
+import {
+  AUTO_FAVORITE_MIN_INTERVAL_HOURS,
+  AUTO_FAVORITE_MAX_INTERVAL_HOURS,
+  AUTO_FAVORITE_MIN_STALE_HOURS,
+  AUTO_FAVORITE_MAX_STALE_HOURS,
+  AUTO_FAVORITE_DEFAULT_INTERVAL_HOURS,
+  AUTO_FAVORITE_DEFAULT_STALE_HOURS,
+} from '../services/meshcoreAutoFavorite.js';
+import {
+  readAutoWelcomeSettings,
+  AUTO_WELCOME_MAX_HOPS_CEIL,
+  AUTO_WELCOME_MAX_DELAY_SECONDS,
+  AUTO_WELCOME_MIN_PER_HOUR,
+  AUTO_WELCOME_MAX_PER_HOUR,
+} from '../services/meshcoreAutoWelcome.js';
 import { MESHCORE_ADVERT_MODES, isMeshCoreAdvertMode, resolveMeshCoreAdvertMode } from '../../types/meshcoreAdvert.js';
 import type { MeshcorePathfindingFilterSettings } from '../../services/database.js';
 import { managerFor, requireMeshcoreTx, failIfTxDisabled } from './meshcoreRouteShared.js';
 import { extendRequestTimeout } from '../middleware/requestTimeout.js';
+import { keepServerRunState, parseStoredTriggers } from '../utils/timerRunState.js';
 
 // Manual announce-send / timer-run routes trigger a radio send + wait that
 // can legitimately run past the 30s default socket timeout; extend it so
 // the caller gets the real result instead of a dropped-socket 504.
 /** Manual announce send / timer run: broadcast + multi-hop settle window. */
-const MANUAL_AUTOMATION_RUN_TIMEOUT_MS = 120_000;
+// 180 s: a split 4-channel timer test takes ~110 s of gaps (M5: 10 s between
+// channels, 10 s between parts) before any lock wait.
+const MANUAL_AUTOMATION_RUN_TIMEOUT_MS = 180_000;
 
 const router = Router({ mergeParams: true });
 
@@ -120,6 +145,547 @@ router.post(
     } catch (error) {
       logger.error('[API] Error saving auto-pathfinding settings:', error);
       res.status(500).json({ success: false, error: 'Failed to save auto-pathfinding settings' });
+    }
+  },
+);
+
+// ============ Auto Ping (#5953) ============
+//
+// `ping N` DM sessions, Companion sources only. Same per-source keys and
+// ranges as the Meshtastic `/api/settings/auto-ping` route
+// (utils/autoPingSettings.ts). Saving writes settings only: it never starts,
+// restarts or re-arms a session; sessions start from a received DM.
+
+router.get(
+  '/automation/auto-ping',
+  optionalAuth(),
+  requirePermission('automation', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const mgr = managerFor(req, res);
+      const sourceId = (req.params as { id?: string }).id!;
+      const settings = await readAutoPingSettings((key) => databaseService.settings.getSettingForSource(sourceId, key));
+      ok(res, { settings, sessions: mgr.getAutoPingSessions() });
+    } catch (error) {
+      logger.error('[API] Error reading meshcore auto-ping settings:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to read auto-ping settings');
+    }
+  },
+);
+
+router.post(
+  '/automation/auto-ping',
+  requireAuth(),
+  requirePermission('automation', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      const parsed = parseAutoPingSettingsUpdate(req.body);
+      if (!parsed.ok) {
+        return fail(res, 400, parsed.code, parsed.message);
+      }
+      for (const [key, value] of parsed.updates) {
+        await databaseService.settings.setSourceSetting(sourceId, key, value);
+      }
+      const settings = await readAutoPingSettings((key) => databaseService.settings.getSettingForSource(sourceId, key));
+      ok(res, { settings });
+    } catch (error) {
+      logger.error('[API] Error saving meshcore auto-ping settings:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to save auto-ping settings');
+    }
+  },
+);
+
+router.post(
+  '/automation/auto-ping/stop',
+  requireAuth(),
+  requirePermission('automation', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const publicKey = (req.body as { publicKey?: unknown } | undefined)?.publicKey;
+      if (typeof publicKey !== 'string' || !publicKey) {
+        return fail(res, 400, 'INVALID_PUBLIC_KEY', 'publicKey is required');
+      }
+      const stopped = managerFor(req, res).stopAutoPingSession(publicKey);
+      if (!stopped) {
+        return fail(res, 404, 'NOT_FOUND', 'No active ping session for that node');
+      }
+      ok(res);
+    } catch (error) {
+      logger.error('[API] Error stopping meshcore auto-ping session:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to stop auto-ping session');
+    }
+  },
+);
+
+// ============ Auto Delete by Distance (#6224) ============
+//
+// MeshCore parity with the Meshtastic auto-delete-by-distance automation. The
+// per-source `DistanceDeleteScheduler` + shared `autoDeleteByDistanceService`
+// already run for MeshCore sources (issue #3901); this only surfaces the same
+// per-source settings in the MeshCore Automation tab. Saving re-arms the
+// scheduler (mgr.restartDistanceDeleteScheduler) so a new interval / home /
+// threshold takes effect immediately. The settings are LOCAL only — purging a
+// node never transmits, so there is no mesh airtime here.
+
+/** Ceiling on the distance threshold the UI can store, in km. */
+const DISTANCE_DELETE_MAX_KM = 50_000;
+/** Interval bounds (hours), matching the Meshtastic UI's 6–48 range. */
+const DISTANCE_DELETE_MIN_HOURS = 6;
+const DISTANCE_DELETE_MAX_HOURS = 48;
+
+interface DistanceDeleteSettings {
+  enabled: boolean;
+  intervalHours: number;
+  thresholdKm: number;
+  lat: number | null;
+  lon: number | null;
+  action: 'delete' | 'ignore';
+}
+
+async function readDistanceDeleteSettings(sourceId: string): Promise<DistanceDeleteSettings> {
+  const get = (key: string) => databaseService.settings.getSettingForSource(sourceId, key);
+  const [enabled, intervalHours, thresholdKm, lat, lon, action] = await Promise.all([
+    get('autoDeleteByDistanceEnabled'),
+    get('autoDeleteByDistanceIntervalHours'),
+    get('autoDeleteByDistanceThresholdKm'),
+    get('autoDeleteByDistanceLat'),
+    get('autoDeleteByDistanceLon'),
+    get('autoDeleteByDistanceAction'),
+  ]);
+  const num = (v: string | null, fallback: number) => {
+    const n = v == null || v === '' ? NaN : Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const coord = (v: string | null): number | null => {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    enabled: enabled === 'true',
+    intervalHours: num(intervalHours, 24),
+    thresholdKm: num(thresholdKm, 100),
+    lat: coord(lat),
+    lon: coord(lon),
+    action: action === 'ignore' ? 'ignore' : 'delete',
+  };
+}
+
+type ParsedResult =
+  | { ok: true; updates: Array<[string, string]> }
+  | { ok: false; code: string; message: string };
+
+function parseDistanceDeleteUpdate(body: unknown): ParsedResult {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, code: 'INVALID_BODY', message: 'Request body must be an object' };
+  }
+  const b = body as Record<string, unknown>;
+  const updates: Array<[string, string]> = [];
+
+  if ('enabled' in b) {
+    if (typeof b.enabled !== 'boolean') return { ok: false, code: 'INVALID_ENABLED', message: 'enabled must be a boolean' };
+    updates.push(['autoDeleteByDistanceEnabled', b.enabled ? 'true' : 'false']);
+  }
+  if ('intervalHours' in b) {
+    const n = Number(b.intervalHours);
+    if (!Number.isFinite(n) || n < DISTANCE_DELETE_MIN_HOURS || n > DISTANCE_DELETE_MAX_HOURS) {
+      return { ok: false, code: 'INVALID_INTERVAL', message: `intervalHours must be ${DISTANCE_DELETE_MIN_HOURS}–${DISTANCE_DELETE_MAX_HOURS}` };
+    }
+    updates.push(['autoDeleteByDistanceIntervalHours', String(Math.round(n))]);
+  }
+  if ('thresholdKm' in b) {
+    const n = Number(b.thresholdKm);
+    if (!Number.isFinite(n) || n <= 0 || n > DISTANCE_DELETE_MAX_KM) {
+      return { ok: false, code: 'INVALID_THRESHOLD', message: `thresholdKm must be between 0 and ${DISTANCE_DELETE_MAX_KM}` };
+    }
+    updates.push(['autoDeleteByDistanceThresholdKm', String(n)]);
+  }
+  if ('lat' in b) {
+    if (b.lat === null || b.lat === '') {
+      updates.push(['autoDeleteByDistanceLat', '']);
+    } else {
+      const n = Number(b.lat);
+      if (!Number.isFinite(n) || n < -90 || n > 90) return { ok: false, code: 'INVALID_LAT', message: 'lat must be -90..90 or null' };
+      updates.push(['autoDeleteByDistanceLat', String(n)]);
+    }
+  }
+  if ('lon' in b) {
+    if (b.lon === null || b.lon === '') {
+      updates.push(['autoDeleteByDistanceLon', '']);
+    } else {
+      const n = Number(b.lon);
+      if (!Number.isFinite(n) || n < -180 || n > 180) return { ok: false, code: 'INVALID_LON', message: 'lon must be -180..180 or null' };
+      updates.push(['autoDeleteByDistanceLon', String(n)]);
+    }
+  }
+  if ('action' in b) {
+    if (b.action !== 'delete' && b.action !== 'ignore') return { ok: false, code: 'INVALID_ACTION', message: "action must be 'delete' or 'ignore'" };
+    updates.push(['autoDeleteByDistanceAction', b.action]);
+  }
+  return { ok: true, updates };
+}
+
+router.get(
+  '/automation/auto-delete-distance',
+  optionalAuth(),
+  requirePermission('automation', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      const mgr = managerFor(req, res);
+      const settings = await readDistanceDeleteSettings(sourceId);
+      ok(res, { settings, running: mgr.isDistanceDeleteRunning() });
+    } catch (error) {
+      logger.error('[API] Error reading meshcore auto-delete-by-distance settings:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to read auto-delete-by-distance settings');
+    }
+  },
+);
+
+router.post(
+  '/automation/auto-delete-distance',
+  requireAuth(),
+  requirePermission('automation', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      const parsed = parseDistanceDeleteUpdate(req.body);
+      if (!parsed.ok) return fail(res, 400, parsed.code, parsed.message);
+      for (const [key, value] of parsed.updates) {
+        await databaseService.settings.setSourceSetting(sourceId, key, value);
+      }
+      // Re-arm the per-source scheduler so a new interval/home/threshold applies
+      // now rather than after a restart (#3900 cache + #6224).
+      await managerFor(req, res).restartDistanceDeleteScheduler();
+      const settings = await readDistanceDeleteSettings(sourceId);
+      ok(res, { settings });
+    } catch (error) {
+      logger.error('[API] Error saving meshcore auto-delete-by-distance settings:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to save auto-delete-by-distance settings');
+    }
+  },
+);
+
+router.post(
+  '/automation/auto-delete-distance/run',
+  requireAuth(),
+  requirePermission('automation', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      // Scope the run to this source; purges only its own out-of-range nodes.
+      managerFor(req, res); // 404s if the source is not a connected MeshCore manager
+      const { deletedCount } = await autoDeleteByDistanceService.runNow(sourceId);
+      ok(res, { deletedCount });
+    } catch (error) {
+      logger.error('[API] Error running meshcore auto-delete-by-distance:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to run auto-delete-by-distance');
+    }
+  },
+);
+
+// ============ Time Sync overview (#6224) ============
+//
+// Central read of the per-node time-sync config (#4916) for the Automation
+// tab. MeshCore time-sync is per-node (timeSyncEnabled / interval live on each
+// meshcore_node), unlike Meshtastic's single source-level toggle, so this is a
+// management OVERVIEW of the nodes that have it enabled; per-node changes go to
+// the existing /nodes/:publicKey/time-sync-config route. Read-only here — it
+// starts no sync and puts nothing on the air.
+
+router.get(
+  '/automation/time-sync',
+  optionalAuth(),
+  requirePermission('automation', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      managerFor(req, res); // 404 unless a connected MeshCore source
+      const nodes = await databaseService.meshcore.getTimeSyncEnabledNodes(sourceId);
+      ok(res, {
+        nodes: nodes.map((n) => ({
+          publicKey: n.publicKey,
+          name: n.name ?? null,
+          intervalMinutes: n.timeSyncIntervalMinutes ?? null,
+          lastSyncAt: n.lastTimeSyncAt ?? null,
+        })),
+      });
+    } catch (error) {
+      logger.error('[API] Error reading meshcore time-sync overview:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to read time-sync overview');
+    }
+  },
+);
+
+// ============ Remote Telemetry overview (#6224) ============
+//
+// Central read of the per-node remote-telemetry config for the Automation tab.
+// Like time-sync it is per-node (telemetryEnabled / interval on each
+// meshcore_node); per-node edits go to /nodes/:publicKey/telemetry-config. The
+// scheduler already runs and already transmits on its own cadence — this is a
+// read-only overview and starts no poll.
+
+router.get(
+  '/automation/remote-telemetry',
+  optionalAuth(),
+  requirePermission('automation', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      managerFor(req, res); // 404 unless a connected MeshCore source
+      const nodes = await databaseService.meshcore.getTelemetryEnabledNodes(sourceId);
+      ok(res, {
+        nodes: nodes.map((n) => ({
+          publicKey: n.publicKey,
+          name: n.name ?? null,
+          intervalMinutes: n.telemetryIntervalMinutes ?? null,
+          lastRequestAt: n.lastTelemetryRequestAt ?? null,
+          lastSuccessAt: n.lastTelemetrySuccessAt ?? null,
+        })),
+      });
+    } catch (error) {
+      logger.error('[API] Error reading meshcore remote-telemetry overview:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to read remote-telemetry overview');
+    }
+  },
+);
+
+// ============ Auto Favorite (#6224) ============
+//
+// MeshCore parity with the Meshtastic auto-favorite. A periodic per-source sweep
+// (MeshCoreAutoFavoriteScheduler) favourites every contact heard within a stale
+// window and un-favourites the ones it previously favourited once they go stale.
+// It only ever un-favourites nodes it owns (tracked in meshcoreAutoFavoriteNodes),
+// so a hand-picked favourite is never touched. Favourite writes go to the
+// companion over its own link, not the LoRa mesh — no airtime cost — but the
+// cadence still defaults slow (6h). Saving re-arms the scheduler so a new
+// interval/stale window applies now rather than after a restart.
+
+interface AutoFavoriteSettings {
+  enabled: boolean;
+  intervalHours: number;
+  staleHours: number;
+  trackedCount: number;
+}
+
+async function readAutoFavoriteSettings(sourceId: string): Promise<AutoFavoriteSettings> {
+  const get = (key: string) => databaseService.settings.getSettingForSource(sourceId, key);
+  const [enabled, intervalHours, staleHours, nodes] = await Promise.all([
+    get('meshcoreAutoFavoriteEnabled'),
+    get('meshcoreAutoFavoriteIntervalHours'),
+    get('meshcoreAutoFavoriteStaleHours'),
+    get('meshcoreAutoFavoriteNodes'),
+  ]);
+  const num = (v: string | null, fallback: number) => {
+    const n = v == null || v === '' ? NaN : Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  let trackedCount = 0;
+  try {
+    const parsed = JSON.parse(nodes || '[]');
+    if (Array.isArray(parsed)) trackedCount = parsed.length;
+  } catch {
+    trackedCount = 0;
+  }
+  return {
+    enabled: enabled === 'true',
+    intervalHours: num(intervalHours, AUTO_FAVORITE_DEFAULT_INTERVAL_HOURS),
+    staleHours: num(staleHours, AUTO_FAVORITE_DEFAULT_STALE_HOURS),
+    trackedCount,
+  };
+}
+
+function parseAutoFavoriteUpdate(body: unknown): ParsedResult {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, code: 'INVALID_BODY', message: 'Request body must be an object' };
+  }
+  const b = body as Record<string, unknown>;
+  const updates: Array<[string, string]> = [];
+
+  if ('enabled' in b) {
+    if (typeof b.enabled !== 'boolean') return { ok: false, code: 'INVALID_ENABLED', message: 'enabled must be a boolean' };
+    updates.push(['meshcoreAutoFavoriteEnabled', b.enabled ? 'true' : 'false']);
+  }
+  if ('intervalHours' in b) {
+    const n = Number(b.intervalHours);
+    if (!Number.isFinite(n) || n < AUTO_FAVORITE_MIN_INTERVAL_HOURS || n > AUTO_FAVORITE_MAX_INTERVAL_HOURS) {
+      return { ok: false, code: 'INVALID_INTERVAL', message: `intervalHours must be ${AUTO_FAVORITE_MIN_INTERVAL_HOURS}–${AUTO_FAVORITE_MAX_INTERVAL_HOURS}` };
+    }
+    updates.push(['meshcoreAutoFavoriteIntervalHours', String(Math.round(n))]);
+  }
+  if ('staleHours' in b) {
+    const n = Number(b.staleHours);
+    if (!Number.isFinite(n) || n < AUTO_FAVORITE_MIN_STALE_HOURS || n > AUTO_FAVORITE_MAX_STALE_HOURS) {
+      return { ok: false, code: 'INVALID_STALE', message: `staleHours must be ${AUTO_FAVORITE_MIN_STALE_HOURS}–${AUTO_FAVORITE_MAX_STALE_HOURS}` };
+    }
+    updates.push(['meshcoreAutoFavoriteStaleHours', String(Math.round(n))]);
+  }
+  return { ok: true, updates };
+}
+
+router.get(
+  '/automation/auto-favorite',
+  optionalAuth(),
+  requirePermission('automation', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      const mgr = managerFor(req, res);
+      const settings = await readAutoFavoriteSettings(sourceId);
+      ok(res, { settings, running: mgr.isAutoFavoriteRunning() });
+    } catch (error) {
+      logger.error('[API] Error reading meshcore auto-favorite settings:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to read auto-favorite settings');
+    }
+  },
+);
+
+router.post(
+  '/automation/auto-favorite',
+  requireAuth(),
+  requirePermission('automation', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      const parsed = parseAutoFavoriteUpdate(req.body);
+      if (!parsed.ok) return fail(res, 400, parsed.code, parsed.message);
+      for (const [key, value] of parsed.updates) {
+        await databaseService.settings.setSourceSetting(sourceId, key, value);
+      }
+      // Re-arm the per-source scheduler so a new interval/stale window applies now.
+      await managerFor(req, res).restartAutoFavoriteScheduler();
+      const settings = await readAutoFavoriteSettings(sourceId);
+      ok(res, { settings });
+    } catch (error) {
+      logger.error('[API] Error saving meshcore auto-favorite settings:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to save auto-favorite settings');
+    }
+  },
+);
+
+router.post(
+  '/automation/auto-favorite/run',
+  requireAuth(),
+  requirePermission('automation', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const mgr = managerFor(req, res); // 404s unless a connected MeshCore source
+      const { favorited, unfavorited } = await mgr.runAutoFavoriteSweep();
+      ok(res, { favorited, unfavorited });
+    } catch (error) {
+      logger.error('[API] Error running meshcore auto-favorite sweep:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to run auto-favorite sweep');
+    }
+  },
+);
+
+// ============ Auto Welcome (#6224) ============
+//
+// Greet a genuinely-new, named MeshCore contact once. Event-driven (fires from
+// the new-node-discovered hook in meshcoreManager), so there is no scheduler to
+// re-arm and no /run — saving just writes the per-source settings. It
+// TRANSMITS: a DM to a brand-new node usually floods, so the limits here
+// (hourly cap, hop gate, welcome-once) are load-bearing, not cosmetic.
+
+/** Welcome message length ceiling (keeps a greeting inside one LoRa packet). */
+const AUTO_WELCOME_MESSAGE_MAX = 200;
+
+function parseAutoWelcomeUpdate(body: unknown): ParsedResult {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, code: 'INVALID_BODY', message: 'Request body must be an object' };
+  }
+  const b = body as Record<string, unknown>;
+  const updates: Array<[string, string]> = [];
+
+  if ('enabled' in b) {
+    if (typeof b.enabled !== 'boolean') return { ok: false, code: 'INVALID_ENABLED', message: 'enabled must be a boolean' };
+    updates.push(['meshcoreAutoWelcomeEnabled', b.enabled ? 'true' : 'false']);
+  }
+  if ('message' in b) {
+    if (typeof b.message !== 'string' || b.message.trim() === '') {
+      return { ok: false, code: 'INVALID_MESSAGE', message: 'message must be a non-empty string' };
+    }
+    if (b.message.length > AUTO_WELCOME_MESSAGE_MAX) {
+      return { ok: false, code: 'INVALID_MESSAGE', message: `message must be ${AUTO_WELCOME_MESSAGE_MAX} characters or fewer` };
+    }
+    updates.push(['meshcoreAutoWelcomeMessage', b.message]);
+  }
+  if ('target' in b) {
+    // 'dm' or a non-negative channel index as a string.
+    const target = b.target;
+    if (target === 'dm') {
+      updates.push(['meshcoreAutoWelcomeTarget', 'dm']);
+    } else {
+      const n = Number(target);
+      if (typeof target !== 'string' && typeof target !== 'number') return { ok: false, code: 'INVALID_TARGET', message: "target must be 'dm' or a channel index" };
+      if (!Number.isInteger(n) || n < 0 || n > 63) return { ok: false, code: 'INVALID_TARGET', message: "target must be 'dm' or a channel index 0-63" };
+      updates.push(['meshcoreAutoWelcomeTarget', String(n)]);
+    }
+  }
+  if ('waitForName' in b) {
+    if (typeof b.waitForName !== 'boolean') return { ok: false, code: 'INVALID_WAIT_FOR_NAME', message: 'waitForName must be a boolean' };
+    updates.push(['meshcoreAutoWelcomeWaitForName', b.waitForName ? 'true' : 'false']);
+  }
+  if ('maxHops' in b) {
+    const n = Number(b.maxHops);
+    if (!Number.isInteger(n) || n < 0 || n > AUTO_WELCOME_MAX_HOPS_CEIL) {
+      return { ok: false, code: 'INVALID_MAX_HOPS', message: `maxHops must be 0–${AUTO_WELCOME_MAX_HOPS_CEIL}` };
+    }
+    updates.push(['meshcoreAutoWelcomeMaxHops', String(n)]);
+  }
+  if ('delaySeconds' in b) {
+    const n = Number(b.delaySeconds);
+    if (!Number.isFinite(n) || n < 0 || n > AUTO_WELCOME_MAX_DELAY_SECONDS) {
+      return { ok: false, code: 'INVALID_DELAY', message: `delaySeconds must be 0–${AUTO_WELCOME_MAX_DELAY_SECONDS}` };
+    }
+    updates.push(['meshcoreAutoWelcomeDelaySeconds', String(Math.round(n))]);
+  }
+  if ('maxPerHour' in b) {
+    const n = Number(b.maxPerHour);
+    if (!Number.isInteger(n) || n < AUTO_WELCOME_MIN_PER_HOUR || n > AUTO_WELCOME_MAX_PER_HOUR) {
+      return { ok: false, code: 'INVALID_MAX_PER_HOUR', message: `maxPerHour must be ${AUTO_WELCOME_MIN_PER_HOUR}–${AUTO_WELCOME_MAX_PER_HOUR}` };
+    }
+    updates.push(['meshcoreAutoWelcomeMaxPerHour', String(n)]);
+  }
+  return { ok: true, updates };
+}
+
+router.get(
+  '/automation/auto-welcome',
+  optionalAuth(),
+  requirePermission('automation', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      managerFor(req, res); // 404 unless a connected MeshCore source
+      const settings = await readAutoWelcomeSettings(sourceId);
+      ok(res, { settings });
+    } catch (error) {
+      logger.error('[API] Error reading meshcore auto-welcome settings:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to read auto-welcome settings');
+    }
+  },
+);
+
+router.post(
+  '/automation/auto-welcome',
+  requireAuth(),
+  requirePermission('automation', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id?: string }).id!;
+      managerFor(req, res); // 404 unless a connected MeshCore source
+      const parsed = parseAutoWelcomeUpdate(req.body);
+      if (!parsed.ok) return fail(res, 400, parsed.code, parsed.message);
+      for (const [key, value] of parsed.updates) {
+        await databaseService.settings.setSourceSetting(sourceId, key, value);
+      }
+      const settings = await readAutoWelcomeSettings(sourceId);
+      ok(res, { settings });
+    } catch (error) {
+      logger.error('[API] Error saving meshcore auto-welcome settings:', error);
+      fail(res, 500, 'INTERNAL_ERROR', 'Failed to save auto-welcome settings');
     }
   },
 );
@@ -441,6 +1007,7 @@ router.get(
       const intervalHours = await settings.getSettingForSource(sourceId, 'meshcoreAutoAnnounceIntervalHours');
       const message = await settings.getSettingForSource(sourceId, 'meshcoreAutoAnnounceMessage');
       const channelIndexesRaw = await settings.getSettingForSource(sourceId, 'meshcoreAutoAnnounceChannelIndexes');
+      const announceSplit = await settings.getSettingForSource(sourceId, 'meshcoreAutoAnnounceSplitLongMessages');
       const announceOnStart = await settings.getSettingForSource(sourceId, 'meshcoreAutoAnnounceOnStart');
       const useSchedule = await settings.getSettingForSource(sourceId, 'meshcoreAutoAnnounceUseSchedule');
       const schedule = await settings.getSettingForSource(sourceId, 'meshcoreAutoAnnounceSchedule');
@@ -463,6 +1030,7 @@ router.get(
             .filter(Boolean)
             .map(s => parseInt(s, 10))
             .filter(n => Number.isFinite(n)),
+          splitLongMessages: announceSplit === 'true',
           announceOnStart: announceOnStart === 'true',
           useSchedule: useSchedule === 'true',
           schedule: schedule || '0 */6 * * *',
@@ -499,6 +1067,7 @@ router.post(
         intervalHours,
         message,
         channelIndexes,
+        splitLongMessages,
         announceOnStart,
         useSchedule,
         schedule,
@@ -512,6 +1081,7 @@ router.post(
         intervalHours?: number;
         message?: string;
         channelIndexes?: number[];
+        splitLongMessages?: boolean;
         announceOnStart?: boolean;
         useSchedule?: boolean;
         schedule?: string;
@@ -542,6 +1112,9 @@ router.post(
           ? channelIndexes.filter(n => Number.isFinite(n)).join(',')
           : '';
         await settings.setSourceSetting(sourceId, 'meshcoreAutoAnnounceChannelIndexes', csv);
+      }
+      if (splitLongMessages !== undefined) {
+        await settings.setSourceSetting(sourceId, 'meshcoreAutoAnnounceSplitLongMessages', String(splitLongMessages === true));
       }
       if (announceOnStart !== undefined) {
         await settings.setSourceSetting(sourceId, 'meshcoreAutoAnnounceOnStart', String(announceOnStart));
@@ -671,7 +1244,20 @@ router.post(
       if (badMode) {
         return fail(res, 400, 'INVALID_ADVERT_MODE', `Trigger ${String(badMode.id ?? '')}: advertMode must be one of: ${MESHCORE_ADVERT_MODES.join(', ')}`);
       }
-      await databaseService.settings.setSourceSetting(sourceId, 'meshcoreTimerTriggers', JSON.stringify(body.triggers));
+      // A timer that splits long messages must fire at most every 5 minutes (#6316).
+      const tooFast = findSplitTimerTooFrequent(body.triggers);
+      if (tooFast) {
+        return fail(res, 400, 'SPLIT_TIMER_INTERVAL_TOO_SHORT', `Trigger ${tooFast.id}: a timer that splits long messages needs an interval of at least ${MESHCORE_SPLIT_TIMER_MIN_INTERVAL_MINUTES} minutes`);
+      }
+      // At most 4 channels per timer (4.17.3 review M5).
+      const tooMany = findTimerTooManyChannels(body.triggers);
+      if (tooMany) {
+        return fail(res, 400, 'TIMER_TOO_MANY_CHANNELS', `Trigger ${tooMany.id}: a timer can send to at most ${MESHCORE_TIMER_MAX_CHANNELS} channels (it has ${tooMany.channels})`);
+      }
+      // Run state belongs to the scheduler; keep the stored values (#5827).
+      const storedJson = await databaseService.settings.getSettingForSource(sourceId, 'meshcoreTimerTriggers');
+      const triggers = keepServerRunState(body.triggers as unknown[], parseStoredTriggers(storedJson));
+      await databaseService.settings.setSourceSetting(sourceId, 'meshcoreTimerTriggers', JSON.stringify(triggers));
 
       await managerFor(req, res).startTimerTriggers().catch((err: Error) =>
         logger.warn(`[API] timer-trigger restart after save failed: ${err.message}`));
@@ -755,17 +1341,20 @@ router.post(
         if (!Array.isArray(body.triggers)) {
           return res.status(400).json({ success: false, error: 'triggers must be an array' });
         }
-        // Validate each trigger's regex up front so a broken pattern
-        // never reaches the message loop. Reuses the same validator
-        // the manager applies at execution time.
-        for (const tr of body.triggers as Array<{ id?: string; pattern?: string }>) {
+        // Validate each trigger's pattern up front, in its syntax (#5924),
+        // so a broken pattern never reaches the message loop. Missing
+        // syntax = 'regex', the pre-#5924 behaviour. Same shared checks
+        // the manager and the UI apply.
+        for (const tr of body.triggers as Array<{ id?: string; pattern?: string; syntax?: unknown }>) {
+          if (tr?.syntax !== undefined && !isResponderSyntax(tr.syntax)) {
+            return fail(res, 400, 'INVALID_REGEX', `Invalid syntax for trigger ${tr.id || '(unnamed)'}: must be "pattern" or "regex"`);
+          }
           if (typeof tr?.pattern !== 'string') continue;
-          const v = validateAutoAckRegex(tr.pattern);
+          const syntax = resolveResponderSyntax(tr.syntax, 'regex');
+          const v = validateResponderTrigger(tr.pattern, syntax);
           if (!v.ok) {
-            return res.status(400).json({
-              success: false,
-              error: `Invalid regex for trigger ${tr.id || '(unnamed)'}: ${v.error}`,
-            });
+            const kind = syntax === 'regex' ? 'regex' : 'pattern';
+            return fail(res, 400, 'INVALID_REGEX', `Invalid ${kind} for trigger ${tr.id || '(unnamed)'}: ${v.error}`);
           }
         }
         await databaseService.settings.setSourceSetting(sourceId, 'meshcoreAutoResponderTriggers', JSON.stringify(body.triggers));

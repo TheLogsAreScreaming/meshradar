@@ -14,7 +14,7 @@
  * so no probe requests fire while the surface is hidden.
  */
 
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { SettingsProvider } from '../contexts/SettingsContext';
@@ -30,6 +30,7 @@ import type { ConnectionStatus } from '../components/MeshCore/hooks/useMeshCore'
 import '../components/MeshCore/MeshCoreTab.css';
 import '../components/AppHeader/AppHeader.css';
 import { UiIcon } from '../components/icons';
+import pageStyles from './SourcePageTopbar.module.css';
 
 function MeshCoreSourceInner() {
   const { t } = useTranslation();
@@ -43,6 +44,13 @@ function MeshCoreSourceInner() {
 
   const [showLogin, setShowLogin] = useState(false);
   const [mcStatus, setMcStatus] = useState<ConnectionStatus | null>(null);
+  const [mcLoaded, setMcLoaded] = useState(false);
+  const [mcConnecting, setMcConnecting] = useState(false);
+  const handleStatusChange = useCallback((status: ConnectionStatus | null, loaded: boolean, connecting: boolean) => {
+    setMcStatus(status);
+    setMcLoaded(loaded);
+    setMcConnecting(connecting);
+  }, []);
 
   if (!sourceId) {
     return (
@@ -54,7 +62,11 @@ function MeshCoreSourceInner() {
 
   // mcStatus is null until the snapshot loads — show "Connecting…" instead of
   // "Disconnected" so the header doesn't mislead the user during the initial fetch.
-  const statusLoading = mcStatus === null;
+  // Once that first load settles with no status (no manager for the source:
+  // not connected, autoConnect off), or when MeshCorePage is not mounted at
+  // all (no connection:read), it is "Disconnected", not "Connecting" — unless
+  // a connect is actually in flight (#4173 N6).
+  const statusLoading = canReadConnection && ((mcStatus === null && !mcLoaded) || mcConnecting);
   const connected = mcStatus?.connected ?? false;
   const localNode = mcStatus?.localNode ?? null;
   const localNodeLabel = localNode?.name || null;
@@ -73,9 +85,9 @@ function MeshCoreSourceInner() {
         {/* #4939: the back-to-sources button already anchors the header, so the
             MeshRadar logo + wordmark are redundant on a per-source page — show
             only the source name. */}
-        <div className="dashboard-topbar-logo">
+        <div className={`dashboard-topbar-logo ${pageStyles.logo}`}>
           {sourceName && (
-            <span className="dashboard-topbar-title">{sourceName}</span>
+            <span className={`dashboard-topbar-title ${pageStyles.title}`} title={sourceName}>{sourceName}</span>
           )}
         </div>
         {localNodeLabel && (
@@ -111,7 +123,7 @@ function MeshCoreSourceInner() {
       </header>
 
       {canReadConnection ? (
-        <MeshCorePage baseUrl={appBasename} sourceId={sourceId} onStatusChange={setMcStatus} />
+        <MeshCorePage baseUrl={appBasename} sourceId={sourceId} onStatusChange={handleStatusChange} />
       ) : (
         <div className="meshcore-tab">
           <h2>{t('meshcore.title')}</h2>

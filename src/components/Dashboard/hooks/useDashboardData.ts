@@ -5,6 +5,8 @@ import { logger } from '../../../utils/logger';
 import { useSource } from '../../../contexts/SourceContext';
 import { type FavoriteChart, type NodeInfo, type CustomWidget } from '../types';
 import { type DashboardDataSource, meshtasticDashboardSource } from '../dataSources';
+import { parseChartYRangeMap, type ChartYRange } from '../../../utils/chartYRange';
+import { isSourceNotConnectedError } from '../../../utils/sourceNotConnected';
 
 interface UseDashboardDataOptions {
   /** Polling interval in milliseconds (default: 30000) */
@@ -24,6 +26,7 @@ interface SettingsResponse {
   telemetryCustomOrder?: string;
   dashboardWidgets?: string;
   dashboardSolarVisibility?: string;
+  dashboardChartYRange?: string;
 }
 
 interface UseDashboardDataResult {
@@ -36,8 +39,13 @@ interface UseDashboardDataResult {
   setCustomWidgets: React.Dispatch<React.SetStateAction<CustomWidget[]>>;
   solarVisibility: Record<string, boolean>;
   setSolarVisibility: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  /** Fixed Y-axis range per chart widget key `${nodeId}-${telemetryType}` (#6348). */
+  chartYRanges: Record<string, ChartYRange>;
+  setChartYRanges: React.Dispatch<React.SetStateAction<Record<string, ChartYRange>>>;
   loading: boolean;
   error: string | null;
+  /** The source has no running manager (SOURCE_NOT_CONNECTED, #4173 N5). */
+  notConnected: boolean;
   refresh: () => Promise<void>;
 }
 
@@ -67,6 +75,7 @@ export function useDashboardData(options?: UseDashboardDataOptions): UseDashboar
   const [localCustomOrder, setLocalCustomOrder] = useState<string[] | null>(null);
   const [localCustomWidgets, setLocalCustomWidgets] = useState<CustomWidget[] | null>(null);
   const [localSolarVisibility, setLocalSolarVisibility] = useState<Record<string, boolean> | null>(null);
+  const [localChartYRanges, setLocalChartYRanges] = useState<Record<string, ChartYRange> | null>(null);
 
   // Fetch settings (favorites, custom order, widgets, solar visibility)
   const settingsQuery = useQuery({
@@ -76,6 +85,7 @@ export function useDashboardData(options?: UseDashboardDataOptions): UseDashboar
       customOrder: string[];
       widgets: CustomWidget[];
       solarVisibility: Record<string, boolean>;
+      chartYRanges: Record<string, ChartYRange>;
     }> => {
       const settings = await api.get<SettingsResponse>(`/api/settings${sourceQuery}`);
 
@@ -100,6 +110,7 @@ export function useDashboardData(options?: UseDashboardDataOptions): UseDashboar
         customOrder: serverCustomOrder,
         widgets: widgetsArray,
         solarVisibility: solarVisibilityObj,
+        chartYRanges: parseChartYRangeMap(settings.dashboardChartYRange),
       };
     },
     enabled,
@@ -177,6 +188,10 @@ export function useDashboardData(options?: UseDashboardDataOptions): UseDashboar
     return localSolarVisibility ?? settingsQuery.data?.solarVisibility ?? {};
   }, [localSolarVisibility, settingsQuery.data?.solarVisibility]);
 
+  const chartYRanges = useMemo(() => {
+    return localChartYRanges ?? settingsQuery.data?.chartYRanges ?? {};
+  }, [localChartYRanges, settingsQuery.data?.chartYRanges]);
+
   const nodes = useMemo(() => {
     return nodesQuery.data ?? new Map<string, NodeInfo>();
   }, [nodesQuery.data]);
@@ -217,6 +232,13 @@ export function useDashboardData(options?: UseDashboardDataOptions): UseDashboar
     });
   }, [settingsQuery.data?.solarVisibility]);
 
+  const setChartYRanges = useCallback((value: React.SetStateAction<Record<string, ChartYRange>>) => {
+    setLocalChartYRanges(prev => {
+      const currentValue = prev ?? settingsQuery.data?.chartYRanges ?? {};
+      return typeof value === 'function' ? value(currentValue) : value;
+    });
+  }, [settingsQuery.data?.chartYRanges]);
+
   // Combined loading state - only true on initial load
   const loading = (settingsQuery.isLoading || nodesQuery.isLoading) && !settingsQuery.data;
 
@@ -234,6 +256,10 @@ export function useDashboardData(options?: UseDashboardDataOptions): UseDashboar
     }
     return null;
   }, [settingsQuery.error, nodesQuery.error]);
+
+  // A source with no running manager is an empty state, not an error (#4173 N5).
+  const notConnected =
+    isSourceNotConnectedError(settingsQuery.error) || isSourceNotConnectedError(nodesQuery.error);
 
   // Manual refresh function
   const refresh = useCallback(async () => {
@@ -253,8 +279,11 @@ export function useDashboardData(options?: UseDashboardDataOptions): UseDashboar
     setCustomWidgets,
     solarVisibility,
     setSolarVisibility,
+    chartYRanges,
+    setChartYRanges,
     loading,
     error,
+    notConnected,
     refresh,
   };
 }

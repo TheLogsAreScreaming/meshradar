@@ -25,6 +25,7 @@ function cand(nodeNum: number, o: Partial<AircraftAgeOutCandidate> = {}): Aircra
     isFavorite: false,
     isIgnored: false,
     aircraftAgedOutAt: null,
+    aircraftManualMark: null,
     positionOverrideEnabled: false,
     latitudeOverride: null,
     longitudeOverride: null,
@@ -239,6 +240,22 @@ describe('AircraftAgeOutService.runSweep — fixed pass', () => {
     expect(r.fixed).toBe(1);
   });
 
+  it("skips a node a person marked 'aircraft' (#5715), but still ages it out", async () => {
+    const { deps } = makeDeps({
+      settings: AGE_ON,
+      candidates: [
+        cand(22, { lastHeard: recentHeard, aircraftManualMark: 'aircraft' }),
+        cand(23, { aircraftManualMark: 'aircraft' }),
+      ],
+      fixes: { '!00000016': tight },
+    });
+    const r = await new AircraftAgeOutService(deps).runSweep(SRC, NOW);
+    expect(deps.setFixed).not.toHaveBeenCalled();
+    expect(r.fixed).toBe(0);
+    expect(deps.addAircraftIgnore).toHaveBeenCalledWith(23, SRC, '!00000017', 'Node 23', 'N23');
+    expect(r.agedOut).toBe(1);
+  });
+
   it('uses the position override as the anchor when one is set', async () => {
     const { deps } = makeDeps({
       candidates: [cand(21, {
@@ -370,7 +387,9 @@ describe('AircraftAgeOutService — live-position lift (D3)', () => {
     await Promise.resolve();
     expect(deps.getAgedOutAt).not.toHaveBeenCalled();
     expect(deps.liftAircraftIgnore).not.toHaveBeenCalled();
-    expect(deps.scheduleClassification).toHaveBeenCalledWith(SRC, 5);
+    // #6045: a replay reclassifies SILENTLY ('replay'), never as a live
+    // 'position' job that could fire the became-aircraft event.
+    expect(deps.scheduleClassification).toHaveBeenCalledWith(SRC, 5, 'replay');
     // #5374: a replay is not a "next live position" for ADS-B lookup 2.
     expect(deps.onLiveAdsbPosition).not.toHaveBeenCalled();
   });

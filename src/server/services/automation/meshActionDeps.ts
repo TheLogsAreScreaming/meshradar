@@ -15,11 +15,18 @@ import { sourceManagerRegistry } from '../../sourceManagerRegistry.js';
 import { appriseNotificationService } from '../appriseNotificationService.js';
 import { runScript as runUserScript } from '../../utils/scriptRunner.js';
 import { logger } from '../../../utils/logger.js';
+import { truncateUtf8Bytes, utf8ByteLength } from '../../utils/splitUtf8Message.js';
 import { waypointService } from '../waypointService.js';
 import { isForwardingEnabled, setForwardingEnabled } from '../forwardingStateService.js';
+import type { ISourceManager } from '../../sourceManagerRegistry.js';
+import { isMeshCoreManager, isReticulumManager } from '../../sourceManagerTypes.js';
+import { isMeshCoreReactionError, MESHCORE_REACTION_SKIP_CODES } from '../../errors/meshcoreReactionError.js';
 import type { ActionDeps } from './actionExecutor.js';
 import type { SendOrigin } from '../../utils/automationPacketTracker.js';
 import { type MeshCoreAdvertMode, LEGACY_MESHCORE_ADVERT_MODE } from '../../../types/meshcoreAdvert.js';
+import { tracePathScheduleService } from '../tracePathScheduleService.js';
+import { TRACE_SCHEDULE_MAX_PER_SOURCE_PER_HOUR } from '../../../types/tracePathSchedule.js';
+import { MESHTASTIC_MAX_TEXT_BYTES } from '../../../utils/messageSplitLimits.js';
 
 /**
  * A Meshtastic manager's per-source outgoing queue (meshtasticManager.ts:1107,
@@ -67,12 +74,23 @@ interface MeshSendManager {
   broadcastNodeInfoToChannel(channel: number, options?: { origin?: SendOrigin }): Promise<unknown>;
 }
 
+/** Meshtastic shared split sender (#6330). Absent on test doubles. */
+interface MeshtasticSplitSendManager {
+  sendAutomatedText(text: string, opts: {
+    destination?: number; channels?: number[]; split: boolean; label: string;
+    replyId?: number; maxAttempts?: number; hopLimitOverride?: number; direct?: boolean; sequenceKey?: string;
+  }): Promise<{ ok: boolean; totalParts: number; truncated: boolean; dropped?: 'duplicate' | 'stale' }>;
+}
+
 /** MeshCore companion managers send via a different method signature. */
 interface MeshCoreSendManager {
+  /** Cap-fitting, optionally splitting sender (#6316). Absent on test doubles. */
+  sendAutomatedText?(text: string, opts: { toPublicKey?: string; channelIdxs?: number[]; scopeOverride?: string | null; split: boolean; label: string; sequenceKey?: string }): Promise<{ ok: boolean; totalParts: number; truncated: boolean; dropped?: 'duplicate' | 'stale' }>;
   sendMessage(text: string, toPublicKey?: string, channelIdx?: number, scopeOverride?: string | null, autoRetryOnMiss?: boolean): Promise<boolean>;
   // Request/operation senders (#3835).
   requestRemoteTelemetry(publicKey: string, timeoutSecs?: number): Promise<unknown>;
-  traceContactPath(publicKey: string): Promise<unknown>;
+  traceContactPath(publicKey: string, opts?: { origin?: 'manual' | 'schedule' | 'automation' | 'api' }): Promise<unknown>;
+  traceContactPathDetailed(publicKey: string, opts?: { autoReturn?: boolean; hashBytes?: 1 | 2; origin?: 'manual' | 'schedule' | 'automation' | 'api' }): Promise<{ ok: boolean; reason?: string; hops?: unknown[]; lastSnr?: number }>;
   requestNeighbors(publicKey?: string): Promise<unknown>;
   /** Floor-checked advert for automated senders (see MeshCoreManager.sendAutomatedAdvert). */
   sendAutomatedAdvert(mode: MeshCoreAdvertMode, origin: string): Promise<{ sent: boolean; reason?: string }>;
@@ -101,6 +119,21 @@ function mgr(sourceId: string | null): MeshSendManager {
  * Meshtastic (`sendTextMessage`) or MeshCore (`sendMessage`). MeshCore has no
  * reply/emoji concept, so those are dropped for that protocol.
  */
+/**
+ * A Meshtastic text payload holds about 200 bytes. Every other automation
+ * sender (auto-ack, auto-responder, timers, forwarding) cuts to 200 before
+ * sending; the engine passed the interpolated body through whole, so a long
+ * `{{ trigger.text }}` (a relayed LXMF reply, a script result) went to the
+ * radio and never delivered (#6202).
+ */
+const MESHTASTIC_TEXT_MAX_BYTES = MESHTASTIC_MAX_TEXT_BYTES;
+function truncateForMeshtastic(text: string): string {
+  const bytes = utf8ByteLength(text);
+  if (bytes <= MESHTASTIC_TEXT_MAX_BYTES) return text;
+  logger.warn(`[Automation] Meshtastic text is ${bytes} bytes; cut to ${MESHTASTIC_TEXT_MAX_BYTES}`);
+  return truncateUtf8Bytes(text, MESHTASTIC_TEXT_MAX_BYTES - 3) + '...';
+}
+
 async function sendTextVia(
   sourceId: string | null,
   text: string,
@@ -111,13 +144,58 @@ async function sendTextVia(
   scopeOverride?: string | null,
   maxAttempts?: number,
   hopLimitOverride?: number,
+  replyToHash?: string,
+  splitLongMessages?: boolean,
 ): Promise<unknown> {
   if (!sourceId) throw new Error('automation action requires a target source');
-  const raw = resolveManager(sourceId) as
+  const manager = resolveManager(sourceId) as ISourceManager | undefined;
+
+  // Reticulum/LXMF (#6143). ReticulumManager.sendMessage takes an OBJECT
+  // ({ to, content, … }), not the positional form the meshtastic/meshcore
+  // branches use — and it ALSO has a `sendMessage` method, so this check MUST
+  // run before the MeshCore `typeof raw.sendMessage === 'function'` branch
+  // below, or a Reticulum target would be handed a bare string and break.
+  // A Reticulum send is always a DM to an LXMF hash; the executor records a
+  // skip when there is no destination, so one is expected here. `sendMessage`
+  // throws when the source is not connected or the send rejects — that
+  // surfaces as a failed step, mirroring the MeshCore path.
+  if (manager && isReticulumManager(manager)) {
+    const to = typeof destination === 'string' ? destination.trim() : '';
+    if (!to) {
+      throw new Error(`source "${sourceId}" needs a destination LXMF address for a Reticulum send`);
+    }
+    return manager.sendMessage({ to, content: text, ...(replyToHash ? { replyToHash } : {}) });
+  }
+
+  const raw = manager as
     (Partial<MeshSendManager> & Partial<MeshCoreSendManager>) | undefined;
   if (raw && typeof raw.sendTextMessage === 'function') {
     // Meshtastic has no scope/region concept — scopeOverride is dropped.
     const dest = typeof destination === 'number' ? destination : undefined;
+    // #6330: split into up to 3 marked parts when the action asks for it,
+    // through the same shared sender as MeshCore. A queued DM (maxAttempts)
+    // keeps the queue; every other send goes direct, 10 s between parts.
+    const splitter = raw as Partial<MeshtasticSplitSendManager>;
+    if (splitLongMessages === true && typeof splitter.sendAutomatedText === 'function') {
+      const queued = maxAttempts != null && dest != null && hopLimitOverride !== 0;
+      const res = await splitter.sendAutomatedText(text, {
+        ...(dest != null ? { destination: dest } : { channels: [channel] }),
+        split: true,
+        label: 'Automation',
+        // M4: no automation id reaches here; the same text to the same target is a duplicate.
+        sequenceKey: `Automation:${text}`,
+        replyId,
+        hopLimitOverride,
+        ...(queued ? { maxAttempts } : { direct: true }),
+      });
+      if (!res.ok) {
+        throw new Error(res.dropped
+          ? splitDropMessage(sourceId, res.dropped)
+          : `source "${sourceId}" failed to send the Meshtastic message (cannot transmit or send rejected)`);
+      }
+      return res.totalParts > 1 || res.truncated ? { ok: true, parts: res.totalParts, truncated: res.truncated } : true;
+    }
+    const body = truncateForMeshtastic(text);
     // #4340 Phase 3. Opt-in ONLY: absent maxAttempts, a channel send, or a
     // MeshCore source all take the unchanged direct path below.
     //   * Channel sends are excluded because the queue hardcodes maxAttempts=1
@@ -138,7 +216,7 @@ async function sendTextVia(
     // maxAttempts is deliberately ignored rather than turned into blind resends.
     if (maxAttempts != null && dest != null && hopLimitOverride !== 0 && typeof q?.enqueue === 'function') {
       const id = q.enqueue(
-        text, dest, replyId,
+        body, dest, replyId,
         () => logger.debug(`[Automation] queued DM to !${dest.toString(16).padStart(8, '0')} delivered`),
         (reason: string) => logger.warn(`[Automation] queued DM to !${dest.toString(16).padStart(8, '0')} failed: ${reason}`),
         undefined,             // channel: undefined ⇒ this is a DM
@@ -149,7 +227,7 @@ async function sendTextVia(
       );
       return { queued: true, messageId: id, maxAttempts };
     }
-    return raw.sendTextMessage(text, channel, dest, replyId, emoji, undefined, undefined, sendOptions);
+    return raw.sendTextMessage(body, channel, dest, replyId, emoji, undefined, undefined, sendOptions);
   }
   if (raw && typeof raw.sendMessage === 'function') {
     // MeshCore: `destination`, when a string, is the contact's public key (#4018)
@@ -163,6 +241,24 @@ async function sendTextVia(
     // channel-send auto-retry (#3979). Inert unless the global opt-in setting is
     // on; user-initiated sends go through the route, not here.
     const toPublicKey = typeof destination === 'string' ? destination : undefined;
+    // #6316: fit the text to the firmware cap (truncate, or split into up to 3
+    // parts when the action asks for it) so the stored row matches the air.
+    if (typeof raw.sendAutomatedText === 'function') {
+      const res = await raw.sendAutomatedText(text, {
+        ...(toPublicKey !== undefined ? { toPublicKey } : { channelIdxs: [channel] }),
+        scopeOverride,
+        split: splitLongMessages === true,
+        label: 'Automation',
+        // M4: no automation id reaches here; the same text to the same target is a duplicate.
+        sequenceKey: `Automation:${text}`,
+      });
+      if (!res.ok) {
+        throw new Error(res.dropped
+          ? splitDropMessage(sourceId, res.dropped)
+          : `source "${sourceId}" failed to send the MeshCore message (node not connected or send rejected)`);
+      }
+      return res.totalParts > 1 || res.truncated ? { ok: true, parts: res.totalParts, truncated: res.truncated } : true;
+    }
     const ok = await raw.sendMessage(text, toPublicKey, channel, scopeOverride, true);
     if (ok === false) {
       throw new Error(`source "${sourceId}" failed to send the MeshCore message (node not connected or send rejected)`);
@@ -172,10 +268,17 @@ async function sendTextVia(
   throw new Error(`source "${sourceId}" cannot send messages`);
 }
 
+/** Run-log text for a split message the per-source queue dropped (4.17.3 review M4). */
+function splitDropMessage(sourceId: string, reason: 'duplicate' | 'stale'): string {
+  return reason === 'duplicate'
+    ? `source "${sourceId}" dropped the split message: the same message to the same target is already waiting to send`
+    : `source "${sourceId}" dropped the split message: it waited over 2 minutes for earlier split messages to finish`;
+}
+
 export function createMeshActionDeps(): ActionDeps {
   return {
-    async sendMessage({ sourceId, text, channel, destination, replyId, scopeOverride, maxAttempts, hopLimitOverride }) {
-      return sendTextVia(sourceId, text, channel ?? 0, destination, replyId, 0, scopeOverride, maxAttempts, hopLimitOverride);
+    async sendMessage({ sourceId, text, channel, destination, replyId, scopeOverride, maxAttempts, hopLimitOverride, replyToHash, splitLongMessages }) {
+      return sendTextVia(sourceId, text, channel ?? 0, destination, replyId, 0, scopeOverride, maxAttempts, hopLimitOverride, replyToHash, splitLongMessages);
     },
 
     // #5482: the service owns the persisted 30-minute floor, onlyWhenChanged,
@@ -185,7 +288,26 @@ export function createMeshActionDeps(): ActionDeps {
       return waypointService.upsertAndBroadcastForAutomation(a);
     },
 
-    async sendTapback({ sourceId, emoji, channel, destination, replyId, hopLimitOverride }) {
+    async sendTapback({ sourceId, emoji, channel, destination, replyId, hopLimitOverride, meshcoreMessageId }) {
+      // MeshCore (#5762): a real emoji reaction to a received message. A refusal
+      // the user cannot fix per run is a recorded skip; a send failure fails the step.
+      const mc = sourceId ? (resolveManager(sourceId) as ISourceManager | undefined) : undefined;
+      if (mc && isMeshCoreManager(mc)) {
+        if (typeof meshcoreMessageId !== 'string') {
+          return { skipped: true, reason: 'meshcore reaction: MESSAGE_NOT_FOUND' };
+        }
+        try {
+          return await mc.sendReaction(meshcoreMessageId, emoji);
+        } catch (error) {
+          if (isMeshCoreReactionError(error)) {
+            if (MESHCORE_REACTION_SKIP_CODES.has(error.code)) {
+              return { skipped: true, reason: `meshcore reaction: ${error.code}` };
+            }
+            throw new Error(`meshcore reaction failed: ${error.code}: ${error.message}`, { cause: error });
+          }
+          throw error;
+        }
+      }
       // emoji flag = 1 marks a tapback/reaction; route the way the trigger arrived.
       const options: SendTextOptions = hopLimitOverride !== undefined
         ? { hopLimitOverride, ...AUTOMATION }
@@ -216,6 +338,32 @@ export function createMeshActionDeps(): ActionDeps {
       }
     },
 
+    async runScheduledTrace({ sourceId, pathKey, path, autoReturn }) {
+      const who = path.label ? `${path.label} (${path.publicKey.slice(0, 8)}…)` : `${path.publicKey.slice(0, 16)}…`;
+      const raw = resolveManager(sourceId) as Partial<MeshCoreSendManager> | undefined;
+      if (!raw || typeof raw.traceContactPathDetailed !== 'function') {
+        return { publicKey: path.publicKey, skipped: true, reason: 'source is not a connected MeshCore companion' };
+      }
+      // Due-time and hourly-cap check, recorded before the send (#5723).
+      const claim = await tracePathScheduleService.claim({ sourceId, pathKey, intervalMinutes: path.intervalMinutes });
+      if (!claim.due) {
+        return claim.reason === 'not_due'
+          ? { publicKey: path.publicKey, skipped: true, notDue: true, reason: `${who}: not due until ${new Date(claim.nextDueAt).toISOString()}` }
+          // `notDue` marks the step idle for the run log; a capped skip is
+          // reported there once an hour (claim.quiet), not on every tick.
+          : { publicKey: path.publicKey, skipped: true, ...(claim.quiet ? { notDue: true } : {}), reason: `${who}: this source already sent ${TRACE_SCHEDULE_MAX_PER_SOURCE_PER_HOUR} scheduled traces in the last hour` };
+      }
+      const outcome = await raw.traceContactPathDetailed(path.publicKey, {
+        autoReturn,
+        origin: 'schedule',
+        ...(path.hashBytes === 'auto' ? {} : { hashBytes: path.hashBytes }),
+      });
+      logger.info(`[Automation] scheduled trace to ${who} on ${sourceId}: ${outcome.ok ? `${outcome.hops?.length ?? 0} hop(s)` : (outcome.reason ?? 'failed')}`);
+      return outcome.ok
+        ? { publicKey: path.publicKey, traced: true, hops: outcome.hops?.length ?? 0, lastSnr: outcome.lastSnr }
+        : { publicKey: path.publicKey, traced: false, reason: `${who}: trace ${outcome.reason === 'timeout' ? 'got no reply' : 'could not be sent (no known path, or the hop width could not be applied)'}` };
+    },
+
     async requestData({ sourceId, op, target, channel, telemetryType, advertMode }) {
       if (!sourceId) throw new Error('automation action requires a target source');
       const raw = resolveManager(sourceId) as
@@ -243,7 +391,8 @@ export function createMeshActionDeps(): ActionDeps {
           // MeshCore telemetry has no per-type selection (the contact returns its
           // available LPP records), so `telemetryType` only applies to Meshtastic.
           case 'telemetry': return raw.requestRemoteTelemetry!(key);
-          case 'traceroute': return raw.traceContactPath!(key);
+          // Automatic origin (M3): the alert goes to notifyOnAutoTrace.
+          case 'traceroute': return raw.traceContactPath!(key, { origin: 'automation' });
           case 'neighbors': return raw.requestNeighbors!(key || undefined);
           case 'advert': {
             // Absent mode = action saved before the field existed → flood (legacy).

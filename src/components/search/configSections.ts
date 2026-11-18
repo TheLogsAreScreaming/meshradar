@@ -24,6 +24,8 @@ import type { TFunction } from 'i18next';
 import type { NavItem } from '../SectionNav';
 import { isCoverageMqttSourceType } from '../../utils/coverage';
 import { DEVICE_CONFIGURATION_NAV_ENTRY, GLOBAL_SETTINGS_NAV_ENTRY, SOURCE_SETTINGS_NAV_ENTRY } from '../nav/sourceNavEntries';
+import { isMqttConsentFilterSourceType } from '../../utils/mqttConsentFilter';
+import { isMeshCoreMqttFedSourceType } from '../../utils/meshcoreSourceTypes.js';
 
 /**
  * i18next's `t`, exactly as the tabs already hold it.
@@ -52,13 +54,25 @@ export const GLOBAL_SETTINGS_SECTIONS = new Set([
   // props/context were already wired up there.
   'settings-sorting',
   'settings-appearance', 'settings-link-previews',
-  'settings-privacy', 'settings-meshcore-messaging', 'settings-map',
+  'settings-privacy', 'settings-public-instance', 'settings-meshcore-messaging', 'settings-map',
   'settings-security',
+  // Default Meshtastic source (#5245): one install-wide choice.
+  'settings-default-source',
   'settings-remote-admin',
   'settings-apprise-server', 'settings-elevation',
+  // MQTT root directory refresh (#6337): one global outbound service, like elevation.
+  'settings-mqtt-root-directory',
+  // Ducting overlay (#5734): one global outbound service, like elevation.
+  'settings-ducting',
   // ADS-B flight matching (#5374): one global outbound service, like elevation.
   'settings-adsb',
-  'settings-atak-cot', 'settings-backup',
+  // MeshWars forwarder: one global outbound service, like ADS-B.
+  'settings-meshwars',
+  'settings-atak-cot',
+  // Virtual Node message replay (#6160): one global, opt-in switch for the
+  // install, like the CoT feed above.
+  'settings-virtual-node-replay',
+  'settings-backup',
   'settings-channel-database',
   'settings-scripts',
   'settings-maintenance', 'settings-analytics',
@@ -78,6 +92,11 @@ export const GLOBAL_SETTINGS_SECTIONS = new Set([
   // Reticulum destination retention (#5683 follow-up): one cap for every
   // Reticulum source, so it left the per-source Settings page.
   'settings-reticulum',
+  // Solar Monitoring (#6258 D5): solarMonitoringService reads bare getSetting,
+  // so the forecast is one per install.
+  'settings-solar',
+  // Restart / shutdown (#6258 D6): acts on the whole process, admin-only.
+  'settings-system',
 ]);
 
 /** Settings sections that belong to a source's own Settings tab. */
@@ -91,13 +110,20 @@ export const SOURCE_SETTINGS_SECTIONS = new Set([
   // PKI DM decryption (#5683 follow-up): a MeshRadar-side switch, moved
   // here from Device Configuration.
   'settings-pki-dm',
-  'settings-notifications', 'settings-packet-monitor', 'settings-solar',
+  // Reliable PKI per-source override (#5691): MeshRadar behaviour for this
+  // source's sends. The install-wide default lives in Global → Security.
+  'settings-reliable-pki',
+  'settings-notifications', 'settings-packet-monitor',
   'settings-reset-ui',
   // Coverage Report reception recording (#5277 P2 WP3 MQTT gateways, P3 WP4
   // MeshCore observers) — shown only on MQTT-shaped sources (see the
   // isCoverageMqttSourceType filter below), so it lives in the source, not
   // global, section set.
   'settings-coverage-mqtt',
+  // Anonymous-viewer MQTT-consent filter (#5156): per-source, Meshtastic only.
+  'settings-anon-mqtt-consent',
+  // MQTT-native send (#4305): per-source, mqtt_broker/mqtt_bridge only.
+  'settings-mqtt-native-send',
   'settings-management', 'settings-danger',
 ]);
 
@@ -109,7 +135,7 @@ export interface SettingsNavOptions {
   mode?: 'global' | 'source';
   isAdmin: boolean;
   canWriteSettings: boolean;
-  /** Database Maintenance is SQLite-only (it uses VACUUM). */
+  /** Unused since #5870: Database Maintenance runs on every backend. */
   databaseType?: 'sqlite' | 'postgres' | 'mysql' | null;
   firmwareOtaEnabled?: boolean;
   /**
@@ -142,7 +168,7 @@ export interface SettingsNavOptions {
  */
 export function hasDeviceConfigurationPage(sourceType: string | null | undefined): boolean {
   if (!sourceType) return false;
-  return !['mqtt_bridge', 'mqtt_broker', 'meshcore', 'meshcore_mqtt', 'reticulum'].includes(sourceType);
+  return !['mqtt_bridge', 'mqtt_broker', 'meshcore', 'reticulum'].includes(sourceType) && !isMeshCoreMqttFedSourceType(sourceType);
 }
 
 /**
@@ -153,7 +179,7 @@ export function hasDeviceConfigurationPage(sourceType: string | null | undefined
  * out deep links that land on nothing.
  */
 export function settingsNavItems(t: Translate, options: SettingsNavOptions): NavItem[] {
-  const { mode, isAdmin, canWriteSettings, databaseType, sourceType, canReadSources = false, canReadConfiguration = false } = options;
+  const { mode, isAdmin, canWriteSettings, sourceType, canReadSources = false, canReadConfiguration = false } = options;
   const inMode = (id: string) =>
     !mode || (mode === 'global' ? GLOBAL_SETTINGS_SECTIONS.has(id) : SOURCE_SETTINGS_SECTIONS.has(id));
 
@@ -164,20 +190,27 @@ export function settingsNavItems(t: Translate, options: SettingsNavOptions): Nav
     { id: 'settings-appearance', label: t('settings.appearance'), keywords: ['theme', 'dark', 'light', 'colors', 'icons', 'font'] },
     { id: 'settings-link-previews', label: t('settings.link_previews', 'Link Previews'), keywords: ['url', 'unfurl'] },
     { id: 'settings-privacy', label: t('settings.privacy', 'Privacy'), keywords: ['terms', 'policy', 'gdpr', 'contact'] },
+    { id: 'settings-public-instance', label: t('settings.public_instance_enabled', 'Public-instance mode'), keywords: ['public', 'anonymous', 'redact', 'privacy', 'embed'] },
     { id: 'settings-meshcore-messaging', label: t('settings.meshcore_messaging', 'MeshCore Messaging'), keywords: ['meshcore', 'chat'] },
     { id: 'settings-map', label: t('settings.map'), keywords: ['tiles', 'tileset', 'basemap', 'markers', 'pins', 'zoom'] },
     { id: 'settings-mqtt-bridge', label: t('mqtt_bridge_config.title', 'MQTT Bridge Configuration'), keywords: ['bridge', 'broker', 'upstream', 'url', 'username', 'password', 'forwarding', 'subscribe', 'publish', 'topics', 'geo', 'filter', 'rewrite', 'uplink', 'downlink'] },
     { id: 'settings-node-display', label: t('settings.node_display'), keywords: ['nodes', 'list', 'columns', 'age', 'inactive', 'aircraft', 'plane', 'altitude', 'AGL', 'balloon', 'drone'] },
     { id: 'settings-telemetry', label: t('settings.telemetry'), keywords: ['battery', 'voltage', 'charts', 'graphs', 'sensors'] },
     { id: 'settings-notifications', label: t('settings.notifications_and_security'), keywords: ['alerts', 'sounds', 'audio', 'desktop'] },
-    { id: 'settings-security', label: t('settings.security', 'Security'), keywords: ['pki', 'keys', 'encryption'] },
+    { id: 'settings-security', label: t('settings.security', 'Security'), keywords: ['pki', 'keys', 'encryption', 'reliable pki', 'nodeinfo'] },
     { id: 'settings-pki-dm', label: t('config.pki_dm.title', 'PKI Direct Message Decryption'), keywords: ['pki', 'dm', 'direct message', 'decrypt', 'private key', 'encryption'] },
+    { id: 'settings-reliable-pki', label: t('settings.reliable_pki.title', 'Reliable PKI'), keywords: ['pki', 'nodeinfo', 'node info', 'encryption', 'keys', 'prime', 'telemetry', 'dm'] },
     { id: 'settings-packet-monitor', label: t('settings.packet_monitor'), keywords: ['packets', 'logging', 'capture'] },
     { id: 'settings-solar', label: t('settings.solar_monitoring'), keywords: ['sun', 'panel', 'power', 'battery'] },
+    { id: 'settings-default-source', label: t('settings.default_source.title', 'Default Meshtastic source'), keywords: ['default', 'primary', 'source', 'radio', 'gateway', 'outbound', 'send', 'api'] },
     { id: 'settings-remote-admin', label: t('settings.remote_admin_section', 'Remote Administration'), keywords: ['admin', 'password', 'credentials'] },
     { id: 'settings-apprise-server', label: t('settings.apprise_server_section', 'Apprise API Server'), keywords: ['notifications', 'email', 'push', 'webhook'] },
     { id: 'settings-elevation', label: t('settings.elevation_section', 'Elevation / Terrain'), keywords: ['dem', 'terrain', 'altitude', 'height'] },
+    { id: 'settings-mqtt-root-directory', label: t('settings.mqtt_root_directory_section', 'MQTT root directory refresh'), keywords: ['mqtt', 'root', 'topic', 'directory', 'community', 'meshtastic', 'finder'] },
+    { id: 'settings-ducting', label: t('settings.ducting_section', 'Tropospheric ducting overlay'), keywords: ['ducting', 'tropo', 'tropospheric', 'refraction', 'gfs', 'noaa', 'propagation', 'weather'] },
     { id: 'settings-adsb', label: t('settings.adsb_section', 'Flight matching (ADS-B)'), keywords: ['adsb', 'ads-b', 'aircraft', 'flight', 'plane', 'callsign', 'adsb.lol', 'adsb.fi'] },
+    { id: 'settings-virtual-node-replay', label: t('settings.vn_replay_section', 'Virtual Node message replay'), keywords: ['virtual node', 'vn', 'replay', 'reconnect', 'missed', 'messages', 'android', 'app', 'backlog'] },
+    { id: 'settings-meshwars', label: t('settings.meshwars.title', 'MeshWars'), keywords: ['meshwars', 'game', 'territory', 'wardriving', 'meshmapper', 'meshcore'] },
     { id: 'settings-translation', label: t('settings.translation_section', 'Message Translation'), keywords: ['translate', 'translation', 'language', 'libretranslate', 'openai', 'deepl', 'ollama'] },
     { id: 'settings-backup', label: t('settings.system_backup', 'System Backup'), keywords: ['restore', 'export', 'import', 'archive'] },
     { id: 'settings-channel-database', label: t('channel_database.title', 'Channel Database'), keywords: ['psk', 'decrypt', 'channels', 'keys'] },
@@ -189,30 +222,39 @@ export function settingsNavItems(t: Translate, options: SettingsNavOptions): Nav
     { id: 'settings-position-estimation', label: t('automation.position_estimation.title', 'Position Estimation'), keywords: ['gps', 'location', 'estimate', 'triangulation'] },
     { id: 'settings-mesh-issues', label: t('automation.mesh_issues.title', 'Mesh Issues Analysis'), keywords: ['diagnostics', 'health', 'problems'] },
     { id: 'settings-auto-enrichment', label: t('automation.auto_enrichment.title', 'Auto-Enrichment'), keywords: ['nodeinfo', 'enrichment', 'fix all', 'schedule', 'cron'] },
-    { id: 'settings-coverage', label: t('settings.coverage_section', 'Coverage Report'), keywords: ['coverage', 'range test', 'retention', 'survey'] },
+    { id: 'settings-coverage', label: t('settings.coverage_section', 'Coverage Report'), keywords: ['coverage', 'range test', 'retention', 'survey', 'direct rf', 'zero hop'] },
     { id: 'settings-coverage-mqtt', label: t('settings.coverage_mqtt_section', 'Coverage recording'), keywords: ['coverage', 'gateway', 'mqtt', 'survey', 'range test', 'observer', 'meshcore'] },
+    { id: 'settings-anon-mqtt-consent', label: t('settings.anon_mqtt_consent.title', 'Anonymous viewers'), keywords: ['anonymous', 'privacy', 'mqtt', 'ok to mqtt', 'consent', 'public', 'gdpr', 'hide'] },
+    { id: 'settings-mqtt-native-send', label: t('settings.mqtt_native.title', 'Send over MQTT (no radio)'), keywords: ['mqtt', 'send', 'nodeless', 'transmit', 'downlink', 'node id', 'native'] },
     { id: 'settings-management', label: t('settings.settings_management'), keywords: ['export', 'import', 'reset'] },
     { id: 'settings-danger', label: t('settings.danger_zone'), keywords: ['delete', 'purge', 'wipe', 'reset'] },
+    { id: 'settings-system', label: t('settings.system_section', 'Restart / Shutdown'), keywords: ['restart', 'shutdown', 'reboot', 'container', 'docker', 'power'] },
   ];
 
   const adminOnly = new Set([
-    'settings-remote-admin', 'settings-apprise-server', 'settings-elevation', 'settings-adsb',
-    'settings-translation', 'settings-channel-database', 'settings-scripts', 'settings-analytics',
+    'settings-default-source',
+    'settings-remote-admin', 'settings-apprise-server', 'settings-elevation', 'settings-mqtt-root-directory', 'settings-ducting', 'settings-adsb', 'settings-meshwars',
+    'settings-translation', 'settings-channel-database', 'settings-scripts', 'settings-analytics', 'settings-system',
   ]);
-  const settingsWriteOnly = new Set(['settings-position-estimation', 'settings-mesh-issues', 'settings-auto-enrichment', 'settings-coverage', 'settings-coverage-mqtt']);
+  const settingsWriteOnly = new Set(['settings-position-estimation', 'settings-mesh-issues', 'settings-auto-enrichment', 'settings-coverage', 'settings-coverage-mqtt', 'settings-anon-mqtt-consent']);
 
   return items.filter((item) => {
     if (!inMode(item.id)) return false;
     if (adminOnly.has(item.id) && !isAdmin) return false;
     if (settingsWriteOnly.has(item.id) && !canWriteSettings) return false;
-    // Database Maintenance uses SQLite-specific features like VACUUM.
-    if (item.id === 'settings-maintenance' && databaseType !== 'sqlite') return false;
     if (item.id === 'settings-mqtt-bridge' && !(sourceType === 'mqtt_bridge' && canReadSources)) return false;
     if (item.id === 'settings-pki-dm' && !(hasDeviceConfigurationPage(sourceType) && canReadConfiguration)) return false;
+    // Reliable PKI only acts on a Meshtastic radio source's own sends.
+    if (item.id === 'settings-reliable-pki' && !hasDeviceConfigurationPage(sourceType)) return false;
     // Coverage recording only means anything on an MQTT-shaped source
     // (mqtt_broker/mqtt_bridge/meshcore_mqtt) — see isCoverageMqttSourceType
     // (#5277 P2 WP3, widened P3 WP4).
     if (item.id === 'settings-coverage-mqtt' && !isCoverageMqttSourceType(sourceType)) return false;
+    // The MQTT-consent filter needs an ok_to_mqtt bit: Meshtastic sources only (#5156).
+    if (item.id === 'settings-anon-mqtt-consent' && !isMqttConsentFilterSourceType(sourceType)) return false;
+    // MQTT-native send (#4305): MQTT broker/bridge sources, for viewers who
+    // can read the source setup (the section saves with sources:write).
+    if (item.id === 'settings-mqtt-native-send' && !((sourceType === 'mqtt_bridge' || sourceType === 'mqtt_broker') && canReadSources)) return false;
     return true;
   });
 }
@@ -229,8 +271,7 @@ export interface ConfigurationNavOptions {
 /** Sections of the per-source Configuration (device radio config) tab. */
 export function configurationNavItems(t: Translate, options: ConfigurationNavOptions = {}): NavItem[] {
   const items: NavItem[] = [
-    { id: 'config-danger', label: t('config.warning_title', 'Warning') },
-    { id: 'config-import-export', label: t('config.import_export_title', 'Import/Export'), keywords: ['backup', 'restore', 'yaml'] },
+    { id: 'config-import-export', label: t('config.import_export_title', 'Import/Export'), keywords: ['backup', 'restore', 'yaml', 'reload', 'refresh'] },
     { id: 'config-node-identity', label: t('config.node_identity', 'Node Identity'), keywords: ['name', 'shortname', 'longname', 'role'] },
     { id: 'config-device', label: t('config.device_config', 'Device'), keywords: ['role', 'rebroadcast', 'button', 'buzzer'] },
     { id: 'config-lora', label: t('config.lora_config', 'LoRa'), keywords: ['radio', 'region', 'preset', 'frequency', 'hops', 'bandwidth', 'spreading', 'tx', 'power'] },
@@ -259,6 +300,8 @@ export function configurationNavItems(t: Translate, options: ConfigurationNavOpt
     { id: 'config-channels', label: t('config.channels', 'Channels'), keywords: ['psk', 'primary', 'slots'] },
     { id: 'config-backup', label: t('config.backup_management', 'Backup'), keywords: ['restore', 'snapshot'] },
     { id: 'config-firmware', label: t('firmware.title', 'Firmware Updates'), keywords: ['ota', 'update', 'flash', 'firmware'] },
+    // Last on the page, as on MeshCore (#5830).
+    { id: 'config-danger', label: t('config.danger_zone', 'Danger zone'), keywords: ['reboot', 'restart', 'purge', 'shutdown', 'factory reset'] },
   ];
   return items.filter((item) => item.id !== 'config-firmware' || options.showFirmware === true);
 }
@@ -287,6 +330,88 @@ export function automationNavItems(t: Translate): NavItem[] {
   ];
 }
 
+/**
+ * Which optional sections the MeshCore Device Configuration page renders.
+ * Each flag is the exact mount condition the view uses, so a chip never
+ * points at a section that is not on the page.
+ */
+export interface MeshCoreConfigurationNavOptions {
+  /** Path hash size and default scope: companion firmware only. */
+  isCompanion?: boolean;
+  showChannels?: boolean;
+  showContactSync?: boolean;
+  showConsole?: boolean;
+  showObserver?: boolean;
+  showDangerZone?: boolean;
+  /** Device backups (#6285): a Companion source the viewer may read configuration on. */
+  showBackups?: boolean;
+  /** Repeater settings form (#6255): a connected Repeater whose settings were read. */
+  showRepeaterSettings?: boolean;
+  /** Repeater clock row (#6255): a connected Repeater. */
+  showRepeaterClock?: boolean;
+}
+
+/**
+ * Sections of a MeshCore source's Device Configuration page.
+ *
+ * The id sits on a wrapper around the WHOLE section (header and body), not on
+ * the ConfigSection header, so the in-page filter hides a section entirely
+ * instead of leaving its body behind.
+ *
+ * Not in the cross-page palette: MeshCore sources render their own page
+ * (MeshCoreSourcePage), which does not mount the palette, and its views are
+ * picked from in-page state rather than a route a deep link could reach.
+ */
+export function meshcoreConfigurationNavItems(t: Translate, options: MeshCoreConfigurationNavOptions = {}): NavItem[] {
+  // `show` absent means the section is always on the page.
+  const items: Array<NavItem & { show?: boolean }> = [
+    { id: 'meshcore-config-name', label: t('meshcore.config.device_name', 'Device name'), keywords: ['identity', 'rename', 'advert'] },
+    { id: 'meshcore-config-location', label: t('meshcore.config.location', 'Location'), keywords: ['gps', 'position', 'coordinates', 'advert'] },
+    { id: 'meshcore-config-repeater-adverts', label: t('meshcore.repeater.adverts_title', 'Adverts & forwarding'), keywords: ['advert', 'flood', 'repeat', 'airtime factor', 'delay', 'hops'], show: options.showRepeaterSettings === true },
+    { id: 'meshcore-config-repeater-access', label: t('meshcore.repeater.access_title', 'Access'), keywords: ['password', 'guest', 'admin', 'login', 'read only'], show: options.showRepeaterSettings === true },
+    { id: 'meshcore-config-repeater-clock', label: t('meshcore.repeater.clock_title', 'Clock'), keywords: ['time', 'sync', 'rtc'], show: options.showRepeaterClock === true },
+    { id: 'meshcore-config-radio', label: t('meshcore.config.radio_params', 'Radio parameters'), keywords: ['lora', 'preset', 'frequency', 'bandwidth', 'spreading factor', 'coding rate', 'region'] },
+    { id: 'meshcore-config-tx-power', label: t('meshcore.config.tx_power', 'TX Power'), keywords: ['transmit', 'dbm', 'output'] },
+    { id: 'meshcore-config-telemetry', label: t('meshcore.config.telemetry', 'Telemetry'), keywords: ['battery', 'sensors', 'environment'] },
+    { id: 'meshcore-path-hash', label: t('meshcore.path_hash.title', 'Default path hash size'), keywords: ['path', 'hash', 'routing', 'bytes'], show: options.isCompanion === true },
+    { id: 'meshcore-default-scope', label: t('meshcore.scope.title', 'Default region / scope'), keywords: ['region', 'scope', 'flood'], show: options.isCompanion === true },
+    { id: 'meshcore-sender-names', label: t('meshcore.sender_names.title', 'API sender names'), keywords: ['sender', 'name', 'api', 'impersonate', 'bot'], show: options.isCompanion === true },
+    { id: 'meshcore-channels', label: t('meshcore.channels.title', 'Channels'), keywords: ['psk', 'secret', 'hashtag', 'slots'], show: options.showChannels === true },
+    { id: 'meshcore-contact-sync', label: t('meshcore.contact_sync.title', 'Radio contact list'), keywords: ['contacts', 'sync', 'auto add', 'favorites'], show: options.showContactSync === true },
+    { id: 'meshcore-device-actions', label: t('meshcore.settings.actions', 'Device actions'), keywords: ['advert', 'flood', 'zero hop', 'discover', 'clock', 'time'] },
+    { id: 'meshcore-local-console', label: t('meshcore.localConsole.title', 'Device console'), keywords: ['cli', 'terminal', 'commands', 'serial'], show: options.showConsole === true },
+    { id: 'meshcore-observer', label: t('meshcore.observer.title', 'Analyzer Observer'), keywords: ['mqtt', 'analyzer', 'broker', 'upload', 'keys'], show: options.showObserver === true },
+    { id: 'meshcore-config-backup', label: t('config.backup_management', 'Backup'), keywords: ['restore', 'snapshot', 'export', 'yaml'], show: options.showBackups === true },
+    // Last on the page, as on Meshtastic.
+    { id: 'meshcore-device-management', label: t('config.danger_zone', 'Danger zone'), keywords: ['reboot', 'restart', 'private key', 'backup', 'restore', 'identity'], show: options.showDangerZone === true },
+  ];
+  return items
+    .filter((item) => item.show !== false)
+    .map(({ id, label, keywords }) => ({ id, label, keywords }));
+}
+
+/** Sections of a MeshCore source's Automations page. */
+export function meshcoreAutomationNavItems(t: Translate, opts: { includeAutoPing?: boolean } = {}): NavItem[] {
+  const items: NavItem[] = [
+    { id: 'meshcore-automation-pathfinding', label: t('meshcore.automation.pathfinding.title', 'Auto-Pathfinding'), keywords: ['path discovery', 'neighbors', 'neighbours', 'repeaters', 'schedule', 'target filter'] },
+    { id: 'meshcore-automation-auto-ack', label: t('meshcore.automation.autoack.title', 'Auto-Acknowledge'), keywords: ['ack', 'reply', 'ping', 'test'] },
+    { id: 'meshcore-automation-auto-announce', label: t('meshcore.automation.announce.title', 'Auto-Announce'), keywords: ['broadcast', 'scheduled', 'advert', 'message'] },
+    { id: 'meshcore-automation-auto-responder', label: t('meshcore.automation.responder.title', 'Auto-Responder'), keywords: ['reply', 'bot', 'keyword', 'trigger'] },
+    // Auto Ping (#5953) is Companion-only; the view passes includeAutoPing.
+    ...(opts.includeAutoPing
+      ? [{ id: 'meshcore-automation-auto-ping', label: t('automation.auto_ping.title', 'Auto Ping'), keywords: ['ping', 'coverage', 'route', 'rtt', 'flood', 'direct'] }]
+      : []),
+    { id: 'meshcore-automation-forwarding', label: t('forwarding.title', 'Forwarding'), keywords: ['forward', 'relay', 'bridge', 'copy'] },
+    { id: 'meshcore-automation-timer-triggers', label: t('meshcore.automation.timers.title', 'Timer Triggers'), keywords: ['schedule', 'cron', 'timed events'] },
+    { id: 'meshcore-automation-auto-delete-distance', label: t('meshcore.automation.delete_distance.title', 'Auto Delete by Distance'), keywords: ['purge', 'distance', 'prune', 'cleanup', 'remove', 'far'] },
+    { id: 'meshcore-automation-time-sync', label: t('meshcore.automation.time_sync.title', 'Time Sync'), keywords: ['clock', 'time', 'rtc', 'repeater', 'schedule', 'sync'] },
+    { id: 'meshcore-automation-remote-telemetry', label: t('meshcore.automation.remote_telemetry.title', 'Remote Telemetry'), keywords: ['telemetry', 'poll', 'battery', 'sensor', 'metrics', 'schedule'] },
+    { id: 'meshcore-automation-auto-favorite', label: t('meshcore.automation.auto_favorite.title', 'Auto Favorite'), keywords: ['favorite', 'favourite', 'star', 'pin', 'active', 'contact', 'sweep'] },
+    { id: 'meshcore-automation-auto-welcome', label: t('meshcore.automation.auto_welcome.title', 'Auto Welcome'), keywords: ['welcome', 'greet', 'greeting', 'new node', 'hello', 'intro'] },
+  ];
+  return items;
+}
+
 /** Sections of the per-source Notifications tab. */
 export function notificationsNavItems(t: Translate): NavItem[] {
   return [
@@ -306,6 +431,7 @@ export function adminCommandsNavItems(t: Translate): NavItem[] {
     { id: 'admin-import-export', label: t('admin_commands.config_import_export', 'Import/Export'), keywords: ['backup', 'restore'] },
     { id: 'admin-node-management', label: t('admin_commands.node_favorites_ignored', 'Node Management'), keywords: ['favorites', 'ignored', 'reboot'] },
     { id: 'admin-auto-favorites', label: t('auto_favorite.nav', 'Automatic Favorites'), keywords: ['star', 'favourite'] },
+    { id: 'admin-cli-console', label: t('admin_commands.cli_console.title', 'Remote CLI console'), keywords: ['cli', 'console', 'terminal', 'command'] },
   ];
 }
 

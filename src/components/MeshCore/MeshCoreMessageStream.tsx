@@ -1,24 +1,53 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState, KeyboardEvent } from 'react';
-import MentionAutocomplete from '../mentions/MentionAutocomplete';
-import { useMentionAutocomplete } from '../../hooks/useMentionAutocomplete';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import MessageComposeInput from '../MessageComposeInput';
+import { createComposeDraftStore } from '../../contexts/composeDraftStore';
+import { useViewTranslations } from '../../hooks/useViewTranslations';
+import { TranslatedMessage, type TranslatedMessageState } from '../translation/TranslatedMessage';
+import { TranslateModal } from '../translation/TranslateModal';
 import { useTranslation } from 'react-i18next';
 import { MeshCoreMessage } from './hooks/useMeshCore';
 import { MeshCoreContact } from '../../utils/meshcoreHelpers';
-import { getMessageDateSeparator, shouldShowDateSeparator } from '../../utils/datetime';
-import { getUtf8ByteLength, formatByteCount } from '../../utils/text';
+import { getMessageDateSeparator, shouldShowDateSeparator, formatRelativeTime } from '../../utils/datetime';
+import { useSettingsOptional } from '../../contexts/SettingsContext';
+import { getUtf8ByteLength } from '../../utils/text';
 import LinkPreview from '../LinkPreview';
 import MeshCoreMessageRouteModal from './MeshCoreMessageRouteModal';
 import MessageDetailsModal from '../diagnostics/MessageDetailsModal';
 import { UiIcon } from '../icons';
+import { HiddenMessageText } from '../messages/HiddenMessageText';
+import { isPublicHiddenText } from '../../utils/publicInstanceMode';
 import UnreadDivider from '../messages/UnreadDivider';
 import { resolveUnreadAnchorId, shouldSuppressDivider } from '../../utils/unreadAnchor';
-import { uniquePrefixMatch } from '../../utils/meshcoreKeyMatch';
+import { resolveAuthorContact, isUsableSenderKey } from '../../utils/meshcoreKeyMatch';
 import { MeshCoreIgnoredRunRow } from './MeshCoreIgnoredRunRow';
 import { findIgnoredRuns } from './meshcoreIgnoredRuns';
+import { groupMeshCoreReactions } from './meshcoreReactionGroups';
+import { MeshCoreReactionChips, MeshCoreUnmatchedReaction } from './MeshCoreReactionChips';
 import Modal from '../common/Modal';
-import { resendAvailability, RESEND_MAX } from './meshcoreResend';
+import { resendAvailability, RESEND_MAX, type ResendAvailabilityOpts } from './meshcoreResend';
+import { MESHCORE_MAX_MESSAGE_BYTES_CHANNEL_WORST_CASE } from '../../utils/meshcoreMessageLimits';
+import { EmojiPickerModal, type TapbackEmoji } from '../EmojiPickerModal/EmojiPickerModal';
+import { isReactableRow, reactionEmojiOptions } from './meshcoreReactionClient';
+import { isReactionEmoji } from '../../utils/meshcoreReactions';
+import { foldReactionEmoji } from '../../utils/meshcoreReactionTarget';
 import styles from './MeshCoreMessageStream.module.css';
-import { getMeshCoreChannelSendState } from '../../utils/deliveryDiagnostics/status';
+import protocolStripe from '../messages/ProtocolStripe.module.css';
+import { getMeshCoreDirectSendState } from '../../utils/deliveryDiagnostics/status';
+import { directSendLabel } from './meshcoreSendLabel';
+import { parseSpip } from '../../utils/spip';
+import { SpipImage } from '../Spip/SpipImage';
+import { meshcoreDisplayTimeMs, meshcoreMessageClockOffsetMs } from '../../utils/meshcoreMessageTime';
+import { MeshCoreClockOffset } from './MeshCoreClockOffset';
+import { requiredRepeatersHeard, RELAY_ADV_TYPES, type RequiredRepeaterMode } from '../../utils/meshcoreHeardBy';
+import { HeardByBubble, HeardByList } from './HeardByBubble';
+import { splitMeshCoreContactTokens, type MeshCoreContactTokenMatch } from '../../utils/meshcoreContactToken';
+import { MeshCoreContactTokenModal } from './MeshCoreContactTokenModal';
+import { MeshCoreShareContactPicker } from './MeshCoreShareContactPicker';
+import { selfContactToken } from './meshcoreContactShare';
+import type { AddContactToDeviceResponse } from './hooks/useMeshCore';
+import type { ComposeInsertMenuItem } from '../composeInsertMenuTypes';
+import tokenStyles from './MeshCoreContactToken.module.css';
+import { isNearBottom, DEFAULT_NEAR_BOTTOM_THRESHOLD_PX } from '../../utils/scrollNearBottom';
 
 interface MeshCoreMessageStreamProps {
   messages: MeshCoreMessage[];
@@ -37,6 +66,10 @@ interface MeshCoreMessageStreamProps {
    *  hover in every browser, so the enclosing element carries it too. Only
    *  meaningful while `disabled` is true; ignored otherwise. */
   disabledReason?: string;
+  /** Hide the composer (text box + Send button + byte counter) entirely, for a
+   *  view-only channel such as a MeshCore virtual channel whose key is not on
+   *  the radio (#6159). The stream still renders its messages. */
+  hideComposer?: boolean;
   onSend: (text: string) => Promise<boolean>;
   onNodeNameClick?: (publicKey: string) => void;
   /** When provided, received channel messages show a Reply button (#3851). The
@@ -50,11 +83,24 @@ interface MeshCoreMessageStreamProps {
    *  Resend action (#5512). The stream asks for confirmation first; the parent
    *  makes the call. Hidden while `disabled`. */
   onResendMessage?: (message: MeshCoreMessage) => Promise<unknown>;
+  /** When provided, reactable messages show a react button and other people's
+   *  reaction chips become clickable (#5762). The parent makes the call. Hidden
+   *  while `disabled`. */
+  onReact?: (message: MeshCoreMessage, emoji: string) => Promise<boolean>;
+  /** Picker emoji list (the user's tapback settings); filtered to what MeshCore can send. */
+  reactionEmojis?: TapbackEmoji[];
   /** Stable key identifying the current conversation. When it changes, the
    *  stream re-runs its entry scroll (to the first-unread row, or the bottom). */
   conversationKey?: string;
   /** Maximum UTF-8 byte length for a message. Send is blocked when exceeded. */
   maxBytes?: number;
+  /**
+   * Text to pre-fill the compose box with once (Security tab notification,
+   * #6281). Seeded when it first arrives; the user reads it and sends it.
+   */
+  initialDraft?: string | null;
+  /** Called after the draft was applied, so the owner can drop it. */
+  onInitialDraftConsumed?: () => void;
   /** When provided together with `hasMoreOlder`, the stream requests older
    *  history (#4460) once the user scrolls near the top, throttled to avoid
    *  spamming the caller. The caller owns fetching/prepending and is expected
@@ -74,6 +120,40 @@ interface MeshCoreMessageStreamProps {
    *  live value would evaporate before the line could be drawn. `null` /
    *  omitted means "no divider" (nothing unread, or unknown). */
   unreadAnchorMs?: number | null;
+  /** True while the parent is still fetching this conversation's backlog.
+   *  The one-shot entry scroll waits for it to clear, so it never runs
+   *  against a partial list (or a previous conversation's rows) and spends
+   *  the shot before the real history lands. */
+  backlogLoading?: boolean;
+  /** Reaction id → target id, for reactions resolved after `messages` was
+   *  loaded (#5759). Lets a view that pages its own history show the chip
+   *  without a reload. */
+  reactionResolutions?: Record<string, string>;
+  /** Per-source Required Repeaters (#6178 → #6193): full public-key hex strings
+   *  of the repeaters whose relay ends a channel send's resend window. In `'any'`
+   *  mode the ↻ button goes once one of them is heard; in `'all'` once every one
+   *  is. Empty = default "heard by any". The matcher reads candidate relays from
+   *  `contacts`. */
+  requiredRepeaterKeys?: string[];
+  requiredRepeaterMode?: RequiredRepeaterMode;
+  /**
+   * Contact-share tokens in messages (#6370). Tokens are always detected and
+   * get an import button; this says whether Import can run. Unset: the modal
+   * opens with Import disabled.
+   */
+  contactTokenImport?: {
+    onImport?: (raw: string, confirmFull: boolean) => Promise<AddContactToDeviceResponse>;
+    canImport: boolean;
+    /** Why Import is off (not a Companion, not connected, no permission). */
+    disabledReason?: string;
+  };
+  /**
+   * Show the composer's + menu with Share contact / Share my contact info
+   * (#6370). `selfNode` is this source's own node, for the self token.
+   */
+  contactShare?: {
+    selfNode: { publicKey?: string | null; name?: string | null } | null;
+  };
 }
 
 /** Scroll-to-top distance (px) that triggers a load-older request. */
@@ -87,7 +167,8 @@ function formatTime(ts: number): string {
 
 const MENTION_RE = /@\[([^\]]+)\]/g;
 
-function renderMessageText(text: string): React.ReactNode {
+/** Plain text with `@[Name]` mentions drawn as chips. `keyPrefix` keeps keys unique across segments. */
+function renderMentions(text: string, keyPrefix: string): React.ReactNode[] {
   const parts: React.ReactNode[] = [];
   let lastIndex = 0;
   let match: RegExpExecArray | null;
@@ -99,7 +180,7 @@ function renderMessageText(text: string): React.ReactNode {
     const name = match[1];
     parts.push(
       <span
-        key={match.index}
+        key={`${keyPrefix}${match.index}`}
         className="mc-mention"
         title={name}
       >
@@ -111,38 +192,101 @@ function renderMessageText(text: string): React.ReactNode {
   if (lastIndex < text.length) {
     parts.push(text.substring(lastIndex));
   }
+  return parts;
+}
+
+function renderMessageText(
+  text: string,
+  onContactToken: (match: MeshCoreContactTokenMatch) => void,
+  importLabel: (name: string) => string,
+): React.ReactNode {
+  // Hidden on a public instance (#5156).
+  if (isPublicHiddenText(text)) return <HiddenMessageText />;
+
+  // A message that is one SPIP image code draws as the image.
+  const spip = parseSpip(text);
+  if (spip) return <SpipImage image={spip} code={text.trim()} />;
+
+  // Contact-share tokens (#6370): keep the token text, add an import button.
+  const parts: React.ReactNode[] = [];
+  let pos = 0;
+  for (const seg of splitMeshCoreContactTokens(text)) {
+    if (seg.kind === 'text') {
+      parts.push(...renderMentions(seg.text, `m${pos}-`));
+      pos += seg.text.length;
+      continue;
+    }
+    pos = seg.match.end;
+    const { match } = seg;
+    parts.push(
+      <span key={`token-${match.start}`} className={tokenStyles.token}>
+        <span className={tokenStyles.tokenText}>{match.raw}</span>
+        <button
+          type="button"
+          className={tokenStyles.tokenButton}
+          onClick={() => onContactToken(match)}
+          title={importLabel(match.token.name)}
+          aria-label={importLabel(match.token.name)}
+        >
+          <UiIcon name="identity" size={15} />
+        </button>
+      </span>,
+    );
+  }
   return parts.length > 0 ? parts : text;
 }
 
 export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
-  messages,
+  messages: allMessages,
   contacts,
   sourceId,
   selfPublicKey,
   emptyText,
   disabled,
   disabledReason,
+  hideComposer = false,
   onSend,
   onNodeNameClick,
   onReply,
   onDeleteMessage,
   onResendMessage,
+  onReact,
+  reactionEmojis,
   conversationKey,
-  maxBytes = 130,
+  maxBytes = MESHCORE_MAX_MESSAGE_BYTES_CHANNEL_WORST_CASE,
+  initialDraft,
+  onInitialDraftConsumed,
   onLoadOlder,
   hasMoreOlder,
   loadingOlder,
   unreadAnchorMs,
+  backlogLoading = false,
+  reactionResolutions,
+  requiredRepeaterKeys,
+  requiredRepeaterMode = 'any',
+  contactTokenImport,
+  contactShare,
 }) => {
   const { t } = useTranslation();
-  const [draft, setDraft] = useState('');
+  // The user's time/date format for the relative-time tooltip, as the
+  // Meshtastic rows use (#4173 review L23). Optional: the stream also renders
+  // outside a SettingsProvider (tests, pop-outs), where the helper defaults hold.
+  const settings = useSettingsOptional();
+  const timeFormat = settings?.timeFormat;
+  const dateFormat = settings?.dateFormat;
+  // Per stream instance; not cleared when the conversation changes (as before).
+  const [draftStore] = useState(() => createComposeDraftStore());
+  // Seed the compose draft once per handed-over text (#6281).
+  const seededDraftRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (initialDraft == null || initialDraft === '' || seededDraftRef.current === initialDraft) return;
+    seededDraftRef.current = initialDraft;
+    draftStore.set(initialDraft);
+    onInitialDraftConsumed?.();
+  }, [initialDraft, draftStore, onInitialDraftConsumed]);
+  const [translateModalOpen, setTranslateModalOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
-  // Message ids whose "heard repeaters" list (#3700) is expanded.
-  const [expandedHeardBy, setExpandedHeardBy] = useState<Set<string>>(new Set());
-  // Ignore / Block (#5408): consecutive ignored messages collapse into one row,
-  // keyed by the run's first message id; this set holds the runs shown open.
-  const ignoredRuns = useMemo(() => findIgnoredRuns(messages), [messages]);
   const [expandedIgnoredRuns, setExpandedIgnoredRuns] = useState<Set<string>>(new Set());
   const toggleIgnoredRun = useCallback((key: string) => {
     setExpandedIgnoredRuns(prev => {
@@ -155,6 +299,16 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
   // Message whose relay-hash chain was clicked — opens the route-detail modal
   // that expands each hash to the matching repeater name.
   const [routeDetail, setRouteDetail] = useState<MeshCoreMessage | null>(null);
+  // Contact-share token the user clicked (#6370).
+  const [tokenDetail, setTokenDetail] = useState<MeshCoreContactTokenMatch | null>(null);
+  const importTokenLabel = useCallback(
+    (name: string) => t('meshcore.contact_token.open', 'Import contact {{name}}', { name }),
+    [t],
+  );
+  // Share contact picker (#6370). The composer hands over its insert function
+  // when the menu entry is picked; the picker calls it with the token.
+  const [sharePickerOpen, setSharePickerOpen] = useState(false);
+  const shareInsertRef = useRef<((text: string) => void) | null>(null);
   // Outgoing message whose delivery-status icon was clicked — opens the
   // Delivery Details modal (#4816 Phase 1 WP3). Independent of `routeDetail`
   // above, which is the pre-existing route-detail popup.
@@ -164,20 +318,12 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
   // Resend (#5512). The button appears once the 30 s cooldown passes and goes
   // away after an hour, so the stream needs a clock. It only ticks while some
   // message could still become (or stop being) resendable.
+  const reactEnabled = !!onReact && !disabled;
+  const [reactTarget, setReactTarget] = useState<MeshCoreMessage | null>(null);
   const [resendConfirm, setResendConfirm] = useState<MeshCoreMessage | null>(null);
   const [resending, setResending] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const resendEnabled = !!onResendMessage && !disabled;
-  const needsResendClock = useMemo(
-    () => resendEnabled && messages.some(m => resendAvailability(m, selfPublicKey, Date.now()).kind !== 'never'),
-    [resendEnabled, messages, selfPublicKey],
-  );
-  useEffect(() => {
-    if (!needsResendClock) return;
-    setNow(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), 5_000);
-    return () => clearInterval(timer);
-  }, [needsResendClock]);
   const confirmResend = useCallback(async () => {
     if (!resendConfirm || !onResendMessage) return;
     setResending(true);
@@ -190,10 +336,16 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
     }
   }, [resendConfirm, onResendMessage]);
 
+  // The heard-by (antenna) badge and the #6124 scroll-on-expand live inside the
+  // shared <HeardByBubble>. Its expand state lives here: the badge sits on the
+  // header row (#6239) but the list opens BELOW the message body, at full
+  // message width, not inside the narrow header meta column (#4173 review L13).
+  const [openHeardBy, setOpenHeardBy] = useState<ReadonlySet<string>>(() => new Set());
   const toggleHeardBy = useCallback((id: string) => {
-    setExpandedHeardBy(prev => {
+    setOpenHeardBy((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
   }, []);
@@ -211,11 +363,94 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
       if (!key) return null;
       // Unique prefix match only (#5349) — never name a message after the
       // first of several contacts sharing its prefix.
-      const hit = exact.get(key) ?? uniquePrefixMatch(list, key);
+      const hit = exact.get(key) ?? resolveAuthorContact(list, key);
       if (!hit) return null;
       return hit.advName || hit.name || null;
     };
   }, [contacts]);
+
+  // Reactions (#5759): a reaction row is not a bubble. It folds into a chip
+  // under its target, or stays as one dim line while the target is unknown.
+  // Everything below works on `messages`, the rows that are drawn.
+  const youLabel = t('meshcore.you', 'You');
+  const { rows: messages, chipsByTarget } = useMemo(
+    () => groupMeshCoreReactions(allMessages, {
+      resolutions: reactionResolutions,
+      selfPublicKey,
+      youLabel,
+      nameForKey,
+    }),
+    [allMessages, reactionResolutions, selfPublicKey, youLabel, nameForKey],
+  );
+  // Inline translation (#6261): one stored-translation fetch for the rows in
+  // view; a Translate button on each translatable row.
+  const translatableIds = useMemo(
+    () => messages
+      .filter(m => m.text && !m.reactionEmoji && !m.reactionPending && parseSpip(m.text) == null)
+      .sort((a, b) => meshcoreDisplayTimeMs(a) - meshcoreDisplayTimeMs(b))
+      .map(m => m.id),
+    [messages],
+  );
+  const { translationSettings, translatedMessages, translateMessage, dismissTranslation } =
+    useViewTranslations(sourceId, translatableIds);
+  const canTranslate = translationSettings.canTranslate;
+  const translatableIdSet = useMemo(() => new Set(translatableIds), [translatableIds]);
+
+  // Send a reaction (#5762). Skip when we already sent the same emoji here.
+  const handleReact = useCallback((m: MeshCoreMessage, emoji: string) => {
+    if (!onReact) return;
+    const folded = foldReactionEmoji(emoji);
+    const dup = (chipsByTarget.get(m.id) ?? []).some(c => c.mine && foldReactionEmoji(c.emoji) === folded);
+    if (dup) return;
+    void onReact(m, emoji);
+  }, [onReact, chipsByTarget]);
+  // Ignore / Block (#5408): consecutive ignored messages collapse into one row,
+  // keyed by the run's first message id; `expandedIgnoredRuns` holds the runs
+  // shown open.
+  const ignoredRuns = useMemo(() => findIgnoredRuns(messages), [messages]);
+  // #6178 → #6193: the source's known relays (repeater / room-server), the
+  // candidate set the Required Repeater matcher resolves path-hash prefixes
+  // against. Carries the display name too, for the heard-by bubble's rows.
+  const repeaters = useMemo(
+    () => (contacts ?? [])
+      .filter(c => c.publicKey && (c.advType == null || RELAY_ADV_TYPES.has(c.advType)))
+      .map(c => ({ publicKey: c.publicKey, advType: c.advType ?? null, name: c.advName || c.name || null })),
+    [contacts],
+  );
+  // The required keys, normalised to a stable array for the memo deps.
+  const requiredKeys = useMemo(
+    () => requiredRepeaterKeys ?? [],
+    [requiredRepeaterKeys],
+  );
+  // Opts bag passed to `resendAvailability`; with no Required Repeaters set this
+  // is undefined, so the default "heard by any" path runs unchanged.
+  const resendOpts = useMemo<ResendAvailabilityOpts | undefined>(
+    () => (requiredKeys.length > 0
+      ? { requiredRepeaterKeys: requiredKeys, requiredRepeaterMode, repeaters }
+      : undefined),
+    [requiredKeys, requiredRepeaterMode, repeaters],
+  );
+  const needsResendClock = useMemo(
+    () => resendEnabled && messages.some(m => resendAvailability(m, selfPublicKey, Date.now(), resendOpts).kind !== 'never'),
+    [resendEnabled, messages, selfPublicKey, resendOpts],
+  );
+  // Display label for the required-aware resend tooltip (#6193). One required
+  // repeater → its name; several → a count. Falls back to a short pubkey.
+  const requiredRepeaterName = useMemo(() => {
+    if (requiredKeys.length === 0) return null;
+    if (requiredKeys.length === 1) {
+      const want = requiredKeys[0].toLowerCase();
+      const hit = (contacts ?? []).find(c => c.publicKey && c.publicKey.toLowerCase() === want);
+      return hit?.advName || hit?.name || `${requiredKeys[0].slice(0, 12)}…`;
+    }
+    return t('meshcore.required_repeater.count', { count: requiredKeys.length, defaultValue: '{{count}} required repeaters' });
+  }, [requiredKeys, contacts, t]);
+  useEffect(() => {
+    if (!needsResendClock) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 5_000);
+    return () => clearInterval(timer);
+  }, [needsResendClock]);
 
   const fullKeyFor = useMemo(() => {
     const list = contacts ?? [];
@@ -223,7 +458,7 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
     return (key: string): string => {
       if (!key) return key;
       if (exact.has(key)) return key;
-      const hit = uniquePrefixMatch(list, key);
+      const hit = resolveAuthorContact(list, key);
       return hit?.publicKey ?? key;
     };
   }, [contacts]);
@@ -250,15 +485,20 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
         ? messages.filter(m => m.fromPublicKey === selfPublicKey).map(m => m.id)
         : []
     );
+    // An unmatched reaction is a dim line, not a message (#5759): the divider
+    // never sits on it.
+    for (const m of messages) {
+      if (m.reactionEmoji) ownIds.add(m.id);
+    }
     const anchorId = resolveUnreadAnchorId({
-      messages: messages.map(m => ({ id: m.id, sortTime: m.timestamp })),
+      messages: messages.map(m => ({ id: m.id, sortTime: meshcoreDisplayTimeMs(m) })),
       watermarkMs: unreadAnchorMs,
       mode: 'lastRead',
       ownMessageIds: ownIds,
     });
     return shouldSuppressDivider({
       anchorId,
-      messages: messages.map(m => ({ id: m.id, sortTime: m.timestamp })),
+      messages: messages.map(m => ({ id: m.id, sortTime: meshcoreDisplayTimeMs(m) })),
       hasMoreOlder,
     }) ? null : anchorId;
   }, [messages, selfPublicKey, unreadAnchorMs, hasMoreOlder]);
@@ -268,6 +508,10 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
   // scroll on every incoming message.
   const unreadAnchorIdRef = useRef<string | null>(unreadAnchorId);
   unreadAnchorIdRef.current = unreadAnchorId;
+  // Same for `backlogLoading`, read inside the deferred frame and the
+  // ResizeObserver below.
+  const backlogLoadingRef = useRef(backlogLoading);
+  backlogLoadingRef.current = backlogLoading;
 
   // Entry scroll: on conversation entry, land on the unread divider when there
   // is one, otherwise at the BOTTOM (newest messages).
@@ -323,13 +567,19 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
     }
     if (state.done) return;
     // Wait for the (possibly async) backlog before committing the entry scroll.
-    if (messages.length === 0) return;
+    // `messages.length > 0` alone is not enough: right after a switch the
+    // parent can still be passing a live tail, or the previous conversation's
+    // rows, and spending the shot on those strands the view (at the top, or at
+    // the old conversation's unread divider) once the real backlog lands.
+    if (messages.length === 0 || backlogLoading) return;
     requestAnimationFrame(() => {
-      // Re-check inside the frame: the pane may still be hidden.
-      if (entryScrollRef.current.done) return;
+      // Re-check inside the frame: the pane may still be hidden, or the
+      // conversation may have changed again.
+      if (entryScrollRef.current.done || backlogLoadingRef.current) return;
+      if (entryScrollRef.current.key !== conversationKey) return;
       if (runEntryScroll(container)) entryScrollRef.current.done = true;
     });
-  }, [conversationKey, messages.length, runEntryScroll]);
+  }, [conversationKey, messages.length, backlogLoading, runEntryScroll]);
 
   // Complete a deferred entry scroll the moment the list gains a real size —
   // i.e. when the hidden conversation pane is revealed. Nothing else changes at
@@ -359,23 +609,39 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
       // changes render timing enough to expose it: the list went 1 child ->
       // 203 children in a single step, while an authenticated session rendered
       // progressively and scrolled correctly by luck of ordering.
-      if (messageCountRef.current === 0) return;
+      if (messageCountRef.current === 0 || backlogLoadingRef.current) return;
       if (runEntryScroll(container)) state.done = true;
     });
     observer.observe(container);
     return () => observer.disconnect();
   }, [runEntryScroll]);
 
-  // Auto-scroll on new messages only when the user is already near the bottom.
+  // Whether the viewport was near the bottom BEFORE the latest render. Captured
+  // from `handleScroll` (pre-commit layout) and consulted by the auto-scroll
+  // effect below. Measuring inside that effect instead would read the DOM
+  // AFTER the new row has grown `scrollHeight`, so a tall bubble could fail the
+  // near-bottom test even though the user was sitting at the bottom — the
+  // #6124 post-render false negative. Defaults to true so a fresh stream, or
+  // one whose entry scroll put it at the bottom, follows the first message.
+  const wasNearBottomRef = useRef(true);
+  const prevLastMessageIdRef = useRef<string | undefined>(messages[messages.length - 1]?.id);
+
+  // Auto-scroll on new messages only when the user was already near the bottom
+  // before this row committed (see `wasNearBottomRef`). Follow an APPEND only,
+  // never a prepend of older history: a load-older page grows the count but
+  // leaves the last id unchanged, and the restore effect below keeps its
+  // position (#4476).
   useEffect(() => {
     const container = listRef.current;
+    const currentLastId = messages[messages.length - 1]?.id;
+    const prevLastId = prevLastMessageIdRef.current;
+    prevLastMessageIdRef.current = currentLastId;
     if (!container) return;
-    const isNearBottom =
-      container.scrollHeight - container.scrollTop - container.clientHeight < 100;
-    if (isNearBottom) {
+    if (currentLastId === prevLastId) return;
+    if (wasNearBottomRef.current) {
       container.scrollTop = container.scrollHeight;
     }
-  }, [messages.length]);
+  }, [messages]);
 
   // Scroll metrics captured right before a load-older request fires, so the
   // restore effect below can keep the same content under the viewport once
@@ -398,14 +664,25 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
   const handleScroll = useCallback(() => {
     const container = listRef.current;
     if (!container) return;
-    const isNearBottom =
-      container.scrollHeight - container.scrollTop - container.clientHeight < 100;
-    setShowJumpToBottom(!isNearBottom);
+    const nearBottom = isNearBottom(container, DEFAULT_NEAR_BOTTOM_THRESHOLD_PX);
+    // Capture the pre-commit position so the auto-scroll effect can follow new
+    // messages even when a tall row would fail a post-render re-measure (#6124).
+    wasNearBottomRef.current = nearBottom;
+    setShowJumpToBottom(!nearBottom);
 
+    // Never page older history before this conversation's entry scroll has
+    // landed. A switch replaces the rows, the browser clamps scrollTop to 0 and
+    // fires a scroll event; reading that as "scrolled to the top" loaded an
+    // older page whose restore then yanked the view off the unread divider.
+    // (A list with no laid-out height cannot be scrolled, so it never counts
+    // as pending; that also keeps jsdom, where scrollHeight is 0, working.)
+    const entryPending = !entryScrollRef.current.done && container.scrollHeight > 0;
     if (
       onLoadOlder &&
       hasMoreOlder &&
       !loadingOlder &&
+      !backlogLoading &&
+      !entryPending &&
       container.scrollTop < LOAD_OLDER_THRESHOLD_PX
     ) {
       const now = Date.now();
@@ -418,7 +695,7 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
         onLoadOlder();
       }
     }
-  }, [onLoadOlder, hasMoreOlder, loadingOlder]);
+  }, [onLoadOlder, hasMoreOlder, loadingOlder, backlogLoading]);
 
   // Once a load-older request settles (loadingOlder flips back to false),
   // restore the viewport to the same content it was showing before older
@@ -452,15 +729,7 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
     return () => container.removeEventListener('scroll', handleScroll);
   }, [handleScroll]);
 
-  // Reuse the shared composer byte-count helpers (same as the Meshtastic
-  // channel/DM composers) so counting + warning thresholds + display stay in
-  // one place. Only the per-context limit differs (channel 130 / scoped 120 /
-  // DM 150), passed in via maxBytes.
-  const byteLen = useMemo(() => getUtf8ByteLength(draft), [draft]);
-  const byteCounter = useMemo(() => formatByteCount(byteLen, maxBytes), [byteLen, maxBytes]);
-  const overLimit = byteLen > maxBytes;
-
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const refocusRef = useRef(false);
 
   useEffect(() => {
@@ -471,18 +740,49 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
   }, [sending, disabled]);
 
   const handleSend = async () => {
-    if (!draft.trim() || sending || overLimit) return;
+    const draft = draftStore.get();
+    if (!draft.trim() || sending || getUtf8ByteLength(draft) > maxBytes) return;
     setSending(true);
     refocusRef.current = true;
     const ok = await onSend(draft);
     setSending(false);
-    if (ok) setDraft('');
+    if (ok) draftStore.set('');
   };
 
   // #5276: `@` autocomplete over known contacts. MeshCore's mention form is
   // the name-based `@[Name]` this app already renders and prefills on reply
   // (#3851) — deliberately NOT the Meshtastic `@!<id>` token, which has no
   // meaning on a MeshCore mesh.
+  // Composer + menu (#6370): only when the parent asks for contact sharing.
+  const selfShareToken = contactShare ? selfContactToken(contactShare.selfNode) : null;
+  const insertMenuItems = useMemo<ComposeInsertMenuItem[] | undefined>(() => {
+    if (!contactShare) return undefined;
+    return [
+      {
+        id: 'share-contact',
+        label: t('meshcore.contact_token.share_contact', 'Share contact'),
+        icon: 'identity',
+        onSelect: (insert) => {
+          shareInsertRef.current = insert;
+          setSharePickerOpen(true);
+        },
+      },
+      {
+        id: 'share-self',
+        label: t('meshcore.contact_token.share_self', 'Share my contact info'),
+        icon: 'companion',
+        disabled: !selfShareToken,
+        disabledReason: t(
+          'meshcore.contact_token.share_self_unavailable',
+          'Needs this radio\'s public key and name. Connect the Companion first.',
+        ),
+        onSelect: (insert) => {
+          if (selfShareToken) insert(selfShareToken);
+        },
+      },
+    ];
+  }, [contactShare, selfShareToken, t]);
+
   const mentionCandidates = useMemo(
     () => (contacts ?? [])
       .map(c => ({
@@ -498,29 +798,12 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
       .map(({ id, longName, shortName }) => ({ id, longName, shortName })),
     [contacts]
   );
-  const mentions = useMentionAutocomplete({
-    value: draft,
-    onChange: setDraft,
-    textareaRef: inputRef,
-    candidates: mentionCandidates,
-    buildInsertion: candidate => `@[${candidate.longName}] `,
-  });
-
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    // The open suggestion list claims Enter/Tab/arrows before send does.
-    if (mentions.handleKeyDown(e)) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      void handleSend();
-    }
-  };
-
   // Reply to a channel message (#3851): prefill the composer with the MeshCore
   // `@[Sender]:` mention, focus it (caret at end), and let the parent send on
   // the originating message's scope via onReply.
   const handleReply = useCallback((m: MeshCoreMessage) => {
     const name = (m.fromName ?? nameForKey(m.fromPublicKey) ?? '').trim();
-    setDraft(name ? `@[${name}]: ` : '');
+    draftStore.set(name ? `@[${name}]: ` : '');
     onReply?.(m);
     requestAnimationFrame(() => {
       const el = inputRef.current;
@@ -530,7 +813,7 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
         el.setSelectionRange(end, end);
       }
     });
-  }, [nameForKey, onReply]);
+  }, [nameForKey, onReply, draftStore]);
 
   return (
     <div className="meshcore-message-stream">
@@ -573,8 +856,9 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
             {emptyText ?? t('meshcore.no_messages', 'No messages')}
           </div>
         ) : messages.map((m, idx) => {
-          const currentDate = new Date(m.timestamp);
-          const prevDate = idx > 0 ? new Date(messages[idx - 1].timestamp) : null;
+          // Receipt time for DMs and channels, sender time for room posts (#5973).
+          const currentDate = new Date(meshcoreDisplayTimeMs(m));
+          const prevDate = idx > 0 ? new Date(meshcoreDisplayTimeMs(messages[idx - 1])) : null;
           const showSeparator = shouldShowDateSeparator(prevDate, currentDate);
           const ignoredRun = ignoredRuns.get(idx);
           const runExpanded = !!ignoredRun && expandedIgnoredRuns.has(ignoredRun.key);
@@ -601,13 +885,40 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
           }
           const outgoing = !!selfPublicKey && m.fromPublicKey === selfPublicKey;
           const friendlyName = outgoing ? null : nameForKey(m.fromPublicKey);
-          const fromLabel = outgoing
-            ? t('meshcore.you', 'You')
-            : m.fromName ?? friendlyName ?? `${m.fromPublicKey.substring(0, 8)}…`;
+          if (m.reactionEmoji) {
+            // Still in `messages` = no known target. No bubble, no actions.
+            return (
+              <React.Fragment key={m.id}>
+                {showSeparator && (
+                  <div className="mc-date-separator">
+                    <span className="mc-date-separator-text">
+                      {getMessageDateSeparator(currentDate)}
+                    </span>
+                  </div>
+                )}
+                <MeshCoreUnmatchedReaction
+                  name={outgoing
+                    ? youLabel
+                    : m.fromName ?? friendlyName ?? t('meshcore.reactions.unknown_sender', 'Someone')}
+                  emoji={m.reactionEmoji}
+                  rawText={m.reactionRawText}
+                />
+              </React.Fragment>
+            );
+          }
           const isChannel = m.fromPublicKey.startsWith('channel-');
+          // A pre-#5774 room post stores a corrupted author prefix, and a post
+          // with an unreadable author stores 'unknown': neither names a node.
+          const senderKeyUsable = isChannel || m.fromPublicKey === selfPublicKey
+            || isUsableSenderKey(m.fromPublicKey) || !!friendlyName;
+          const fromLabel = outgoing
+            ? youLabel
+            : m.fromName ?? friendlyName ?? (senderKeyUsable
+              ? `${m.fromPublicKey.substring(0, 8)}…`
+              : t('meshcore.unknown_sender', 'Unknown sender'));
           const clickTarget = isChannel
             ? (m.fromName ? contactKeyForName(m.fromName) : null)
-            : fullKeyFor(m.fromPublicKey);
+            : senderKeyUsable ? fullKeyFor(m.fromPublicKey) : null;
           const canClick = !outgoing && onNodeNameClick && clickTarget;
           return (
             <React.Fragment key={m.id}>
@@ -629,7 +940,11 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
                   onToggle={() => toggleIgnoredRun(ignoredRun.key)}
                 />
               )}
-              <div className={`mc-message-row ${outgoing ? 'outgoing' : ''}`} data-message-id={m.id}>
+              <div
+                className={`mc-message-row ${outgoing ? 'outgoing' : ''} ${protocolStripe.stripe}`}
+                data-message-id={m.id}
+                data-protocol="meshcore"
+              >
               <div className="mc-message-header">
                 {canClick ? (
                   <button
@@ -645,88 +960,118 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
                   </span>
                 )}
                 <span className="mc-message-meta">
-                  <span className="mc-message-time">
-                  {formatTime(m.timestamp)}
-                  {outgoing && m.deliveryStatus && (
-                    <button
-                      type="button"
-                      className={`mc-delivery-status mc-delivery-${m.deliveryStatus}`}
-                      title={
-                        m.deliveryStatus === 'delivered'
-                          ? `Delivered (${m.roundTripMs}ms)`
-                          : m.deliveryStatus === 'failed'
-                            ? 'Delivery failed'
-                            : m.deliveryStatus === 'sent'
-                              ? 'Sent, awaiting confirmation'
-                              : 'Sending…'
-                      }
-                      aria-label={
-                        m.deliveryStatus === 'delivered'
-                          ? `Delivered (${m.roundTripMs}ms)`
-                          : m.deliveryStatus === 'failed'
-                            ? 'Delivery failed'
-                            : m.deliveryStatus === 'sent'
-                              ? 'Sent, awaiting confirmation'
-                              : 'Sending…'
-                      }
-                      onClick={() => setDeliveryDetailsMsg(m)}
-                    >
-                      <UiIcon
-                        name={m.deliveryStatus === 'delivered'
-                          ? 'checkAll'
-                          : m.deliveryStatus === 'failed'
-                            ? 'error'
-                            : m.deliveryStatus === 'sent'
-                              ? 'check'
-                              : 'time'}
-                        size={13}
-                      />
-                    </button>
-                  )}
-                  {/* "Sent to radio" (#5682): our channel send that no repeater
-                      was heard relaying. The radio accepted the message; it does
-                      not report transmitting, so this claims no more than that.
-                      Gives way to the heard-by badge once a relay is heard.
-                      `deliveryStatus` is the DM ack state; a channel send has
-                      no ack and never carries one. Should one ever appear,
-                      the status icon above speaks for the message instead. */}
-                  {!m.deliveryStatus && getMeshCoreChannelSendState(m, selfPublicKey) === 'sent_to_radio' && (
-                    <button
-                      type="button"
-                      className={styles.sentToRadio}
-                      data-testid="mc-sent-to-radio"
-                      title={t(
-                        'meshcore.sent_to_radio.tooltip',
-                        'Your radio accepted this message for sending. MeshCore radios do not report when they transmit, and no repeater has been heard relaying it yet, so MeshRadar cannot tell whether it went out or whether anyone heard it.',
-                      )}
-                      onClick={() => setDeliveryDetailsMsg(m)}
-                    >
-                      <UiIcon name="upload" size={13} /> {t('meshcore.sent_to_radio.label', 'Sent to radio')}
-                    </button>
-                  )}
-                  {outgoing && m.heardBy && m.heardBy.length > 0 && (
-                    <button
-                      type="button"
-                      className="mc-heard-by-badge"
-                      title={t('meshcore.heard_by_tooltip', 'Repeaters that relayed this message')}
-                      aria-expanded={expandedHeardBy.has(m.id)}
-                      onClick={() => toggleHeardBy(m.id)}
-                    >
-                      <UiIcon name="radioSignal" size={13} /> {m.heardBy.length}
-                    </button>
-                  )}
-                  {resendEnabled && resendAvailability(m, selfPublicKey, now).kind === 'ready' && (
+                  <span
+                    className="mc-message-time"
+                    title={formatRelativeTime(meshcoreDisplayTimeMs(m), timeFormat, dateFormat, true)}
+                  >
+                  {formatTime(meshcoreDisplayTimeMs(m))}
+                  <MeshCoreClockOffset offsetMs={meshcoreMessageClockOffsetMs(m)} />
+                  {/* Our own send's delivery mark (#5682). One selector per
+                      kind, shared with Delivery Details, so the two agree.
+                      A DM or room post has a real ack: a tick once it comes,
+                      a warning when it does not. Until then, and for a channel
+                      send no repeater was heard relaying, the mark is "Sent to
+                      radio": the radio accepted the message. It does not
+                      report transmitting, so the mark claims no more than
+                      that. A channel send gives way to the heard-by badge. */}
+                  {(() => {
+                    const direct = getMeshCoreDirectSendState(m, selfPublicKey);
+                    if (direct && (direct.state === 'delivered' || direct.state === 'not_confirmed')) {
+                      const label = directSendLabel(t, direct, m.roundTripMs);
+                      return (
+                        <button
+                          type="button"
+                          className={`mc-delivery-status mc-delivery-${direct.state === 'delivered' ? 'delivered' : 'failed'}`}
+                          title={label}
+                          aria-label={label}
+                          onClick={() => setDeliveryDetailsMsg(m)}
+                        >
+                          <UiIcon name={direct.state === 'delivered' ? 'checkAll' : 'error'} size={13} />
+                        </button>
+                      );
+                    }
+                    // #6193: channel sends no longer show "Sent to radio" — the
+                    // always-on heard-by antenna (rendered in the body) stands in
+                    // from send time. Only DM / room posts keep this mark.
+                    const tooltip = direct ? directSendLabel(t, direct, m.roundTripMs) : null;
+                    if (!tooltip) return null;
+                    return (
+                      <button
+                        type="button"
+                        className={styles.sentToRadio}
+                        data-testid="mc-sent-to-radio"
+                        data-send-state={direct ? direct.state : 'sent_to_radio'}
+                        title={tooltip}
+                        onClick={() => setDeliveryDetailsMsg(m)}
+                      >
+                        <UiIcon name="upload" size={13} /> {t('meshcore.sent_to_radio.label', 'Sent to radio')}
+                      </button>
+                    );
+                  })()}
+                  {(() => {
+                    // #6178 → #6193: when Required Repeaters are set and this send
+                    // was heard by others but the ANY/ALL gate is NOT yet satisfied,
+                    // the resend tooltip explains why the button is still here. The
+                    // heard-by antenna itself now lives in the message body.
+                    const requiredNotHeard =
+                      requiredKeys.length > 0 &&
+                      !!m.heardBy && m.heardBy.length > 0 &&
+                      !requiredRepeatersHeard(m.heardBy, requiredKeys, requiredRepeaterMode, repeaters);
+                    return (
+                      <>
+                  {resendEnabled && resendAvailability(m, selfPublicKey, now, resendOpts).kind === 'ready' && (
                     <button
                       type="button"
                       className={styles.resendButton}
-                      title={t('meshcore.resend.tooltip', 'No repeater was heard relaying this message. Resend it.')}
+                      title={requiredNotHeard
+                        ? t('meshcore.resend.required_tooltip', {
+                            count: m.heardBy!.length,
+                            name: requiredRepeaterName,
+                            defaultValue: 'Heard by {{count}} repeater(s), but the required repeater ({{name}}) has not relayed this yet. Resend it.',
+                          })
+                        : t('meshcore.resend.tooltip', 'No repeater was heard relaying this message. Resend it.')}
                       aria-label={t('meshcore.resend.button', 'Resend')}
                       onClick={() => setResendConfirm(m)}
                     >
                       <UiIcon name="resend" size={13} /> {t('meshcore.resend.button', 'Resend')}
                     </button>
                   )}
+                      </>
+                    );
+                  })()}
                   </span>
+                  {/* #6193/#6194: our own channel send and DM carry the heard-by
+                      antenna (count 0 until a repeater relays it). #6239: it
+                      lives on the header row — with "You", the timestamp and the
+                      delete icon — not on its own line below the body, which
+                      wasted a full line per sent message. The expanded repeater
+                      list still opens below. A channel send is identified by its
+                      channel destination (our key is the sender, so `isChannel`
+                      is false); a DM by a real recipient key. Room posts and
+                      reactions are excluded. */}
+                  {outgoing && !m.reactionEmoji && !!m.toPublicKey && m.messageType !== 'room_post' && (
+                    <HeardByBubble
+                      heardBy={m.heardBy}
+                      requiredKeys={requiredKeys}
+                      repeaters={repeaters}
+                      mode={requiredRepeaterMode}
+                      open={openHeardBy.has(m.id)}
+                      onToggle={() => toggleHeardBy(m.id)}
+                      renderList={false}
+                    />
+                  )}
+                  {reactEnabled && isReactableRow(m, selfPublicKey) && (
+                    <button
+                      type="button"
+                      className={styles.reactButton}
+                      data-testid="mc-react-button"
+                      title={t('meshcore.reactions.react_button', 'React')}
+                      aria-label={t('meshcore.reactions.react_button', 'React')}
+                      onClick={() => setReactTarget(m)}
+                    >
+                      <UiIcon name="reaction" size={15} />
+                    </button>
+                  )}
                   {onReply && isChannel && !outgoing && (
                     <button
                       type="button"
@@ -736,6 +1081,17 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
                       onClick={() => handleReply(m)}
                     >
                       <UiIcon name="reply" size={15} />
+                    </button>
+                  )}
+                  {canTranslate && translatableIdSet.has(m.id) && (
+                    <button
+                      type="button"
+                      className="translate-button"
+                      title={t('messages.translate', 'Translate')}
+                      aria-label={t('messages.translate', 'Translate')}
+                      onClick={() => { void translateMessage(m.id, m.text); }}
+                    >
+                      <UiIcon name="translate" size={15} />
                     </button>
                   )}
                   {onDeleteMessage && (
@@ -751,7 +1107,7 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
                   )}
                 </span>
               </div>
-              <div className="mc-message-text">{renderMessageText(m.text)}</div>
+              <div className="mc-message-text">{renderMessageText(m.text, setTokenDetail, importTokenLabel)}</div>
               {!outgoing && typeof m.hopCount === 'number' && (
                 <div className="mc-message-route" title={t('meshcore.route_tooltip', 'How this message reached you')}>
                   {m.hopCount === 0 ? (
@@ -817,70 +1173,119 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
                     : `#${(m.scopeCode ?? 0).toString(16).padStart(4, '0')}`}
                 </div>
               )}
-              {outgoing && m.heardBy && m.heardBy.length > 0 && expandedHeardBy.has(m.id) && (
-                <ul className="mc-heard-by-list">
-                  {m.heardBy.map(h => (
-                    <li key={h.hash} className="mc-heard-by-item">
-                      <span className="mc-heard-by-name">{h.name || h.hash}</span>
-                      {typeof h.snr === 'number' && (
-                        <span className="mc-heard-by-snr"> ({h.snr} dB)</span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
+              {m.senderNameOverride && (
+                <div
+                  className="mc-message-scope"
+                  data-testid="mc-sent-as"
+                  title={t('meshcore.sent_as_tooltip', 'Sent through the API under this sender name, not the node name')}
+                >
+                  <UiIcon name="user" size={13} /> {t('meshcore.sent_as', 'Sent as {{name}}', { name: m.senderNameOverride })}
+                </div>
+              )}
+              {/* #6239: the heard-by antenna renders on the header row above
+                  (was a full line here); its list opens here, below the body
+                  (#4173 review L13). Same gate as the antenna. */}
+              {outgoing && !m.reactionEmoji && !!m.toPublicKey && m.messageType !== 'room_post' && openHeardBy.has(m.id) && (
+                <HeardByList heardBy={m.heardBy} requiredKeys={requiredKeys} repeaters={repeaters} />
               )}
               {m.text && <LinkPreview text={m.text} />}
+              {translatedMessages[m.id] && (
+                <TranslatedMessage
+                  state={translatedMessages[m.id] as TranslatedMessageState}
+                  onDismiss={() => dismissTranslation(m.id)}
+                  onRetry={canTranslate ? () => { void translateMessage(m.id, m.text); } : undefined}
+                  onChangeTargetLang={canTranslate ? (newLang) => { void translateMessage(m.id, m.text, newLang); } : undefined}
+                />
+              )}
+              {chipsByTarget.has(m.id) && <MeshCoreReactionChips
+                chips={chipsByTarget.get(m.id) ?? []}
+                onAdd={reactEnabled && isReactableRow(m, selfPublicKey) ? (emoji => handleReact(m, emoji)) : undefined}
+              />}
               </div>
             </React.Fragment>
           );
         })}
       </div>
-      <div className="meshcore-send-bar" title={disabled ? disabledReason : undefined} style={{ position: 'relative' }}>
-        <MentionAutocomplete
-          id="meshcore-mention-list"
-          candidates={mentions.suggestions}
-          activeIndex={mentions.activeIndex}
-          onHover={mentions.setActiveIndex}
-          onSelect={mentions.select}
-        />
-        <input
-          ref={inputRef}
-          type="text"
-          value={draft}
-          onChange={e => {
-            setDraft(e.target.value);
-            mentions.handleChange(e.target.value, e.target.selectionStart);
-          }}
-          onSelect={e => mentions.syncFromCaret(e.currentTarget.value, e.currentTarget.selectionStart)}
-          onBlur={mentions.close}
-          role="combobox"
-          aria-expanded={mentions.isOpen}
-          aria-controls={mentions.isOpen ? 'meshcore-mention-list' : undefined}
-          aria-activedescendant={mentions.activeDescendantId('meshcore-mention-list')}
-          aria-autocomplete="list"
-          onKeyDown={handleKeyDown}
+      {!hideComposer && (<>
+      <div
+        className="meshcore-send-bar message-input-container"
+        title={disabled ? disabledReason : undefined}
+      >
+        <MessageComposeInput
+          listId="meshcore-mention-list"
+          textareaRef={inputRef}
+          draftStore={draftStore}
+          mentionCandidates={mentionCandidates}
+          buildMentionInsertion={c => `@[${c.longName}] `}
+          homoglyphEnabled={false}
+          maxBytes={maxBytes}
+          blockSendOverLimit
+          sending={sending}
+          allowNewlines={false}
           placeholder={t('meshcore.type_message', 'Type a message…')}
-          disabled={disabled || sending}
-          title={disabled ? disabledReason : undefined}
+          disabled={!!disabled}
+          disabledTitle={disabledReason}
+          onSend={() => void handleSend()}
+          sendAriaLabel={t('meshcore.send', 'Send')}
+          insertMenuItems={insertMenuItems}
+          actions={canTranslate ? (
+            <button
+              type="button"
+              onClick={() => setTranslateModalOpen(true)}
+              disabled={disabled}
+              className="send-btn channel-action-btn"
+              title={t('messages.translate', 'Translate message')}
+              aria-label={t('messages.translate', 'Translate message')}
+            >
+              <UiIcon name="translate" size={16} />
+            </button>
+          ) : undefined}
         />
-        <button
-          onClick={() => void handleSend()}
-          disabled={disabled || sending || !draft.trim() || overLimit}
-          title={disabled ? disabledReason : undefined}
-        >
-          {sending ? t('meshcore.sending', 'Sending…') : t('meshcore.send', 'Send')}
-        </button>
       </div>
-      {draft.length > 0 && (
-        <div className={`meshcore-byte-counter ${byteCounter.className}`}>
-          {byteCounter.text}
-        </div>
+      {translateModalOpen && (
+        <TranslateModal
+          isOpen={translateModalOpen}
+          onClose={() => setTranslateModalOpen(false)}
+          initialText={draftStore.get()}
+          defaultTargetLanguage={translationSettings.defaultOutgoingLanguage}
+          defaultSourceLanguage={translationSettings.defaultLanguage}
+          maxBytes={maxBytes}
+          onApply={(text) => draftStore.set(text)}
+        />
       )}
+      </>)}
+      {contactShare && (
+        <MeshCoreShareContactPicker
+          isOpen={sharePickerOpen}
+          contacts={contacts ?? []}
+          selfPublicKey={contactShare.selfNode?.publicKey ?? selfPublicKey}
+          onPick={(token) => {
+            shareInsertRef.current?.(token);
+            shareInsertRef.current = null;
+            setSharePickerOpen(false);
+          }}
+          onClose={() => {
+            shareInsertRef.current = null;
+            setSharePickerOpen(false);
+          }}
+        />
+      )}
+      <MeshCoreContactTokenModal
+        token={tokenDetail?.token ?? null}
+        raw={tokenDetail?.raw ?? ''}
+        onClose={() => setTokenDetail(null)}
+        onImport={contactTokenImport?.onImport}
+        canImport={contactTokenImport?.canImport ?? false}
+        disabledReason={contactTokenImport?.disabledReason}
+        selfPublicKey={selfPublicKey}
+        knownName={tokenDetail ? nameForKey(tokenDetail.token.publicKey) : null}
+      />
       {routeDetail && (
         <MeshCoreMessageRouteModal
           message={routeDetail}
           fromLabel={routeDetail.fromName ?? nameForKey(routeDetail.fromPublicKey) ?? `${routeDetail.fromPublicKey.substring(0, 8)}…`}
           contacts={contacts ?? []}
+          sourceId={sourceId}
           onClose={() => setRouteDetail(null)}
         />
       )}
@@ -923,6 +1328,15 @@ export const MeshCoreMessageStream: React.FC<MeshCoreMessageStreamProps> = ({
           </button>
         </div>
       </Modal>
+      {reactEnabled && (
+        <EmojiPickerModal<MeshCoreMessage>
+          message={reactTarget}
+          customEmojis={reactionEmojiOptions(reactionEmojis)}
+          isEmojiAllowed={isReactionEmoji}
+          onSelectEmoji={(emoji, m) => { setReactTarget(null); handleReact(m, emoji); }}
+          onClose={() => setReactTarget(null)}
+        />
+      )}
       {deliveryDetailsMsg && (
         <MessageDetailsModal
           protocol="meshcore"

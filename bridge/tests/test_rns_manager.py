@@ -31,13 +31,83 @@ from meshmonitor_rns_bridge.rns_manager import (
     RemoteManagementDeniedError,
     RNSManager,
     RNSStartupError,
+    EXCLUDED_INTERFACE_TYPES,
     _build_rnode_ifconf,
     _jsonify_field_value,
     _load_or_create_lxmf_identity,
     _lxmf_method_to_wire,
     _lxmf_state_to_wire,
+    _normalize_interface,
     _sanitize_lxmf_fields,
 )
+
+
+def test_excluded_interface_types_includes_autointerface_peer():
+    # #6121: AutoInterfacePeer duplicates its parent AutoInterface's counters
+    # and renders as a confusing `None` card, so it is excluded alongside the
+    # shared-instance plumbing interfaces.
+    assert "AutoInterfacePeer" in EXCLUDED_INTERFACE_TYPES
+    assert "LocalServerInterface" in EXCLUDED_INTERFACE_TYPES
+    assert "LocalClientInterface" in EXCLUDED_INTERFACE_TYPES
+
+
+# --------------------------------------------------------------------------
+# _normalize_interface — live RNode gauges (issue #6120)
+# --------------------------------------------------------------------------
+
+
+def test_normalize_interface_passes_through_live_rnode_gauges():
+    out = _normalize_interface({
+        "short_name": "RNode LoRa Interface",
+        "type": "RNodeInterface",
+        "status": True,
+        "mode": 1,
+        "txb": 1460,
+        "rxb": 54020,
+        "airtime_short": 0.0,
+        "airtime_long": 0.12,
+        "channel_load_short": 2.44,
+        "channel_load_long": 1.15,
+        "noise_floor": -109,
+        "interference": -86,
+        "interference_last_ts": 1700000000,
+        "interference_last_dbm": -86,
+        "cpu_load": 4.2,
+        "battery_state": "discharging",
+        "battery_percent": 100,
+    })
+    assert out["airtimeShort"] == 0.0
+    assert out["airtimeLong"] == 0.12
+    assert out["channelLoadShort"] == 2.44
+    assert out["channelLoadLong"] == 1.15
+    assert out["noiseFloor"] == -109
+    assert out["interference"] == -86
+    assert out["interferenceLastTs"] == 1700000000
+    assert out["interferenceLastDbm"] == -86
+    assert out["cpuLoad"] == 4.2
+    assert out["batteryState"] == "discharging"
+    assert out["batteryPercent"] == 100
+
+
+def test_normalize_interface_live_gauges_null_for_non_rnode():
+    out = _normalize_interface({
+        "name": "AutoInterface",
+        "type": "AutoInterface",
+        "status": True,
+        "txb": 547,
+        "rxb": 1290,
+    })
+    # Base fields still populated...
+    assert out["name"] == "AutoInterface"
+    assert out["txBytes"] == 547
+    assert out["online"] is True
+    # ...every live gauge absent from RNS passes through as None.
+    for key in (
+        "airtimeShort", "airtimeLong", "channelLoadShort", "channelLoadLong",
+        "noiseFloor", "interference", "interferenceLastTs", "interferenceLastDbm",
+        "cpuLoad", "batteryState", "batteryPercent",
+    ):
+        assert out[key] is None
 
 # --------------------------------------------------------------------------
 # Delivery-state mapping
@@ -837,6 +907,10 @@ def test_get_remote_status_happy_path_normalizes_status_and_path():
                     "rxb": 362,
                 },
                 {"type": "LocalClientInterface", "short_name": "local", "status": True},
+                # AutoInterfacePeer (#6121): a peer sub-interface that duplicates
+                # its parent AutoInterface's counters and renders as a confusing
+                # `None` card. Must not survive normalization.
+                {"type": "AutoInterfacePeer", "short_name": None, "status": True},
             ]
         },
         2,
@@ -854,9 +928,13 @@ def test_get_remote_status_happy_path_normalizes_status_and_path():
 
     assert result["ok"] is True
     # WP0 correction #2's plumbing-interface filter applies to the remote's
-    # interfaces too -- LocalClientInterface must not survive normalization.
+    # interfaces too -- LocalClientInterface and AutoInterfacePeer (#6121) must
+    # not survive normalization.
     assert len(result["status"]["interfaces"]) == 1
     assert result["status"]["interfaces"][0]["name"] == "TCP Server Interface"
+    assert "AutoInterfacePeer" not in {
+        i["type"] for i in result["status"]["interfaces"]
+    }
     assert result["status"]["interfaces"][0]["online"] is True
     assert result["status"]["linkCount"] == 2
     assert result["path"][0]["destinationHash"] == "a1b2c3d4"

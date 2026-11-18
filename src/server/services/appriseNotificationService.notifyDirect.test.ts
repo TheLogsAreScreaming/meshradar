@@ -17,6 +17,10 @@ vi.mock('../../services/database.js', () => ({
 vi.mock('../meshtasticManager.js', () => ({ fallbackManager: { getLocalNodeInfo: vi.fn(() => null) } }));
 vi.mock('../sourceManagerRegistry.js', () => ({ sourceManagerRegistry: {} }));
 vi.mock('../sourceManagerTypes.js', () => ({ getPrimaryMeshtasticManager: () => undefined }));
+// SSRF guard on the Apprise egress (SSRF-03, #6078) resolves the host via DNS.
+// Stub the resolver to a public IP so these functional tests (which mock fetch)
+// reach the mocked fetch instead of a real/failed DNS lookup.
+vi.mock('node:dns/promises', () => ({ lookup: vi.fn().mockResolvedValue([{ address: '93.184.216.34', family: 4 }]) }));
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
@@ -59,6 +63,17 @@ describe('appriseNotificationService.notifyDirect', () => {
     const r = await appriseNotificationService.notifyDirect({ sourceId: 'default', title: 'T', body: 'B' });
     expect(r.ok).toBe(false);
     expect(r.message).toContain('400');
+  });
+
+  it('allows up to 30 s for the Apprise API to send a notification', async () => {
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(new AbortController().signal);
+    try {
+      mockFetch.mockResolvedValue({ ok: true, json: async () => ({}) });
+      await appriseNotificationService.notifyDirect({ sourceId: 'default', title: 'T', body: 'B' });
+      expect(timeout).toHaveBeenCalledWith(30_000);
+    } finally {
+      timeout.mockRestore();
+    }
   });
 
   it('does not call the API when Apprise is disabled for the source', async () => {

@@ -32,6 +32,9 @@ vi.mock('../meshtasticManager.js', () => ({
   fallbackManager: { getLocalNodeInfo: vi.fn(() => ({ longName: 'LocalNode' })), sourceId: 'src-a' },
 }));
 vi.mock('../sourceManagerRegistry.js', () => ({ sourceManagerRegistry: {} }));
+vi.mock('../utils/localNodeNameForSource.js', () => ({
+  resolveLocalNodeNameForSource: vi.fn(async () => 'LocalNode'),
+}));
 vi.mock('../sourceManagerTypes.js', () => ({ getPrimaryMeshtasticManager: () => undefined }));
 vi.mock('node-notifier', () => ({ default: { notify: h.notify } }));
 
@@ -275,6 +278,46 @@ describe('message notification rendering in each delivery wrapper (#5593)', () =
       const legacy = { title: 'Something', body: 'happened', sourceId: SOURCE, sourceName: SOURCE_NAME };
       await pushNotificationService.broadcastWithFiltering(legacy, filterFor(context()));
       expect(pushSend.mock.calls[0][1]).toMatchObject({ title: '[Home Base] Something', body: 'happened' });
+    });
+  });
+
+  describe('configurable text length (#6278)', () => {
+    const long = 'abcdefghij'.repeat(20); // 200 characters
+    const cases: Array<[string, Partial<MessageTemplateContext>]> = [
+      ['Meshtastic', {}],
+      ['MeshCore', { serviceLabel: 'MeshCore' }],
+    ];
+
+    it.each(cases)('%s: Apprise set to 500 gets the whole message, push at the default is cut', async (_name, over) => {
+      const message = context({ text: long, ...over });
+      useUser(1, fixturePrefs({ messageTextMaxApprise: 500 }));
+
+      await pushNotificationService.broadcastWithFiltering(payloadFor(message), filterFor(message));
+      await appriseNotificationService.broadcastWithFiltering(payloadFor(message), filterFor(message));
+
+      const pushed = pushSend.mock.calls[0][1] as { body: string };
+      expect(pushed.body).toBe(`Alice Mobile: ${long.substring(0, 97)}...`);
+      expect(appriseBodies()[0].body).toBe(`Alice Mobile: ${long}`);
+    });
+
+    it('push and desktop share the push value; Apprise keeps its own', async () => {
+      const message = context({ text: long });
+      useUser(1, fixturePrefs({ messageTextMaxPush: 250 }));
+
+      await pushNotificationService.broadcastWithFiltering(payloadFor(message), filterFor(message));
+      await desktopNotificationService.broadcastWithFiltering(payloadFor(message), filterFor(message));
+      await appriseNotificationService.broadcastWithFiltering(payloadFor(message), filterFor(message));
+
+      expect((pushSend.mock.calls[0][1] as { body: string }).body).toBe(`Alice Mobile: ${long}`);
+      expect((h.notify.mock.calls[0][0] as { message: string }).message).toBe(`Alice Mobile: ${long}`);
+      expect(appriseBodies()[0].body).toBe(`Alice Mobile: ${long.substring(0, 97)}...`);
+    });
+
+    it('a user with no setting keeps the default of 100', async () => {
+      const message = context({ text: long });
+      useUser(1);
+      await appriseNotificationService.broadcastWithFiltering(payloadFor(message), filterFor(message));
+      expect(appriseBodies()[0].body).toBe(`Alice Mobile: ${long.substring(0, 97)}...`);
     });
   });
 });

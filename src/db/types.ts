@@ -48,6 +48,12 @@ export interface DbNode {
   transportLastRf?: number | null;
   transportLastMqtt?: number | null;
   transportLastUdp?: number | null;
+  /** #5156: ok_to_mqtt bit of the latest MQTT-delivered packet we could read; null = unknown. */
+  mqttOkToMqtt?: boolean | null;
+  /** #5156: unix seconds when mqttOkToMqtt was read. */
+  mqttOkToMqttAt?: number | null;
+  /** #5156: unix seconds last heard over LoRa with via_mqtt clear. */
+  rfDirectLastHeard?: number | null;
   isStoreForwardServer?: boolean | null;
   macaddr?: string | null;
   latitude?: number | null;
@@ -96,6 +102,7 @@ export interface DbNode {
   positionOverrideIsPrivate?: boolean | null;
   // Map visibility — #3549: suppress this node's marker on maps only
   hideFromMap?: boolean | null;
+  channelLocked?: boolean | null; // #5923
   // Free-text per-node notes — #3921: MeshRadar-local annotation, never synced
   notes?: string | null;
   // User capability flags from the node's User protobuf — #3684
@@ -141,6 +148,15 @@ export interface DbNode {
   /** Anchor of the fixed mark; null when not marked. */
   aircraftFixedLatitude?: number | null;
   aircraftFixedLongitude?: number | null;
+  /**
+   * Manual aircraft mark (#5715): 'not_aircraft' | 'aircraft'; null when none.
+   * A 'not_aircraft' mark keeps its anchor in aircraftFixed*.
+   */
+  aircraftManualMark?: string | null;
+  /** Epoch ms the manual mark was set. */
+  aircraftManualMarkAt?: number | null;
+  /** users.id of who set the manual mark. */
+  aircraftManualMarkBy?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -169,6 +185,8 @@ export interface DbMessage {
   viaStoreForward?: boolean | null;
   /** Broadcast carried a verified XEdDSA signature (firmware 2.8+). NULL for pre-migration rows / unsigned traffic. */
   xeddsaSigned?: boolean | null;
+  /** Data.bitfield bit 2 (#6449): sender flagged this as sent by an automation. NULL = bitfield absent / unknown. */
+  isAutomation?: boolean | null;
   /**
    * `meshtastic.MeshPacket.AckProofStatus` number (#5279) from the ack/nak that
    * settled this outbound DM. NULL = no status reported.
@@ -371,6 +389,7 @@ export interface DbDeadDropMessage {
 export interface DbPushSubscription {
   id?: number;
   userId?: number | null;
+  sourceId?: string | null;
   endpoint: string;
   p256dhKey: string;
   authKey: string;
@@ -414,6 +433,8 @@ export interface DbPacketLog {
   transport_mechanism?: number | null;
   /** Firmware 2.8 XEdDSA signature verified (#3923). NULL/undefined = unknown (pre-2.8 packet or feature). */
   xeddsa_signed?: boolean | null;
+  /** Data.bitfield bit 2 (#6449): sender flagged this as sent by an automation. NULL = bitfield absent / unknown. */
+  is_automation?: boolean | null;
   sourceId?: string | null;
   /** Impersonation flag (#2584): packet claims from == our local node but arrived over RF and wasn't sent by us. */
   spoof_suspected?: boolean | null;
@@ -490,6 +511,8 @@ export interface DbChannelDatabase {
   description?: string | null;
   isEnabled: boolean;
   enforceNameValidation: boolean;
+  /** AES-CCM (AEAD) channel, firmware 2.8.1+ (#5248). */
+  useAead: boolean;
   sortOrder: number; // Order for decryption priority (lower = tried first)
   decryptedPacketCount: number;
   lastDecryptedAt?: number | null;

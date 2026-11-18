@@ -3,6 +3,8 @@ import { EventEmitter } from 'events';
 import { randomBytes } from 'crypto';
 import { logger } from '../utils/logger.js';
 import databaseService from '../services/database.js';
+import { recordMeshcoreCliHistory, cliErrorOutcome } from './services/meshcoreCliHistoryService.js';
+import type { MeshCoreCliOutcome } from '../db/repositories/meshcoreCliHistory.js';
 import type {
   MeshCoreNode,
   TelemetryMode,
@@ -84,7 +86,7 @@ import {
   type ParsedCommand,
   type SendBinaryReqCmd,
 } from './meshcoreCompanionCodec.js';
-import { OUT_PATH_UNKNOWN } from './meshcoreNativeBackend.js';
+import { OUT_PATH_UNKNOWN, encodeOutPathLen } from './meshcoreNativeBackend.js';
 
 /**
  * Minimal surface the virtual node server needs from a MeshCoreManager. Kept as
@@ -103,6 +105,14 @@ export interface MeshCoreVirtualNodeManager {
    * the 9 TX-causing companion commands while this is true.
    */
   isReceiveOnly(): boolean;
+  /**
+   * Hop-hash width (1-3 bytes) the node stamps on its own floods, or null while
+   * unknown (#6441). Lets a channel message MeshRadar sent go to the app as
+   * "0 hops at this width" instead of the 0xFF fallback the app reads as
+   * "63 hops, 4-byte". Optional so test fakes and older managers need not
+   * implement it; absent behaves as unknown.
+   */
+  getSendPathHashSize?(): 1 | 2 | 3 | null;
   /** Send a text message to the real node: channel (by index) or DM (full key). */
   sendMessage(text: string, toPublicKey?: string, channelIdx?: number): Promise<boolean>;
   /**
@@ -261,6 +271,13 @@ class VnCommandError extends Error {
     this.name = 'VnCommandError';
   }
 }
+
+/**
+ * DeviceInfo capacities before the real node's DeviceQuery is cached (#5916):
+ * the companion firmware's stock MAX_GROUP_CHANNELS and MAX_CONTACTS.
+ */
+const DEFAULT_MAX_CHANNELS = 8;
+const DEFAULT_MAX_CONTACTS = 100;
 
 /** Reverse map of command codes → names, for human-readable command logging. */
 const COMMAND_NAMES: Record<number, string> = Object.fromEntries(
@@ -661,7 +678,7 @@ export class MeshCoreVirtualNodeServer extends EventEmitter {
           this.send(clientId, encodeOk());
           break;
         case CommandCodes.DeviceQuery:
-          this.handleDeviceQuery(clientId);
+          void this.handleDeviceQuery(clientId);
           break;
         case CommandCodes.GetContacts:
           this.handleGetContacts(clientId);
@@ -1646,28 +1663,42 @@ export class MeshCoreVirtualNodeServer extends EventEmitter {
     this.send(clientId, encodeSelfInfo(this.buildSelfInfo(localNode)));
   }
 
-  private handleDeviceQuery(clientId: string): void {
+  private async handleDeviceQuery(clientId: string): Promise<void> {
     const localNode = this.options.manager.getLocalNode();
     // Intentionally does NOT gate on isConnected()/localNode (unlike
     // handleAppStart, which replies BadState): the app sends DeviceQuery
     // *before* AppStart, so we must reply even with a cold manager — display
     // fields just fall back to safe defaults below.
-    // The DeviceInfo version byte is the *companion protocol* version the app
-    // must use to talk to us — NOT the proxied node's firmware version. We only
-    // implement v1 frames, so this MUST always be SUPPORTED_COMPANION_PROTOCOL_VERSION.
     //
-    // Leaking the real node's `firmwareVer` here (once the manager's background
-    // deviceQuery() has cached it) makes the meshcore-flutter app abort the
-    // handshake: it sends DeviceQuery *before* AppStart, and on seeing a version
-    // it can't reconcile with our v1 wire format it never sends AppStart and
-    // drops the socket after ~5s. Before the cache is warm we fell back to v1
-    // and the app connected — which is exactly the "works once after restart,
-    // then never again" symptom (issue #3705). Build date / model are display
-    // strings and stay real so the app shows a faithful identity.
+    // The version byte is always SUPPORTED_COMPANION_PROTOCOL_VERSION, never
+    // the proxied node's real firmwareVer: clients read it as a feature level,
+    // and leaking the real value made meshcore-flutter drop the handshake
+    // (issue #3705). The firmware version string stays '' for the same reason,
+    // since MeshCore One also reads features from it. Build date and model are
+    // display strings and stay real so the app shows a faithful identity.
+    //
+    // Capacities come from the real node's DeviceQuery once the poller has
+    // cached them. MeshCore One syncs only `maxChannels` slots and offers no
+    // free slot when it reads 0 (#5916), so a cold cache falls back to enough
+    // slots for every synced channel.
+    let channels: ChannelRow[] = [];
+    if (!localNode?.maxChannels) {
+      try {
+        channels = await this.db.channels.getAllChannels(this.sourceId);
+      } catch (err) {
+        logger.warn(`[MeshCore VN ${this.sourceId}] DeviceQuery: channel count unavailable: ${(err as Error).message}`);
+      }
+    }
+    const maxContacts = localNode?.maxContacts
+      || Math.max(DEFAULT_MAX_CONTACTS, this.options.manager.getContacts().length);
     this.send(clientId, encodeDeviceInfo({
       firmwareVer: SUPPORTED_COMPANION_PROTOCOL_VERSION,
+      maxContacts,
+      maxChannels: this.getReportedMaxChannels(localNode, channels),
+      blePin: 0,
       firmwareBuildDate: localNode?.firmwareBuild ?? '',
       manufacturerModel: localNode?.model || 'MeshRadar Virtual Node',
+      firmwareVersion: '',
     }));
   }
 
@@ -1701,14 +1732,29 @@ export class MeshCoreVirtualNodeServer extends EventEmitter {
     logger.debug(`[MeshCore VN ${this.sourceId}] ▶ ${contacts.length} contacts to ${clientId}`);
   }
 
-  /** GetChannel(idx) → ChannelInfo from the synced channel list, or Err(NotFound). */
+  /** Keep GetChannel's empty-slot boundary identical to DeviceInfo's wire capacity (#5933). */
+  private getReportedMaxChannels(localNode: MeshCoreNode | null, channels: ChannelRow[]): number {
+    let maxChannels = localNode?.maxChannels;
+    if (!maxChannels) {
+      maxChannels = DEFAULT_MAX_CHANNELS;
+      for (const ch of channels) maxChannels = Math.max(maxChannels, ch.id + 1);
+    }
+    // DeviceInfo carries the capacity in one unsigned byte.
+    return Math.max(0, Math.min(255, maxChannels | 0));
+  }
+
+  /** GetChannel(idx) → ChannelInfo (including empty slots), or Err(NotFound) beyond capacity. */
   private async handleGetChannel(clientId: string, channelIdx: number): Promise<void> {
     try {
       const channels = await this.db.channels.getAllChannels(this.sourceId);
       const row = channels.find((ch) => ch.id === channelIdx);
       if (!row) {
-        // Tells the app it has reached the end of the configured slots.
-        this.send(clientId, encodeErr(ErrorCodes.NotFound));
+        // Firmware returns an empty ChannelInfo for every unused in-range slot.
+        // Pipelined clients count only ChannelInfo, so NotFound stalls their sync.
+        const maxChannels = this.getReportedMaxChannels(this.options.manager.getLocalNode(), channels);
+        this.send(clientId, channelIdx < maxChannels
+          ? encodeChannelInfo(channelIdx, '', Buffer.alloc(16))
+          : encodeErr(ErrorCodes.NotFound));
         return;
       }
       const secret = row.psk ? Buffer.from(row.psk, 'base64') : Buffer.alloc(16);
@@ -1878,6 +1924,7 @@ export class MeshCoreVirtualNodeServer extends EventEmitter {
   private async handleSendCliTxtMsg(clientId: string, targetPublicKey: string, command: string): Promise<void> {
     if (!this.allowAdminCommands) {
       logger.debug(`[MeshCore VN ${this.sourceId}] CLI command blocked from ${clientId} (allowAdminCommands off)`);
+      this.recordCliHistory(clientId, targetPublicKey, command, { outcome: 'blocked', error: 'ADMIN_COMMANDS_DISABLED' });
       this.send(clientId, encodeErr(ErrorCodes.UnsupportedCmd));
       return;
     }
@@ -1885,7 +1932,8 @@ export class MeshCoreVirtualNodeServer extends EventEmitter {
     const timeoutMs = await this.resolveCliReplyTimeoutMs();
     this.send(clientId, encodeSent(0, 0, timeoutMs));
     try {
-      const { reply } = await this.options.manager.sendCliCommand(targetPublicKey, command, { timeoutMs });
+      const { reply, elapsedMs } = await this.options.manager.sendCliCommand(targetPublicKey, command, { timeoutMs });
+      this.recordCliHistory(clientId, targetPublicKey, command, { outcome: 'ok', reply, elapsedMs });
       const client = this.clients.get(clientId);
       if (!client) return; // client disconnected while the CLI round-trip was in flight
       client.pendingMessages.push({
@@ -1898,8 +1946,35 @@ export class MeshCoreVirtualNodeServer extends EventEmitter {
       this.send(clientId, encodeMsgWaitingPush());
       logger.debug(`[MeshCore VN ${this.sourceId}] CLI reply from ${keyShort}… queued for ${clientId} (${reply.length} chars)`);
     } catch (err) {
-      logger.warn(`[MeshCore VN ${this.sourceId}] CLI command to ${keyShort}… from ${clientId} failed: ${(err as Error).message}`);
+      const message = (err as Error).message;
+      this.recordCliHistory(clientId, targetPublicKey, command, { outcome: cliErrorOutcome(message), error: message });
+      logger.warn(`[MeshCore VN ${this.sourceId}] CLI command to ${keyShort}… from ${clientId} failed: ${message}`);
     }
+  }
+
+  /**
+   * Record a CLI command a phone app sent through this Virtual Node (#5892).
+   * There is no MeshRadar user, so the row names the VN client and its IP.
+   */
+  private recordCliHistory(
+    clientId: string,
+    targetPublicKey: string,
+    command: string,
+    result: { outcome: MeshCoreCliOutcome; reply?: string; error?: string; elapsedMs?: number },
+  ): void {
+    const contact = this.options.manager.getContacts().find((c) => c.publicKey === targetPublicKey);
+    void recordMeshcoreCliHistory({
+      sourceId: this.sourceId,
+      targetKind: 'remote',
+      targetPublicKey,
+      targetName: contact?.advName ?? contact?.name ?? null,
+      origin: 'vn',
+      userId: null,
+      username: `vn:${clientId}`,
+      ipAddress: this.clients.get(clientId)?.socket.remoteAddress ?? null,
+      command,
+      ...result,
+    });
   }
 
   /**
@@ -2082,11 +2157,20 @@ export class MeshCoreVirtualNodeServer extends EventEmitter {
     // shows the actual hop count instead of always "direct" (#3871). The value
     // is the raw byte the device reported; the app decodes the hop count the
     // same way MeshRadar does. Falls back to 0xff (direct) when unknown.
-    const wirePathLen = msg.pathLen ?? 0xff;
+    let wirePathLen = msg.pathLen ?? 0xff;
     // The `channel-N` marker lands in toPublicKey for messages we sent and in
     // fromPublicKey for messages we received — check both.
+    const sentChannelIdx = this.sentChannelIndex(msg);
     const channelMatch =
       /^channel-(\d+)$/.exec(msg.toPublicKey ?? '') ?? /^channel-(\d+)$/.exec(msg.fromPublicKey ?? '');
+    // A channel message we sent was never received, so it has no pathLen. The
+    // 0xFF fallback is read by the app as width bits `11` + 63 hops ("63 hops,
+    // 4-byte", #6441). Send "0 hops" at the width the node floods with instead;
+    // keep 0xFF only while that width is unknown.
+    if (sentChannelIdx !== undefined && (msg.pathLen === null || msg.pathLen === undefined)) {
+      const size = this.options.manager.getSendPathHashSize?.() ?? null;
+      if (size !== null) wirePathLen = encodeOutPathLen(0, size);
+    }
     if (channelMatch) {
       // Channel packets carry the sender's name inline; reconstruct it so the
       // app renders the originator the way the firmware would deliver it.

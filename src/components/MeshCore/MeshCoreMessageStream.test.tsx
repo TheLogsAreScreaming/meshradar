@@ -227,6 +227,34 @@ describe('MeshCoreMessageStream entry scroll (#3810)', () => {
     list = container.querySelector('.meshcore-message-list') as HTMLElement;
     expect(list.scrollTop).toBe(500);
   });
+
+  it('holds the entry scroll while backlogLoading, then runs it once the backlog lands', () => {
+    // Rows can be present before the backlog is: a live tail, or (before the
+    // fix) the previous conversation's rows. The shot must wait for the real
+    // history instead of spending itself on those.
+    const { container, rerender } = render(
+      <MeshCoreMessageStream
+        messages={threeMessages()}
+        conversationKey="channel-1"
+        backlogLoading
+        onSend={async () => true}
+      />,
+    );
+    let list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    expect(list.scrollTop).toBe(0);
+    expect(scrollIntoViewSpy).not.toHaveBeenCalled();
+
+    rerender(
+      <MeshCoreMessageStream
+        messages={threeMessages()}
+        conversationKey="channel-1"
+        backlogLoading={false}
+        onSend={async () => true}
+      />,
+    );
+    list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    expect(list.scrollTop).toBe(500);
+  });
 });
 
 describe('MeshCoreMessageStream load older (#4460)', () => {
@@ -276,6 +304,45 @@ describe('MeshCoreMessageStream load older (#4460)', () => {
     list.scrollTop = 10;
     fireEvent.scroll(list);
     expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not call onLoadOlder while the backlog is still loading', () => {
+    const onLoadOlder = vi.fn();
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={twoMessages()}
+        conversationKey="channel-1"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder
+        backlogLoading
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    list.scrollTop = 0;
+    fireEvent.scroll(list);
+    expect(onLoadOlder).not.toHaveBeenCalled();
+  });
+
+  it('does not call onLoadOlder before the entry scroll has landed', () => {
+    // A channel switch swaps the rows and the browser clamps scrollTop to 0,
+    // firing a scroll event. That is not the user scrolling up: paging older
+    // history then, and restoring around it, yanked the view off the divider.
+    vi.stubGlobal('requestAnimationFrame', () => 0); // the entry frame never runs
+    const onLoadOlder = vi.fn();
+    const { container } = render(
+      <MeshCoreMessageStream
+        messages={twoMessages()}
+        conversationKey="channel-1"
+        onSend={async () => true}
+        onLoadOlder={onLoadOlder}
+        hasMoreOlder
+      />,
+    );
+    const list = container.querySelector('.meshcore-message-list') as HTMLElement;
+    list.scrollTop = 0;
+    fireEvent.scroll(list);
+    expect(onLoadOlder).not.toHaveBeenCalled();
   });
 
   it('does not call onLoadOlder when there is no older page', () => {
@@ -456,10 +523,12 @@ describe('MeshCoreMessageStream route-detail popup', () => {
     // No modal until the chain is clicked.
     expect(container.querySelector('.mcpm-modal')).toBeNull();
     fireEvent.click(container.querySelector('.mc-route-chain-link')!);
-    expect(container.querySelector('.mcpm-modal')).not.toBeNull();
-    const resolved = container.querySelector('.mc-route-resolved');
-    expect(resolved?.textContent).toContain('Hilltop');
-    expect(resolved?.textContent).toContain('Downtown Room');
+    const modal = container.querySelector('.mcpm-modal');
+    expect(modal).not.toBeNull();
+    // Names now render in the per-hop rows (the redundant "Resolved" row was
+    // removed in #6190); assert them in the modal body.
+    expect(modal?.textContent).toContain('Hilltop');
+    expect(modal?.textContent).toContain('Downtown Room');
     // Close via the backdrop.
     fireEvent.click(container.querySelector('.mcpm-modal')!);
     expect(container.querySelector('.mcpm-modal')).toBeNull();
@@ -717,10 +786,14 @@ describe('MeshCoreMessageStream delivery details modal (#4816)', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
-  it('does not disturb the heard-by toggle', () => {
+  it('does not disturb the heard-by toggle (#6193: antenna on channel sends)', () => {
+    // The heard-by antenna now lives on channel sends (toPublicKey channel-*).
     const { container } = renderWithQuery(
       <MeshCoreMessageStream
         messages={[outgoingMessage({
+          toPublicKey: 'channel-1',
+          deliveryStatus: undefined,
+          roundTripMs: undefined,
           heardBy: [{ hash: 'ab12', name: 'Repeater1', snr: 5 }],
         })]}
         selfPublicKey={SELF_KEY}
@@ -728,17 +801,55 @@ describe('MeshCoreMessageStream delivery details modal (#4816)', () => {
       />,
     );
 
-    // Heard-by list is collapsed until the badge is toggled.
+    // Heard-by list is collapsed until the antenna badge is toggled.
     expect(container.querySelector('.mc-heard-by-list')).toBeNull();
     fireEvent.click(container.querySelector('.mc-heard-by-badge')!);
     expect(container.querySelector('.mc-heard-by-list')).not.toBeNull();
     expect(screen.getByText('Repeater1')).toBeTruthy();
 
-    // Opening the delivery details modal afterward doesn't collapse it or
-    // interfere with its own state.
-    fireEvent.click(container.querySelector('.mc-delivery-status')!);
-    expect(screen.getByRole('dialog')).toBeInTheDocument();
-    expect(container.querySelector('.mc-heard-by-list')).not.toBeNull();
+    // #4173 review L13: the antenna stays on the header row, but the list opens
+    // below the message body at full width, not in the narrow meta column.
+    const list = container.querySelector('.mc-heard-by-list')!;
+    expect(container.querySelector('.mc-message-meta .mc-heard-by-badge')).not.toBeNull();
+    expect(list.closest('.mc-message-meta')).toBeNull();
+    const text = container.querySelector('.mc-message-text')!;
+    expect(text.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    // Toggling again collapses it — independent, self-contained state.
+    fireEvent.click(container.querySelector('.mc-heard-by-badge')!);
+    expect(container.querySelector('.mc-heard-by-list')).toBeNull();
+  });
+
+  it('shows each repeater\'s hop count, sorted by hops then SNR, old rows last (#6000)', () => {
+    const { container } = renderWithQuery(
+      <MeshCoreMessageStream
+        messages={[outgoingMessage({
+          toPublicKey: 'channel-1',
+          deliveryStatus: undefined,
+          roundTripMs: undefined,
+          heardBy: [
+            { hash: 'old1', name: 'OldRow', snr: 9, hops: null },
+            { hash: 'bb', name: 'Far', snr: 8, hops: 2 },
+            { hash: 'aa', name: 'NearWeak', snr: 1, hops: 0 },
+            { hash: 'cc', name: 'NearStrong', snr: 6, hops: 0 },
+          ],
+        })]}
+        selfPublicKey={SELF_KEY}
+        onSend={async () => true}
+      />,
+    );
+    fireEvent.click(container.querySelector('.mc-heard-by-badge')!);
+    const items = Array.from(container.querySelectorAll('.mc-heard-by-item'));
+    expect(items.map((li) => li.querySelector('.mc-heard-by-name')!.textContent)).toEqual([
+      'NearStrong',
+      'NearWeak',
+      'Far',
+      'OldRow',
+    ]);
+    expect(items[0].querySelector('.mc-heard-by-hops')!.textContent).toContain('0 hops');
+    expect(items[2].querySelector('.mc-heard-by-hops')!.textContent).toContain('2 hops');
+    // A row from before migration 218 has no hop count and shows none.
+    expect(items[3].querySelector('.mc-heard-by-hops')).toBeNull();
   });
 
   it('does not disturb the route-detail popup', () => {

@@ -55,7 +55,7 @@ List all configured sources. Authentication required.
 
 ### Per-source resource endpoints
 
-Replace `{sourceId}` with the `id` returned above, or use the literal string `"default"` to target the primary source.
+Replace `{sourceId}` with the `id` returned above, or use the literal string `"default"` to target the primary source: the [default Meshtastic source](/features/multi-source#default-meshtastic-source) set in Global Settings when it is enabled and the token can read it, else the oldest enabled source the token can read. `GET /api/v1/sources` marks that source with `isPrimary` (as an admin's `default` would resolve).
 
 | Legacy v1 path (≤ 4.12, deprecated)              | Canonical v1 path (4.13+)                              |
 | ------------------------------------------------- | ------------------------------------------------------- |
@@ -758,7 +758,7 @@ Update automation and system settings.
 - **Auto Acknowledge**: `autoAckEnabled`, `autoAckRegex`, `autoAckMessage`, etc.
 - **Auto Welcome**: `autoWelcomeEnabled`, `autoWelcomeMessage`, etc.
 - **Display Preferences**: `temperatureUnit`, `distanceUnit`, `timeFormat`, `dateFormat`, etc.
-- **Traceroute**: `tracerouteIntervalMinutes` (1-60)
+- **Traceroute** (per-source — pass `?sourceId=<id>`): `tracerouteIntervalMinutes` (0 = off, or 3-60). Off when no value is saved.
 - **MeshCore** (per-source — pass `?sourceId=<id>`): `meshcoreReceiveOnly` (string: exact
   `"true"`/`"false"` — see the strict-boolean note below). Blocks every transmission from that
   MeshCore source; see [MeshCore Receive-Only Mode](../features/meshcore-receive-only.md).
@@ -802,12 +802,12 @@ Update automation and system settings.
 - See [Automation Documentation](../features/automation.md) for detailed information about each automation feature
 
 ### POST /api/settings/traceroute-interval
-Update the automatic traceroute interval.
+Save a source's Auto Traceroute interval, in minutes, and apply it to that source's scheduler. `0` turns it off; otherwise the value must be 3-60 (anything else returns `400 INVALID_INTERVAL`). Pass `?sourceId=<id>` to pick the source; without it, the call targets the primary Meshtastic source. The value is saved as the source's `tracerouteIntervalMinutes`, so it survives a restart. The same interval leaves the schedule alone, and a new one counts from the last auto traceroute, so this call never makes a traceroute go out sooner than one interval after the last.
 
 **Request Body:**
 ```json
 {
-  "interval": 600000
+  "intervalMinutes": 10
 }
 ```
 
@@ -815,8 +815,7 @@ Update the automatic traceroute interval.
 ```json
 {
   "success": true,
-  "interval": 600000,
-  "message": "Traceroute interval updated to 10 minutes"
+  "intervalMinutes": 10
 }
 ```
 

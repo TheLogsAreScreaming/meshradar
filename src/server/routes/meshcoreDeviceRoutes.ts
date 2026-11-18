@@ -18,6 +18,8 @@ import { managerFor, isValidConnectionParams, requireMeshcoreTx, failIfTxDisable
 import { meshcoreChannelIdx } from '../services/socketEventGates.js';
 import type { ResourceType, PermissionAction } from '../../types/permission.js';
 import { ok, fail } from '../utils/apiResponse.js';
+import { assertSafeHost, SsrfBlockedError } from '../utils/ssrfGuard.js';
+import { isReactionsOutboundEnabled } from '../services/meshcoreReactionSend.js';
 import {
   type MeshCoreAdvertMode,
   MESHCORE_ADVERT_MODES,
@@ -28,6 +30,7 @@ import { MeshCoreZeroHopAdvertUnsupportedError } from '../utils/meshcoreAdvert.j
 import { buildLocalContactRow, withoutLocalFlag, type MeshCoreContactResponse } from './meshcoreLocalContactRow.js';
 import { applySignFlipToMeshCoreRows } from '../services/signFlipCorrection.js';
 import { extendRequestTimeout } from '../middleware/requestTimeout.js';
+import { applyMeshCorePositionOverrides, loadMeshCorePositionOverrides } from '../utils/meshcorePositionOverride.js';
 
 /** Device connect: serial/TCP/BLE handshake + capability probe over RF. */
 const CONNECT_TIMEOUT_MS = 90_000;
@@ -50,6 +53,7 @@ router.get('/status', optionalAuth(), requirePermission('connection', 'read', { 
         ...status,
         localNode,
         deviceTypeName: MeshCoreDeviceType[status.deviceType],
+        reactionsOutboundEnabled: await isReactionsOutboundEnabled(req.params.id),
       },
     });
   } catch (error) {
@@ -79,6 +83,26 @@ router.post('/connect', extendRequestTimeout(CONNECT_TIMEOUT_MS), meshcoreDevice
     });
     if (!validation.valid) {
       return res.status(400).json({ success: false, error: validation.error });
+    }
+
+    // SSRF-05 (issue #6080): a TCP connect opens a raw socket to an operator-
+    // supplied host. Connecting to a LAN MeshCore device IS the feature, so
+    // RFC1918 stays allowed (non-strict, loopback blocked), but reject loopback,
+    // link-local and cloud-metadata targets so this endpoint can't be turned
+    // into an internal port scanner / IMDS reach. DNS resolution of the host is
+    // validated too, closing the hostname path.
+    if (connectionType === 'tcp' && typeof tcpHost === 'string' && tcpHost.trim().length > 0) {
+      try {
+        await assertSafeHost(tcpHost.trim(), { strict: false });
+      } catch (err) {
+        if (err instanceof SsrfBlockedError) {
+          return res.status(400).json({
+            success: false,
+            error: 'TCP host is not permitted (loopback, link-local and metadata addresses are blocked)',
+          });
+        }
+        throw err;
+      }
     }
 
     const firmwareType: 'companion' | 'repeater' = deviceType === 'repeater' ? 'repeater' : 'companion';
@@ -120,7 +144,7 @@ router.post('/connect', extendRequestTimeout(CONNECT_TIMEOUT_MS), meshcoreDevice
  */
 router.post('/disconnect', meshcoreDeviceLimiter, requireAuth(), requirePermission('connection', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
   try {
-    await managerFor(req, res).disconnect();
+    await managerFor(req, res).disconnect({ userInitiated: true });
     res.json({ success: true, message: 'Disconnected' });
   } catch (error) {
     logger.error('[API] Error disconnecting:', error);
@@ -242,8 +266,17 @@ router.get('/snapshot', optionalAuth(), requirePermission('connection', 'read', 
       // Resolved once for both arrays.
       const canViewOnMap = await can('nodes', 'viewOnMap');
       // #5363: display-only sign-flip correction of the positions that remain.
-      maskedContacts = canViewOnMap ? await applySignFlipToMeshCoreRows(allContacts, sourceId) : stripPositions(allContacts);
-      maskedNodes = canViewOnMap ? await applySignFlipToMeshCoreRows(nodes, sourceId) : stripPositions(nodes);
+      // #5842: an enabled location override wins over the advert position.
+      // Applied only when positions are shown at all; stripPositions drops it.
+      if (canViewOnMap) {
+        const overrides = await loadMeshCorePositionOverrides(sourceId);
+        const canViewPrivate = overrides.size > 0 && await can('nodes_private', 'read');
+        maskedContacts = await applySignFlipToMeshCoreRows(applyMeshCorePositionOverrides(allContacts, overrides, canViewPrivate), sourceId);
+        maskedNodes = await applySignFlipToMeshCoreRows(applyMeshCorePositionOverrides(nodes, overrides, canViewPrivate), sourceId);
+      } else {
+        maskedContacts = stripPositions(allContacts);
+        maskedNodes = stripPositions(nodes);
+      }
     }
 
     res.json({
@@ -253,6 +286,7 @@ router.get('/snapshot', optionalAuth(), requirePermission('connection', 'read', 
           ...status,
           localNode,
           deviceTypeName: MeshCoreDeviceType[status.deviceType],
+          reactionsOutboundEnabled: await isReactionsOutboundEnabled(req.params.id),
         },
         contacts: maskedContacts,
         nodes: maskedNodes,

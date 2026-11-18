@@ -5,12 +5,15 @@
  * counts, channels, telemetry availability, config, device config,
  * traceroutes, device node numbers) moved out of server.ts as part of
  * #3502 PR1. This is a smoke test of the real router via the route-test
- * harness — no prior test exercised this handler directly (server.poll.test.ts
- * hand-rolls a duplicate mini-app that never imports pollRoutes.ts).
+ * harness — no prior test exercised this handler directly (the removed server.poll.test.ts
+ * hand-rolled a duplicate mini-app that never imported pollRoutes.ts).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import pollRoutes from './pollRoutes.js';
 import { createRouteTestApp, type RouteTestHarness } from '../test-helpers/routeTestApp.js';
+// Registers the real `fallbackManager` that resolveSourceManager() returns
+// when no primary source is registered (the server loads it at startup).
+import '../meshtasticManager.js';
 
 describe('pollRoutes — GET /poll', () => {
   let harness: RouteTestHarness;

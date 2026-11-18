@@ -4,8 +4,11 @@
  * Manages user authentication state, login/logout, and permissions
  */
 
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import type { RedactionConfig } from '../utils/publicInstanceMode.js';
+import React, { useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import api from '../services/api';
+import { AuthContext } from './authContextObject';
+import { signInWithPasskey, recoverWithCode as postRecoveryCode } from '../services/passkeyClient';
 import { logger } from '../utils/logger';
 import type { PermissionSet, SourcedPermissionSet } from '../types/permission';
 import { isSourceyResource } from '../types/permission';
@@ -21,6 +24,8 @@ export interface User {
   isActive: boolean;
   passwordLocked: boolean;
   mfaEnabled: boolean;
+  /** Passkey-only account (#5841): the password does not sign in. */
+  passwordLoginDisabled?: boolean;
   createdAt: number;
   lastLoginAt: number | null;
 }
@@ -48,6 +53,16 @@ export interface AuthStatus {
    */
   customTitle: string | null;
   customLogoUrl: string | null;
+  /**
+   * This session signed in with a passkey recovery code (#5841) and must
+   * choose a new password. Only sent when authenticated.
+   */
+  passwordChangeRequired?: boolean;
+  /**
+   * Public-instance mode (#5156) config. Only sent to signed-out viewers; the
+   * UI uses it to tolerate redacted fields. Absent when signed in.
+   */
+  publicInstance?: RedactionConfig;
 }
 
 export interface LoginResult {
@@ -55,11 +70,22 @@ export interface LoginResult {
   success?: boolean;
 }
 
-interface AuthContextType {
+export interface AuthContextType {
   authStatus: AuthStatus | null;
   loading: boolean;
   login: (username: string, password: string) => Promise<LoginResult>;
   verifyMfa: (code: string, isBackupCode?: boolean) => Promise<void>;
+  /**
+   * Sign in with a passkey (#5841). No TOTP step follows (D5). With
+   * `autofill`, waits for a pick from the username field's autofill list.
+   * Reloads the page on success, like password login.
+   */
+  loginWithPasskey: (opts?: { autofill?: boolean }) => Promise<void>;
+  /**
+   * Sign in with a passkey recovery code (#5841). Turns password sign-in back
+   * on; the next page asks for a new password. Reloads on success.
+   */
+  recoverWithCode: (username: string, code: string) => Promise<void>;
   loginWithOIDC: () => Promise<void>;
   logout: () => Promise<void>;
   refreshAuth: () => Promise<void>;
@@ -82,44 +108,60 @@ interface AuthContextType {
   hasChannelDbPermission: (channelDbId: number, action: 'viewOnMap' | 'read') => boolean;
 }
 
-export const AuthContext = createContext<AuthContextType | undefined>(undefined);
+export { AuthContext };
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Bumped on every refresh so a slow channel-database-permissions reply from
+  // an older refresh can't overwrite a newer auth status.
+  const refreshSeq = useRef(0);
+
   // Check authentication status
   const refreshAuth = useCallback(async () => {
+    const seq = ++refreshSeq.current;
     try {
       const response = await api.get<AuthStatus>('/api/auth/status');
 
-      // Fetch channel database permissions if authenticated
-      const channelDbPermissions: ChannelDbPermissionSet = {};
-      if (response.authenticated && response.user) {
-        try {
-          const cdPermsResponse = await api.get<{
-            data: Array<{ channelDatabaseId: number; canViewOnMap: boolean; canRead: boolean }>;
-          }>(`/api/users/${response.user.id}/channel-database-permissions`);
-
-          for (const perm of cdPermsResponse.data || []) {
-            channelDbPermissions[perm.channelDatabaseId] = {
-              viewOnMap: perm.canViewOnMap,
-              read: perm.canRead
-            };
-          }
-        } catch (err) {
-          // Non-fatal - user may not have permissions to view this
-          logger.debug('Could not fetch channel database permissions:', err);
-        }
-      }
-
+      // Publish the auth status as soon as /api/auth/status answers. Auth-gated
+      // queries (the dashboard among them) wait on this, so it must not also
+      // wait on the channel-database permission fetch below.
       setAuthStatus({
         ...response,
-        channelDbPermissions
+        channelDbPermissions: {},
       });
       logger.debug('Auth status refreshed:', response.authenticated);
+
+      // Channel database (virtual channel) permissions load after, without
+      // blocking. Until they arrive, hasChannelDbPermission() denies non-admins
+      // (the same answer it gave when the fetch failed). Admins never need them.
+      if (response.authenticated && response.user) {
+        const userId = response.user.id;
+        void (async () => {
+          try {
+            const cdPermsResponse = await api.get<{
+              data: Array<{ channelDatabaseId: number; canViewOnMap: boolean; canRead: boolean }>;
+            }>(`/api/users/${userId}/channel-database-permissions`);
+
+            const channelDbPermissions: ChannelDbPermissionSet = {};
+            for (const perm of cdPermsResponse.data || []) {
+              channelDbPermissions[perm.channelDatabaseId] = {
+                viewOnMap: perm.canViewOnMap,
+                read: perm.canRead
+              };
+            }
+            if (seq !== refreshSeq.current) return;
+            setAuthStatus((prev) => (prev ? { ...prev, channelDbPermissions } : prev));
+          } catch (err) {
+            // Non-fatal - user may not have permissions to view this
+            logger.debug('Could not fetch channel database permissions:', err);
+          }
+        })();
+      }
     } catch (error) {
       logger.error('Failed to fetch auth status:', error);
+      if (seq !== refreshSeq.current) return;
       // Set unauthenticated state on error
       setAuthStatus({
         authenticated: false,
@@ -131,6 +173,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         anonymousDisabled: false,
         customTitle: null,
         customLogoUrl: null,
+        publicInstance: undefined,
       });
     } finally {
       setLoading(false);
@@ -208,6 +251,33 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       logger.error('MFA verification failed:', error);
       throw error;
     }
+  }, [refreshAuth]);
+
+  // Passkey authentication (#5841). passkeyClient loads the WebAuthn library on first use.
+  const loginWithPasskey = useCallback(async (opts?: { autofill?: boolean }) => {
+    try {
+      await signInWithPasskey(opts);
+      await refreshAuth();
+
+      const statusCheck = await api.get<AuthStatus>('/api/auth/status');
+      if (!statusCheck.authenticated) {
+        throw new Error('Session cookie not working after passkey sign-in.');
+      }
+
+      logger.debug('Passkey login successful - reloading page');
+      window.location.reload();
+    } catch (error) {
+      logger.debug('Passkey login did not complete:', error);
+      throw error;
+    }
+  }, [refreshAuth]);
+
+  // Passkey recovery code (#5841).
+  const recoverWithCode = useCallback(async (username: string, code: string) => {
+    await postRecoveryCode(username, code);
+    await refreshAuth();
+    logger.debug('Recovery-code sign-in successful - reloading page');
+    window.location.reload();
   }, [refreshAuth]);
 
   // OIDC authentication
@@ -316,12 +386,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     loading,
     login,
     verifyMfa,
+    loginWithPasskey,
+    recoverWithCode,
     loginWithOIDC,
     logout,
     refreshAuth,
     hasPermission,
     hasChannelDbPermission
-  }), [authStatus, loading, login, verifyMfa, loginWithOIDC, logout, refreshAuth, hasPermission, hasChannelDbPermission]);
+  }), [authStatus, loading, login, verifyMfa, loginWithPasskey, recoverWithCode, loginWithOIDC, logout, refreshAuth, hasPermission, hasChannelDbPermission]);
 
   return (
     <AuthContext.Provider value={value}>

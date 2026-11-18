@@ -24,6 +24,8 @@ import { useWebSocketContext } from '../../../contexts/WebSocketContext';
 import { useToast } from '../../ToastContainer';
 import { isTxDisabledBody } from '../../../utils/txDisabled';
 import { parseJsonResponse } from '../../../utils/parseJsonResponse';
+import { buildOptimisticReaction } from '../meshcoreReactionClient';
+import { mergeMeshCoreHeardBy } from '../../../utils/meshcoreHeardBy';
 import { createNeighboursFetchActions, type MeshCoreNeighboursFetchActions } from './meshcoreNeighboursFetchApi';
 import type { MeshCoreAdvertMode } from '../../../types/meshcoreAdvert';
 import type {
@@ -33,10 +35,93 @@ import type {
   MeshCoreLocalNodeUpdateEvent,
 } from '../../../hooks/useWebSocket';
 import { MeshCoreContact, mapContactsToNodes } from '../../../utils/meshcoreHelpers';
-import { remapChannelLastRead } from '../meshcoreUnreadStore';
+import { remapChannelLastRead, canonicalizePeerKey } from '../meshcoreUnreadStore';
 import { remapChannelCustomOrder } from '../meshcoreChannelOrder';
 import { emitChannelsReordered, remapChannelKey, slotMoveMap } from '../meshcoreChannelReorderEvents';
+import { useMessageSound, meshcoreSoundArgs } from '../../../hooks/useMessageSound';
 import { emitFiltersChanged, subscribeFiltersChanged } from '../meshcoreFilterEvents';
+
+/** A Repeater's readable settings (#6255 P9). Secrets are never in here. */
+export interface RepeaterSettingsValues {
+  lat?: number;
+  lon?: number;
+  advertInterval?: number;
+  floodAdvertInterval?: number;
+  floodMax?: number;
+  repeat?: boolean;
+  af?: number;
+  rxDelay?: number;
+  txDelay?: number;
+  directTxDelay?: number;
+  allowReadOnly?: boolean;
+  /** Remote reads (#6256 P10): the node's name, TX power (dBm) and `freq,bw,sf,cr` radio string. */
+  name?: string;
+  txPower?: number;
+  radio?: string;
+}
+
+export interface RepeaterCapabilities {
+  /** Reboot is always on for a connected Repeater; factory reset is Companion-only. */
+  reboot?: boolean;
+  powerOff: boolean;
+  keyExport: boolean;
+  keyImport: boolean;
+  factoryReset?: boolean;
+  /** Why an action is off, keyed like the flags above. */
+  reasons?: Partial<Record<'reboot' | 'powerOff' | 'keyExport' | 'keyImport' | 'factoryReset', string>>;
+}
+
+export interface RepeaterSettingsSnapshot {
+  values: RepeaterSettingsValues;
+  guestPasswordSet: boolean;
+  capabilities: RepeaterCapabilities;
+  firmware?: { version?: string | null; gates?: unknown };
+}
+
+export type RepeaterSettingsPatch = Partial<RepeaterSettingsValues> & {
+  adminPassword?: string;
+  guestPassword?: string;
+};
+
+export interface RepeaterKeyResult {
+  ok: boolean;
+  changed?: boolean;
+  value?: number | boolean | string;
+  error?: string;
+  code?: string;
+  /** Remote: false when the key was accepted but no readback ran (the run stopped early). */
+  verified?: boolean;
+}
+
+export interface RepeaterSaveResponse {
+  /** False when any key failed (still HTTP 200). */
+  ok?: boolean;
+  results: Record<string, RepeaterKeyResult>;
+  values?: RepeaterSettingsValues;
+  guestPasswordSet?: boolean;
+  read?: boolean;
+  drifted?: boolean;
+  /** Remote only: radio commands this request sent. */
+  sent?: number;
+}
+
+/** Settings groups a remote read asks for one at a time (#6256 P10). */
+export type RemoteSettingsGroup = 'identity' | 'adverts' | 'access';
+
+export interface RemoteSettingsReadData {
+  values: RepeaterSettingsValues;
+  guestPasswordSet: boolean;
+  errors: Record<string, string>;
+  firmware: string | null;
+  deviceType: 'repeater' | 'room';
+  sent: number;
+  stoppedAt?: string;
+}
+
+/** A remote settings call's outcome; errors keep the server code for the form. */
+export type RemoteSettingsResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; code?: string; error: string; field?: string; retryAfterSeconds?: number };
 
 export type TelemetryMode = 'always' | 'device' | 'never';
 
@@ -129,7 +214,13 @@ export interface MeshCoreNode {
   positionSource?: string | null;
   /** #5578: did the latest advert heard carry a position? null/unset = unknown. */
   lastAdvertHadPosition?: boolean | null;
+  /** P7a #6254: latest checked advert signature (true / false); null or unset = not checked. */
+  advertSignatureVerified?: boolean | null;
+  /** #6281: persisted clock offset in seconds (positive = node behind); set while flagged, else null. */
+  clockOffsetSeconds?: number | null;
   advLocPolicy?: number;
+  /** P8a #6257: 0 or 1 (extra ACKs on received DMs). Absent on firmware before v7. */
+  multiAcks?: number;
   /** Favorite flag (issue #3588). Pins the node to the top of the list; for a
    *  connected Companion source it also syncs the firmware favourite bit so the
    *  contact is protected from contact-table eviction (#4838). */
@@ -162,7 +253,7 @@ export interface MeshCoreMessage {
   /** Repeaters that re-flooded this outgoing channel message, inferred by
    *  self-echo correlation (#3700). Best-effort; `name` is null when the relay
    *  hash couldn't be resolved to a known contact. */
-  heardBy?: Array<{ hash: string; name?: string | null; snr?: number | null }>;
+  heardBy?: Array<{ hash: string; name?: string | null; snr?: number | null; hops?: number | null }>;
   /**
    * Signal-to-noise ratio (dB) of the received packet, as reported by the
    * companion. The server has always sent this; the client type just never
@@ -190,9 +281,26 @@ export interface MeshCoreMessage {
   scopeCode?: number | null;
   /** Region name resolved from the scope code; null = unscoped or unknown scope (#3742 Ph2). */
   scopeName?: string | null;
-  /** Wire sender_timestamp (epoch seconds) of our own channel send (#5512).
-   *  Absent on messages sent before resend support; those can't be resent. */
+  /** Wire sender_timestamp (epoch seconds). Set on every row stored since
+   *  reactions (#5759); before that only on our own channel sends (#5512).
+   *  Absent on older rows; an own channel send without it can't be resent. */
   senderTimestamp?: number;
+  /** Set when this own channel send went out under an override sender name (#6282). */
+  senderNameOverride?: string | null;
+  /** Reactions (#5759). Set = this row is a reaction and `text` equals it. */
+  reactionEmoji?: string | null;
+  /** Wire format the reaction arrived in (`mc1-channel`, `mc1-dm`, `mco-v3`, …). */
+  reactionFormat?: string | null;
+  /** Client-only: this reaction row is the optimistic copy, not yet confirmed by the server (#5762). */
+  reactionPending?: boolean;
+  /** Id of the message reacted to. Null/absent on a reaction row = unmatched. */
+  reactionTargetId?: string | null;
+  /** Sender the reaction names (MC1 channel form only). */
+  reactionTargetSender?: string | null;
+  /** Hash the reaction names its target by. */
+  reactionTargetHash?: string | null;
+  /** The reaction as it came off the wire. */
+  reactionRawText?: string | null;
   /** User resends so far (#5512). */
   resendCount?: number;
   /** When (ms) the latest resend of any kind went out (#5512). */
@@ -220,18 +328,21 @@ export interface MeshCoreMessage {
    * trigger stamped …213050, the reply stamped …213000 despite arriving 1.4s
    * later.
    *
-   * Ordering therefore compares `timestamp` at second granularity — all the
-   * wire actually gives us — and breaks ties on this field, a single monotonic
-   * clock across both directions. Display still uses `timestamp`.
+   * Since #5973, DMs and channel messages both SORT and DISPLAY by this
+   * clock; the sender's offset from it shows beside the time. Room posts
+   * keep `timestamp` (a room replays its backlog on login), with this as the
+   * tie-break. See `utils/meshcoreMessageTime.ts` and `../messageOrder.ts`.
    *
-   * Optional: rows persisted before this field existed carry no value, and
-   * `compareMeshCoreMessages` falls back to `timestamp` for those.
+   * Optional: reloaded rows carry the DB `createdAt` here; rows from before
+   * either existed fall back to `timestamp`.
    */
   receivedAt?: number;
 }
 
 export interface ConnectionStatus {
   connected: boolean;
+  /** Outbound reactions switch for this source (#5762); absent on older servers. */
+  reactionsOutboundEnabled?: boolean;
   deviceType: number;
   deviceTypeName: string;
   config: {
@@ -297,6 +408,21 @@ export interface AddContactToDeviceResponse {
   evicted?: string[];
 }
 
+/** Body for `setNodePositionOverride` (#5842), same fields as the Meshtastic modal. */
+export interface MeshCorePositionOverrideInput {
+  enabled: boolean;
+  latitude?: number;
+  longitude?: number;
+  altitude?: number;
+  isPrivate?: boolean;
+}
+
+/** Per-source sender-name override policy (#6282). */
+export interface SenderNamePolicy {
+  enabled: boolean;
+  allowedNames: string[];
+}
+
 export interface MeshCoreActions {
   connect: () => Promise<boolean>;
   disconnect: () => Promise<void>;
@@ -338,6 +464,10 @@ export interface MeshCoreActions {
   getDefaultScope: () => Promise<string>;
   /** Set the per-source default region/scope. Returns the normalized value, or null on error. */
   setDefaultScope: (scope: string) => Promise<string | null>;
+  /** Read the per-source sender-name override policy (#6282). Null on error. */
+  getSenderNamePolicy: () => Promise<SenderNamePolicy | null>;
+  /** Replace the per-source sender-name override policy. Returns the stored policy, or null on error. */
+  setSenderNamePolicy: (policy: SenderNamePolicy) => Promise<SenderNamePolicy | null>;
   /** Read the per-source default MeshCore path hash size (1/2/3 bytes) (#4945). */
   getDefaultPathHashSize: () => Promise<1 | 2 | 3>;
   /** Set the per-source default path hash size. Returns the applied value, or null on error. */
@@ -362,12 +492,24 @@ export interface MeshCoreActions {
    *  contact is protected from contact-table eviction (#4838). Resolves `true`
    *  on success. */
   setNodeFavorite: (publicKey: string, isFavorite: boolean) => Promise<boolean>;
+  /** Allow or stop a contact running CLI commands on this radio (contact flag
+   *  0x10, fw 1.18.0+, #5867). Resolves the error text on failure, else null. */
+  setContactRemoteCli: (publicKey: string, allowed: boolean) => Promise<string | null>;
+  /** Set (enabled) or clear (disabled) a contact's location override (#5842).
+   *  MeshRadar-only, no airtime. Reloads the snapshot so every view picks
+   *  up the new position. Rejects with the server's message on failure. */
+  setNodePositionOverride: (publicKey: string, data: MeshCorePositionOverrideInput) => Promise<void>;
   /** Export a contact as a signed advert blob for sharing. Pass 'self' to
    *  export the local node's identity. Returns the raw bytes or null. */
   exportContact: (publicKey: string) => Promise<number[] | null>;
   /** Import a contact from a signed advert blob. Refreshes contacts on
    *  success. */
   importContact: (advertBytes: number[]) => Promise<boolean>;
+  /** Import a contact from a MeshCore One contact-share token
+   *  `<PUBKEYHEX:type:name>` into the companion radio (#6370). Same response
+   *  shape as `addContactToDevice`: `CONTACT_TABLE_FULL_CONFIRM` means ask,
+   *  then retry with `confirmFull`. Refreshes contacts on success. */
+  importContactToken: (token: string, confirmFull?: boolean) => Promise<AddContactToDeviceResponse>;
   /** Sync the device's RTC to the server's current time. */
   syncDeviceTime: () => Promise<boolean>;
   /** Query the neighbour list from a remote repeater. */
@@ -375,8 +517,26 @@ export interface MeshCoreActions {
     total: number;
     neighbours: { publicKeyPrefix: string; heardSecondsAgo: number; snr: number }[];
   } | null>;
+  /** Read a Repeater's settings over its serial CLI (#6255 P9). Null on failure. */
+  getRepeaterSettings: () => Promise<RepeaterSettingsSnapshot | null>;
+  /** Save changed Repeater settings. Returns per-key results, or null on a request failure. */
+  saveRepeaterSettings: (patch: RepeaterSettingsPatch) => Promise<RepeaterSaveResponse | null>;
+  /** Read settings groups from a remote Repeater / Room Server over RF (#6256 P10). */
+  readRemoteSettings: (publicKey: string, groups: RemoteSettingsGroup[]) => Promise<RemoteSettingsResult<RemoteSettingsReadData>>;
+  /** Save changed settings on a remote Repeater / Room Server over RF (#6256 P10). */
+  saveRemoteSettings: (publicKey: string, patch: RepeaterSettingsPatch) => Promise<RemoteSettingsResult<RepeaterSaveResponse>>;
+  /** Power the device off until it is power-cycled. Admin only; destructive. */
+  powerOffDevice: (opts?: { confirm?: boolean }) => Promise<boolean>;
   /** Reboot the locally connected device. Destructive — requires confirm flow. */
   rebootDevice: (opts?: { confirm?: boolean }) => Promise<boolean>;
+  /** Read the BLE pairing PIN (0 = firmware default). Null on failure. P8a #6257. */
+  getBlePin: () => Promise<number | null>;
+  /** Set the BLE PIN (0 or 100000-999999). Applies after the next reboot. */
+  setBlePin: (pin: number) => Promise<boolean>;
+  /** Turn extra ACKs on received DMs on (1) or off (0). */
+  setMultiAcks: (value: 0 | 1) => Promise<boolean>;
+  /** Factory-reset the Companion. Destructive: the device wipes itself and reboots. */
+  factoryReset: (opts?: { confirm?: boolean }) => Promise<boolean>;
   /** Export the device's Ed25519 private key as a hex string for backup. */
   exportPrivateKey: () => Promise<string | null>;
   /** Import an Ed25519 private key onto the device. Destructive — replaces identity. */
@@ -388,6 +548,11 @@ export interface MeshCoreActions {
    *  send re-asserts the channel/default scope. Omit (or pass `undefined`) for
    *  the normal channel/default resolution. */
   sendMessage: (text: string, toPublicKey?: string, channelIdx?: number, scope?: string | null) => Promise<boolean>;
+  /** Send an emoji reaction to a message (#5762). Shows an optimistic chip at once;
+   *  resolves `true` when the server sent it. */
+  sendReaction: (target: MeshCoreMessage, emoji: string) => Promise<boolean>;
+  /** Re-read the connection status now (resolves `connected`). */
+  refreshStatus: () => Promise<boolean>;
   /** Delete a single stored message by id (#3981). Resolves `true` on success. */
   deleteMessage: (id: string) => Promise<boolean>;
   /** Resend a channel message no repeater relayed (#5512). Resolves the new
@@ -399,6 +564,17 @@ export interface MeshCoreActions {
   clearChannelMessages: (channelIdx: number) => Promise<boolean>;
   /** Purge every MeshCore message (channel + DM) for this source (#3981). */
   purgeAllMessages: () => Promise<boolean>;
+  /** Load a peer's DM backlog from the server (#6186), independent of the
+   *  shared 100-message window. Prefix-aware peer match; `offset` pages older. */
+  fetchDmMessages: (publicKey: string, opts?: { limit?: number; offset?: number }) => Promise<{ messages: MeshCoreMessage[]; hasMore: boolean }>;
+  /** DM threads with stored history + their latest DM time (#6186), from a
+   *  server query rather than the live window. */
+  fetchDmPeers: () => Promise<Array<{ publicKey: string; lastMessageAt: number }>>;
+  /** Load a room's post backlog from the server (#6186). Sender-time order;
+   *  `offset` pages older. */
+  fetchRoomMessages: (publicKey: string, opts?: { limit?: number; offset?: number }) => Promise<{ messages: MeshCoreMessage[]; hasMore: boolean }>;
+  /** Per-room post count + latest-post time (#6186), from a server query. */
+  fetchRoomStats: () => Promise<Array<{ roomPublicKey: string; count: number; latest: number; latestReceivedAt: number }>>;
   setDeviceName: (name: string) => Promise<boolean>;
   setRadioParams: (params: { freq: number; bw: number; sf: number; cr: number }) => Promise<boolean>;
   setTxPower: (power: number) => Promise<boolean>;
@@ -479,6 +655,12 @@ export interface MeshCoreActions {
   /** Forget the saved admin password for a remote node. No-op when none is
    *  saved; resolves `true` on success. */
   forgetRemoteCredential: (publicKey: string) => Promise<boolean>;
+  /** Is there a remembered login to this node the console can resume
+   *  (#5785)? Server/DB lookup only, no radio traffic. Null on error. */
+  getRemoteAdminSession: (publicKey: string) => Promise<MeshCoreRemoteAdminSession | null>;
+  /** "Log out" (#5785): forget the remembered session. Sends nothing to the
+   *  node; the next use logs in again. Resolves `true` on success. */
+  logoutRemote: (publicKey: string) => Promise<boolean>;
   /** Fetch typed status from a remote node (SendStatusReq → StatusResponse).
    *  Populated fields depend on the remote's role: Repeater / Room Server
    *  return the full counter set; Companion firmware returns only battery
@@ -510,6 +692,19 @@ export interface MeshCoreActions {
  * server-side `MeshCoreStatus` in src/server/meshcoreManager.ts; defined
  * separately here so the frontend doesn't pull in server-only modules.
  */
+/** A remembered remote-admin login (#5785), from GET /admin/session/:pk. */
+export interface MeshCoreRemoteAdminSession {
+  /** True when the console can resume it: recorded by the companion that is
+   *  connected now. */
+  active: boolean;
+  /** Epoch ms of the login, or null when nothing is remembered. */
+  loggedInAt: number | null;
+  /** The node's admin flag from the login reply; null when it did not say. */
+  isAdmin: boolean | null;
+  /** Why not active: nothing remembered, another radio, or not connected. */
+  reason?: 'none' | 'other_radio' | 'not_connected';
+}
+
 export interface MeshCoreRemoteStatus {
   batteryMv?: number;
   uptimeSecs?: number;
@@ -543,6 +738,8 @@ export interface UseMeshCoreState {
   nodes: MeshCoreNode[];
   contacts: MeshCoreContact[];
   messages: MeshCoreMessage[];
+  /** Reaction id → target id for reactions resolved since load (#5759). */
+  reactionResolutions: Record<string, string>;
   loading: boolean;
   /**
    * True once the first contacts/nodes snapshot fetch has resolved (success
@@ -576,6 +773,10 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
   const { setMeshCoreNodes } = useMapContext();
   const { state: wsState } = useWebSocketContext();
   const socket = wsState.socket;
+  const { playForMessage } = useMessageSound(sourceId);
+  const playForMessageRef = useRef(playForMessage);
+  playForMessageRef.current = playForMessage;
+  const soundedIdsRef = useRef<Set<string>>(new Set());
 
   const mcPrefix = `${baseUrl}/api/sources/${encodeURIComponent(sourceId)}/meshcore`;
   const sourceLifecyclePrefix = `${baseUrl}/api/sources/${encodeURIComponent(sourceId)}`;
@@ -584,6 +785,23 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
   const [nodes, setNodes] = useState<MeshCoreNode[]>([]);
   const [contacts, setContacts] = useState<MeshCoreContact[]>([]);
   const [messages, setMessages] = useState<MeshCoreMessage[]>([]);
+  // Keep relay pushes even if their message has not loaded yet, and preserve
+  // them across HTTP responses that were captured before the push arrived.
+  const heardByRef = useRef(new Map<string, MeshCoreMessage['heardBy']>());
+  useEffect(() => { heardByRef.current.clear(); }, [sourceId]);
+  const withKnownHeardBy = useCallback((message: MeshCoreMessage): MeshCoreMessage => {
+    const heardBy = mergeMeshCoreHeardBy(heardByRef.current.get(message.id), message.heardBy);
+    if (!heardBy?.length) return message;
+    heardByRef.current.set(message.id, heardBy);
+    return { ...message, heardBy };
+  }, []);
+  // Reaction id → target id, for reactions resolved after they were stored
+  // (#5759). Views that hold paged history in their own state read this map,
+  // since the hook cannot patch rows it does not own.
+  const [reactionResolutions, setReactionResolutions] = useState<Record<string, string>>({});
+  useEffect(() => {
+    setReactionResolutions({});
+  }, [sourceId]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // True once the FIRST snapshot fetch (mount-time loadSnapshot below) has
@@ -722,11 +940,11 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     try {
       const response = await csrfFetch(`${mcPrefix}/messages?limit=100`);
       const data = await parseJsonResponse(response);
-      if (data.success) setMessages(data.data ?? []);
+      if (data.success) setMessages((data.data ?? []).map(withKnownHeardBy));
     } catch (_err) {
       console.error('Failed to fetch meshcore messages:', _err);
     }
-  }, [enabled, mcPrefix, csrfFetch]);
+  }, [enabled, mcPrefix, csrfFetch, withKnownHeardBy]);
 
   // Single-call initial load. Returns status, contacts, nodes, messages and
   // a seqCursor (newest message timestamp) for reconnect catch-up. Replaces
@@ -744,7 +962,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       contactsRef.current = new Map(stampedContacts.map((c) => [c.publicKey, c]));
       setContacts(stampedContacts);
       setNodes(snap.nodes ?? []);
-      setMessages(snap.messages ?? []);
+      setMessages((snap.messages ?? []).map(withKnownHeardBy));
       seqCursorRef.current = snap.seqCursor ?? 0;
       setMeshCoreNodes(mapContactsToNodes(stampedContacts));
       return snap.status?.connected ?? false;
@@ -752,7 +970,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       console.error('Failed to load meshcore snapshot:', _err);
       return false;
     }
-  }, [enabled, mcPrefix, csrfFetch, setMeshCoreNodes, stampLocal]);
+  }, [enabled, mcPrefix, csrfFetch, setMeshCoreNodes, stampLocal, withKnownHeardBy]);
 
   useEffect(() => {
     connectedRef.current = status?.connected ?? false;
@@ -805,15 +1023,29 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     };
 
     const onMessage = (msg: MeshCoreMessageEvent) => {
+      // Live message sound (P11 S9): once per message id; own, reaction and
+      // ignored/blocked messages stay silent.
+      if (!soundedIdsRef.current.has(msg.id)) {
+        soundedIdsRef.current.add(msg.id);
+        if (soundedIdsRef.current.size > 500) {
+          soundedIdsRef.current.delete(soundedIdsRef.current.values().next().value as string);
+        }
+        // Mutes are stored under the canonical full key; a DM may arrive with a 12-hex prefix.
+        const args = meshcoreSoundArgs(msg as MeshCoreMessage, localNodeRef.current?.publicKey, (k) =>
+          canonicalizePeerKey(k, Array.from(contactsRef.current.values())));
+        if (args) playForMessageRef.current(args);
+      }
       setMessages(prev => {
         if (prev.some(m => m.id === msg.id)) return prev;
-        const enriched: MeshCoreMessage = msg.expectedAckCrc
+        // The server now stamps the ack state on the row (#5682); the CRC
+        // check stays for an older server that sends none.
+        const enriched: MeshCoreMessage = !msg.deliveryStatus && msg.expectedAckCrc
           ? { ...msg, deliveryStatus: 'sent' as const }
           : msg;
         if (enriched.expectedAckCrc && enriched.estTimeout) {
           startAckTimeout(enriched.expectedAckCrc, enriched.estTimeout);
         }
-        return [...prev, enriched];
+        return [...prev, withKnownHeardBy(enriched)];
       });
       if (msg.timestamp > seqCursorRef.current) seqCursorRef.current = msg.timestamp;
     };
@@ -875,7 +1107,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
               for (const m of additions) {
                 if (m.timestamp > seqCursorRef.current) seqCursorRef.current = m.timestamp;
               }
-              return [...prev, ...additions];
+              return [...prev, ...additions.map(withKnownHeardBy)];
             });
           }
         } catch (_err) {
@@ -951,15 +1183,18 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
 
     // Channel "heard repeaters" (#3700): a repeater re-flooded one of our
     // outgoing channel messages and the server correlated the self-echo. The
-    // event carries the current full heard-by set, so we replace state by id.
+    // Remember the observation before updating state: the row may still be
+    // loading, and an older HTTP response must not erase its relay evidence.
     const onChannelHeard = (evt: {
       sourceId: string;
       id: string;
-      heardBy: Array<{ hash: string; name?: string | null; snr?: number | null }>;
+      heardBy: Array<{ hash: string; name?: string | null; snr?: number | null; hops?: number | null }>;
     }) => {
       if (evt.sourceId !== sourceId) return;
+      const heardBy = mergeMeshCoreHeardBy(heardByRef.current.get(evt.id), evt.heardBy);
+      heardByRef.current.set(evt.id, heardBy);
       setMessages(prev => prev.map(m =>
-        m.id === evt.id ? { ...m, heardBy: evt.heardBy } : m,
+        m.id === evt.id ? withKnownHeardBy(m) : m,
       ));
     };
 
@@ -976,7 +1211,8 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
         if (evt.all) return [];
         if (evt.ids && evt.ids.length > 0) {
           const del = new Set(evt.ids);
-          return prev.filter(m => !del.has(m.id));
+          // A deleted message takes its reactions with it (#5759).
+          return prev.filter(m => !del.has(m.id) && !(m.reactionTargetId && del.has(m.reactionTargetId)));
         }
         if (typeof evt.channelIdx === 'number') {
           const key = `channel-${evt.channelIdx}`;
@@ -993,6 +1229,15 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
         }
         return prev;
       });
+    };
+
+    // A stored reaction found its target later (#5759): the dim "not seen
+    // here" line becomes a chip. Source-room filtered at the socket layer.
+    const onReactionResolved = (evt: { id?: string; reactionTargetId?: string }) => {
+      const { id, reactionTargetId } = evt ?? {};
+      if (!id || !reactionTargetId) return;
+      setMessages(prev => prev.map(m => (m.id === id ? { ...m, reactionTargetId } : m)));
+      setReactionResolutions(prev => (prev[id] === reactionTargetId ? prev : { ...prev, [id]: reactionTargetId }));
     };
 
     // On-device channel reorder (#5379): the server moved every stored
@@ -1015,6 +1260,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
 
     socket.on('meshcore:message', onMessage);
     socket.on('meshcore:messages:deleted', onMessagesDeleted);
+    socket.on('meshcore:reaction:resolved', onReactionResolved);
     socket.on('meshcore:channels:reordered', onChannelsReordered);
     socket.on('meshcore:contact:updated', onContactUpdated);
     socket.on('meshcore:status:updated', onStatusUpdated);
@@ -1030,6 +1276,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       socket.off('connect', joinRoom);
       socket.off('meshcore:message', onMessage);
       socket.off('meshcore:messages:deleted', onMessagesDeleted);
+      socket.off('meshcore:reaction:resolved', onReactionResolved);
       socket.off('meshcore:channels:reordered', onChannelsReordered);
       socket.off('meshcore:contact:updated', onContactUpdated);
       socket.off('meshcore:status:updated', onStatusUpdated);
@@ -1039,7 +1286,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       socket.off('meshcore:channel-heard', onChannelHeard);
       socket.io.off('reconnect', onReconnect);
     };
-  }, [enabled, sourceId, socket, mcPrefix, csrfFetch, setMeshCoreNodes, recomputeNodes, stampLocal]);
+  }, [enabled, sourceId, socket, mcPrefix, csrfFetch, setMeshCoreNodes, recomputeNodes, stampLocal, withKnownHeardBy]);
 
   // Ignore / Block (#5408): the ignored flag is computed by the server at read
   // time, so reload the message pool whenever this source's lists change —
@@ -1278,6 +1525,38 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       return typeof data.scope === 'string' ? data.scope : '';
     } catch (_err) {
       setError('Failed to update default scope');
+      return null;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const getSenderNamePolicy = useCallback(async (): Promise<SenderNamePolicy | null> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/sender-names`);
+      const data = await parseJsonResponse(response);
+      const d = data.data as Partial<SenderNamePolicy> | undefined;
+      return data.success && d && typeof d.enabled === 'boolean' && Array.isArray(d.allowedNames)
+        ? { enabled: d.enabled, allowedNames: d.allowedNames }
+        : null;
+    } catch (_err) {
+      return null;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const setSenderNamePolicy = useCallback(async (policy: SenderNamePolicy): Promise<SenderNamePolicy | null> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/sender-names`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(policy),
+      });
+      const data = await parseJsonResponse(response);
+      if (!data.success) {
+        setError(data.error || 'Failed to update sender names');
+        return null;
+      }
+      return data.data as SenderNamePolicy;
+    } catch (_err) {
+      setError('Failed to update sender names');
       return null;
     }
   }, [mcPrefix, csrfFetch]);
@@ -1555,6 +1834,29 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     }
   }, [mcPrefix, csrfFetch]);
 
+  const getRemoteAdminSession = useCallback(async (publicKey: string): Promise<MeshCoreRemoteAdminSession | null> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/admin/session/${encodeURIComponent(publicKey)}`);
+      const data = await parseJsonResponse(response);
+      return data.success && data.data ? (data.data as MeshCoreRemoteAdminSession) : null;
+    } catch (_err) {
+      return null;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const logoutRemote = useCallback(async (publicKey: string): Promise<boolean> => {
+    try {
+      const response = await csrfFetch(
+        `${mcPrefix}/admin/session/${encodeURIComponent(publicKey)}`,
+        { method: 'DELETE' },
+      );
+      const data = await parseJsonResponse(response);
+      return !!data.success;
+    } catch (_err) {
+      return false;
+    }
+  }, [mcPrefix, csrfFetch]);
+
   const getRemoteStatus = useCallback(async (publicKey: string): Promise<MeshCoreRemoteStatus | null> => {
     try {
       const response = await csrfFetch(
@@ -1785,6 +2087,45 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     }
   }, [mcPrefix, csrfFetch]);
 
+  const setContactRemoteCli = useCallback(async (publicKey: string, allowed: boolean): Promise<string | null> => {
+    try {
+      const response = await csrfFetch(
+        `${mcPrefix}/nodes/${encodeURIComponent(publicKey)}/remote-cli`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ allowed }),
+        },
+      );
+      const data = await parseJsonResponse(response);
+      if (!data.success) return data.error || 'Failed to update remote CLI permission';
+      const existing = contactsRef.current.get(publicKey);
+      if (existing && typeof data.data?.flags === 'number') {
+        contactsRef.current.set(publicKey, { ...existing, flags: data.data.flags });
+        setContacts(Array.from(contactsRef.current.values()));
+      }
+      return null;
+    } catch (_err) {
+      return 'Network error';
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const setNodePositionOverride = useCallback(async (publicKey: string, input: MeshCorePositionOverrideInput): Promise<void> => {
+    const url = `${mcPrefix}/nodes/${encodeURIComponent(publicKey)}/position-override`;
+    const response = input.enabled
+      ? await csrfFetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(input),
+        })
+      : await csrfFetch(url, { method: 'DELETE' });
+    const data = await parseJsonResponse(response);
+    if (!data.success) {
+      throw new Error(data.error || 'Failed to save position override');
+    }
+    await loadSnapshot();
+  }, [mcPrefix, csrfFetch, loadSnapshot]);
+
   const exportContact = useCallback(async (publicKey: string): Promise<number[] | null> => {
     try {
       const response = await csrfFetch(
@@ -1819,6 +2160,34 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     } catch (_err) {
       setError('Failed to import contact');
       return false;
+    }
+  }, [mcPrefix, csrfFetch, refreshContacts]);
+
+  const importContactToken = useCallback(async (
+    token: string,
+    confirmFull = false,
+  ): Promise<AddContactToDeviceResponse> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/contacts/import-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, confirmFull }),
+      });
+      const body = await parseJsonResponse(response);
+      if (!body.success) {
+        return {
+          success: false,
+          code: body.code,
+          error: body.error,
+          count: body.count,
+          maxContacts: body.maxContacts,
+        };
+      }
+      const data = (body.data ?? {}) as { status?: string; count?: number; maxContacts?: number | null; evicted?: string[] };
+      await refreshContacts();
+      return { success: true, ...data };
+    } catch (_err) {
+      return { success: false, error: 'Network error' };
     }
   }, [mcPrefix, csrfFetch, refreshContacts]);
 
@@ -1861,12 +2230,109 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     }
   }, [mcPrefix, csrfFetch, reportTxDisabled]);
 
+  const getRepeaterSettings = useCallback(async (): Promise<RepeaterSettingsSnapshot | null> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/repeater-settings`);
+      const data = await parseJsonResponse(response);
+      if (!data.success) {
+        setError(data.error || 'Failed to read repeater settings');
+        return null;
+      }
+      return data.data as RepeaterSettingsSnapshot;
+    } catch (_err) {
+      setError('Failed to read repeater settings');
+      return null;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const saveRepeaterSettings = useCallback(async (patch: RepeaterSettingsPatch): Promise<RepeaterSaveResponse | null> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/repeater-settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const data = await parseJsonResponse(response);
+      if (!data.success) {
+        setError(data.error || 'Failed to save repeater settings');
+        return null;
+      }
+      return data.data as RepeaterSaveResponse;
+    } catch (_err) {
+      setError('Failed to save repeater settings');
+      return null;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const remoteSettingsCall = useCallback(async <T,>(
+    path: string,
+    init: RequestInit,
+  ): Promise<RemoteSettingsResult<T>> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}${path}`, {
+        ...init,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await parseJsonResponse(response);
+      if (!data.success) {
+        reportTxDisabled(response.status, data);
+        return {
+          ok: false,
+          code: typeof data.code === 'string' ? data.code : undefined,
+          error: data.error || 'Request failed',
+          field: typeof data.field === 'string' ? data.field : undefined,
+          retryAfterSeconds: typeof data.retryAfterSeconds === 'number' ? data.retryAfterSeconds : undefined,
+        };
+      }
+      return { ok: true, data: data.data as T };
+    } catch (_err) {
+      return { ok: false, error: 'Request failed' };
+    }
+  }, [mcPrefix, csrfFetch, reportTxDisabled]);
+
+  const readRemoteSettings = useCallback(
+    (publicKey: string, groups: RemoteSettingsGroup[]) =>
+      remoteSettingsCall<RemoteSettingsReadData>(`/admin/settings/${encodeURIComponent(publicKey)}/read`, {
+        method: 'POST',
+        body: JSON.stringify({ groups }),
+      }),
+    [remoteSettingsCall],
+  );
+
+  const saveRemoteSettings = useCallback(
+    (publicKey: string, patch: RepeaterSettingsPatch) =>
+      remoteSettingsCall<RepeaterSaveResponse>(`/admin/settings/${encodeURIComponent(publicKey)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      }),
+    [remoteSettingsCall],
+  );
+
+  const powerOffDevice = useCallback(async (opts?: { confirm?: boolean }): Promise<boolean> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/power-off`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: opts?.confirm === true }),
+      });
+      const data = await parseJsonResponse(response);
+      if (!data.success) {
+        setError(data.error || 'Power off failed');
+        return false;
+      }
+      return true;
+    } catch (_err) {
+      setError('Power off failed');
+      return false;
+    }
+  }, [mcPrefix, csrfFetch]);
+
   const rebootDevice = useCallback(async (opts?: { confirm?: boolean }): Promise<boolean> => {
     try {
       const response = await csrfFetch(`${mcPrefix}/config/reboot`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirm: opts?.confirm ?? true }),
+        body: JSON.stringify({ confirm: opts?.confirm === true }),
       });
       const data = await parseJsonResponse(response);
       if (!data.success) {
@@ -1876,6 +2342,74 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       return true;
     } catch (_err) {
       setError('Reboot failed');
+      return false;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const getBlePin = useCallback(async (): Promise<number | null> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/ble-pin`);
+      const data = await parseJsonResponse(response);
+      if (!data.success) return null;
+      return typeof data.data?.pin === 'number' ? data.data.pin : null;
+    } catch (_err) {
+      return null;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const setBlePin = useCallback(async (pin: number): Promise<boolean> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/ble-pin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin }),
+      });
+      const data = await parseJsonResponse(response);
+      if (!data.success) {
+        setError(data.error || 'Failed to set BLE PIN');
+        return false;
+      }
+      return true;
+    } catch (_err) {
+      setError('Failed to set BLE PIN');
+      return false;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const setMultiAcks = useCallback(async (value: 0 | 1): Promise<boolean> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/multi-acks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      });
+      const data = await parseJsonResponse(response);
+      if (!data.success) {
+        setError(data.error || 'Failed to set multi-ACKs');
+        return false;
+      }
+      return true;
+    } catch (_err) {
+      setError('Failed to set multi-ACKs');
+      return false;
+    }
+  }, [mcPrefix, csrfFetch]);
+
+  const factoryReset = useCallback(async (opts?: { confirm?: boolean }): Promise<boolean> => {
+    try {
+      const response = await csrfFetch(`${mcPrefix}/config/factory-reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: opts?.confirm === true }),
+      });
+      const data = await parseJsonResponse(response);
+      if (!data.success) {
+        setError(data.error || 'Factory reset failed');
+        return false;
+      }
+      return true;
+    } catch (_err) {
+      setError('Factory reset failed');
       return false;
     }
   }, [mcPrefix, csrfFetch]);
@@ -1900,7 +2434,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       const response = await csrfFetch(`${mcPrefix}/config/private-key`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ privateKey: hexKey, confirm: opts?.confirm ?? true }),
+        body: JSON.stringify({ privateKey: hexKey, confirm: opts?.confirm === true }),
       });
       const data = await parseJsonResponse(response);
       if (!data.success) {
@@ -2003,6 +2537,49 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     }
   }, [mcPrefix, csrfFetch, reportTxDisabled]);
 
+  const sendReaction = useCallback(async (target: MeshCoreMessage, emoji: string): Promise<boolean> => {
+    const selfKey = localNodeRef.current?.publicKey ?? '';
+    const optimistic = buildOptimisticReaction(
+      target,
+      emoji,
+      { publicKey: selfKey, name: localNodeRef.current?.name },
+      Date.now(),
+    );
+    setMessages(prev => (prev.some(m => m.id === optimistic.id) ? prev : [...prev, optimistic]));
+    const dropOptimistic = () => setMessages(prev => prev.filter(m => m.id !== optimistic.id));
+    try {
+      const response = await csrfFetch(`${mcPrefix}/messages/${encodeURIComponent(target.id)}/reaction`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emoji }),
+      });
+      const data = await parseJsonResponse(response);
+      if (data.success) {
+        const sent = data.data?.message as MeshCoreMessage | undefined;
+        setMessages(prev => {
+          const rest = prev.filter(m => m.id !== optimistic.id);
+          return sent && !rest.some(m => m.id === sent.id) ? [...rest, sent] : rest;
+        });
+        return true;
+      }
+      dropOptimistic();
+      if (reportTxDisabled(response.status, data)) return false;
+      if (data.code === 'DUPLICATE_REACTION') return false;
+      showToast(
+        t(
+          `meshcore.reactions.error.${data.code}`,
+          t('meshcore.reactions.send_failed', 'Could not send the reaction'),
+        ),
+        'error',
+      );
+      return false;
+    } catch (_err) {
+      dropOptimistic();
+      showToast(t('meshcore.reactions.send_failed', 'Could not send the reaction'), 'error');
+      return false;
+    }
+  }, [mcPrefix, csrfFetch, reportTxDisabled, showToast, t]);
+
   const clearConversation = useCallback(async (publicKey: string): Promise<boolean> => {
     try {
       const response = await csrfFetch(`${mcPrefix}/messages/conversation/${encodeURIComponent(publicKey)}`, {
@@ -2060,6 +2637,66 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       return false;
     }
   }, [mcPrefix, csrfFetch]);
+
+  // #6186: per-peer DM history and the DM thread list, read from the server so
+  // they survive channel traffic that evicts them from the shared window.
+  const fetchDmMessages = useCallback(async (
+    publicKey: string,
+    opts?: { limit?: number; offset?: number },
+  ): Promise<{ messages: MeshCoreMessage[]; hasMore: boolean }> => {
+    if (!enabled) return { messages: [], hasMore: false };
+    const limit = opts?.limit ?? 200;
+    const offset = opts?.offset ?? 0;
+    try {
+      const response = await csrfFetch(`${mcPrefix}/messages/dm/${encodeURIComponent(publicKey)}?limit=${limit}&offset=${offset}`);
+      const data = await parseJsonResponse(response);
+      if (data.success && Array.isArray(data.data)) {
+        return { messages: data.data as MeshCoreMessage[], hasMore: Boolean(data.hasMore) };
+      }
+    } catch { /* fall through to empty */ }
+    return { messages: [], hasMore: false };
+  }, [enabled, mcPrefix, csrfFetch]);
+
+  const fetchDmPeers = useCallback(async (): Promise<Array<{ publicKey: string; lastMessageAt: number }>> => {
+    if (!enabled) return [];
+    try {
+      const response = await csrfFetch(`${mcPrefix}/messages/dm-peers`);
+      const data = await parseJsonResponse(response);
+      if (data.success && Array.isArray(data.data)) {
+        return data.data as Array<{ publicKey: string; lastMessageAt: number }>;
+      }
+    } catch { /* fall through to empty */ }
+    return [];
+  }, [enabled, mcPrefix, csrfFetch]);
+
+  const fetchRoomMessages = useCallback(async (
+    publicKey: string,
+    opts?: { limit?: number; offset?: number },
+  ): Promise<{ messages: MeshCoreMessage[]; hasMore: boolean }> => {
+    if (!enabled) return { messages: [], hasMore: false };
+    const limit = opts?.limit ?? 200;
+    const offset = opts?.offset ?? 0;
+    try {
+      const response = await csrfFetch(`${mcPrefix}/messages/room/${encodeURIComponent(publicKey)}?limit=${limit}&offset=${offset}`);
+      const data = await parseJsonResponse(response);
+      if (data.success && Array.isArray(data.data)) {
+        return { messages: data.data as MeshCoreMessage[], hasMore: Boolean(data.hasMore) };
+      }
+    } catch { /* fall through to empty */ }
+    return { messages: [], hasMore: false };
+  }, [enabled, mcPrefix, csrfFetch]);
+
+  const fetchRoomStats = useCallback(async (): Promise<Array<{ roomPublicKey: string; count: number; latest: number; latestReceivedAt: number }>> => {
+    if (!enabled) return [];
+    try {
+      const response = await csrfFetch(`${mcPrefix}/messages/room-stats`);
+      const data = await parseJsonResponse(response);
+      if (data.success && Array.isArray(data.data)) {
+        return data.data as Array<{ roomPublicKey: string; count: number; latest: number; latestReceivedAt: number }>;
+      }
+    } catch { /* fall through to empty */ }
+    return [];
+  }, [enabled, mcPrefix, csrfFetch]);
 
   const setDeviceName = useCallback(async (name: string): Promise<boolean> => {
     try {
@@ -2330,6 +2967,7 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
     nodes,
     contacts,
     messages,
+    reactionResolutions,
     loading,
     hasLoadedOnce,
     error,
@@ -2344,6 +2982,8 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       setDiscoverable,
       getDefaultScope,
       setDefaultScope,
+      getSenderNamePolicy,
+      setSenderNamePolicy,
       getDefaultPathHashSize,
       setDefaultPathHashSize,
       discoverRegions,
@@ -2357,20 +2997,38 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       removeContact,
       addContactToDevice,
       setNodeFavorite,
+      setContactRemoteCli,
+      setNodePositionOverride,
       exportContact,
       importContact,
+      importContactToken,
       syncDeviceTime,
       getNeighbours,
       rebootDevice,
+      getRepeaterSettings,
+      saveRepeaterSettings,
+      readRemoteSettings,
+      saveRemoteSettings,
+      powerOffDevice,
+      getBlePin,
+      setBlePin,
+      setMultiAcks,
+      factoryReset,
       exportPrivateKey,
       importPrivateKey,
       sendAdvert,
       sendMessage,
       deleteMessage,
       resendMessage,
+      sendReaction,
+      refreshStatus: fetchStatus,
       clearConversation,
       clearChannelMessages,
       purgeAllMessages,
+      fetchDmMessages,
+      fetchDmPeers,
+      fetchRoomMessages,
+      fetchRoomStats,
       setDeviceName,
       setRadioParams,
       setTxPower,
@@ -2385,6 +3043,8 @@ export function useMeshCore(options: UseMeshCoreOptions): UseMeshCoreState {
       sendCliCommand,
       getRemoteAdminCapability,
       forgetRemoteCredential,
+      getRemoteAdminSession,
+      logoutRemote,
       getRemoteStatus,
       loginRemoteWithSaved,
       getLoginProgress,

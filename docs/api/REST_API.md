@@ -31,7 +31,7 @@ The old v1 root paths (`/api/v1/nodes`, `/api/v1/messages`, etc.) were deprecate
 
 All v1 requests require `Authorization: Bearer mm_v1_...` except `GET /api/v1/docs`.
 
-Use `"default"` as the `{sourceId}` to target the primary source without looking up its ID.
+Use `"default"` as the `{sourceId}` to target the primary source without looking up its ID. It resolves to the [default Meshtastic source](/features/multi-source#default-meshtastic-source) set in Global Settings, when that source is enabled and the token can read it; otherwise to the oldest enabled source the token can read.
 
 Per-source resources:
 - `GET /api/v1/sources` — list sources the token can read
@@ -85,6 +85,120 @@ every grant, get the same replies as before.
 Refusals on these routes that changed now use the standard error body
 `{ "success": false, "error": "<message>", "code": "FORBIDDEN" }`.
 :::
+
+### MeshCore sources on v1
+
+The read endpoints serve MeshCore sources as well as Meshtastic ones: `nodes`, `channels`, `packets`, `traceroutes`, `network` and `messages`. The permissions are the same as for a Meshtastic source (see [What a token can read](#what-a-token-can-read)).
+
+**The `protocol` field.** Every row on these endpoints now carries `protocol`, either `"meshtastic"` or `"meshcore"`. Meshtastic rows change in no other way.
+
+**Node ids.** A MeshCore node has `nodeId` `mc:<publicKey>`, where `<publicKey>` is the 64-character hex public key. Rows also carry `publicKey`, `nodeKey` and a synthetic `nodeNum`. Do not join on `nodeNum`: it derives from the key and has no meaning on the mesh. Wherever a request takes a node id, `mc:<publicKey>` and the bare 64-character hex key both work.
+
+| Endpoint | What a MeshCore source returns |
+| --- | --- |
+| `GET …/nodes` | Contacts, with role, name and last-heard. Positions follow `nodes:viewOnMap`. A private position override needs `nodes_private:read`. |
+| `GET …/channels` | Channel slots. Slots above 7 need `messages:read`. A slot's `psk` (the channel secret) shows only to admins and to users with `channel_<n>:write` on slots 0 to 7; `messages:read` shows the slot, never the secret. |
+| `GET …/messages` | Channel and direct messages. `timestamp` is the sender's clock. `since` and the sort order use arrival time (`createdAt`). |
+| `GET …/packets` | The MeshCore packet log, in snake_case (`payload_type`, `route_type`, `path_hops`, `node_key`). Takes `payload_type`, `route_type`, `since`, `limit` and `offset`. A group packet you may read carries `plaintext`. The packet monitor must be on for the source. |
+| `GET …/traceroutes` | Traces started from MeshMonitor, as a round trip. `fromNode*` is your radio and `toNode*` is the target or the turnaround hop; `routeBack` and `snrBack` hold the return leg. `route` holds synthetic node numbers (`4294967295` when a hop did not resolve). `hops[]` lists each hop's `publicKey`, `hash` and `snr`. |
+| `GET …/network` | Node and trace counts for the source. |
+
+The Meshtastic-only packet filters `portnum`, `from_node`, `to_node`, `channel` and `encrypted` answer `400` with code `UNSUPPORTED_FILTER` on a MeshCore source.
+
+#### POST /api/v1/sources/{sourceId}/messages (MeshCore)
+
+Send a message through a MeshCore source. The request goes to the radio.
+
+::: warning Airtime cost
+A MeshCore channel message is a flood. Every repeater in range sends it again. A 100-character channel message costs about 0.46 s of airtime × (1 + the number of repeaters that hear it) per send on the US narrow presets. The rate limit is 30 messages per minute per client (set by `RATE_LIMIT_MESSAGES`). A script that sends at that limit can saturate a busy mesh. Send the least you can. Do not loop a send on a timer without a cap of your own.
+:::
+
+Body:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `text` | string | Required. |
+| `channel` | integer 0–255 | Channel slot. Use this or `toNodeId`, not both. |
+| `toNodeId` | string | `mc:<publicKey>` or a 64-character hex key. Sends a direct message. |
+| `scope` | string, up to 63 characters | Optional region for a channel message. Not allowed with `toNodeId`. |
+| `senderName` | string, 1–31 bytes | Optional. Send a channel message under this name instead of the node's name. Off by default; see [Send under another name](#send-under-another-name). Not allowed with `toNodeId`. |
+
+Limits:
+
+- A message never splits or queues. It must fit in one packet: 150 bytes for a direct message, 130 bytes for a channel message, 120 bytes for a channel message with a `scope`. The count is UTF-8 bytes, not characters.
+- MeshMonitor sends the message once. It never retries on its own.
+- A direct message needs `messages:write` on the source. A channel message needs write on that channel slot.
+- The send shares the rate-limit bucket of the web UI's message sends.
+
+Success returns `201`:
+
+```json
+{
+  "success": true,
+  "data": {
+    "messageId": "…",
+    "requestId": null,
+    "deliveryState": "pending",
+    "messageCount": 1,
+    "text": "hello",
+    "channel": 2,
+    "toNodeId": "broadcast",
+    "protocol": "meshcore"
+  }
+}
+```
+
+For a direct message, `channel` is `-1` and `toNodeId` is the `mc:` id.
+
+| Status | Code | Cause |
+| --- | --- | --- |
+| 400 | `INVALID_INPUT` | Missing text, both or neither of `channel` and `toNodeId`, a bad channel or key, or a bad `scope`. |
+| 400 | `SEND_FAILED` | The radio refused the send. |
+| 403 | `FORBIDDEN` | The token's user lacks the write grant. |
+| 403 | `SENDER_NAME_DISABLED` | `senderName` was sent but the source does not allow it. |
+| 403 | `SENDER_NAME_NOT_ALLOWED` | `senderName` is not on the source's allowed list. |
+| 409 | `TX_DISABLED` | The source is receive-only. |
+| 409 | `CLIENT_REPEAT_ON`, `CHANNEL_KEY_UNAVAILABLE` | `senderName` only: the companion has client repeat on, or the channel key is not stored. |
+| 413 | `PAYLOAD_TOO_LARGE` | The text is over the byte limit for its kind. |
+| 422 | `FIRMWARE_UNSUPPORTED` | `senderName` only: the companion firmware is older than 1.16. |
+| 429 | — | The message rate limit was hit. |
+| 503 | `SOURCE_NOT_CONNECTED` | The MeshCore source is offline. |
+
+##### Send under another name {#send-under-another-name}
+
+A bot or alert script can post on a MeshCore channel under a name of its own, such as `Alerts Bot`, instead of the node's name. This is off by default.
+
+- A source admin turns it on and lists the names it allows: `PUT /api/sources/{id}/meshcore/config/sender-names` with `{"enabled": true, "allowedNames": ["Alerts Bot"]}` (up to 16 names; needs `configuration:write` on the source), or **Device Configuration, API sender names** in the web UI. `GET` on the same path reads the list.
+- A caller needs its normal write grant on the channel **and** a name from that list. Names match exactly (case-sensitive). A name that is the node's own name needs no list entry.
+- A name is 1 to 31 bytes, with no `:`, no control, bidi or zero-width characters, and no leading `#`.
+- The text limit is 155 bytes minus the name's bytes minus 2, which is 5 bytes lower than a normal send. Over it answers `413`.
+- Channel messages only. A direct message with `senderName` answers `400`. A Meshtastic source answers `400`.
+- Needs companion firmware 1.16 or later (`422` `FIRMWARE_UNSUPPORTED`) and **client repeat off** (`409` `CLIENT_REPEAT_ON`).
+- Every send under a name writes an audit row (`meshcore_message_sent_as`) with the source, channel, name, scope, byte count and message id. It never stores the text. A refused attempt writes `meshcore_message_sent_as_denied`.
+- The radio's own copy of the packet is dropped, so the message appears once. A resend of such a message goes out raw under the same name and is refused if the name has since left the list.
+
+::: warning Impersonation
+MeshCore does not prove who sent a channel message. Anyone who holds the channel write grant on a source that allows a name can post as that name, and receivers cannot tell. List only names you want your API callers to use.
+:::
+
+#### Actions on MeshCore sources
+
+Two actions run on a MeshCore source. Name the target in `destination` (or `nodeId`) as `mc:<publicKey>` or a 64-character hex key.
+
+- `POST …/actions/traceroute` needs `traceroute:write`. It is fire-and-forget: the call answers `200` as soon as MeshMonitor accepts the request, and the trace runs in the background. The result appears later in `GET …/traceroutes`. MeshMonitor never retries a trace. The source must be a Companion device and the contact must be known, or the call answers `409` `MESHCORE_TRACE_FAILED`.
+- `POST …/actions/request-telemetry` is new and works on both protocols. It needs `messages:write`.
+  - On Meshtastic, `type` is `device`, `environment`, `airQuality` or `power`. The default is `device`.
+  - On MeshCore, `type` is required and is `status` or `lpp`. Any other value answers `400` `INVALID_INPUT`.
+  - A MeshCore source allows one transmission per 60 seconds. A request inside that gate answers `429` `RATE_LIMITED` with a `Retry-After` header (seconds) and `retryAfter` in the body.
+  - Other errors: `409` `TX_DISABLED`, `503` `SOURCE_NOT_CONNECTED` or `TELEMETRY_UNAVAILABLE`.
+
+The other actions (`request-position`, `request-nodeinfo`, `request-neighbors`) are Meshtastic-only. On a MeshCore source they answer `400` `SOURCE_NOT_MESHTASTIC`.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"destination":"mc:<publicKey>","type":"status"}' \
+  "http://localhost:8080/api/v1/sources/$SOURCE/actions/request-telemetry"
+```
 
 ### Migration table
 
@@ -1074,6 +1188,16 @@ permission on that source.
 | `meshmonitor_node_rssi_dbm` | `source`, `node_id`, `short_name` | RSSI of the last packet from this node |
 | `meshmonitor_node_last_heard_timestamp_seconds` | `source`, `node_id`, `short_name` | Unix time the node was last heard |
 | `meshmonitor_node_hops_away` | `source`, `node_id`, `short_name` | Hop distance from the local node |
+| `meshmonitor_node_last_position_timestamp_seconds` | `source`, `node_id`, `short_name` | Unix time the node's most recent position was observed (absent if it has never sent one) |
+| `meshmonitor_packets_by_payload_type_last_hour` | `source`, `payload_type`, `payload_type_name` | MeshCore packets logged in the last hour, by payload type. Empty unless the source's MeshCore packet monitor is on. Needs `packetmonitor:read` on the source. Capped at 16 series per source. Absent from a scrape with no MeshCore source. |
+
+**MeshCore sources.** A MeshCore source fills a subset of these gauges:
+
+- `meshmonitor_source_connected`, `meshmonitor_nodes_total` and `meshmonitor_nodes_active` work as for Meshtastic.
+- `meshmonitor_messages_last_hour` counts MeshCore messages and needs `messages:read` on the source.
+- `meshmonitor_packets_by_payload_type_last_hour` (above) needs `packetmonitor:read`.
+- Per-node series (`snr_db`, `rssi_dbm`, `last_heard_timestamp_seconds`, `hops_away`, `voltage_volts`) need `nodes:read` on the source. Their `node_id` label is `mc:<publicKey>`. `hops_away` is the path length, and `voltage_volts` comes from the battery reading. A MeshCore source exports at most 1000 nodes. No series carries a position.
+- Channel utilization, air-time, battery level and last-position series are Meshtastic-only.
 
 Per-node values are the latest reported telemetry — check
 `meshmonitor_node_last_heard_timestamp_seconds` in queries where staleness
@@ -1111,6 +1235,15 @@ time() - meshmonitor_node_last_heard_timestamp_seconds > 900
   and (meshmonitor_node_battery_level <= 100)
   and on (source, node_id)
     (time() - meshmonitor_node_last_heard_timestamp_seconds < 1800)
+
+# GPS tracker heard but without a position for 30 minutes (lost or no fix).
+# Firmware sends no position while it has no fix but keeps sending telemetry,
+# so a node with no position series at all (never had a fix) matches too.
+# Hold it with `for:` long enough to ride out a cold start, and restrict it
+# to your GPS nodes -- a node with no GPS never sends a position either.
+(time() - meshmonitor_node_last_heard_timestamp_seconds < 4500)
+  unless on (source, node_id)
+    (time() - meshmonitor_node_last_position_timestamp_seconds < 1800)
 
 # Gateway link down
 meshmonitor_source_connected == 0
@@ -1275,7 +1408,7 @@ curl -X POST \
 ```
 
 **Notes:**
-- Traceroutes are automatically scheduled every 3 minutes by the system
+- Auto Traceroute is off by default. When you turn it on, it sends one traceroute per interval (3-60 minutes, set per source)
 - Manual traceroutes can be useful for immediate path discovery
 - Results are stored in the database for historical analysis
 

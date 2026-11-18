@@ -1,0 +1,88 @@
+/* MeshCore Timer Trigger editor (#5812). */
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  min-width: 0;
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.field [aria-invalid='true'] {
+  border-color: var(--color-error);
+}
+
+.mono {
+  font-family: monospace;
+}
+
+.error {
+  font-size: 0.8rem;
+  color: var(--color-error);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.row > .field:first-child {
+  flex: 0 1 10rem;
+}
+
+.grow {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+/* Multi-channel selection (#6230), mirrors the Auto-Responder editor. */
+.channels {
+  margin: 0;
+  padding: 0.5rem;
+  border: 1px solid var(--color-surface-active);
+  border-radius: 4px;
+  min-width: 0;
+}
+
+.legend {
+  padding: 0 0.5rem;
+  font-size: 0.8rem;
+}
+
+.muted {
+  font-size: 0.8rem;
+  color: var(--color-text-subtle);
+}
+
+.channelList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.check input {
+  width: auto;
+  margin: 0;
+}

@@ -65,6 +65,7 @@ describe('per-source settings key allowlist invariants', () => {
       'telemetryCustomOrder',
       'dashboardWidgets',
       'dashboardSolarVisibility',
+      'dashboardChartYRange',
       'autoKeyManagementIntervalMinutes',
       'autoKeyManagementMaxExchanges',
       'autoKeyManagementAutoPurge',
@@ -140,7 +141,7 @@ describe('per-source settings key allowlist invariants', () => {
       ...AIRCRAFT_NODE_DISPLAY_KEYS,
       ...SIGN_FLIP_NODE_DISPLAY_KEYS,
     ]);
-    expect(NODE_DISPLAY_SETTING_KEYS.length).toBe(20);
+    expect(NODE_DISPLAY_SETTING_KEYS.length).toBe(21);
   });
 
   // `localStatsIntervalMinutes` predates this work item (already read
@@ -167,7 +168,34 @@ describe('per-source settings key allowlist invariants', () => {
     // #5364/#5365 Phase 2 added aircraftAgeOutLastRunAt + aircraftAgeOutLastResult.
     // #5446 added forwardingRules (dedicated automation-gated route only).
     // #5537 added forwardingEnabled (same dedicated route).
-    expect(PER_SOURCE_KEYS_NOT_POSTABLE.size).toBe(29);
+    // #5704 added aircraftPositionRequestStarts (persisted hourly cap).
+    // #5723 added tracePathScheduleState (persisted trace intervals + cap).
+    // #5745 added statusMessageLastVerified (last verified Status Message).
+    // MeshCore mention alerts added meshcoreMentionNotifyState (per-sender cooldown).
+    // #6011 added reticulumLastAnnounceAt (announce cooldown + periodic timer).
+    // #6033 added remoteLocalStatsRetryState (Meshtastic remote-LocalStats
+    // retry/cooldown state, server-written per-source JSON blob).
+    // #6306 added newNodeAlertLearnUntil + newNodeAlertRate (new-node alert gate).
+    // #6282 added meshcoreSenderNameOverride (per-source sender-name allowlist).
+    // #4305 added the 8 mqttNative* keys (MQTT-native send; written only by
+    // PUT /api/sources/:id/mqtt/native, which clamps the limits).
+    // Auto Traceroute added autoTracerouteLastSentAt (persisted last send).
+    // Auto Remote LocalStats added remoteLocalStatsLastSentAt (same reason).
+    expect(PER_SOURCE_KEYS_NOT_POSTABLE.size).toBe(48);
+  });
+
+  // A POST that cleared the last auto-traceroute time would let the next
+  // scheduler restart send before last send + interval.
+  it('remoteLocalStatsLastSentAt is server-managed, never client-postable', () => {
+    const valid = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
+    expect(PER_SOURCE_KEYS_NOT_POSTABLE.has('remoteLocalStatsLastSentAt')).toBe(true);
+    expect(valid.has('remoteLocalStatsLastSentAt')).toBe(false);
+  });
+
+  it('autoTracerouteLastSentAt is server-managed, never client-postable', () => {
+    const valid = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
+    expect(PER_SOURCE_KEYS_NOT_POSTABLE.has('autoTracerouteLastSentAt')).toBe(true);
+    expect(valid.has('autoTracerouteLastSentAt')).toBe(false);
   });
 
   // #5101 Phase 3 WP3: the transport-traffic writer's checkpoint is
@@ -186,6 +214,14 @@ describe('per-source settings key allowlist invariants', () => {
     const valid = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
     expect(PER_SOURCE_KEYS_NOT_POSTABLE.has('meshcoreLastFloodAdvertAt')).toBe(true);
     expect(valid.has('meshcoreLastFloodAdvertAt')).toBe(false);
+  });
+
+  // #6011: a POST that cleared the last-announce time would clear the
+  // Announce now cooldown and re-time the periodic announce.
+  it('reticulumLastAnnounceAt is server-managed, never client-postable', () => {
+    const valid = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
+    expect(PER_SOURCE_KEYS_NOT_POSTABLE.has('reticulumLastAnnounceAt')).toBe(true);
+    expect(valid.has('reticulumLastAnnounceAt')).toBe(false);
   });
 
   // #5364/#5365 D19: the two-strike counter must not be resettable from the
@@ -215,5 +251,57 @@ describe('per-source settings key allowlist invariants', () => {
       expect(PER_SOURCE_KEYS_NOT_POSTABLE.has(key)).toBe(false);
       expect(GLOBAL_ONLY_SETTINGS_KEYS.has(key)).toBe(false);
     }
+  });
+
+  // #5759: MeshCore reactions settings.
+  it('meshcoreReactionsInboundEnabled is per-source and POST-able', () => {
+    const key = 'meshcoreReactionsInboundEnabled';
+    expect((VALID_SETTINGS_KEYS as readonly string[]).includes(key)).toBe(true);
+    expect((PER_SOURCE_SETTINGS_KEYS as readonly string[]).includes(key)).toBe(true);
+    expect(PER_SOURCE_KEYS_NOT_POSTABLE.has(key)).toBe(false);
+    expect(GLOBAL_ONLY_SETTINGS_KEYS.has(key)).toBe(false);
+  });
+
+  it('meshcoreReactionsOutboundEnabled is per-source and POST-able', () => {
+    const key = 'meshcoreReactionsOutboundEnabled';
+    expect((VALID_SETTINGS_KEYS as readonly string[]).includes(key)).toBe(true);
+    expect((PER_SOURCE_SETTINGS_KEYS as readonly string[]).includes(key)).toBe(true);
+    expect(PER_SOURCE_KEYS_NOT_POSTABLE.has(key)).toBe(false);
+    expect(GLOBAL_ONLY_SETTINGS_KEYS.has(key)).toBe(false);
+  });
+
+  it('meshcoreReactionsAckOnReceive is global-only', () => {
+    const key = 'meshcoreReactionsAckOnReceive';
+    expect((VALID_SETTINGS_KEYS as readonly string[]).includes(key)).toBe(true);
+    expect(GLOBAL_ONLY_SETTINGS_KEYS.has(key)).toBe(true);
+    expect((PER_SOURCE_SETTINGS_KEYS as readonly string[]).includes(key)).toBe(false);
+  });
+
+it('statusMessageReapplyAfterReboot is user-postable and per-source; statusMessageLastVerified is server-only (#5745)', () => {
+const perSource = new Set<string>(PER_SOURCE_SETTINGS_KEYS as readonly string[]);
+const valid = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
+expect(perSource.has('statusMessageReapplyAfterReboot')).toBe(true);
+expect(valid.has('statusMessageReapplyAfterReboot')).toBe(true);
+expect(PER_SOURCE_KEYS_NOT_POSTABLE.has('statusMessageReapplyAfterReboot')).toBe(false);
+expect(perSource.has('statusMessageLastVerified')).toBe(true);
+expect(valid.has('statusMessageLastVerified')).toBe(false);
+expect(PER_SOURCE_KEYS_NOT_POSTABLE.has('statusMessageLastVerified')).toBe(true);
+});
+});
+
+describe('securityDeadNodeDays (P7a #6254)', () => {
+  it('is POST-able and per-source', async () => {
+    const { isValidSecurityDeadNodeDays, resolveSecurityDeadNodeDays } = await import('./settings.js');
+    expect((VALID_SETTINGS_KEYS as readonly string[]).includes('securityDeadNodeDays')).toBe(true);
+    expect((PER_SOURCE_SETTINGS_KEYS as readonly string[]).includes('securityDeadNodeDays')).toBe(true);
+    expect(PER_SOURCE_KEYS_NOT_POSTABLE.has('securityDeadNodeDays')).toBe(false);
+    expect(['1', '14', '365', 30].every(isValidSecurityDeadNodeDays)).toBe(true);
+    expect(['0', '366', '-1', '1.5', 'abc', '', null, undefined].some(isValidSecurityDeadNodeDays)).toBe(false);
+    // defaults are applied by the reader, never stored
+    expect(resolveSecurityDeadNodeDays(null, false)).toBe(7);
+    expect(resolveSecurityDeadNodeDays(undefined, true)).toBe(14);
+    expect(resolveSecurityDeadNodeDays('bad', true)).toBe(14);
+    expect(resolveSecurityDeadNodeDays('30', true)).toBe(30);
+    expect(resolveSecurityDeadNodeDays('30', false)).toBe(30);
   });
 });

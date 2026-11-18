@@ -1,12 +1,16 @@
-import React, { useState, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
+import { ConfigSection } from '../shared/config/ConfigSection';
 
 interface PowerConfigSectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
   // Power saving
   isPowerSaving: boolean;
   setIsPowerSaving: (value: boolean) => void;
@@ -30,10 +34,15 @@ interface PowerConfigSectionProps {
   setDeviceBatteryInaAddress: (value: number) => void;
   // UI state
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
+  /** Bumped when the page reloads config from the node (#5797). */
+  configVersion?: number;
 }
 
 const PowerConfigSection: React.FC<PowerConfigSectionProps> = ({
+  canWrite = true,
+  configVersion,
   isPowerSaving,
   setIsPowerSaving,
   onBatteryShutdownAfterSecs,
@@ -56,51 +65,30 @@ const PowerConfigSection: React.FC<PowerConfigSectionProps> = ({
   const { t } = useTranslation();
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // What the node holds; moves on a successful save or a reload (#5797)
+  const values = {
     isPowerSaving, onBatteryShutdownAfterSecs, adcMultiplierOverride,
     waitBluetoothSecs, sdsSecs, lsSecs, minWakeSecs, deviceBatteryInaAddress
-  });
-
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      isPowerSaving !== initial.isPowerSaving ||
-      onBatteryShutdownAfterSecs !== initial.onBatteryShutdownAfterSecs ||
-      adcMultiplierOverride !== initial.adcMultiplierOverride ||
-      waitBluetoothSecs !== initial.waitBluetoothSecs ||
-      sdsSecs !== initial.sdsSecs ||
-      lsSecs !== initial.lsSecs ||
-      minWakeSecs !== initial.minWakeSecs ||
-      deviceBatteryInaAddress !== initial.deviceBatteryInaAddress
-    );
-  }, [isPowerSaving, onBatteryShutdownAfterSecs, adcMultiplierOverride,
-      waitBluetoothSecs, sdsSecs, lsSecs, minWakeSecs, deviceBatteryInaAddress]);
+  };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values, { reseedKey: configVersion });
 
   // Reset to initial values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setIsPowerSaving(initial.isPowerSaving);
-    setOnBatteryShutdownAfterSecs(initial.onBatteryShutdownAfterSecs);
-    setAdcMultiplierOverride(initial.adcMultiplierOverride);
-    setWaitBluetoothSecs(initial.waitBluetoothSecs);
-    setSdsSecs(initial.sdsSecs);
-    setLsSecs(initial.lsSecs);
-    setMinWakeSecs(initial.minWakeSecs);
-    setDeviceBatteryInaAddress(initial.deviceBatteryInaAddress);
-  }, [setIsPowerSaving, setOnBatteryShutdownAfterSecs, setAdcMultiplierOverride,
+    setIsPowerSaving(baseline.isPowerSaving);
+    setOnBatteryShutdownAfterSecs(baseline.onBatteryShutdownAfterSecs);
+    setAdcMultiplierOverride(baseline.adcMultiplierOverride);
+    setWaitBluetoothSecs(baseline.waitBluetoothSecs);
+    setSdsSecs(baseline.sdsSecs);
+    setLsSecs(baseline.lsSecs);
+    setMinWakeSecs(baseline.minWakeSecs);
+    setDeviceBatteryInaAddress(baseline.deviceBatteryInaAddress);
+  }, [baseline, setIsPowerSaving, setOnBatteryShutdownAfterSecs, setAdcMultiplierOverride,
       setWaitBluetoothSecs, setSdsSecs, setLsSecs, setMinWakeSecs, setDeviceBatteryInaAddress]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      isPowerSaving, onBatteryShutdownAfterSecs, adcMultiplierOverride,
-      waitBluetoothSecs, sdsSecs, lsSecs, minWakeSecs, deviceBatteryInaAddress
-    };
-  }, [onSave, isPowerSaving, onBatteryShutdownAfterSecs, adcMultiplierOverride,
-      waitBluetoothSecs, sdsSecs, lsSecs, minWakeSecs, deviceBatteryInaAddress]);
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Register with SaveBar
   const numberScope = useNumberInputScope();
@@ -125,23 +113,7 @@ const PowerConfigSection: React.FC<PowerConfigSectionProps> = ({
 
   return (
     <NumberInputScope scope={numberScope}>
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('power_config.title')}
-        <a
-          href="https://meshmonitor.org/features/device#power-configuration"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('power_config.view_docs')}
-        >
-          <UiIcon name="help" />
-        </a>
-      </h3>
+    <ConfigSection canWrite={canWrite} title={t('power_config.title')} docsUrl="https://meshmonitor.org/features/device#power-configuration">
 
       {/* Power Saving Mode */}
       <div className="setting-item">
@@ -343,7 +315,7 @@ const PowerConfigSection: React.FC<PowerConfigSectionProps> = ({
           </div>
         </div>
       )}
-    </div>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

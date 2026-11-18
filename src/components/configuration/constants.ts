@@ -577,8 +577,22 @@ export function getRecipeIllegalReason(
 export const FEM_LNA_MODE_OPTIONS: RegionOption[] = [
   { value: 0, label: 'DISABLED - FEM LNA present but disabled' },
   { value: 1, label: 'ENABLED - FEM LNA present and enabled' },
-  { value: 2, label: 'NOT_PRESENT - No FEM LNA on this device' }
+  { value: 2, label: 'NOT_PRESENT - No FEM LNA on this device' },
+  // protobufs#1175 / firmware#12380: the firmware picks the LNA state from the
+  // measured noise floor. Default on new installs of boards with a switchable LNA.
+  { value: 3, label: 'AUTO - Firmware switches the FEM LNA by noise floor' }
 ];
+
+/**
+ * The FEM LNA dropdown's options for a node's current value. A value newer than
+ * this list (a future enum entry) gets its own "Unknown (N)" option, so the
+ * select shows it and a save sends it back unchanged instead of the first
+ * option the browser would otherwise display (#6452).
+ */
+export function femLnaModeOptionsFor(current: number): RegionOption[] {
+  if (FEM_LNA_MODE_OPTIONS.some((o) => o.value === current)) return FEM_LNA_MODE_OPTIONS;
+  return [...FEM_LNA_MODE_OPTIONS, { value: current, label: `Unknown (${current}) - keep the node's current value` }];
+}
 
 // Mapping from string role names to numeric values
 export const ROLE_MAP: Record<string, number> = {
@@ -750,13 +764,15 @@ export interface RebroadcastModeOption {
   description: string;
 }
 
+// Descriptions follow firmware runtime behavior, not the stale protobuf comments (#5779).
+// Verified against meshtastic/firmware 6d41e279: RoutingModule.cpp, Router.cpp, AdminModule.cpp.
 export const REBROADCAST_MODE_OPTIONS: RebroadcastModeOption[] = [
-  { value: 0, name: 'ALL', description: 'Rebroadcast any observed packet that was not decoded.' },
-  { value: 1, name: 'ALL_SKIP_DECODING', description: 'Same as ALL but skip decoding of rebroadcast packets. Only for testing.' },
-  { value: 2, name: 'LOCAL_ONLY', description: 'Rebroadcast only packets from our local directly heard nodes.' },
-  { value: 3, name: 'KNOWN_ONLY', description: 'Only rebroadcast from packets in our node database.' },
-  { value: 4, name: 'NONE', description: 'Never rebroadcast any packet. For testing and security.' },
-  { value: 5, name: 'CORE_PORTNUMS_ONLY', description: 'Only rebroadcast core node info and position packets.' }
+  { value: 0, name: 'ALL', description: 'Default. Rebroadcasts any observed packet, including encrypted packets from meshes with matching LoRa params.' },
+  { value: 1, name: 'ALL_SKIP_DECODING', description: 'Historically meant to skip decoding before rebroadcasting; current firmware treats this mode as ALL.' },
+  { value: 2, name: 'LOCAL_ONLY', description: 'Rebroadcasts packets on this node\'s primary/secondary channels, with no additional hop-count filter. Also permits PKI DMs when the sender or recipient is known in NodeDB.' },
+  { value: 3, name: 'KNOWN_ONLY', description: 'Like LOCAL_ONLY, and also drops packets whose sender is not already in this node\'s NodeDB.' },
+  { value: 4, name: 'NONE', description: 'Never rebroadcast any packet. Not permitted on ROUTER or ROUTER_LATE roles (firmware rewrites to ALL).' },
+  { value: 5, name: 'CORE_PORTNUMS_ONLY', description: 'Filters decoded packets to standard portnums: Text (including compressed), Position, NodeInfo, Routing, Telemetry, Admin, Alert, KeyVerification, Waypoint, StoreForward (including ++), and Traceroute. Drops TAK, RangeTest, PaxCounter, etc.' }
 ];
 
 // Buzzer mode options from protobufs

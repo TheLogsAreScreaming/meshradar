@@ -15,6 +15,8 @@ import type {
   ReticulumMessageState,
   ReticulumMessageMethod,
 } from '../../db/repositories/reticulum.js';
+import type { PacketFlight } from '../../types/packetFlight.js';
+import { hasPacketFlightWatchers } from './packetFlightWatchers.js';
 import { logger } from '../../utils/logger.js';
 
 export type DataEventType =
@@ -23,11 +25,14 @@ export type DataEventType =
   | 'meshcore:node:changed'
   | 'node:mobility'
   | 'node:rebooted'
+  | 'neighbor:sighting'
   | 'node:powerChanged'
+  | 'node:clockOffset'
   | 'node:aircraft'
   | 'message:new'
   | 'channel:updated'
   | 'telemetry:batch'
+  | 'node:batch'
   | 'connection:status'
   | 'client-notification'
   | 'traceroute:complete'
@@ -37,6 +42,7 @@ export type DataEventType =
   | 'waypoint:deleted'
   | 'waypoint:expired'
   | 'meshcore:message'
+  | 'meshcore:reaction:resolved'
   | 'meshcore:messages:deleted'
   | 'meshcore:message:updated'
   | 'meshcore:contact:updated'
@@ -47,6 +53,7 @@ export type DataEventType =
   | 'meshcore:channels:reordered'
   | 'meshcore:filters:changed'
   | 'meshcore:ota-packet'
+  | 'packet:flight'
   | 'meshbeacon:received'
   | 'reticulum:message'
   | 'reticulum:delivery-state:updated'
@@ -175,6 +182,38 @@ export interface NodeRebootedData {
 }
 
 /**
+ * A pending MeshCore neighbour was seen again in a repeater's neighbour table
+ * (#6274). Feeds `trigger.neighborAdded`, which fires once the neighbour has
+ * stayed `confirmHours`. The subject is the NEIGHBOUR; the reporter is the
+ * repeater whose table listed it. Times are epoch ms.
+ */
+export interface NeighborSightingData {
+  reporterPublicKey: string;
+  reporterName?: string | null;
+  neighborPublicKey: string;
+  firstSeenAt: number;
+  prevLastHeardAt: number;
+  lastHeardAt: number;
+  snr: number | null;
+  sightings: number;
+}
+
+/**
+ * A passive clock-offset sample for a MeshCore node (#6273): receipt time minus
+ * the node's own time, in seconds (positive = the node is behind). Carries the
+ * two stored samples before this one so `trigger.clockOutOfSync` can decide
+ * whether the sample starts an out-of-sync episode. Nothing here is sent over
+ * the air; the sample comes from adverts already heard or the local clock read.
+ */
+export interface NodeClockOffsetData {
+  publicKey: string;
+  offsetSeconds: number;
+  /** The stored samples before this one, newest first (at most 2). */
+  previousOffsets: number[];
+  sampleSource: 'advert' | 'device';
+}
+
+/**
  * A detected node power-source transition (Device Health #4558 Phase C) — the
  * node crossed between external/USB power and battery power, derived from its
  * `batteryLevel` telemetry (firmware convention: > 100 = powered). Carries the
@@ -244,9 +283,56 @@ export interface AutoPingUpdateData {
   results: Array<{ pingNum: number; status: 'ack' | 'nak' | 'timeout'; durationMs?: number; sentAt: number }>;
 }
 
-export interface TelemetryBatchData {
-  [nodeNum: number]: DbTelemetry[];
+/**
+ * Facts about one reading that the automation engine needs and the stored row
+ * does not carry. Two booleans; harmless if they reach a browser through the
+ * per-node `telemetry:batch` socket gate.
+ */
+export interface TelemetryEventMeta {
+  /**
+   * The reading answers a telemetry request we sent (its `decoded.requestId`
+   * names one of our requests). Telemetry triggers skip it: otherwise a
+   * telemetry trigger with a "request telemetry" action loops.
+   */
+  answersOwnRequest?: boolean;
+  /**
+   * The reading came from a LocalStats packet (noiseFloor, uptime, packet
+   * counters …). Our own node is the only source of these, so the #3914
+   * self-origin guard would drop every one; telemetry triggers exempt them.
+   */
+  localStats?: boolean;
+  /**
+   * MeshCore readings only (#6397): who the reading came from. MeshCore has
+   * no node number (the row's `nodeNum` is a hash of the key), so without
+   * these a telemetry automation could not name the node it fired for.
+   */
+  meshcorePublicKey?: string;
+  /** The contact's display name, when known. */
+  meshcoreName?: string | null;
+  /** The contact's advert type (1 companion, 2 repeater, 3 room, 4 sensor). */
+  meshcoreAdvType?: number | null;
 }
+
+/** A stored telemetry row plus its {@link TelemetryEventMeta}. */
+export type TelemetryEventRow = DbTelemetry & TelemetryEventMeta;
+
+export interface TelemetryBatchData {
+  [nodeNum: number]: TelemetryEventRow[];
+}
+
+/**
+ * Coalesced node changes for the UI only: nodeNum → the merged changed fields
+ * of every update queued for that node in the window. Raised by
+ * {@link DataEventEmitter.emitNodeBatchUpdate}. Unlike `node:updated` it does
+ * not feed the automation engine, so high-volume ingest (MQTT) can keep the
+ * client fresh without firing trigger.nodeUpdated / nodeOnline per packet.
+ */
+export interface NodeBatchData {
+  [nodeNum: number]: Partial<DbNode>;
+}
+
+/** Window for coalescing `node:batch` updates (per source). */
+export const NODE_BATCH_INTERVAL_MS = 2000;
 
 export interface ClientNotificationData {
   /** LogRecord.Level numeric value (WARNING=30, ERROR=40, …). */
@@ -254,17 +340,29 @@ export interface ClientNotificationData {
   message: string;
   replyId?: number;
   time?: number;
+  /**
+   * Set when the server recognised the notice, so the UI can show a
+   * translated explanation instead of the firmware's English text (#5944).
+   */
+  kind?: 'unsigned_update_ignored';
+  nodeNum?: number;
+  nodeName?: string | null;
+  policy?: 'balanced' | 'strict';
 }
 
 class DataEventEmitter extends EventEmitter {
   // Keyed by sourceId (or '__default__') → nodeNum → telemetry list
-  private telemetryBuffer: Map<string, Map<number, DbTelemetry[]>> = new Map();
+  private telemetryBuffer: Map<string, Map<number, TelemetryEventRow[]>> = new Map();
   private batchTimeout: NodeJS.Timeout | null = null;
   private batchIntervalMs: number = 1000; // 1 second batching window
 
   // Keyed by sourceId → publicKey → contact (latest wins within window)
   private contactBuffer: Map<string, Map<string, MeshCoreContact>> = new Map();
   private contactBatchTimeout: NodeJS.Timeout | null = null;
+
+  // Keyed by sourceId → nodeNum → merged changed fields (latest value wins)
+  private nodeBatchBuffer: Map<string, Map<number, Partial<DbNode>>> = new Map();
+  private nodeBatchTimeout: NodeJS.Timeout | null = null;
 
   constructor() {
     super();
@@ -355,6 +453,34 @@ class DataEventEmitter extends EventEmitter {
   }
 
   /**
+   * Emit a pending-neighbour sighting (used by trigger.neighborAdded, #6274).
+   */
+  emitNeighborSighting(data: NeighborSightingData, sourceId?: string): void {
+    const event: DataEvent = {
+      type: 'neighbor:sighting',
+      data,
+      timestamp: Date.now(),
+      sourceId,
+    };
+    this.emit('data', event);
+    logger.debug(`[DataEventEmitter] Neighbour sighting: ${data.neighborPublicKey.substring(0, 12)}… via ${data.reporterPublicKey.substring(0, 12)}… (sighting ${data.sightings})`);
+  }
+
+  /**
+   * Emit a clock-offset sample (used by trigger.clockOutOfSync, #6273).
+   */
+  emitNodeClockOffset(data: NodeClockOffsetData, sourceId?: string): void {
+    const event: DataEvent = {
+      type: 'node:clockOffset',
+      data,
+      timestamp: Date.now(),
+      sourceId,
+    };
+    this.emit('data', event);
+    logger.debug(`[DataEventEmitter] Node clock offset: ${data.publicKey.substring(0, 12)} ${data.offsetSeconds}s (${data.sampleSource})`);
+  }
+
+  /**
    * Emit a node power-source transition event (used by trigger.nodePowerChanged,
    * #4558 Phase C). Raised by the telemetry-save seam when a node's batteryLevel
    * reading crosses the firmware's powered threshold (> 100) in either direction.
@@ -406,9 +532,11 @@ class DataEventEmitter extends EventEmitter {
   }
 
   /**
-   * Buffer telemetry for batched emission (reduces WebSocket traffic)
+   * Buffer telemetry for batched emission. Feeds `trigger.telemetry`. Browsers
+   * get it through the per-node gate in socketEventGates but do not act on it
+   * (see useWebSocket). Call it after the row is stored, once per reading.
    */
-  emitTelemetry(nodeNum: number, telemetry: DbTelemetry, sourceId?: string): void {
+  emitTelemetry(nodeNum: number, telemetry: DbTelemetry, sourceId?: string, meta?: TelemetryEventMeta): void {
     const key = sourceId ?? '__default__';
     if (!this.telemetryBuffer.has(key)) {
       this.telemetryBuffer.set(key, new Map());
@@ -417,7 +545,7 @@ class DataEventEmitter extends EventEmitter {
     if (!sourceBuffer.has(nodeNum)) {
       sourceBuffer.set(nodeNum, []);
     }
-    sourceBuffer.get(nodeNum)!.push(telemetry);
+    sourceBuffer.get(nodeNum)!.push(meta ? { ...telemetry, ...meta } : telemetry);
 
     // Start batch timer if not already running
     if (!this.batchTimeout) {
@@ -451,6 +579,47 @@ class DataEventEmitter extends EventEmitter {
 
     this.telemetryBuffer.clear();
     this.batchTimeout = null;
+  }
+
+  /**
+   * Queue a UI-only node change; flushed as one `node:batch` event per source
+   * every {@link NODE_BATCH_INTERVAL_MS}. Repeated updates to one node inside
+   * the window merge, so a busy MQTT feed costs at most one event per source
+   * per window. Fields that are `undefined` are dropped. Requires a sourceId:
+   * the socket gate checks every event on its own source.
+   */
+  emitNodeBatchUpdate(nodeNum: number, node: Partial<DbNode>, sourceId: string): void {
+    if (!sourceId || !Number.isFinite(nodeNum)) return;
+    const fields: Partial<DbNode> = {};
+    let any = false;
+    for (const [key, value] of Object.entries(node)) {
+      if (value === undefined) continue;
+      (fields as Record<string, unknown>)[key] = value;
+      any = true;
+    }
+    if (!any) return;
+    let sourceBuffer = this.nodeBatchBuffer.get(sourceId);
+    if (!sourceBuffer) {
+      sourceBuffer = new Map();
+      this.nodeBatchBuffer.set(sourceId, sourceBuffer);
+    }
+    const prev = sourceBuffer.get(nodeNum);
+    sourceBuffer.set(nodeNum, prev ? { ...prev, ...fields } : fields);
+    if (!this.nodeBatchTimeout) {
+      this.nodeBatchTimeout = setTimeout(() => this.flushNodeBatch(), NODE_BATCH_INTERVAL_MS);
+    }
+  }
+
+  private flushNodeBatch(): void {
+    for (const [sourceId, sourceBuffer] of this.nodeBatchBuffer) {
+      const batch: NodeBatchData = {};
+      for (const [nodeNum, fields] of sourceBuffer) batch[nodeNum] = fields;
+      const event: DataEvent = { type: 'node:batch', data: batch, timestamp: Date.now(), sourceId };
+      this.emit('data', event);
+      logger.debug(`[DataEventEmitter] Node batch: ${sourceBuffer.size} nodes (source: ${sourceId})`);
+    }
+    this.nodeBatchBuffer.clear();
+    this.nodeBatchTimeout = null;
   }
 
   /**
@@ -612,6 +781,31 @@ class DataEventEmitter extends EventEmitter {
   }
 
   /**
+   * Emit that a MeshCore reaction found its target after the fact (#5759). The
+   * key fields are the reaction row's own, so the socket gate can apply the same
+   * channel and key rules it applies to `meshcore:message`.
+   */
+  emitMeshCoreReactionResolved(
+    data: {
+      id: string;
+      reactionTargetId: string;
+      fromPublicKey: string;
+      toPublicKey?: string | null;
+      keyFingerprint?: string | null;
+    },
+    sourceId: string,
+  ): void {
+    const event: DataEvent = {
+      type: 'meshcore:reaction:resolved',
+      data,
+      timestamp: Date.now(),
+      sourceId,
+    };
+    this.emit('data', event);
+    logger.debug(`[DataEventEmitter] MeshCore reaction ${data.id} resolved to ${data.reactionTargetId}`);
+  }
+
+  /**
    * Emit a MeshCore message-deletion event (#3981) so connected clients prune
    * the deleted messages from their view. The payload describes the deletion
    * scope; the client applies the same match locally (single ids, a whole DM
@@ -736,7 +930,7 @@ class DataEventEmitter extends EventEmitter {
    * message so the client can replace its state idempotently.
    */
   emitMeshCoreChannelHeard(
-    data: { id: string; heardBy: Array<{ hash: string; name?: string | null; snr?: number | null }> },
+    data: { id: string; heardBy: Array<{ hash: string; name?: string | null; snr?: number | null; hops?: number | null }> },
     sourceId: string,
   ): void {
     const event: DataEvent = {
@@ -791,6 +985,22 @@ class DataEventEmitter extends EventEmitter {
       data: packet,
       timestamp: Date.now(),
       sourceId,
+    };
+    this.emit('data', event);
+  }
+
+  /**
+   * Emit one live packet flight for the map (#4835). A no-op unless some
+   * socket watches the flight's source, so it costs nothing while unused.
+   * The payload names the two ends and nothing of what the packet said.
+   */
+  emitPacketFlight(flight: PacketFlight): void {
+    if (!hasPacketFlightWatchers(flight.sourceId)) return;
+    const event: DataEvent = {
+      type: 'packet:flight',
+      data: flight,
+      timestamp: Date.now(),
+      sourceId: flight.sourceId,
     };
     this.emit('data', event);
   }
@@ -870,6 +1080,10 @@ class DataEventEmitter extends EventEmitter {
     if (this.contactBatchTimeout) {
       clearTimeout(this.contactBatchTimeout);
       this.flushContacts();
+    }
+    if (this.nodeBatchTimeout) {
+      clearTimeout(this.nodeBatchTimeout);
+      this.flushNodeBatch();
     }
   }
 }

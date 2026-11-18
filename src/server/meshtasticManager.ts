@@ -5,6 +5,8 @@ import { buildContactRow, buildContactRowV2 } from './services/atakContactServic
 import meshtasticProtobufService, { formatTakPreview, formatTakV2Preview } from './meshtasticProtobufService.js';
 import { takV2Variant } from './takV2Decoder.js';
 import type { RawSecurityConfig } from './utils/securityConfigWrite.js';
+import { formatAdminMqttConfig } from './utils/adminMqttConfig.js';
+import { normalizeTracerouteIntervalMinutes } from './utils/tracerouteInterval.js';
 import protobufService, { convertIpv4ConfigToStrings } from './protobufService.js';
 import { getProtobufRoot, type MeshBeaconPayload } from './protobufLoader.js';
 import { TcpTransport } from './tcpTransport.js';
@@ -29,6 +31,8 @@ type SupportedModules = Record<ExcludedModuleKey, boolean> & {
   takConfig: boolean;
   /** Legacy alias of `rangetest`, read by the Config tab since #5041. */
   rangeTest: boolean;
+  /** AES-CCM channels (`ChannelSettings.use_aead`), firmware 2.8.1+ (#5248). */
+  aeadChannels: boolean;
 };
 import { shouldDiscardPosition } from '../utils/nullIsland.js';
 import { getDiscardInvalidPositions } from '../utils/positionIngestConfig.js';
@@ -43,6 +47,7 @@ import {
   TIME_SYNC_MINUTES,
 } from './utils/schedulerInterval.js';
 import { transportColumnForPacket, classifyNodeTransport } from '../utils/nodeTransport.js';
+import { mqttConsentStamp } from './utils/mqttConsentCapture.js';
 import { segmentTransportMechanism } from '../utils/tracerouteTransport.js';
 import { replyPacketToRequesterFirst } from '../utils/tracerouteOrientation.js';
 import {
@@ -52,57 +57,73 @@ import {
 } from '../utils/firmwareVersion.js';
 import { MODEM_PRESET_NAMES } from '../utils/loraFrequency.js';
 import { getEnvironmentConfig } from './config/environment.js';
+import { dataPath } from './config/dataDir.js';
 import { notificationService } from './services/notificationService.js';
 import { sendMessagePushNotification } from './services/messagePushNotifier.js';
 import { getMaxNodeAgeHours } from './services/nodeDisplaySettings.js';
 import { deadDropService, nodeIdHex } from './services/deadDropService.js';
 import { serverEventNotificationService } from './services/serverEventNotificationService.js';
 import { transportTrafficService } from './services/transportTrafficService.js';
+import {
+  resolveRetryConfig as resolveTelemetryRetryConfig,
+  nextRetryState as nextTelemetryRetryState,
+  RETRY_DELAY_SETTING_KEY,
+  RETRY_MAX_ATTEMPTS_SETTING_KEY,
+  RETRY_COOLDOWN_SETTING_KEY,
+  type TelemetryRetryConfig,
+} from './services/telemetryRetryPolicy.js';
 import packetLogService from './services/packetLogService.js';
 import { channelDecryptionService } from './services/channelDecryptionService.js';
 import { pkiDecryptionService } from './services/pkiDecryptionService.js';
 import { getSourcePkiKeyStore, isPkiDmDecryptionGloballyEnabled } from './services/sourcePkiKeyStore.js';
-import { dataEventEmitter } from './services/dataEventEmitter.js';
+import { dataEventEmitter, type TelemetryEventMeta } from './services/dataEventEmitter.js';
+import { recordOwnTelemetryRequest, isAnswerToOwnTelemetryRequest } from './services/ownTelemetryRequests.js';
 import { aircraftClassificationService } from './services/aircraftClassificationService.js';
 import { aircraftAgeOutService } from './services/aircraftAgeOutService.js';
 import {
   ToastThrottle,
   shouldSuppressToast,
   parseProtectedCapRefusal,
+  parseUnsignedUpdateIgnored,
   sanitizeNotificationMessage,
   type ParsedClientNotification,
 } from './services/clientNotificationPolicy.js';
 import { waypointService } from './services/waypointService.js';
+import type { WireWaypoint } from './services/waypointGeofence.js';
 // import type only — cannot use a static runtime import here because of a circular
 // dependency chain: meshtasticManager → distanceDeleteScheduler →
 // autoDeleteByDistanceService → resolveSourceManager → meshtasticManager.
 // The class is loaded lazily via dynamic import() inside startDistanceDeleteScheduler().
 import type { DistanceDeleteScheduler } from './services/distanceDeleteScheduler.js';
 import { MessageQueueService } from './messageQueueService.js';
+import { registerFallbackManager } from './fallbackManagerHolder.js';
 import { resolveAutoWelcomeDelaySeconds } from './autoWelcomeDelay.js';
 import { TxDisabledError } from './errors/txDisabledError.js';
 import { resolveAutoAckPreSendDelaySeconds } from './autoAckDelay.js';
 import { AUTO_ACK_MAX_PENDING, autoAckChannelWaitMs, resolveAutoAckMaxResponses } from './autoAckResponseCap.js';
 import { countDistinctResponders } from '../utils/messageReplies.js';
 import { clampHopLimitOverride, parseHopLimitOverride } from '../utils/hopLimitOverride.js';
-import { normalizeTriggerPatterns, normalizeTriggerChannels } from '../utils/autoResponderUtils.js';
-import { matchAutoResponderPattern } from './utils/autoResponderMatcher.js';
+import { normalizeTriggerChannels, normalizeTimerChannels } from '../utils/autoResponderUtils.js';
+import { matchResponderTrigger } from './utils/autoResponderMatcher.js';
+import { resolveResponderSyntax, type ResponderSyntax } from '../utils/responderTrigger.js';
 import { runForwarding, parseStoredForwardingRules } from './utils/forwardingEngine.js';
 import { FORWARDING_SETTING_KEY } from '../types/forwarding.js';
 import { isForwardingEnabled } from './services/forwardingStateService.js';
 import { isOwnNodeNum } from './utils/ownNodes.js';
 import { isWithinTimeWindow } from './utils/timeWindow.js';
 import { compileUserRegex } from '../utils/safeRegex.js';
-import { shouldGateAutomations, averageStrongestNeighborUtilization, DEFAULT_AIRTIME_CUTOFF_THRESHOLD, DEFAULT_AIRTIME_CUTOFF_SOURCE, DEFAULT_NEIGHBOR_UTIL_MAX_HOPS, MAX_NEIGHBOR_UTIL_MAX_HOPS, NEIGHBOR_UTIL_SAMPLE_COUNT, type AirtimeCutoffSource, type NeighborUtilContributor } from './utils/airtimeCutoff.js';
+import { shouldGateAutomations, computeNeighborUtilization, clampNeighborSampleCount, parseManualNeighborNodes, isPickableInfrastructureNode, DEFAULT_AIRTIME_CUTOFF_THRESHOLD, DEFAULT_AIRTIME_CUTOFF_SOURCE, DEFAULT_NEIGHBOR_UTIL_MAX_HOPS, DEFAULT_NEIGHBOR_SELECTION_MODE, MAX_NEIGHBOR_UTIL_MAX_HOPS, NEIGHBOR_UTIL_SAMPLE_COUNT, MAX_NEIGHBOR_UTIL_SAMPLE_COUNT, type AirtimeCutoffSource, type NeighborSelectionMode, type NeighborUtilCandidate, type NeighborUtilContributor, type LocalFillReason, type SkippedNeighbor } from './utils/airtimeCutoff.js';
 import { resolveLastHopName } from './utils/lastHop.js';
 import { isRelayedReception } from './utils/packetHops.js';
-import { resolveLastHeardSec, isLiveReception, resolvePositionObservedAtMs, resolveNodeDbPositionObservedAtMs } from './utils/replayGuard.js';
+import { resolveLastHeardSec, isLiveReception, isFirmwareReplayPacket, resolvePositionObservedAtMs, resolveNodeDbPositionObservedAtMs } from './utils/replayGuard.js';
+import { channelIndexFromPacket } from './utils/nodeChannelEvidence.js';
 import { isLiveNodeDiscovery } from './utils/nodeDiscovery.js';
 import { isUptimeReboot } from './utils/rebootDetection.js';
 import { isPowered, detectPowerTransition } from './utils/poweredState.js';
-import { autoAckIsZeroHop, autoAckCellKey, resolveAutoAckReplyRouting } from './utils/autoAckDecision.js';
-import { hopCountEmoji, HOP_COUNT_EMOJIS } from '../utils/hopEmoji.js';
-import { scriptDependencyEnv } from './utils/scriptRunner.js';
+import { autoAckIsIp, autoAckIsZeroHop, autoAckCellKey, resolveAutoAckReplyRouting } from './utils/autoAckDecision.js';
+import { hopCountEmoji, HOP_COUNT_EMOJIS, parseHopEmojiOverrides } from '../utils/hopEmoji.js';
+import { buildScriptChildEnv } from './utils/scriptRunner.js';
+import { scrubScriptSecrets } from './utils/scriptSecretsSnapshot.js';
 import { canonicalMessageTime, plausibleRxTime } from './utils/messageTime.js';
 import { canonicalTelemetryType, canonicalTelemetryUnit } from './utils/telemetryKeys.js';
 import { isNodeComplete } from '../utils/nodeHelpers.js';
@@ -115,8 +136,18 @@ import { detectLocalNodeSpoof, SentPacketIdCache, type SpoofDetectionResult } fr
 import { automationPacketTracker, randomPacketId, type SendOrigin } from './utils/automationPacketTracker.js';
 import { resolveBroadcastChannel } from './utils/resolveDestinationChannel.js';
 import { applyHomoglyphOptimization } from '../utils/homoglyph.js';
-import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, resolveRadioPacketTransport, isViaMqtt, MIN_TRACEROUTE_INTERVAL_MS, StoreForwardRequestResponse, getStoreForwardRequestResponseName, isUdpBroadcastEnabled, resolveHopLimit, PacketSignaturePolicy } from './constants/meshtastic.js';
+import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, resolveRadioPacketTransport, isViaMqtt, MIN_TRACEROUTE_INTERVAL_MS, StoreForwardRequestResponse, getStoreForwardRequestResponseName, isUdpBroadcastEnabled, resolveHopLimit, PacketSignaturePolicy, WANT_CONFIG_NONCE_FULL, WANT_CONFIG_NONCE_ONLY_CONFIG, modemPresetChannelName, MAX_MESSAGE_BYTES, readIsAutomationBit } from './constants/meshtastic.js';
+import { SPLIT_PART_GAP_MS } from '../utils/messageSplitLimits.js';
+import {
+  SplitSequenceLock,
+  planAutomatedTextParts,
+  sendAutomatedTextParts,
+  type AutomatedTextResult,
+} from './utils/automatedTextSplit.js';
+import { QuickCloseDetector } from './meshtastic/quickCloseDetector.js';
 import { normalizeChannelRole } from './constants/channelRole.js';
+import { MODULE_FIELD_BY_ADMIN_TYPE, CONFIG_TYPE_MAP } from './constants/configTypes.js';
+import { runStatusMessageReapply } from './services/statusMessageReapply.js';
 import { createRequire } from 'module';
 import { validateCron, scheduleCron, type CronJob } from './utils/cronScheduler.js';
 import {
@@ -128,6 +159,8 @@ import {
 } from './services/mqttProxyBridge.js';
 import { isDuplicatePacketLog, packetLogDedupKey, dedupTtlForTransport, isRfTransport, isNodeDbReplayForPacketLog } from './services/packetLogDedup.js';
 import { maybeRecordMeshtasticLink } from './services/crossSourceLinkRecorder.js';
+import { maybeRecordMeshtasticDirectRf } from './services/directRfContactRecorder.js';
+import { buildMeshtasticFlight, emitPacketFlight } from './services/packetFlights.js';
 import {
   isStaleCoverageRxTime,
   computeMeshtasticHopsAway,
@@ -137,9 +170,11 @@ import {
 import { CoverageReceiverPositionCache } from './utils/coverageReceiverPositionCache.js';
 import { NodeDbMaintenanceService } from './services/nodeDbMaintenanceService.js';
 import { AutoAnnounceService } from './services/autoAnnounceService.js';
+import { ReliablePkiTracker, resolveReliablePkiMode } from './services/reliablePki.js';
+import { channelEncryptToRadio, resolveChannelKey, type RadioChannel } from './utils/channelEncryption.js';
 import { AdminTransactionService } from './services/adminTransactionService.js';
 import { FavoritesService } from './services/favoritesService.js';
-import { DeviceAdminService } from './services/deviceAdminService.js';
+import { DeviceAdminService, type SetModuleConfigOptions } from './services/deviceAdminService.js';
 import { RemoteAdminService } from './services/remoteAdminService.js';
 import { ConnState, dispatch, type SmContext } from './meshtastic/connectionStateMachine.js';
 import fs from 'fs';
@@ -147,12 +182,41 @@ import path from 'path';
 import * as net from 'net';
 import { safeJson } from './utils/redactSecrets.js';
 
+/** The MeshPacket fields `maybeEmitPacketFlight` reads (#4835). */
+/** Effective ChUtil the airtime cutoff compares against; neighbour fields are set in `neighbors` mode (#6007). */
+interface EffectiveChannelUtilization {
+  value: number | null;
+  sampleCount: number;
+  contributors: NeighborUtilContributor[];
+  targetCount?: number;
+  neighborAverage?: number | null;
+  localUsed?: LocalFillReason | null;
+  skipped?: SkippedNeighbor[];
+}
+
+interface PacketFlightSourcePacket {
+  from?: number | bigint | null;
+  to?: number | bigint | null;
+  id?: number | null;
+  decoded?: { portnum?: number } | null;
+  transportMechanism?: number;
+  viaMqtt?: boolean | null;
+  hopStart?: number;
+  hopLimit?: number;
+  relayNode?: number;
+  rxTime?: number | null;
+  rxSnr?: number;
+  rxRssi?: number | null;
+}
+
 const POST_RESET_COOLDOWN_MS = 5000;
 // AdminMessage.ConfigType.SECURITY_CONFIG, and how long a local read of it may
 // take. The local link answers in well under a second; 5s leaves room for a
 // busy serial bridge and stays far inside the HTTP request timeout.
 const SECURITY_CONFIG_ADMIN_TYPE = 7;
 const LOCAL_SECURITY_READ_TIMEOUT_MS = 5000;
+// Same budget for a local module-config read (#5745).
+const LOCAL_MODULE_READ_TIMEOUT_MS = 5000;
 const TCP_READY_TIMEOUT_MS = 15000;
 const TCP_READY_INTERVAL_MS = 500;
 const TCP_READY_CONNECT_TIMEOUT_MS = 1500;
@@ -254,7 +318,7 @@ export function parseAutoResponderResponse(
     jsonResp = JSON.parse(rawResp);
   } catch (_) {
     if (jsonExpected) {
-      logger.error(`❌ Auto responder output is not valid JSON: ${rawResp.substring(0, 100)}`);
+      logger.error(`❌ Auto responder output is not valid JSON: ${scrubScriptSecrets(rawResp).substring(0, 100)}`);
       return { json: {}, responses: [] };
     }
     return { json: {}, responses: [rawResp] };
@@ -283,7 +347,7 @@ export function parseAutoResponderResponse(
 
   // Single response format: { "response": "msg" }
   if (typeof obj.response === 'string') {
-    logger.debug(`📥 Auto responder output: ${obj.response.substring(0, 50)}…`);
+    logger.debug(`📥 Auto responder output: ${scrubScriptSecrets(obj.response).substring(0, 50)}…`);
     return { json: obj, responses: [obj.response] };
   }
 
@@ -312,38 +376,17 @@ export interface ProcessingContext {
   viaStoreForward?: boolean; // Message was received via Store & Forward replay
   /** #5534: this packet first discovered its sender; suppress trigger.nodeUpdated for it. */
   nodeDiscovered?: boolean;
+  /** #5923: packet came from a Virtual Node client's MQTT proxy, not from our radio. */
+  fromMqttProxy?: boolean;
 }
 
 // CHANNEL_DB_OFFSET is imported from './constants/meshtastic.js'
 // Re-export for consumers who import from meshtasticManager
 export { CHANNEL_DB_OFFSET } from './constants/meshtastic.js';
 
-/**
- * Link Quality scoring constants.
- * Link Quality is a 0-10 score tracking the reliability of message routing to a node.
- */
-export const LINK_QUALITY = {
-  /** Maximum quality score */
-  MAX: 10,
-  /** Minimum quality score (0 = dead link) */
-  MIN: 0,
-  /** Base value for initial calculation (LQ = BASE - hops) */
-  INITIAL_BASE: 8,
-  /** Default quality when hop count is unknown */
-  DEFAULT_QUALITY: 5,
-  /** Default hop count when unknown */
-  DEFAULT_HOPS: 3,
-  /** Bonus for stable/improved message delivery */
-  STABLE_MESSAGE_BONUS: 1,
-  /** Penalty for degraded routing (hops increased by 2+) */
-  DEGRADED_PATH_PENALTY: -1,
-  /** Penalty for failed traceroute */
-  TRACEROUTE_FAIL_PENALTY: -2,
-  /** Penalty for PKI/encryption error */
-  PKI_ERROR_PENALTY: -5,
-  /** Traceroute timeout in milliseconds (5 minutes) */
-  TRACEROUTE_TIMEOUT_MS: 5 * 60 * 1000,
-} as const;
+// LINK_QUALITY lives in utils/linkQuality.ts (shared with the MeshCore read-side replay).
+import { LINK_QUALITY, initialLinkQuality } from './utils/linkQuality.js';
+export { LINK_QUALITY };
 
 export interface DeviceInfo {
   nodeNum: number;
@@ -524,6 +567,7 @@ type TextMessage = {
   decryptedBy?: 'node' | 'server' | null; // Decryption source - 'server' means read-only
   viaStoreForward?: boolean; // Message received via Store & Forward replay
   xeddsaSigned?: boolean; // Broadcast had a cryptographically verified XEdDSA signature (firmware 2.8+)
+  isAutomation?: boolean | null; // Data.bitfield bit 2 (#6449); null = bitfield absent
   ackProofStatus?: number; // #5279 — MeshPacket.AckProofStatus from the settling ack/nak (outbound DMs)
   sourceIp?: string | null; // Per-message ingress attribution (client IP for HTTP injects)
   sourcePath?: 'http_api' | 'tcp_radio' | 'mqtt_bridge' | 'system' | null;
@@ -534,8 +578,21 @@ type TextMessage = {
 /**
  * Auto-responder trigger configuration
  */
+/** NodeInfo flags the radio reports that MeshRadar does not persist (#5921). */
+export interface DeviceNodeFlags {
+  isKeyManuallyVerified: boolean;
+  isMuted: boolean;
+  hasXeddsaSigned: boolean;
+  heardOnCurrentLora: boolean;
+}
+
 interface AutoResponderTrigger {
   trigger: string | string[];
+  /**
+   * `'pattern'` (placeholder DSL, anchored) or `'regex'` (bare, unanchored,
+   * case-insensitive). Missing = `'pattern'`, the pre-#5924 behaviour.
+   */
+  syntax?: ResponderSyntax;
   response: string;
   responseType?: 'text' | 'http' | 'script' | 'traceroute' | 'mailbox';
   channel?: number | 'dm' | 'none';
@@ -543,6 +600,8 @@ interface AutoResponderTrigger {
   multiline?: boolean;
   scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
   cooldownSeconds?: number; // Per-node cooldown in seconds (0 = disabled, default)
+  /** Per-trigger switch (#6405). Only an explicit `false` turns it off; absent = enabled. */
+  enabled?: boolean;
 }
 
 /**
@@ -619,6 +678,39 @@ interface PendingTelemetryRequest {
 }
 
 /**
+ * Persisted per-node retry/cooldown state for the remote-LocalStats scheduler
+ * (#6033). Keyed by nodeNum inside a per-source settings JSON blob
+ * (`remoteLocalStatsRetryState`), so a restart or a settings save can neither
+ * re-arm nor clear a cooldown — mirrors autoAnnounceService persisting
+ * `lastAnnouncementTime`. `lastRequestAt` is when we last polled the node;
+ * `settledAt` marks the request we already resolved into success/miss, so a
+ * single poll is counted once.
+ */
+interface RemoteLocalStatsRetryEntry {
+  missCount: number;
+  cooldownUntil: number | null;
+  lastRequestAt: number | null;
+  settledAt: number | null;
+}
+
+/** Per-source key under which the above map is persisted. */
+const REMOTE_LOCALSTATS_RETRY_STATE_KEY = 'remoteLocalStatsRetryState';
+
+/**
+ * Per-source key holding the epoch-ms time of the last auto traceroute this
+ * source sent. The scheduler reads it on every (re)start, so a settings save,
+ * a reconnect or a process restart never sends sooner than last + interval.
+ */
+const AUTO_TRACEROUTE_LAST_SENT_KEY = 'autoTracerouteLastSentAt';
+
+/**
+ * Per-source key holding the epoch-ms time of the last remote LocalStats
+ * request the scheduler sent. Read on every (re)start, so a settings save, a
+ * reconnect or a process restart never sends sooner than last + interval.
+ */
+const REMOTE_LOCALSTATS_LAST_SENT_KEY = 'remoteLocalStatsLastSentAt';
+
+/**
  * Bounds for `autoAckCooldowns` (#4399). It was previously never evicted at
  * all — it got away with that because it is per-manager (per-source) and
  * bounded in practice by one radio's NodeDB, but it has no upper bound in
@@ -645,6 +737,15 @@ class MeshtasticManager implements ISourceManager {
   //   * fast initial reconnect for the first post-sync drop
   private passiveMode = false;
   private lastDisconnectAt: number | null = null;
+  // When the last FULL config sync finished: set only when the node answers
+  // our full want_config_id with a matching config_complete_id (#5974). The
+  // passive skip requires it, so a sync that died part way — whose Config
+  // frames still filled actualDeviceConfig — cannot arm the skip. Kept across
+  // a passive disconnect along with the rest of the cache.
+  private lastCompletedSyncAt: number | null = null;
+  // Warns when the node keeps closing the link seconds after connect — the
+  // signature of a second TCP client taking the node's one slot (#5974).
+  private quickCloseDetector = new QuickCloseDetector();
   // Per-source override of PASSIVE_RESYNC_STALE_MS. null means "use the
   // class default". The reporter (#3122 follow-up) asked for this as an
   // advanced setting so operators can tune the window for their specific
@@ -684,6 +785,10 @@ class MeshtasticManager implements ISourceManager {
   private static readonly MANUAL_RESYNC_COOLDOWN_MS = 30_000;
   private static readonly MANUAL_RESYNC_WATCHDOG_MS = 120_000;
   private manualResyncInFlight = false;
+  /** #6161: until this time, config-burst FromRadio types are not relayed to virtual node clients. */
+  private vnConfigRelaySuppressedUntil = 0;
+  private static readonly VN_CONFIG_RELAY_SUPPRESS_MS = 120000;
+  private static readonly VN_CONFIG_BURST_TYPES = new Set(['myInfo', 'metadata', 'config', 'moduleConfig', 'nodeInfo']);
   private manualResyncLastAt: number | null = null;
   private manualResyncWatchdog: NodeJS.Timeout | null = null;
   // Latches across the next disconnect/reconnect so recovery skips the
@@ -1017,6 +1122,10 @@ class MeshtasticManager implements ISourceManager {
 
   private tracerouteIntervalMinutes: number = 0;
   private lastTracerouteSentTime: number = 0;
+  // Bumped on every traceroute scheduler start/stop, so a start that is still
+  // reading the persisted last-send time drops out if a newer start or a stop
+  // ran meanwhile (no double timers, no timer armed after disconnect).
+  private tracerouteSchedulerGeneration: number = 0;
   // Airtime cutoff: pause all transmitting automations when the local node's
   // Channel Utilization exceeds this percent. 0 disables the feature.
   private automationAirtimeCutoffThreshold: number = DEFAULT_AIRTIME_CUTOFF_THRESHOLD;
@@ -1047,19 +1156,27 @@ class MeshtasticManager implements ISourceManager {
   private static readonly TELEMETRY_HIJACK_RETRY_2_DELAY_MS = 70000;
   // Outstanding auto-retry timers, so they can be cancelled on disconnect/teardown.
   private telemetryRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  // Reliable PKI (#5691): per-node outcome of PKI exchanges + priming NodeInfo.
+  private reliablePki!: ReliablePkiTracker;
   // Where the cutoff reads ChUtil from: the local node, or the averaged
   // strongest-RSSI infrastructure neighbours reached within maxHops.
   private automationAirtimeCutoffSource: AirtimeCutoffSource = DEFAULT_AIRTIME_CUTOFF_SOURCE;
   // Highest hopsAway a router may be reached at and still count as a
   // neighbour candidate (issue #4801). 0 = directly heard only.
   private automationAirtimeCutoffNeighborMaxHops: number = DEFAULT_NEIGHBOR_UTIL_MAX_HOPS;
+  // Issue #6007: how neighbours are chosen (strongest RSSI, or the user's
+  // picks), how many the auto mode averages (3-5), and the manual picks.
+  private automationAirtimeCutoffNeighborMode: NeighborSelectionMode = DEFAULT_NEIGHBOR_SELECTION_MODE;
+  private automationAirtimeCutoffNeighborSampleCount: number = NEIGHBOR_UTIL_SAMPLE_COUNT;
+  private automationAirtimeCutoffNeighborNodes: number[] = [];
   // Short-lived cache for the neighbour-averaged ChUtil so the per-fire gate
   // doesn't hit the database on every automation in `neighbors` mode.
-  private neighborUtilCache: { value: number | null; sampleCount: number; contributors: NeighborUtilContributor[]; at: number } | null = null;
+  private neighborUtilCache: (EffectiveChannelUtilization & { at: number }) | null = null;
   private static readonly NEIGHBOR_UTIL_TTL_MS = 30000;
   // Throttle the "automations gated" log so a busy mesh doesn't spam.
   private lastAirtimeGateLogTime: number = 0;
   private localStatsInterval: NodeJS.Timeout | null = null;
+  private localStatsFirstRequestTimeout: NodeJS.Timeout | null = null;
   private timeOffsetSamples: number[] = [];
   private timeOffsetInterval: NodeJS.Timeout | null = null;
   // Hourly auto-favorite staleness sweep. Kept on the instance so a reconnect
@@ -1085,6 +1202,9 @@ class MeshtasticManager implements ISourceManager {
   // target per tick (least-recently-polled) to stay gentle on shared airtime.
   private remoteLocalStatsInterval: NodeJS.Timeout | null = null;
   private remoteLocalStatsJitterTimeout: NodeJS.Timeout | null = null;
+  // Bumped on every remote LocalStats scheduler start/stop; see
+  // tracerouteSchedulerGeneration.
+  private remoteLocalStatsSchedulerGeneration: number = 0;
   private remoteLocalStatsIntervalMinutes: number = 0;
   private lastRemoteLocalStatsSentTime: number = 0;
   private remoteLocalStatsLastSentAt: Map<number, number> = new Map();
@@ -1101,9 +1221,13 @@ class MeshtasticManager implements ISourceManager {
   private pendingFavoriteResync: Map<number, boolean> = new Map();
   private remoteAdminScannerInterval: NodeJS.Timeout | null = null;
   private remoteAdminScannerIntervalMinutes: number = 0; // 0 = disabled
+  // Bumped by every start/stop; a start that awaited the DB and finds it
+  // changed drops out, so overlapping starts cannot arm two timers.
+  private remoteAdminScannerGeneration = 0;
   private pendingRemoteAdminScans: Set<number> = new Set(); // Track nodes being scanned
   private timeSyncInterval: NodeJS.Timeout | null = null;
   private timeSyncIntervalMinutes: number = 0; // 0 = disabled
+  private timeSyncSchedulerGeneration = 0; // same role as remoteAdminScannerGeneration
   private pendingTimeSyncs: Set<number> = new Set(); // Track nodes being synced
   private keyRepairInterval: NodeJS.Timeout | null = null;
   private keyRepairEnabled: boolean = false;
@@ -1155,12 +1279,27 @@ class MeshtasticManager implements ISourceManager {
     // this firmware build left out. Undefined until a device reports it, which
     // means "nothing excluded"; see src/server/utils/excludedModules.ts.
     excludedModules?: number;
+    // #6157: DeviceMetadata.ble_address — the BLE MAC the node advertises
+    // ("AA:BB:CC:DD:EE:FF"). Firmware-develop only today; empty/absent on
+    // current releases, left undefined then so the UI shows nothing.
+    bleAddress?: string;
+    // #6321: DeviceMetadata.bootloader_version — nRF52 bootloader version packed
+    // as major << 16 | minor << 8 | patch. 0 means not reported (non-nRF52 or
+    // older firmware); left undefined then so the UI shows nothing.
+    bootloaderVersion?: number;
     // #3684: User capability flags from the local node's NodeInfo, surfaced to the
     // frontend Config tab via getCurrentConfig().localNodeInfo.
     isUnmessagable?: boolean;
     isLicensed?: boolean;
   } | null = null;
   private actualDeviceConfig: any = null;  // Store actual device config (local node)
+  /**
+   * Channel slots exactly as the radio reported them on this connection (raw
+   * name, raw PSK, role, AEAD flag). Used by Reliable PKI "Avoid PKI" (#5711)
+   * to channel-encrypt a request the way the radio would. Cleared on
+   * disconnect; a slot MeshRadar reconfigures is dropped until reported again.
+   */
+  private readonly radioChannels = new Map<number, RadioChannel>();
   private actualModuleConfig: any = null;  // Store actual module config (local node)
   private sessionPasskey: Uint8Array | null = null;  // Session passkey for local node (backward compatibility)
   private sessionPasskeyExpiry: number | null = null;  // Expiry time for local node (expires after 300 seconds)
@@ -1179,8 +1318,14 @@ class MeshtasticManager implements ISourceManager {
   private pendingModuleConfigRequests: Map<number, string> = new Map();
   // Callers of refreshLocalSecurityConfig() waiting on the device's answer
   private localSecurityConfigWaiters: Array<(security: RawSecurityConfig | null) => void> = [];
+  // Callers of readLocalModuleConfig() waiting on the device's answer, by
+  // moduleConfig field name ('statusmessage', ...). Settled by
+  // processAdminMessage, by their own timeout, or by a disconnect (#5745).
+  private localModuleConfigWaiters: Map<string, Array<(section: Record<string, unknown> | null) => void>> = new Map();
   // Track whether module configs have ever been fetched this process lifetime (skip on reconnect)
   private moduleConfigsEverFetched: boolean = false;
+  // This connection already ran its Status Message re-apply check (#5745).
+  private statusReapplyAttempted: boolean = false;
   // Per-node channel storage for remote nodes
   private remoteNodeChannels: Map<number, Map<number, any>> = new Map();
   // Per-node owner storage for remote nodes
@@ -1246,6 +1391,13 @@ class MeshtasticManager implements ISourceManager {
   // favoritesService.ts's header comment for the full rationale.
   private autoFavoritingNodes = new Set<number>();  // Track nodes currently being auto-favorited
   private deviceNodeNums: Set<number> = new Set();  // Nodes in the connected radio's local database
+  /**
+   * Per-node flags from the radio's own NodeDB replay (#5921). MeshRadar does
+   * not store them, but the Virtual Node must pass them on: Android 2.8.x draws
+   * its lock from `hasXeddsaSigned` and, against firmware >= 2.8.1, an orange
+   * "unheard" badge on every node whose `heardOnCurrentLora` is unset.
+   */
+  private deviceNodeFlags = new Map<number, DeviceNodeFlags>();
   /**
    * Nodes we have positive evidence the radio already holds a PUBLIC KEY for
    * (issue #4368). Deliberately distinct from `deviceNodeNums`, which only says
@@ -1570,6 +1722,26 @@ class MeshtasticManager implements ISourceManager {
     };
   }
 
+  /**
+   * Loopback endpoint of this source's Virtual Node, or null when the VN is
+   * not enabled for the source.
+   *
+   * The remote-admin CLI console (#6154) runs the `meshtastic` CLI against this
+   * endpoint so commands relay through MeshRadar's existing connection
+   * (exactly like examples/auto-responder-scripts/remote-admin.sh, which reads
+   * MESHTASTIC_IP/MESHTASTIC_PORT). The VN is the only transport the console
+   * uses — when it is disabled the console refuses rather than opening a second
+   * TCP session to the physical radio (which would kill MeshRadar's own link).
+   */
+  getVirtualNodeTarget(): { host: string; port: number } | null {
+    // Gate on isRunning(), not merely on the object existing: a VN whose
+    // start() failed (caught + logged) stays assigned but is not listening, so
+    // returning its endpoint would hand the CLI an ECONNREFUSED instead of the
+    // clear VIRTUAL_NODE_DISABLED the caller expects.
+    if (!this.virtualNodeServer?.isRunning()) return null;
+    return { host: '127.0.0.1', port: this.virtualNodeServer.getPort() };
+  }
+
   // Per-source message queue — each MeshtasticManager instance gets its own queue
   // so the sendCallback routes to THIS source's device. A singleton queue would
   // overwrite its callback on every new manager constructor, causing all auto-acks
@@ -1611,6 +1783,18 @@ class MeshtasticManager implements ISourceManager {
   constructor(sourceId: string = 'default', sourceConfig?: { host?: string; port?: number; heartbeatIntervalSeconds?: number; virtualNode?: VirtualNodeConfig; mqttLink?: MeshtasticMqttLink; passiveMode?: boolean; passiveResyncStaleMs?: number | null }) {
     this.sourceId = sourceId;
     this.messageQueue = new MessageQueueService(this.sourceId);
+    this.reliablePki = new ReliablePkiTracker({
+      sourceId: this.sourceId,
+      store: {
+        getState: (sid, n) => databaseService.pkiExchangeState.getState(sid, n),
+        markPending: (sid, n, now) => databaseService.pkiExchangeState.markPending(sid, n, now),
+        markSuccessful: (sid, n, now) => databaseService.pkiExchangeState.markSuccessful(sid, n, now),
+        markFailed: (sid, n, reason, now) => databaseService.pkiExchangeState.markFailed(sid, n, reason, now),
+        recordPriming: (sid, n, now) => databaseService.pkiExchangeState.recordPriming(sid, n, now),
+        countPrimedSince: (sid, since) => databaseService.pkiExchangeState.countPrimedSince(sid, since),
+      },
+      getMode: () => resolveReliablePkiMode(databaseService.settings, this.sourceId),
+    });
     this.nodeDbMaintenanceService = new NodeDbMaintenanceService(this);
     this.autoAnnounceService = new AutoAnnounceService(this);
     this.adminTransactionService = new AdminTransactionService(this);
@@ -1776,7 +1960,9 @@ class MeshtasticManager implements ISourceManager {
 
   /**
    * Save an array of telemetry metrics to the database
-   * Filters out undefined/null/NaN values before inserting
+   * Filters out undefined/null/NaN values before inserting.
+   * With `eventMeta`, each stored reading is also emitted for trigger.telemetry;
+   * without it (a replayed frame) the readings are stored only.
    */
   private async saveTelemetryMetrics(
     metricsToSave: Array<{ type: string; value: number | undefined; unit: string }>,
@@ -1784,25 +1970,34 @@ class MeshtasticManager implements ISourceManager {
     fromNum: number,
     timestamp: number,
     packetTimestamp: number | undefined,
-    packetId?: number
+    packetId?: number,
+    eventMeta?: TelemetryEventMeta
   ): Promise<void> {
     const now = Date.now();
     for (const metric of metricsToSave) {
       if (metric.value !== undefined && metric.value !== null && !isNaN(Number(metric.value))) {
-        // Device Health (#4558 Phase B): an uptime reset is a reboot. Read the
-        // PRIOR stored uptime (persistent baseline — restart-safe) BEFORE
-        // inserting this reading and compare. DB read only, no packet sent.
-        if (metric.type === 'uptimeSeconds') {
-          await this.detectRebootFromUptime(nodeId, fromNum, Number(metric.value));
+        // Device Health detectors emit automation events (node:rebooted /
+        // node:powerChanged), so run them ONLY for a live reading — the exact
+        // signal the emit below uses (no eventMeta = a replay). A firmware 2.8
+        // NodeDB replay (#5034/#5426, hourly and on every reconnect) re-sends
+        // old telemetry; without this gate a replayed uptime/battery value
+        // fired a spurious reboot/power-change event (#6099).
+        if (eventMeta) {
+          // Device Health (#4558 Phase B): an uptime reset is a reboot. Read the
+          // PRIOR stored uptime (persistent baseline — restart-safe) BEFORE
+          // inserting this reading and compare. DB read only, no packet sent.
+          if (metric.type === 'uptimeSeconds') {
+            await this.detectRebootFromUptime(nodeId, fromNum, Number(metric.value));
+          }
+          // Device Health (#4558 Phase C): a batteryLevel crossing the firmware's
+          // "powered" threshold (> 100) is an external-power transition. Read the
+          // PRIOR stored batteryLevel (persistent baseline — restart-safe) BEFORE
+          // inserting this reading and compare. DB read only, no packet sent.
+          if (metric.type === 'batteryLevel') {
+            await this.detectPowerChangeFromBattery(nodeId, fromNum, Number(metric.value));
+          }
         }
-        // Device Health (#4558 Phase C): a batteryLevel crossing the firmware's
-        // "powered" threshold (> 100) is an external-power transition. Read the
-        // PRIOR stored batteryLevel (persistent baseline — restart-safe) BEFORE
-        // inserting this reading and compare. DB read only, no packet sent.
-        if (metric.type === 'batteryLevel') {
-          await this.detectPowerChangeFromBattery(nodeId, fromNum, Number(metric.value));
-        }
-        await databaseService.telemetry.insertTelemetry({
+        const row = {
           nodeId,
           nodeNum: fromNum,
           telemetryType: metric.type,
@@ -1812,7 +2007,11 @@ class MeshtasticManager implements ISourceManager {
           createdAt: now,
           packetTimestamp,
           packetId
-        }, this.sourceId);
+        };
+        await databaseService.telemetry.insertTelemetry(row, this.sourceId);
+        // Feeds trigger.telemetry (batched by the emitter, 1s per source).
+        // No eventMeta = not a live reading (replay); store it, don't emit.
+        if (eventMeta) dataEventEmitter.emitTelemetry(fromNum, row, this.sourceId, eventMeta);
       }
     }
   }
@@ -2124,6 +2323,7 @@ class MeshtasticManager implements ISourceManager {
       logger.debug('🟡 [connect-race] handleConnected fired with no transport — skipping handshake (#3247)');
       return;
     }
+    this.quickCloseDetector.noteConnected();
 
     // Passive Mode (issue #3122): if we already have a cached snapshot of the
     // node and config, skip the destabilizing post-reconnect full sync.
@@ -2137,8 +2337,13 @@ class MeshtasticManager implements ISourceManager {
     // here, BEFORE the state write, and folded into ONE atomic
     // TRANSPORT_CONNECTED dispatch below — no intermediate "connected but
     // undecided" window between setting isConnected and picking a target.
+    //
+    // #5974: the cache must come from a sync that actually FINISHED. Any
+    // Config frame fills actualDeviceConfig, so a sync the node cut off part
+    // way used to arm the skip and the source never got a full sync at all.
     const passiveResyncFresh =
       this.passiveMode &&
+      this.lastCompletedSyncAt !== null &&
       this.localNodeInfo !== null &&
       this.actualDeviceConfig !== null &&
       this.lastDisconnectAt !== null &&
@@ -2183,19 +2388,37 @@ class MeshtasticManager implements ISourceManager {
 
     try {
       if (skipFullSync) {
-        // Skip the want_config_id handshake. Mesh traffic (received packets)
-        // continues to flow without it, and we already have a recent config
-        // snapshot. This is the core stability fix for large TCP nodes that
-        // close the socket under sync pressure (#3122). Mark capture complete
-        // so the post-config scheduler logic still runs (with passive-mode
-        // skips applied below).
+        // Skip the FULL sync (the NodeDB dump), not the handshake. The node
+        // sends a TCP client nothing at all until it asks with want_config_id
+        // (firmware PhoneAPI stays in STATE_SEND_NOTHING), so a session that
+        // skips it entirely is silent: no mesh packets arrive (#5974). Ask
+        // for config only (SPECIAL_NONCE_ONLY_CONFIG): MyInfo, our own
+        // NodeInfo, channels, config and module config, then the session goes
+        // live. That still spares a large node the NodeDB stream that made it
+        // close the socket (#3122). Mark capture complete now so the
+        // post-config scheduler logic runs once (with passive-mode skips
+        // applied); the config-only config_complete_id that follows is not
+        // treated as a sync (see the 'configComplete' case).
         const reason = consumeSuppressFlag
-          ? '🟡 [manual-resync recovery] Skipping want_config_id — using cached config'
-          : '🟢 [passive] Skipping want_config_id on reconnect — using cached config from last session';
+          ? '🟡 [manual-resync recovery] Requesting config only (no NodeDB) — using cached node list'
+          : '🟢 [passive] Requesting config only (no NodeDB) on reconnect — using cached node list from last session';
         logger.debug(reason);
         // 'completeConfigCapture' action — skip path marks the cached
         // snapshot current without a fresh sync.
         this.completeConfigCapture();
+        try {
+          await this.sendWantConfigId(WANT_CONFIG_NONCE_ONLY_CONFIG);
+        } catch (sendErr) {
+          // Unlike the full path, no capture state hangs on this send, so
+          // there is nothing to unwind: a dead socket surfaces through the
+          // transport's own close event and reconnect.
+          const msg = sendErr instanceof Error ? sendErr.message : String(sendErr);
+          if (this.transport !== transportAtConnect) {
+            logger.debug(`🟡 [connect-race] config-only want_config_id aborted — transport replaced (${msg}) (#3247)`);
+          } else {
+            logger.warn(`⚠️ Could not send config-only want_config_id (${msg}); the node will send no packets on this session`);
+          }
+        }
         // A manual-resync recovery should also clear the in-flight latch so the
         // operator's button re-enables (the original sync never reached
         // configComplete, so the normal onConfigCaptureComplete handler
@@ -2220,6 +2443,7 @@ class MeshtasticManager implements ISourceManager {
       this.initConfigCache = [];
       this.startConfigCapture();
       this.deviceNodeNums.clear();
+      this.deviceNodeFlags.clear();
       // Key evidence is per-connection: a different radio (or one whose NodeDB
       // was wiped while we were away) may not hold the keys the last one did.
       this.deviceContactKeyNums.clear();
@@ -2315,6 +2539,8 @@ class MeshtasticManager implements ISourceManager {
       // Replace (not chain) the config capture callback on each reconnect.
       // Chaining would accumulate scheduler starts across reconnects, causing
       // duplicate cron jobs (e.g., 4 reconnects = 4x auto-welcome messages).
+      // A new connection earns one Status Message re-apply check (#5745).
+      this.statusReapplyAttempted = false;
       this.onConfigCaptureComplete = () => {
         // Manual resync completed successfully — clear the in-flight latch and
         // cancel the watchdog so the operator's button re-enables (after cooldown).
@@ -2337,6 +2563,13 @@ class MeshtasticManager implements ISourceManager {
         this.maybeExtractAndStorePkiKey().catch(e =>
           logger.warn(`[MeshtasticManager:${this.sourceId}] PKI key extraction failed: ${(e as Error).message}`));
 
+        // Opt-in: put back a Status Message the node lost in a reboot (#5745).
+        // Local admin packets only, never in passive mode, and at most one
+        // check per connection (a second configComplete is a no-op).
+        if (!this.passiveMode) {
+          void this.maybeReapplyStatusMessage();
+        }
+
         // Stagger scheduler starts to avoid overwhelming the device (#2474)
         // Each scheduler gets its own delay so outbound requests are spread out
         const S = MeshtasticManager.SCHEDULER_STAGGER_MS;
@@ -2347,7 +2580,8 @@ class MeshtasticManager implements ISourceManager {
         // time-offset learning, announce, timer, key repair, distance delete,
         // auto-favorite sweep) running.
         const passive = this.passiveMode;
-        setTimeout(() => this.startTracerouteScheduler(), S * 1);
+        setTimeout(() => this.startTracerouteScheduler().catch(e =>
+          logger.error('❌ Error starting traceroute scheduler:', e)), S * 1);
         if (passive) {
           logger.debug('🟢 [passive] Skipping remote admin scanner — outbound queries to device');
         } else {
@@ -2387,7 +2621,8 @@ class MeshtasticManager implements ISourceManager {
         if (passive) {
           logger.debug('🟢 [passive] Skipping remote LocalStats scheduler — outbound queries to mesh');
         } else {
-          setTimeout(() => this.startRemoteLocalStatsScheduler(), S * 10);
+          setTimeout(() => this.startRemoteLocalStatsScheduler().catch(e =>
+            logger.error('❌ Error starting remote LocalStats scheduler:', e)), S * 10);
         }
 
         // Request LoRa config (config type 5) for Configuration tab — deferred
@@ -2457,6 +2692,8 @@ class MeshtasticManager implements ISourceManager {
   private async handleDisconnected(): Promise<void> {
     // A waiting auto-ack must not fire into a dead (or a later, new) link.
     this.clearPendingAutoAcks();
+    // Nor will a module-config read get its answer (#5745).
+    this.cancelLocalModuleConfigWaiters();
     logger.debug('TCP connection lost');
 
     // Losing the link mid-sync means the whole NodeDB stream restarts from
@@ -2493,6 +2730,24 @@ class MeshtasticManager implements ISourceManager {
     // pre-refactor behavior (only the resulting state and the notify call
     // were ever gated on it).
     const alreadyUserDisconnected = this.#state === ConnState.UserDisconnected;
+
+    // A node that keeps closing the link seconds after connect most likely
+    // has a second TCP client taking its single slot (#5974). The detector
+    // returns a message only after a streak, and at most once per window.
+    if (alreadyUserDisconnected) {
+      this.quickCloseDetector.reset();
+    } else {
+      const quickCloseWarning = this.quickCloseDetector.noteClosed();
+      if (quickCloseWarning) {
+        const cfg = this.sourceConfigOverride;
+        const target = cfg?.host ? ` (${cfg.host}:${cfg.port ?? 4403})` : '';
+        // Not awaited: the state write below must not wait on a DB lookup.
+        void this.getSourceName()
+          .catch(() => this.sourceId)
+          .then((name) => logger.warn(`⚠️ [${name}${target}] ${quickCloseWarning}`));
+      }
+    }
+
     const ctx = this.buildSmContext({ vnEnabled: this.virtualNodeServer !== undefined });
     const { next, actions } = dispatch(this.#state, 'TRANSPORT_DISCONNECTED', ctx);
     this.#state = alreadyUserDisconnected ? ConnState.UserDisconnected : next;
@@ -2524,6 +2779,9 @@ class MeshtasticManager implements ISourceManager {
           this.localNodeInfo = null;
           this.actualDeviceConfig = null;
           this.actualModuleConfig = null;
+          // The cache a completed sync filled is gone, so its marker goes too.
+          this.lastCompletedSyncAt = null;
+          this.radioChannels.clear();
           // A sync that died mid-flight must not carry its deferred favorite
           // write-backs into the next session — the device re-reports its own
           // state on reconnect and the reconciliation runs again from there (#5122).
@@ -2656,7 +2914,9 @@ class MeshtasticManager implements ISourceManager {
     destination: number,
     channel: number,
     payloadPreview: string,
-    metadata: Record<string, unknown> = {}
+    metadata: Record<string, unknown> = {},
+    /** Send origin (#6449): an automation send carries the is_automation bit. */
+    origin?: SendOrigin
   ): Promise<void> {
     if (!await packetLogService.isEnabled()) return;
 
@@ -2682,21 +2942,31 @@ class MeshtasticManager implements ISourceManager {
       metadata: JSON.stringify({ ...metadata, direction: 'tx' }),
       direction: 'tx',
       transport_mechanism: TransportMechanism.INTERNAL,  // Outgoing packets are sent via direct connection
+      // Mirrors the wire: only an automation send sets the bit; a manual send
+      // leaves the bitfield absent, which reads as NULL (#6449).
+      is_automation: origin === 'automation' ? true : undefined,
       sourceId: this.sourceId,
     });
   }
 
   // public: called by NodeDbMaintenanceService.refreshNodeDatabase (#3962 Phase 4.2a PR2 §4f)
-  async sendWantConfigId(): Promise<void> {
+  // `nonce` defaults to the full sync (config + NodeDB). Passive reconnects
+  // pass WANT_CONFIG_NONCE_ONLY_CONFIG to skip the NodeDB dump (#5974).
+  async sendWantConfigId(nonce: number = WANT_CONFIG_NONCE_FULL): Promise<void> {
     if (!this.transport) {
       throw new Error('Transport not initialized');
     }
 
+    // #6161: the answer to this request is a config burst (my_info, metadata,
+    // config, moduleConfig, node_info...) that virtual node clients never asked
+    // for. Stop relaying those types until configComplete (bounded by a deadline).
+    this.vnConfigRelaySuppressedUntil = Date.now() + MeshtasticManager.VN_CONFIG_RELAY_SUPPRESS_MS;
+
     try {
-      logger.debug('Sending want_config_id to trigger configuration data...');
+      logger.debug(`Sending want_config_id ${nonce} to trigger configuration data...`);
 
       // Use the new protobuf service to create a proper want_config_id message
-      const wantConfigMessage = meshtasticProtobufService.createWantConfigRequest();
+      const wantConfigMessage = meshtasticProtobufService.createWantConfigRequest(nonce);
 
       await this.transport.send(wantConfigMessage);
       logger.debug('Successfully sent want_config_id request');
@@ -2719,35 +2989,13 @@ class MeshtasticManager implements ISourceManager {
       this.transport = null;
     }
 
-    if (this.tracerouteJitterTimeout) {
-      clearTimeout(this.tracerouteJitterTimeout);
-      this.tracerouteJitterTimeout = null;
-    }
+    this.stopTracerouteScheduler();
 
-    if (this.tracerouteInterval) {
-      clearInterval(this.tracerouteInterval);
-      this.tracerouteInterval = null;
-    }
+    this.stopRemoteLocalStatsScheduler();
 
-    if (this.remoteLocalStatsJitterTimeout) {
-      clearTimeout(this.remoteLocalStatsJitterTimeout);
-      this.remoteLocalStatsJitterTimeout = null;
-    }
+    this.stopRemoteAdminScanner();
 
-    if (this.remoteLocalStatsInterval) {
-      clearInterval(this.remoteLocalStatsInterval);
-      this.remoteLocalStatsInterval = null;
-    }
-
-    if (this.remoteAdminScannerInterval) {
-      clearInterval(this.remoteAdminScannerInterval);
-      this.remoteAdminScannerInterval = null;
-    }
-
-    if (this.timeSyncInterval) {
-      clearInterval(this.timeSyncInterval);
-      this.timeSyncInterval = null;
-    }
+    this.stopTimeSyncScheduler();
 
     if (this.autoFavoriteSweepInterval) {
       clearInterval(this.autoFavoriteSweepInterval);
@@ -2786,6 +3034,10 @@ class MeshtasticManager implements ISourceManager {
     this.telemetryRetryTimers.clear();
     this.pendingTelemetryRequests.clear();
 
+    // Reliable PKI (#5691): drop in-flight exchanges and the sweep timer. Rows
+    // left `pending` stay pending; a disconnect is not a failure.
+    this.reliablePki.stop();
+
     logger.debug('Disconnected from Meshtastic node');
   }
 
@@ -2797,8 +3049,10 @@ class MeshtasticManager implements ISourceManager {
     this.externalConfigCaptureCallback = callback;
   }
 
-  private startTracerouteScheduler(): void {
-    // Clear any pending jitter timeout to prevent leaked timers
+  /** Cancel the auto-traceroute timers and any start still reading the DB. */
+  private stopTracerouteScheduler(): void {
+    this.tracerouteSchedulerGeneration++;
+
     if (this.tracerouteJitterTimeout) {
       clearTimeout(this.tracerouteJitterTimeout);
       this.tracerouteJitterTimeout = null;
@@ -2808,6 +3062,38 @@ class MeshtasticManager implements ISourceManager {
       clearInterval(this.tracerouteInterval);
       this.tracerouteInterval = null;
     }
+  }
+
+  /** Persisted time of this source's last auto traceroute (epoch ms), or 0. */
+  private async loadAutoTracerouteLastSentAt(): Promise<number> {
+    try {
+      const raw = await databaseService.settings.getSettingForSource(this.sourceId, AUTO_TRACEROUTE_LAST_SENT_KEY);
+      const at = raw ? Number(raw) : 0;
+      return Number.isFinite(at) && at > 0 ? at : 0;
+    } catch (err) {
+      logger.warn(`🗺️ Auto-traceroute: failed to read last send time for source ${this.sourceId}:`, err);
+      return 0;
+    }
+  }
+
+  private async persistAutoTracerouteLastSentAt(at: number): Promise<void> {
+    try {
+      await databaseService.settings.setSourceSetting(this.sourceId, AUTO_TRACEROUTE_LAST_SENT_KEY, String(at));
+    } catch (err) {
+      logger.warn(`🗺️ Auto-traceroute: failed to persist last send time for source ${this.sourceId}:`, err);
+    }
+  }
+
+  /**
+   * Start (or restart) the auto-traceroute scheduler. A restart (settings
+   * save, reconnect, process restart) is never a trigger: the first run waits
+   * until the persisted last send plus one interval, or the startup jitter,
+   * whichever is later.
+   */
+  private async startTracerouteScheduler(): Promise<void> {
+    // Clear any pending timers to prevent leaks, and invalidate older starts.
+    this.stopTracerouteScheduler();
+    const generation = this.tracerouteSchedulerGeneration;
 
     // If interval is 0, traceroute is disabled
     if (this.tracerouteIntervalMinutes === 0) {
@@ -2822,9 +3108,21 @@ class MeshtasticManager implements ISourceManager {
     // Only the first execution is delayed; subsequent runs use the regular interval.
     const maxJitterMs = Math.min(intervalMs, 5 * 60 * 1000); // Cap at 5 minutes
     const initialJitterMs = Math.random() * maxJitterMs;
-    const jitterSeconds = Math.round(initialJitterMs / 1000);
 
-    logger.debug(`🗺️ Starting traceroute scheduler with ${this.tracerouteIntervalMinutes} minute interval (initial jitter: ${jitterSeconds}s)`);
+    // Never run sooner than last send + interval. The in-memory time covers a
+    // failed DB read; the persisted time covers a process restart.
+    const lastSentAt = Math.max(this.lastTracerouteSentTime, await this.loadAutoTracerouteLastSentAt());
+    if (generation !== this.tracerouteSchedulerGeneration) {
+      return; // a newer start or a stop ran while we read the DB
+    }
+    // Cap at one interval so a last-send time in the future (clock moved
+    // back) cannot stall the scheduler.
+    const untilDueMs = lastSentAt > 0
+      ? Math.min(intervalMs, Math.max(0, lastSentAt + intervalMs - Date.now()))
+      : 0;
+    const initialDelayMs = Math.max(initialJitterMs, untilDueMs);
+
+    logger.debug(`🗺️ Starting traceroute scheduler with ${this.tracerouteIntervalMinutes} minute interval (first run in ${Math.round(initialDelayMs / 1000)}s)`);
 
     // The traceroute execution logic
     const executeTraceroute = async () => {
@@ -2876,7 +3174,10 @@ class MeshtasticManager implements ISourceManager {
             this.pendingAutoTraceroutes.add(targetNode.nodeNum);
             this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
 
-            this.lastTracerouteSentTime = Date.now();
+            const sentAt = Date.now();
+            this.lastTracerouteSentTime = sentAt;
+            // Persist so a restart or settings save cannot send early.
+            await this.persistAutoTracerouteLastSentAt(sentAt);
             await this.sendTraceroute(targetNode.nodeNum, channel, { origin: 'automation' });
 
             // Check for timed-out traceroutes (> 5 minutes old)
@@ -2892,7 +3193,7 @@ class MeshtasticManager implements ISourceManager {
       }
     };
 
-    // Delay first execution by jitter, then start regular interval
+    // Delay first execution, then start regular interval
     this.tracerouteJitterTimeout = setTimeout(() => {
       this.tracerouteJitterTimeout = null;
       // Execute first traceroute
@@ -2900,7 +3201,7 @@ class MeshtasticManager implements ISourceManager {
 
       // Start regular interval (no jitter on subsequent runs)
       this.tracerouteInterval = setInterval(executeTraceroute, intervalMs);
-    }, initialJitterMs);
+    }, initialDelayMs);
   }
 
   /** Start this source's per-source auto-delete-by-distance scheduler (#3901).
@@ -2925,9 +3226,19 @@ class MeshtasticManager implements ISourceManager {
     this.distanceDeleteScheduler?.stop();
   }
 
-  setTracerouteInterval(minutes: number): void {
-    if (minutes < 0 || minutes > 60) {
-      throw new Error('Traceroute interval must be between 0 and 60 minutes (0 = disabled)');
+  setTracerouteInterval(requestedMinutes: number): void {
+    // 0 or 3–60; a request for 1 or 2 rises to 3 (the UI minimum).
+    const minutes = normalizeTracerouteIntervalMinutes(requestedMinutes);
+    if (minutes === null) {
+      throw new Error('Traceroute interval must be 0 (disabled) or 3–60 minutes');
+    }
+
+    // Same interval and the scheduler already armed: leave it alone, so a
+    // save that only changes filters or the schedule window does not re-time
+    // the next traceroute.
+    const armed = this.tracerouteJitterTimeout !== null || this.tracerouteInterval !== null;
+    if (minutes === this.tracerouteIntervalMinutes && (armed || minutes === 0)) {
+      return;
     }
     this.tracerouteIntervalMinutes = minutes;
 
@@ -2938,7 +3249,7 @@ class MeshtasticManager implements ISourceManager {
     }
 
     if (this.isConnected) {
-      this.startTracerouteScheduler();
+      this.startTracerouteScheduler().catch(err => logger.error('❌ Error starting traceroute scheduler:', err));
     }
   }
 
@@ -2950,6 +3261,14 @@ class MeshtasticManager implements ISourceManager {
     if (minutes < 0 || minutes > 1440) {
       throw new Error('Remote LocalStats interval must be between 0 and 1440 minutes (0 = disabled)');
     }
+
+    // Same interval and the scheduler already armed: leave it alone, so a
+    // save that only changes filters or the schedule window does not re-time
+    // the next request.
+    const armed = this.remoteLocalStatsJitterTimeout !== null || this.remoteLocalStatsInterval !== null;
+    if (minutes === this.remoteLocalStatsIntervalMinutes && (armed || minutes === 0)) {
+      return;
+    }
     this.remoteLocalStatsIntervalMinutes = minutes;
     logger.debug(
       minutes === 0
@@ -2957,7 +3276,7 @@ class MeshtasticManager implements ISourceManager {
         : `📊 Remote LocalStats interval updated to ${minutes} minutes`
     );
     if (this.isConnected) {
-      this.startRemoteLocalStatsScheduler();
+      this.startRemoteLocalStatsScheduler().catch(err => logger.error('❌ Error starting remote LocalStats scheduler:', err));
     }
   }
 
@@ -2967,16 +3286,14 @@ class MeshtasticManager implements ISourceManager {
    * schedule-window + airtime gating, and a minimum-interval rate limit. Each
    * tick polls ONE target (the least-recently-polled match) to keep airtime use
    * low while still cycling through the whole matched set over time. Issue #3398.
+   * A restart (settings save, reconnect, process restart) is never a trigger:
+   * the first run waits until the persisted last send plus one interval, or
+   * the startup jitter, whichever is later.
    */
-  private startRemoteLocalStatsScheduler(): void {
-    if (this.remoteLocalStatsJitterTimeout) {
-      clearTimeout(this.remoteLocalStatsJitterTimeout);
-      this.remoteLocalStatsJitterTimeout = null;
-    }
-    if (this.remoteLocalStatsInterval) {
-      clearInterval(this.remoteLocalStatsInterval);
-      this.remoteLocalStatsInterval = null;
-    }
+  private async startRemoteLocalStatsScheduler(): Promise<void> {
+    // Clear any pending timers to prevent leaks, and invalidate older starts.
+    this.stopRemoteLocalStatsScheduler();
+    const generation = this.remoteLocalStatsSchedulerGeneration;
 
     if (this.remoteLocalStatsIntervalMinutes === 0) {
       logger.debug('📊 Remote LocalStats automation is disabled');
@@ -2990,7 +3307,20 @@ class MeshtasticManager implements ISourceManager {
 
     const maxJitterMs = Math.min(intervalMs, 5 * 60 * 1000);
     const initialJitterMs = Math.random() * maxJitterMs;
-    logger.debug(`📊 Starting remote LocalStats scheduler with ${this.remoteLocalStatsIntervalMinutes} minute interval (initial jitter: ${Math.round(initialJitterMs / 1000)}s)`);
+
+    // Never run sooner than last send + interval. The in-memory time covers a
+    // failed DB read; the persisted time covers a process restart.
+    const lastSentAt = Math.max(this.lastRemoteLocalStatsSentTime, await this.loadRemoteLocalStatsLastSentAt());
+    if (generation !== this.remoteLocalStatsSchedulerGeneration) {
+      return; // a newer start or a stop ran while we read the DB
+    }
+    // Cap at one interval so a last-send time in the future (clock moved
+    // back) cannot stall the scheduler.
+    const untilDueMs = lastSentAt > 0
+      ? Math.min(intervalMs, Math.max(0, lastSentAt + intervalMs - Date.now()))
+      : 0;
+    const initialDelayMs = Math.max(initialJitterMs, untilDueMs);
+    logger.debug(`📊 Starting remote LocalStats scheduler with ${this.remoteLocalStatsIntervalMinutes} minute interval (first run in ${Math.round(initialDelayMs / 1000)}s)`);
 
     const executeRemoteLocalStats = async () => {
       // TX-disabled radios cannot send remote telemetry requests; skip quietly and
@@ -3029,9 +3359,26 @@ class MeshtasticManager implements ISourceManager {
           return;
         }
 
-        const candidates = await databaseService.getNodesNeedingRemoteLocalStatsAsync(this.localNodeInfo.nodeNum, this.sourceId);
+        // Retry-burst / cooldown parity (#6033). Load the per-source policy and
+        // the persisted per-node state, then settle the outcome of earlier polls
+        // (success if telemetry arrived since the request, a miss otherwise)
+        // before choosing this tick's target. Persisted to a per-source settings
+        // blob, so a restart or a settings save never re-arms or clears a cooldown.
+        const retryConfig = await this.resolveRemoteLocalStatsRetryConfig();
+        const retryState = await this.loadRemoteLocalStatsRetryState();
+        const settleChanged = await this.settleRemoteLocalStatsRetries(retryState, retryConfig, Date.now());
+
+        const allCandidates = await databaseService.getNodesNeedingRemoteLocalStatsAsync(this.localNodeInfo.nodeNum, this.sourceId);
+        // Drop nodes serving a cooldown after repeated misses so a persistently
+        // unreachable multi-hop node stops burning airtime every round-robin cycle.
+        const nowMs = Date.now();
+        const candidates = allCandidates.filter(n => {
+          const st = retryState.get(Number(n.nodeNum));
+          return !(st && st.cooldownUntil !== null && st.cooldownUntil > nowMs);
+        });
         if (candidates.length === 0) {
-          logger.debug('📊 Remote LocalStats: No matching target nodes');
+          if (settleChanged) await this.saveRemoteLocalStatsRetryState(retryState);
+          logger.debug('📊 Remote LocalStats: No matching target nodes (after cooldown filter)');
           return;
         }
 
@@ -3050,8 +3397,17 @@ class MeshtasticManager implements ISourceManager {
         const targetName = target.longName || target.nodeId;
         logger.debug(`📊 Remote LocalStats: Requesting local_stats from ${targetName} (${target.nodeId}) on channel ${channel}, hopLimit ${hopLimit}`);
 
-        this.remoteLocalStatsLastSentAt.set(Number(target.nodeNum), Date.now());
-        this.lastRemoteLocalStatsSentTime = Date.now();
+        // Record the request so the NEXT tick settles it into success/miss.
+        const sentAt = Date.now();
+        this.remoteLocalStatsLastSentAt.set(Number(target.nodeNum), sentAt);
+        this.lastRemoteLocalStatsSentTime = sentAt;
+        // Persist so a restart or settings save cannot send early.
+        await this.persistRemoteLocalStatsLastSentAt(sentAt);
+        const entry = retryState.get(Number(target.nodeNum))
+          ?? { missCount: 0, cooldownUntil: null, lastRequestAt: null, settledAt: null };
+        entry.lastRequestAt = sentAt;
+        retryState.set(Number(target.nodeNum), entry);
+        await this.saveRemoteLocalStatsRetryState(retryState);
         await this.requestRemoteLocalStats(target.nodeNum, channel, hopLimit, { origin: 'automation' });
       } catch (error) {
         logger.error('❌ Error in remote LocalStats automation:', error);
@@ -3062,7 +3418,151 @@ class MeshtasticManager implements ISourceManager {
       this.remoteLocalStatsJitterTimeout = null;
       executeRemoteLocalStats().catch(err => logger.error('Remote LocalStats scheduler error:', err));
       this.remoteLocalStatsInterval = setInterval(executeRemoteLocalStats, intervalMs);
-    }, initialJitterMs);
+    }, initialDelayMs);
+  }
+
+  /** Cancel the remote LocalStats timers and any start still reading the DB. */
+  private stopRemoteLocalStatsScheduler(): void {
+    this.remoteLocalStatsSchedulerGeneration++;
+
+    if (this.remoteLocalStatsJitterTimeout) {
+      clearTimeout(this.remoteLocalStatsJitterTimeout);
+      this.remoteLocalStatsJitterTimeout = null;
+    }
+
+    if (this.remoteLocalStatsInterval) {
+      clearInterval(this.remoteLocalStatsInterval);
+      this.remoteLocalStatsInterval = null;
+    }
+  }
+
+  /** Persisted time of this source's last remote LocalStats request (epoch ms), or 0. */
+  private async loadRemoteLocalStatsLastSentAt(): Promise<number> {
+    try {
+      const raw = await databaseService.settings.getSettingForSource(this.sourceId, REMOTE_LOCALSTATS_LAST_SENT_KEY);
+      const at = raw ? Number(raw) : 0;
+      return Number.isFinite(at) && at > 0 ? at : 0;
+    } catch (err) {
+      logger.warn(`📊 Remote LocalStats: failed to read last send time for source ${this.sourceId}:`, err);
+      return 0;
+    }
+  }
+
+  private async persistRemoteLocalStatsLastSentAt(at: number): Promise<void> {
+    try {
+      await databaseService.settings.setSourceSetting(this.sourceId, REMOTE_LOCALSTATS_LAST_SENT_KEY, String(at));
+    } catch (err) {
+      logger.warn(`📊 Remote LocalStats: failed to persist last send time for source ${this.sourceId}:`, err);
+    }
+  }
+
+  /**
+   * Resolve the per-source retry policy for remote-LocalStats (#6033),
+   * defaulting to the approved 90s / 5 / 30m. Read with the PER-SOURCE key
+   * (#5080) so a job never silently gets the bare-key null.
+   */
+  private async resolveRemoteLocalStatsRetryConfig(): Promise<TelemetryRetryConfig> {
+    try {
+      const [delaySeconds, maxAttempts, cooldownMinutes] = await Promise.all([
+        databaseService.settings.getSettingForSource(this.sourceId, RETRY_DELAY_SETTING_KEY),
+        databaseService.settings.getSettingForSource(this.sourceId, RETRY_MAX_ATTEMPTS_SETTING_KEY),
+        databaseService.settings.getSettingForSource(this.sourceId, RETRY_COOLDOWN_SETTING_KEY),
+      ]);
+      return resolveTelemetryRetryConfig({ delaySeconds, maxAttempts, cooldownMinutes });
+    } catch {
+      return resolveTelemetryRetryConfig({});
+    }
+  }
+
+  /**
+   * Load the persisted per-node retry/cooldown state for this source (#6033).
+   * Returns an empty map on absent / malformed data — the scheduler then
+   * behaves exactly as before for every node.
+   */
+  private async loadRemoteLocalStatsRetryState(): Promise<Map<number, RemoteLocalStatsRetryEntry>> {
+    const map = new Map<number, RemoteLocalStatsRetryEntry>();
+    try {
+      const raw = await databaseService.settings.getSettingForSource(this.sourceId, REMOTE_LOCALSTATS_RETRY_STATE_KEY);
+      if (!raw) return map;
+      const parsed = JSON.parse(raw) as Record<string, Partial<RemoteLocalStatsRetryEntry>>;
+      for (const [k, v] of Object.entries(parsed)) {
+        const nodeNum = Number(k);
+        if (!Number.isFinite(nodeNum) || !v || typeof v !== 'object') continue;
+        map.set(nodeNum, {
+          missCount: typeof v.missCount === 'number' ? v.missCount : 0,
+          cooldownUntil: typeof v.cooldownUntil === 'number' ? v.cooldownUntil : null,
+          lastRequestAt: typeof v.lastRequestAt === 'number' ? v.lastRequestAt : null,
+          settledAt: typeof v.settledAt === 'number' ? v.settledAt : null,
+        });
+      }
+    } catch (err) {
+      logger.warn(`📊 Remote LocalStats: failed to load retry state for source ${this.sourceId}:`, err);
+    }
+    return map;
+  }
+
+  /**
+   * Persist the per-node retry/cooldown state, pruning fully-settled, clean,
+   * non-cooling entries so the per-source blob stays bounded.
+   */
+  private async saveRemoteLocalStatsRetryState(state: Map<number, RemoteLocalStatsRetryEntry>): Promise<void> {
+    try {
+      const now = Date.now();
+      const obj: Record<string, RemoteLocalStatsRetryEntry> = {};
+      for (const [nodeNum, e] of [...state.entries()]) {
+        const cooldownActive = e.cooldownUntil !== null && e.cooldownUntil > now;
+        const outstanding = e.lastRequestAt !== null && e.lastRequestAt !== e.settledAt;
+        if (e.missCount === 0 && !cooldownActive && !outstanding) {
+          state.delete(nodeNum);
+          continue;
+        }
+        obj[String(nodeNum)] = e;
+      }
+      await databaseService.settings.setSourceSetting(
+        this.sourceId,
+        REMOTE_LOCALSTATS_RETRY_STATE_KEY,
+        JSON.stringify(obj),
+      );
+    } catch (err) {
+      logger.warn(`📊 Remote LocalStats: failed to persist retry state for source ${this.sourceId}:`, err);
+    }
+  }
+
+  /**
+   * Resolve the outcome of earlier remote-LocalStats polls (#6033). For each
+   * node with an unsettled request older than the retry delay, success is
+   * "fresh telemetry arrived since the request" and anything else is a miss;
+   * the shared `nextRetryState` folds that into the miss counter / cooldown.
+   * Mutates `state` in place and returns whether anything changed. Restart-safe:
+   * an outstanding request simply settles once the delay has passed, which is
+   * the correct outcome, never a spurious miss.
+   */
+  private async settleRemoteLocalStatsRetries(
+    state: Map<number, RemoteLocalStatsRetryEntry>,
+    config: TelemetryRetryConfig,
+    now: number,
+  ): Promise<boolean> {
+    let changed = false;
+    for (const [nodeNum, entry] of [...state.entries()]) {
+      const lastReq = entry.lastRequestAt;
+      if (lastReq === null) continue;
+      if (entry.settledAt === lastReq) continue;          // already resolved this poll
+      if (now - lastReq < config.retryDelayMs) continue;  // give the reply time to arrive
+      let heard: boolean;
+      try {
+        const rows = await databaseService.telemetry.getLatestTelemetryPerNodeAndTypeSince(this.sourceId, lastReq);
+        heard = rows.some(r => Number(r.nodeNum) === nodeNum && (r.timestamp ?? 0) > lastReq);
+      } catch (err) {
+        logger.warn(`📊 Remote LocalStats: telemetry freshness check failed for node ${nodeNum}:`, err);
+        continue; // leave unsettled; retry the check next tick
+      }
+      const next = nextTelemetryRetryState(entry, heard ? 'success' : 'miss', now, config);
+      entry.missCount = next.missCount;
+      entry.cooldownUntil = next.cooldownUntil;
+      entry.settledAt = lastReq;
+      changed = true;
+    }
+    return changed;
   }
 
   /**
@@ -3110,6 +3610,32 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
+   * Set how the neighbour-averaged ChUtil picks its nodes (issue #6007). Any
+   * field left undefined keeps its current value. The sample count clamps to
+   * 3-5; the manual list keeps unique valid node numbers, at most 5.
+   */
+  setAutomationAirtimeCutoffNeighborSelection(selection: {
+    mode?: string;
+    sampleCount?: number | string;
+    nodes?: unknown;
+  }): void {
+    if (selection.mode !== undefined) {
+      this.automationAirtimeCutoffNeighborMode = selection.mode === 'manual' ? 'manual' : 'auto';
+    }
+    if (selection.sampleCount !== undefined) {
+      this.automationAirtimeCutoffNeighborSampleCount = clampNeighborSampleCount(selection.sampleCount);
+    }
+    if (selection.nodes !== undefined) {
+      this.automationAirtimeCutoffNeighborNodes = parseManualNeighborNodes(selection.nodes).slice(0, MAX_NEIGHBOR_UTIL_SAMPLE_COUNT);
+    }
+    this.neighborUtilCache = null; // force a fresh computation on the next check
+    logger.debug(
+      `📡 Airtime cutoff neighbour selection for ${this.sourceId}: mode=${this.automationAirtimeCutoffNeighborMode}, ` +
+        `samples=${this.automationAirtimeCutoffNeighborSampleCount}, picks=${this.automationAirtimeCutoffNeighborNodes.length}`
+    );
+  }
+
+  /**
    * Load the persisted airtime cutoff settings (threshold + source) for this
    * source. Falls back to defaults when unset or invalid.
    */
@@ -3129,11 +3655,20 @@ class MeshtasticManager implements ISourceManager {
         Number.isFinite(parsedHops) && parsedHops >= 0 && parsedHops <= MAX_NEIGHBOR_UTIL_MAX_HOPS
           ? parsedHops
           : DEFAULT_NEIGHBOR_UTIL_MAX_HOPS;
+
+      // Issue #6007: read per source (getSettingForSource), never the bare key.
+      const savedMode = await databaseService.settings.getSettingForSource(this.sourceId, 'automationAirtimeCutoffNeighborMode');
+      this.automationAirtimeCutoffNeighborMode = savedMode === 'manual' ? 'manual' : DEFAULT_NEIGHBOR_SELECTION_MODE;
+      const savedCount = await databaseService.settings.getSettingForSource(this.sourceId, 'automationAirtimeCutoffNeighborSampleCount');
+      this.automationAirtimeCutoffNeighborSampleCount = clampNeighborSampleCount(savedCount ?? NEIGHBOR_UTIL_SAMPLE_COUNT);
+      const savedNodes = await databaseService.settings.getSettingForSource(this.sourceId, 'automationAirtimeCutoffNeighborNodes');
+      this.automationAirtimeCutoffNeighborNodes = parseManualNeighborNodes(savedNodes).slice(0, MAX_NEIGHBOR_UTIL_SAMPLE_COUNT);
       this.neighborUtilCache = null;
 
       logger.debug(
         `📡 Airtime cutoff for ${this.sourceId}: ${this.automationAirtimeCutoffThreshold}% ` +
-          `(source: ${this.automationAirtimeCutoffSource}, maxHops: ${this.automationAirtimeCutoffNeighborMaxHops})` +
+          `(source: ${this.automationAirtimeCutoffSource}, maxHops: ${this.automationAirtimeCutoffNeighborMaxHops}, ` +
+          `mode: ${this.automationAirtimeCutoffNeighborMode}, samples: ${this.automationAirtimeCutoffNeighborSampleCount})` +
           (this.automationAirtimeCutoffThreshold === 0 ? ' (disabled)' : '')
       );
     } catch (error) {
@@ -3141,16 +3676,50 @@ class MeshtasticManager implements ISourceManager {
       this.automationAirtimeCutoffThreshold = DEFAULT_AIRTIME_CUTOFF_THRESHOLD;
       this.automationAirtimeCutoffSource = DEFAULT_AIRTIME_CUTOFF_SOURCE;
       this.automationAirtimeCutoffNeighborMaxHops = DEFAULT_NEIGHBOR_UTIL_MAX_HOPS;
+      this.automationAirtimeCutoffNeighborMode = DEFAULT_NEIGHBOR_SELECTION_MODE;
+      this.automationAirtimeCutoffNeighborSampleCount = NEIGHBOR_UTIL_SAMPLE_COUNT;
+      this.automationAirtimeCutoffNeighborNodes = [];
     }
   }
 
   /**
-   * Compute the Channel Utilization the cutoff should compare against, honoring
-   * the configured source. In 'neighbors' mode the value is the average ChUtil
-   * of the strongest-RSSI 0-hop infrastructure neighbours, cached briefly so the
-   * per-fire gate doesn't query the database on every automation.
+   * Candidate infrastructure neighbours for this source: nodes heard in the
+   * last day, minus the local node, with each node's newest ChUtil sample time
+   * (issue #6007) and its `viaMqtt` flag.
    */
-  private async getEffectiveChannelUtilization(): Promise<{ value: number | null; sampleCount: number; contributors: NeighborUtilContributor[] }> {
+  private async loadNeighborUtilCandidates(): Promise<NeighborUtilCandidate[]> {
+    const localNodeNum = this.localNodeInfo?.nodeNum;
+    const [nodes, samples] = await Promise.all([
+      databaseService.nodes.getActiveNodes(1, this.sourceId),
+      databaseService.telemetry.getLatestTelemetrySampleForAllNodes('channelUtilization', this.sourceId),
+    ]);
+    return nodes
+      .filter((n: any) => Number(n.nodeNum) !== localNodeNum)
+      .map((n: any) => {
+        const sample = n.nodeId ? samples.get(n.nodeId) : undefined;
+        return {
+          nodeNum: n.nodeNum != null ? Number(n.nodeNum) : null,
+          nodeId: n.nodeId,
+          longName: n.longName,
+          shortName: n.shortName,
+          role: n.role,
+          hopsAway: n.hopsAway,
+          rssi: n.rssi,
+          channelUtilization: n.channelUtilization ?? sample?.value ?? null,
+          channelUtilizationAt: sample?.timestamp ?? null,
+          viaMqtt: n.viaMqtt,
+        };
+      });
+  }
+
+  /**
+   * Compute the Channel Utilization the cutoff should compare against, honoring
+   * the configured source. In 'neighbors' mode the value comes from
+   * `computeNeighborUtilization` (auto or manual picks, MQTT excluded, local
+   * fills the gap), cached briefly so the per-fire gate doesn't query the
+   * database on every automation.
+   */
+  private async getEffectiveChannelUtilization(): Promise<EffectiveChannelUtilization> {
     if (this.automationAirtimeCutoffSource !== 'neighbors') {
       return {
         value: this.localChannelUtilization,
@@ -3161,39 +3730,36 @@ class MeshtasticManager implements ISourceManager {
 
     const now = Date.now();
     if (this.neighborUtilCache && now - this.neighborUtilCache.at < MeshtasticManager.NEIGHBOR_UTIL_TTL_MS) {
-      return {
-        value: this.neighborUtilCache.value,
-        sampleCount: this.neighborUtilCache.sampleCount,
-        contributors: this.neighborUtilCache.contributors,
-      };
+      const { at: _at, ...cached } = this.neighborUtilCache;
+      return cached;
     }
 
-    let result: { value: number | null; sampleCount: number; contributors: NeighborUtilContributor[] } = { value: null, sampleCount: 0, contributors: [] };
+    let result: EffectiveChannelUtilization;
     try {
-      const localNodeNum = this.localNodeInfo?.nodeNum;
-      const nodes = await databaseService.nodes.getActiveNodes(1, this.sourceId);
-      const candidates = nodes
-        .filter((n: any) => Number(n.nodeNum) !== localNodeNum)
-        .map((n: any) => ({
-          nodeNum: n.nodeNum,
-          nodeId: n.nodeId,
-          longName: n.longName,
-          shortName: n.shortName,
-          role: n.role,
-          hopsAway: n.hopsAway,
-          rssi: n.rssi,
-          channelUtilization: n.channelUtilization,
-        }));
-      result = averageStrongestNeighborUtilization(
-        candidates,
-        NEIGHBOR_UTIL_SAMPLE_COUNT,
-        this.automationAirtimeCutoffNeighborMaxHops,
-      );
+      const candidates = await this.loadNeighborUtilCandidates();
+      const r = computeNeighborUtilization(candidates, {
+        mode: this.automationAirtimeCutoffNeighborMode,
+        sampleCount: this.automationAirtimeCutoffNeighborSampleCount,
+        maxHops: this.automationAirtimeCutoffNeighborMaxHops,
+        manualNodeNums: this.automationAirtimeCutoffNeighborNodes,
+        localChannelUtilization: this.localChannelUtilization,
+        now,
+      });
+      result = {
+        value: r.value,
+        sampleCount: r.sampleCount,
+        contributors: r.contributors,
+        targetCount: r.targetCount,
+        neighborAverage: r.neighborAverage,
+        localUsed: r.localUsed,
+        skipped: r.skipped,
+      };
     } catch (error) {
       logger.error(`Failed to compute neighbour airtime utilization for ${this.sourceId}:`, error);
+      result = { value: null, sampleCount: 0, contributors: [] };
     }
 
-    this.neighborUtilCache = { value: result.value, sampleCount: result.sampleCount, contributors: result.contributors, at: now };
+    this.neighborUtilCache = { ...result, at: now };
     return result;
   }
 
@@ -3204,8 +3770,29 @@ class MeshtasticManager implements ISourceManager {
    * disabled or no utilization reading is available.
    */
   async isAutomationAirtimeGated(): Promise<boolean> {
+    return (await this.getAirtimeGateVerdict()).gated;
+  }
+
+  /**
+   * The one airtime-cutoff verdict every automation path shares: the legacy
+   * timers (via {@link isAutomationAirtimeGated}) and the Automation Engine
+   * (via its NodeDataProvider). Carries the figures so a skipped Engine
+   * action can say why. Fail-open like {@link shouldGateAutomations}.
+   */
+  async getAirtimeGateVerdict(): Promise<{
+    gated: boolean;
+    channelUtilization: number | null;
+    threshold: number;
+    measuredFrom: AirtimeCutoffSource;
+  }> {
     const { value } = await this.getEffectiveChannelUtilization();
     const gated = shouldGateAutomations(value, this.automationAirtimeCutoffThreshold);
+    const verdict = {
+      gated,
+      channelUtilization: value,
+      threshold: this.automationAirtimeCutoffThreshold,
+      measuredFrom: this.automationAirtimeCutoffSource,
+    };
     if (gated) {
       const now = Date.now();
       if (now - this.lastAirtimeGateLogTime > 60000) {
@@ -3216,14 +3803,16 @@ class MeshtasticManager implements ISourceManager {
         );
       }
     }
-    return gated;
+    return verdict;
   }
 
   /**
    * Current airtime-cutoff status for this source: the configured threshold and
    * measurement source, the effective Channel Utilization (or null if unknown),
    * the number of neighbours sampled (neighbours mode), and whether automations
-   * are currently gated. Used by the Automation page banner.
+   * are currently gated. Used by the Automation page banner. In neighbours
+   * mode it also says whether the local ChUtil filled the gap and which manual
+   * picks were skipped (issue #6007).
    */
   async getAirtimeCutoffStatus(): Promise<{
     threshold: number;
@@ -3233,17 +3822,70 @@ class MeshtasticManager implements ISourceManager {
     sampleCount: number;
     contributors: NeighborUtilContributor[];
     gated: boolean;
+    neighborMode?: NeighborSelectionMode;
+    neighborSampleCount?: number;
+    neighborNodes?: number[];
+    targetCount?: number;
+    neighborAverage?: number | null;
+    localChannelUtilization?: number | null;
+    localUsed?: LocalFillReason | null;
+    skipped?: SkippedNeighbor[];
   }> {
-    const { value, sampleCount, contributors } = await this.getEffectiveChannelUtilization();
-    return {
+    const eff = await this.getEffectiveChannelUtilization();
+    const base = {
       threshold: this.automationAirtimeCutoffThreshold,
       source: this.automationAirtimeCutoffSource,
       neighborMaxHops: this.automationAirtimeCutoffNeighborMaxHops,
-      channelUtilization: value,
-      sampleCount,
-      contributors,
-      gated: shouldGateAutomations(value, this.automationAirtimeCutoffThreshold),
+      channelUtilization: eff.value,
+      sampleCount: eff.sampleCount,
+      contributors: eff.contributors,
+      gated: shouldGateAutomations(eff.value, this.automationAirtimeCutoffThreshold),
     };
+    if (this.automationAirtimeCutoffSource !== 'neighbors') return base;
+    return {
+      ...base,
+      neighborMode: this.automationAirtimeCutoffNeighborMode,
+      neighborSampleCount: this.automationAirtimeCutoffNeighborSampleCount,
+      neighborNodes: [...this.automationAirtimeCutoffNeighborNodes],
+      targetCount: eff.targetCount,
+      neighborAverage: eff.neighborAverage ?? null,
+      localChannelUtilization: this.localChannelUtilization,
+      localUsed: eff.localUsed ?? null,
+      skipped: eff.skipped ?? [],
+    };
+  }
+
+  /**
+   * Infrastructure nodes the manual airtime-cutoff picker may offer (issue
+   * #6007): infrastructure roles heard in the last day, never MQTT-heard, with
+   * their hops, last ChUtil and that reading's time. Read-only, no traffic.
+   */
+  async getAirtimeCutoffCandidates(): Promise<Array<{
+    nodeNum: number;
+    nodeId: string | null;
+    longName: string | null;
+    shortName: string | null;
+    role: number;
+    hopsAway: number | null;
+    rssi: number | null;
+    channelUtilization: number | null;
+    channelUtilizationAt: number | null;
+  }>> {
+    const candidates = await this.loadNeighborUtilCandidates();
+    return candidates
+      .filter((n) => n.nodeNum != null && isPickableInfrastructureNode(n))
+      .map((n) => ({
+        nodeNum: n.nodeNum as number,
+        nodeId: n.nodeId ?? null,
+        longName: n.longName ?? null,
+        shortName: n.shortName ?? null,
+        role: n.role as number,
+        hopsAway: typeof n.hopsAway === 'number' ? n.hopsAway : null,
+        rssi: typeof n.rssi === 'number' ? n.rssi : null,
+        channelUtilization: typeof n.channelUtilization === 'number' ? n.channelUtilization : null,
+        channelUtilizationAt: n.channelUtilizationAt ?? null,
+      }))
+      .sort((a, b) => (a.hopsAway ?? 99) - (b.hopsAway ?? 99) || (b.rssi ?? -999) - (a.rssi ?? -999));
   }
 
   /**
@@ -3253,6 +3895,13 @@ class MeshtasticManager implements ISourceManager {
   setRemoteAdminScannerInterval(minutes: number): void {
     if (minutes < 0 || minutes > 60) {
       throw new Error('Remote admin scanner interval must be between 0 and 60 minutes (0 = disabled)');
+    }
+
+    // Same interval and the scanner already armed: leave it alone. A restart
+    // starts a fresh full interval, so every save would push the next scan
+    // back, and frequent saves would stop it from ever running.
+    if (minutes === this.remoteAdminScannerIntervalMinutes && (this.remoteAdminScannerInterval !== null || minutes === 0)) {
+      return;
     }
     this.remoteAdminScannerIntervalMinutes = minutes;
 
@@ -3272,14 +3921,15 @@ class MeshtasticManager implements ISourceManager {
    * Periodically checks nodes for remote admin capability
    */
   private async startRemoteAdminScanner(): Promise<void> {
-    if (this.remoteAdminScannerInterval) {
-      clearInterval(this.remoteAdminScannerInterval);
-      this.remoteAdminScannerInterval = null;
-    }
+    this.stopRemoteAdminScanner();
+    const generation = this.remoteAdminScannerGeneration;
 
     // Load setting from database if not already set
     if (this.remoteAdminScannerIntervalMinutes === 0) {
       const savedInterval = await databaseService.settings.getSettingForSource(this.sourceId, 'remoteAdminScannerIntervalMinutes');
+      if (generation !== this.remoteAdminScannerGeneration) {
+        return; // a newer start or a stop ran while we read the DB
+      }
       if (savedInterval) {
         const parsed = parseInt(savedInterval, 10) || 0;
         // 0 keeps the scanner off; anything else is clamped to the UI's 1–60.
@@ -3334,6 +3984,15 @@ class MeshtasticManager implements ISourceManager {
     }, intervalMs);
   }
 
+  /** Cancel the remote admin scanner and any start still reading the DB. */
+  private stopRemoteAdminScanner(): void {
+    this.remoteAdminScannerGeneration++;
+    if (this.remoteAdminScannerInterval) {
+      clearInterval(this.remoteAdminScannerInterval);
+      this.remoteAdminScannerInterval = null;
+    }
+  }
+
   /**
    * Set the auto time sync interval in minutes
    * @param minutes Interval in minutes (15-1440), 0 to disable
@@ -3341,6 +4000,12 @@ class MeshtasticManager implements ISourceManager {
   setTimeSyncInterval(minutes: number): void {
     if (minutes !== 0 && (minutes < 15 || minutes > 1440)) {
       throw new Error('Time sync interval must be 0 (disabled) or between 15 and 1440 minutes');
+    }
+
+    // Same interval and the scheduler already armed: leave it alone, so a
+    // save that only changes the node filter does not push the next sync back.
+    if (minutes === this.timeSyncIntervalMinutes && (this.timeSyncInterval !== null || minutes === 0)) {
+      return;
     }
     this.timeSyncIntervalMinutes = minutes;
 
@@ -3361,20 +4026,24 @@ class MeshtasticManager implements ISourceManager {
    * Start the automatic time sync scheduler
    */
   private async startTimeSyncScheduler(): Promise<void> {
-    if (this.timeSyncInterval) {
-      clearInterval(this.timeSyncInterval);
-      this.timeSyncInterval = null;
-    }
+    this.stopTimeSyncScheduler();
+    const generation = this.timeSyncSchedulerGeneration;
 
     // Per-source reads: when saved via /api/settings/time-sync-nodes?sourceId=,
     // these live at source:<id>:autoTimeSync* and fall back to global keys.
     const enabledStr = await databaseService.settings.getSettingForSource(this.sourceId, 'autoTimeSyncEnabled');
+    if (generation !== this.timeSyncSchedulerGeneration) {
+      return; // a newer start or a stop ran while we read the DB
+    }
     const isEnabled = enabledStr === 'true';
 
     // Load settings from database if not already set
     if (this.timeSyncIntervalMinutes === 0) {
       if (isEnabled) {
         const intervalStr = await databaseService.settings.getSettingForSource(this.sourceId, 'autoTimeSyncIntervalMinutes');
+        if (generation !== this.timeSyncSchedulerGeneration) {
+          return;
+        }
         const parsed = intervalStr ? parseInt(intervalStr, 10) : NaN;
         // NaN keeps the historical default of 15 and 0 still means disabled;
         // anything else is clamped to the UI's 15–1440 range (the setter
@@ -3407,6 +4076,15 @@ class MeshtasticManager implements ISourceManager {
         logger.debug('🕐 Time sync scheduler: Skipping - not connected or no local node info');
       }
     }, intervalMs);
+  }
+
+  /** Cancel the time sync scheduler and any start still reading the DB. */
+  private stopTimeSyncScheduler(): void {
+    this.timeSyncSchedulerGeneration++;
+    if (this.timeSyncInterval) {
+      clearInterval(this.timeSyncInterval);
+      this.timeSyncInterval = null;
+    }
   }
 
   /**
@@ -3666,6 +4344,8 @@ class MeshtasticManager implements ISourceManager {
     autoPurge?: boolean;
     immediatePurge?: boolean;
   }): void {
+    const wasEnabled = this.keyRepairEnabled;
+    const prevIntervalMinutes = this.keyRepairIntervalMinutes;
     if (settings.enabled !== undefined) {
       this.keyRepairEnabled = settings.enabled;
     }
@@ -3690,8 +4370,13 @@ class MeshtasticManager implements ISourceManager {
 
     logger.debug(`🔐 Key repair settings updated: enabled=${this.keyRepairEnabled}, interval=${this.keyRepairIntervalMinutes}min, maxExchanges=${this.keyRepairMaxExchanges}, autoPurge=${this.keyRepairAutoPurge}, immediatePurge=${this.keyRepairImmediatePurge}`);
 
-    // Restart scheduler if connected
-    if (this.isConnected) {
+    // Restart only when the timing changed or the scheduler should run but is
+    // not armed. A restart starts a fresh full interval, so restarting on a
+    // max-exchanges or purge change would push the next repair pass back.
+    const timingChanged = this.keyRepairEnabled !== wasEnabled
+      || this.keyRepairIntervalMinutes !== prevIntervalMinutes;
+    const needsArming = this.keyRepairEnabled && this.keyRepairInterval === null;
+    if (this.isConnected && (timingChanged || needsArming)) {
       this.startKeyRepairScheduler();
     }
   }
@@ -3701,10 +4386,7 @@ class MeshtasticManager implements ISourceManager {
    * Requests LocalStats at the configured interval to track mesh health metrics
    */
   private startLocalStatsScheduler(): void {
-    if (this.localStatsInterval) {
-      clearInterval(this.localStatsInterval);
-      this.localStatsInterval = null;
-    }
+    this.stopLocalStatsScheduler();
 
     // If interval is 0, collection is disabled
     if (this.localStatsIntervalMinutes === 0) {
@@ -3716,7 +4398,8 @@ class MeshtasticManager implements ISourceManager {
     logger.debug(`📊 Starting LocalStats scheduler with ${this.localStatsIntervalMinutes} minute interval`);
 
     // Delay the first request by 30 seconds to let the node settle after connect
-    setTimeout(() => {
+    this.localStatsFirstRequestTimeout = setTimeout(() => {
+      this.localStatsFirstRequestTimeout = null;
       if (this.isConnected && this.localNodeInfo) {
         this.requestLocalStats().catch(error => {
           logger.error('❌ Error requesting initial LocalStats:', error);
@@ -3746,6 +4429,12 @@ class MeshtasticManager implements ISourceManager {
    * Stop LocalStats collection scheduler
    */
   private stopLocalStatsScheduler(): void {
+    // The 30-second first request is a timer too; leaving it armed let every
+    // restart add one more request.
+    if (this.localStatsFirstRequestTimeout) {
+      clearTimeout(this.localStatsFirstRequestTimeout);
+      this.localStatsFirstRequestTimeout = null;
+    }
     if (this.localStatsInterval) {
       clearInterval(this.localStatsInterval);
       this.localStatsInterval = null;
@@ -3808,6 +4497,12 @@ class MeshtasticManager implements ISourceManager {
   setLocalStatsInterval(minutes: number): void {
     if (minutes < 0 || minutes > 60) {
       throw new Error('LocalStats interval must be between 0 and 60 minutes (0 = disabled)');
+    }
+
+    // Same interval and the scheduler already armed: leave it alone, so a
+    // save of an unrelated setting does not restart collection.
+    if (minutes === this.localStatsIntervalMinutes && (this.localStatsInterval !== null || minutes === 0)) {
+      return;
     }
     this.localStatsIntervalMinutes = minutes;
 
@@ -3913,7 +4608,9 @@ class MeshtasticManager implements ISourceManager {
       scriptPath?: string; // Path to script in /data/scripts/ (when responseType is 'script')
       scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
       response?: string; // Text message with expansion tokens (when responseType is 'text')
-      channel?: number; // Channel index (0-7) to send output to
+      channels?: Array<number | 'none'>; // Channel indexes to send output to, or ['none'] for no mesh output (#6230)
+      channel?: number | 'none'; // Legacy single channel (#6230 back-compat)
+      multiline?: boolean; // Split long messages into up to 3 marked parts (#6330)
       enabled: boolean;
       lastRun?: number;
       lastResult?: 'success' | 'error';
@@ -3960,11 +4657,27 @@ class MeshtasticManager implements ISourceManager {
         if (await this.isAutomationAirtimeGated()) {
           return;
         }
+        // Skip if still queued (#6330): the previous fire's messages have not
+        // all left the queue, so another fire would only grow the backlog.
+        const backlogKey = `timer:${trigger.id}`;
+        if (this.isAutomationBacklogged(backlogKey)) {
+          logger.info(`⏱️ Timer "${trigger.name}" (${trigger.id}): skipped, the previous fire is still in the message queue`);
+          return;
+        }
         const responseType = trigger.responseType || 'script'; // Default to script for backward compatibility
+        // Multi-channel (#6230): read the channels array, coercing an old
+        // single-channel timer into a one-item array. Each chosen channel gets
+        // one send; the message queue's SEND_INTERVAL_MS spaces them on air, so
+        // a multi-channel timer never bursts — no new cadence or cap is added.
+        const timerChannels = normalizeTimerChannels(trigger);
         if (responseType === 'text' && trigger.response?.trim()) {
-          await this.executeTimerTextMessage(trigger.id, trigger.name, trigger.response, trigger.channel ?? 0);
+          const response = trigger.response;
+          await this.runAutomationFire(backlogKey, () =>
+            this.executeTimerTextMessage(trigger.id, trigger.name, response, timerChannels, trigger.multiline === true));
         } else if (trigger.scriptPath) {
-          await this.executeTimerScript(trigger.id, trigger.name, trigger.scriptPath, trigger.channel ?? 0, trigger.scriptArgs);
+          const scriptPath = trigger.scriptPath;
+          await this.runAutomationFire(backlogKey, () =>
+            this.executeTimerScript(trigger.id, trigger.name, scriptPath, timerChannels, trigger.scriptArgs, trigger.multiline === true));
         } else {
           logger.error(`⏱️ Timer "${trigger.name}" has no valid response configured`);
           await this.updateTimerTriggerResult(trigger.id, 'error', 'No response configured');
@@ -4323,20 +5036,23 @@ class MeshtasticManager implements ISourceManager {
       // Expand tokens in script args if provided
       let scriptArgsList: string[] = [];
       if (trigger.scriptArgs) {
-        const expandedArgs = await this.replaceGeofenceTokens(
-          trigger.scriptArgs, trigger, nodeNum, lat, lng, eventType
+        // SECURITY (#6090): tokenize the admin template FIRST, then expand the
+        // OTA-sourced tokens per argv element so a crafted node name cannot
+        // inject extra arguments. See expandScriptArgsTokens.
+        scriptArgsList = await this.expandScriptArgsTokens(
+          trigger.scriptArgs,
+          (part) => this.replaceGeofenceTokens(part, trigger, nodeNum, lat, lng, eventType),
         );
-        scriptArgsList = this.parseScriptArgs(expandedArgs);
         logger.debug(`📍 Geofence script args expanded: ${trigger.scriptArgs} -> ${safeJson(scriptArgsList)}`);
       }
 
       const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath, ...scriptArgsList], {
         timeout: 30000,
-        env: { ...scriptEnv, ...scriptDependencyEnv(ext, scriptEnv) },
+        env: buildScriptChildEnv(scriptEnv, ext),
         maxBuffer: 1024 * 1024,
       });
 
-      if (stderr) logger.warn(`📍 Geofence script "${trigger.name}" stderr: ${stderr}`);
+      if (stderr) logger.warn(`📍 Geofence script "${trigger.name}" stderr: ${scrubScriptSecrets(stderr)}`);
 
       // Parse JSON output and send messages (same format as timer scripts)
       if (stdout && stdout.trim()) {
@@ -4385,10 +5101,10 @@ class MeshtasticManager implements ISourceManager {
       await this.updateGeofenceTriggerResult(trigger.id, 'success');
     } catch (error: any) {
       const duration = Date.now() - startTime;
-      const errorMessage = error.message || 'Unknown error';
+      const errorMessage = scrubScriptSecrets(error.message || 'Unknown error');
       logger.error(`📍 Geofence "${trigger.name}" script failed after ${duration}ms: ${errorMessage}`);
-      if (error.stderr) logger.error(`📍 Geofence script stderr: ${error.stderr}`);
-      if (error.stdout) logger.warn(`📍 Geofence script stdout before failure: ${error.stdout.substring(0, 200)}`);
+      if (error.stderr) logger.error(`📍 Geofence script stderr: ${scrubScriptSecrets(String(error.stderr))}`);
+      if (error.stdout) logger.warn(`📍 Geofence script stdout before failure: ${scrubScriptSecrets(String(error.stdout)).substring(0, 200)}`);
       await this.updateGeofenceTriggerResult(trigger.id, 'error', errorMessage);
     }
   }
@@ -4480,7 +5196,10 @@ class MeshtasticManager implements ISourceManager {
           delete trigger.lastError;
         }
 
-        await databaseService.settings.setSetting('geofenceTriggers', JSON.stringify(triggers));
+        // Write back to the SAME per-source key read above. The global setter
+        // copied this source's geofence list into the global key on every fire,
+        // where it bled into other sources (the timer-trigger bug, again).
+        await databaseService.settings.setSourceSetting(this.sourceId, 'geofenceTriggers', JSON.stringify(triggers));
         logger.debug(`📍 Updated geofence trigger ${triggerId} result: ${result}`);
       }
     } catch (e) {
@@ -4499,8 +5218,12 @@ class MeshtasticManager implements ISourceManager {
   /**
    * Execute a timer trigger script and send output to specified channel
    */
-  private async executeTimerScript(triggerId: string, triggerName: string, scriptPath: string, channel: number | 'none', scriptArgs?: string): Promise<void> {
+  private async executeTimerScript(triggerId: string, triggerName: string, scriptPath: string, channels: Array<number | 'none'>, scriptArgs?: string, split = false): Promise<void> {
     const startTime = Date.now();
+    // Multi-channel (#6230): the script runs ONCE; its responses go to every
+    // selected channel. 'none' (or an empty selection) means the script owns
+    // its output and nothing is sent to the mesh.
+    const targetChannels = channels.filter((c): c is number => c !== 'none');
 
     // Validate script path
     if (!scriptPath.startsWith('/data/scripts/') || scriptPath.includes('..')) {
@@ -4577,20 +5300,25 @@ class MeshtasticManager implements ISourceManager {
       // Expand tokens in script args if provided
       let scriptArgsList: string[] = [];
       if (scriptArgs) {
-        const expandedArgs = await this.replaceAnnouncementTokens(scriptArgs);
-        scriptArgsList = this.parseScriptArgs(expandedArgs);
+        // SECURITY (#6090): tokenize the admin template FIRST, then expand
+        // tokens per argv element so a token value carrying spaces/quotes
+        // cannot inject extra arguments. See expandScriptArgsTokens.
+        scriptArgsList = await this.expandScriptArgsTokens(
+          scriptArgs,
+          (part) => this.replaceAnnouncementTokens(part),
+        );
         logger.debug(`⏱️ Timer script args expanded: ${scriptArgs} -> ${safeJson(scriptArgsList)}`);
       }
 
       // Execute script with 30-second timeout (longer than auto-responder for scheduled tasks)
       const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath, ...scriptArgsList], {
         timeout: 30000,
-        env: { ...scriptEnv, ...scriptDependencyEnv(ext, scriptEnv) },
+        env: buildScriptChildEnv(scriptEnv, ext),
         maxBuffer: 1024 * 1024, // 1MB max output
       });
 
       if (stderr) {
-        logger.warn(`⏱️ Timer script "${triggerName}" stderr: ${stderr}`);
+        logger.warn(`⏱️ Timer script "${triggerName}" stderr: ${scrubScriptSecrets(stderr)}`);
       }
 
       const duration = Date.now() - startTime;
@@ -4598,14 +5326,14 @@ class MeshtasticManager implements ISourceManager {
 
       // Parse JSON output and send messages to channel
       if (stdout && stdout.trim()) {
-        logger.debug(`⏱️ Timer script stdout: ${stdout.substring(0, 200)}${stdout.length > 200 ? '...' : ''}`);
+        logger.debug(`⏱️ Timer script stdout: ${scrubScriptSecrets(stdout).substring(0, 200)}${stdout.length > 200 ? '...' : ''}`);
 
         // Try to parse as JSON (same format as Auto-Responder scripts)
         let scriptOutput;
         try {
           scriptOutput = JSON.parse(stdout.trim());
         } catch (parseError) {
-          logger.debug(`⏱️ Timer script output is not JSON, ignoring: ${stdout.substring(0, 100)}`);
+          logger.debug(`⏱️ Timer script output is not JSON, ignoring: ${scrubScriptSecrets(stdout).substring(0, 100)}`);
           await this.updateTimerTriggerResult(triggerId, 'success');
           return;
         }
@@ -4624,36 +5352,45 @@ class MeshtasticManager implements ISourceManager {
         } else if (scriptOutput.response && typeof scriptOutput.response === 'string') {
           // Single response format: { "response": "msg" }
           scriptResponses = [scriptOutput.response];
-          logger.debug(`⏱️ Timer script response: ${scriptOutput.response.substring(0, 50)}...`);
+          logger.debug(`⏱️ Timer script response: ${scrubScriptSecrets(scriptOutput.response).substring(0, 50)}...`);
         } else {
           logger.debug(`⏱️ Timer script output has no 'response' or 'responses' field, ignoring`);
           await this.updateTimerTriggerResult(triggerId, 'success');
           return;
         }
 
-        // Skip sending if channel is 'none' (script handles its own output)
-        if (channel !== 'none') {
-          // Send each response to the specified channel
-          logger.debug(`⏱️ Enqueueing ${scriptResponses.length} timer response(s) to channel ${channel}`);
+        // Skip sending when no real channel is selected (script owns its output).
+        if (targetChannels.length > 0) {
+          // Enqueue every response to every selected channel. The message
+          // queue spaces all items by SEND_INTERVAL_MS, so even a multi-channel,
+          // multi-response script never bursts on air — the existing per-source
+          // TX gap is reused, no new cadence (#6230).
+          logger.debug(`⏱️ Enqueueing ${scriptResponses.length} timer response(s) to ${targetChannels.length} channel(s)`);
 
-          scriptResponses.forEach((resp, index) => {
-            const truncated = this.truncateMessageForMeshtastic(resp, 200);
-
-            this.enqueueAutomation(
-              truncated,
-              0, // destination: 0 for channel broadcast
-              undefined, // no reply-to packet ID for timer messages
-              () => {
-                logger.debug(`✅ Timer response ${index + 1}/${scriptResponses.length} delivered to channel ${channel}`);
-              },
-              (reason: string) => {
-                logger.warn(`❌ Timer response ${index + 1}/${scriptResponses.length} failed to channel ${channel}: ${reason}`);
-              },
-              channel // channel number
-            );
-          });
+          if (split && scriptResponses.length === 1) {
+            // Split (#6330): only a script that prints exactly one message
+            // can split. Part i goes to every channel, then part i+1.
+            await this.sendAutomatedText(scriptResponses[0], {
+              channels: targetChannels,
+              split: true,
+              label: `Timer "${triggerName}" response`,
+              backlogKey: `timer:${triggerId}`,
+            });
+          } else {
+            // Each response cut to the 200-byte cap, channel by channel.
+            for (const channel of targetChannels) {
+              for (let index = 0; index < scriptResponses.length; index++) {
+                await this.sendAutomatedText(scriptResponses[index], {
+                  channels: [channel],
+                  split: false,
+                  label: `Timer response ${index + 1}/${scriptResponses.length}`,
+                  backlogKey: `timer:${triggerId}`,
+                });
+              }
+            }
+          }
         } else {
-          logger.debug(`⏱️ Timer "${triggerName}" script executed (channel=none, no mesh output)`);
+          logger.debug(`⏱️ Timer "${triggerName}" script executed (no mesh output)`);
         }
       }
 
@@ -4661,10 +5398,10 @@ class MeshtasticManager implements ISourceManager {
 
     } catch (error: any) {
       const duration = Date.now() - startTime;
-      const errorMessage = error.message || 'Unknown error';
+      const errorMessage = scrubScriptSecrets(error.message || 'Unknown error');
       logger.error(`⏱️ Timer "${triggerName}" failed after ${duration}ms: ${errorMessage}`);
-      if (error.stderr) logger.error(`⏱️ Timer script stderr: ${error.stderr}`);
-      if (error.stdout) logger.warn(`⏱️ Timer script stdout before failure: ${error.stdout.substring(0, 200)}`);
+      if (error.stderr) logger.error(`⏱️ Timer script stderr: ${scrubScriptSecrets(String(error.stderr))}`);
+      if (error.stdout) logger.warn(`⏱️ Timer script stdout before failure: ${scrubScriptSecrets(String(error.stdout)).substring(0, 200)}`);
       await this.updateTimerTriggerResult(triggerId, 'error', errorMessage);
     }
   }
@@ -4673,28 +5410,27 @@ class MeshtasticManager implements ISourceManager {
    * Execute a timer trigger text message and send to specified channel
    * Uses the same token expansion as auto-announce
    */
-  private async executeTimerTextMessage(triggerId: string, triggerName: string, message: string, channel: number): Promise<void> {
+  private async executeTimerTextMessage(triggerId: string, triggerName: string, message: string, channels: Array<number | 'none'>, split = false): Promise<void> {
     try {
       logger.debug(`⏱️ Executing timer text message: "${triggerName}"`);
 
-      // Replace tokens using the same method as auto-announce
+      // Replace tokens once; the same rendered body goes to every channel (#6230).
       const expandedMessage = await this.replaceAnnouncementTokens(message);
-      const truncated = this.truncateMessageForMeshtastic(expandedMessage, 200);
 
-      logger.debug(`⏱️ Timer "${triggerName}" sending to channel ${channel}: ${truncated.substring(0, 50)}${truncated.length > 50 ? '...' : ''}`);
+      // 'none' is a script-only choice; a text timer has none, but filter defensively.
+      const targetChannels = channels.filter((c): c is number => c !== 'none');
 
-      this.enqueueAutomation(
-        truncated,
-        0, // destination: 0 for channel broadcast
-        undefined, // no reply-to packet ID for timer messages
-        () => {
-          logger.debug(`✅ Timer "${triggerName}" message delivered to channel ${channel}`);
-        },
-        (reason: string) => {
-          logger.warn(`❌ Timer "${triggerName}" message failed to channel ${channel}: ${reason}`);
-        },
-        channel // channel number
-      );
+      // One queue item per channel (per part when split, #6330). The message
+      // queue sends one item every SEND_INTERVAL_MS, so multi-channel timers
+      // are spaced on air by the existing per-source TX gap and never burst
+      // (#6230). Split off: cut to the 200-byte cap.
+      logger.debug(`⏱️ Timer "${triggerName}" queuing to ${targetChannels.length} channel(s)${split ? ' (split)' : ''}`);
+      await this.sendAutomatedText(expandedMessage, {
+        channels: targetChannels,
+        split,
+        label: `Timer "${triggerName}" message`,
+        backlogKey: `timer:${triggerId}`,
+      });
 
       await this.updateTimerTriggerResult(triggerId, 'success');
 
@@ -4797,7 +5533,17 @@ class MeshtasticManager implements ISourceManager {
       //   this as "config done with zero channels" and clears its channel list.
       // If parsing failed, still broadcast the raw data (clients may understand it even if
       // the server can't parse it).
-      const shouldBroadcast = !context?.skipVirtualNodeBroadcast &&
+      // #6161: also drop the config burst answering our own want_config_id (my_info,
+      // metadata, config, moduleConfig, node_info). Without the channels and the
+      // config_complete (filtered above) apps restart a config that never finishes
+      // and lose their channel names. Apps already got the full config from sendInitialConfig().
+      if (parsed?.type === 'configComplete') {
+        this.vnConfigRelaySuppressedUntil = 0;
+      }
+      const suppressConfigBurst = !!parsed &&
+        Date.now() < this.vnConfigRelaySuppressedUntil &&
+        MeshtasticManager.VN_CONFIG_BURST_TYPES.has(parsed.type);
+      const shouldBroadcast = !context?.skipVirtualNodeBroadcast && !suppressConfigBurst &&
         (!parsed || (parsed.type !== 'channel' && parsed.type !== 'configComplete'));
       if (shouldBroadcast) {
         const virtualNodeServer = this.virtualNodeServer;
@@ -4903,6 +5649,10 @@ class MeshtasticManager implements ISourceManager {
             if (parsed.data.lora.configOkToMqtt === undefined) {
               parsed.data.lora.configOkToMqtt = false;
               logger.debug('📊 Set configOkToMqtt to false (was undefined - Proto3 default)');
+            }
+            if (parsed.data.lora.txEnabled === undefined) {
+              parsed.data.lora.txEnabled = false;
+              logger.debug('📊 Set txEnabled to false (was undefined - Proto3 default, receive-only radio)');
             }
 
             // Ensure numeric fields have explicit values (Proto3 omits 0)
@@ -5178,7 +5928,20 @@ class MeshtasticManager implements ISourceManager {
           // Out-of-scope guard (task42b_spec.md §9): this dispatch case fires
           // the CONFIG_COMPLETE event into the SM, but its body (lastHeard
           // refresh above, #2425 migration, callback) is unchanged.
-          if (this.isCapturingInitConfig && !this.configCaptureComplete) {
+          //
+          // #5974: a config-only completion (our passive-reconnect request) is
+          // never a sync. It normally lands with capture already marked
+          // complete, so the block below is skipped anyway; the explicit check
+          // also keeps a late one from ending a full sync that began after it
+          // (a manual resync) before that sync's NodeDB arrived.
+          if (Number(parsed.data.configCompleteId) === WANT_CONFIG_NONCE_ONLY_CONFIG) {
+            logger.debug('✅ Config-only refresh complete — node list kept from the last full sync');
+          } else if (this.isCapturingInitConfig && !this.configCaptureComplete) {
+            // Only the answer to OUR full request counts as a completed sync,
+            // the marker the passive skip needs (#5974).
+            if (Number(parsed.data.configCompleteId) === WANT_CONFIG_NONCE_FULL) {
+              this.lastCompletedSyncAt = Date.now();
+            }
             const { next, actions } = dispatch(this.#state, 'CONFIG_COMPLETE', this.buildSmContext());
             this.#state = next;
             logger.debug(`📸 Init config capture complete! Captured ${this.initConfigCache.length} messages for virtual node replay`);
@@ -5569,7 +6332,7 @@ class MeshtasticManager implements ISourceManager {
     // Note: Local node's public key is extracted from security config when received
   }
 
-  getLocalNodeInfo(): { nodeNum: number; nodeId: string; longName: string; shortName: string; hwModel?: number; firmwareVersion?: string; rebootCount?: number; isLocked?: boolean; hasWifi?: boolean; hasEthernet?: boolean; hasBluetooth?: boolean; hasXeddsa?: boolean; canShutdown?: boolean } | null {
+  getLocalNodeInfo(): { nodeNum: number; nodeId: string; longName: string; shortName: string; hwModel?: number; firmwareVersion?: string; rebootCount?: number; isLocked?: boolean; hasWifi?: boolean; hasEthernet?: boolean; hasBluetooth?: boolean; hasXeddsa?: boolean; canShutdown?: boolean; bleAddress?: string; bootloaderVersion?: number } | null {
     return this.localNodeInfo;
   }
 
@@ -5776,15 +6539,24 @@ class MeshtasticManager implements ISourceManager {
   /**
    * Update cached device config section after a successful admin command
    * This keeps the cache in sync until the device sends updated config on reconnect
+   *
+   * `mode: 'replace'` drops the previous section, as `AdminModule::handleSetConfig`
+   * does: it assigns `config.<section> = <incoming>` whole, so a field the save
+   * left out is cleared on the node. Several device sections apply without a
+   * reboot (LoRa always; device/power/display when no reboot-only field
+   * changed), so nothing re-downloads the config to correct a merged cache.
+   * `merge` is for callers that cache only part of what they sent (security).
    */
-  updateCachedDeviceConfig(section: string, values: Record<string, any>): void {
+  updateCachedDeviceConfig(section: string, values: Record<string, any>, mode: 'merge' | 'replace' = 'merge'): void {
     if (!this.actualDeviceConfig) {
       this.actualDeviceConfig = {};
     }
-    this.actualDeviceConfig[section] = {
-      ...this.actualDeviceConfig[section],
-      ...values
-    };
+    this.actualDeviceConfig[section] = mode === 'replace'
+      ? { ...values }
+      : {
+        ...this.actualDeviceConfig[section],
+        ...values
+      };
     logger.debug(`📊 Updated cached device config section '${section}':`, Object.keys(values));
   }
 
@@ -5923,6 +6695,7 @@ class MeshtasticManager implements ISourceManager {
         sx126xRxBoostedGain: deviceConfig.lora.sx126xRxBoostedGain !== undefined ? deviceConfig.lora.sx126xRxBoostedGain : false,
         ignoreMqtt: deviceConfig.lora.ignoreMqtt !== undefined ? deviceConfig.lora.ignoreMqtt : false,
         configOkToMqtt: deviceConfig.lora.configOkToMqtt !== undefined ? deviceConfig.lora.configOkToMqtt : false,
+        txEnabled: deviceConfig.lora.txEnabled !== undefined ? deviceConfig.lora.txEnabled : false,
         frequencyOffset: deviceConfig.lora.frequencyOffset !== undefined ? deviceConfig.lora.frequencyOffset : 0,
         overrideFrequency: deviceConfig.lora.overrideFrequency !== undefined ? deviceConfig.lora.overrideFrequency : 0,
         modemPreset: deviceConfig.lora.modemPreset !== undefined ? deviceConfig.lora.modemPreset : 0,
@@ -5988,16 +6761,10 @@ class MeshtasticManager implements ISourceManager {
 
     // Apply Proto3 defaults to MQTT module config
     if (moduleConfig.mqtt) {
-      const mqttConfigWithDefaults = {
-        ...moduleConfig.mqtt,
-        // IMPORTANT: Proto3 omits boolean false values from JSON serialization
-        enabled: moduleConfig.mqtt.enabled !== undefined ? moduleConfig.mqtt.enabled : false,
-        encryptionEnabled: moduleConfig.mqtt.encryptionEnabled !== undefined ? moduleConfig.mqtt.encryptionEnabled : false,
-        jsonEnabled: moduleConfig.mqtt.jsonEnabled !== undefined ? moduleConfig.mqtt.jsonEnabled : false,
-        tlsEnabled: moduleConfig.mqtt.tlsEnabled !== undefined ? moduleConfig.mqtt.tlsEnabled : false,
-        proxyToClientEnabled: moduleConfig.mqtt.proxyToClientEnabled !== undefined ? moduleConfig.mqtt.proxyToClientEnabled : false,
-        mapReportingEnabled: moduleConfig.mqtt.mapReportingEnabled !== undefined ? moduleConfig.mqtt.mapReportingEnabled : false
-      };
+      // Every MQTTConfig field, stated. The spread this replaced left
+      // mapReportSettings a protobufjs Message, whose toJSON drops 0 and false,
+      // so the form never saw a stored precision of 0 or the location consent.
+      const mqttConfigWithDefaults = formatAdminMqttConfig(moduleConfig.mqtt);
 
       moduleConfig = {
         ...moduleConfig,
@@ -6167,6 +6934,8 @@ class MeshtasticManager implements ISourceManager {
         trafficManagement: this.supportsTrafficManagement(),
         meshBeacon: this.supportsMeshBeacon(),
         takConfig: this.supportsTakConfig(),
+        // AES-CCM channels (ChannelSettings.use_aead), firmware 2.8.1+ (#5248).
+        aeadChannels: this.supportsAeadChannels(),
         // Range Test has two reasons to be unavailable, and they get separate
         // keys because the UI explains them differently: `rangetest` (from the
         // bitmask spread above) means this build left the module out, while
@@ -6222,6 +6991,22 @@ class MeshtasticManager implements ISourceManager {
     if (excludedModules !== undefined) {
       logger.debug(`📱 Device reports excluded modules: 0x${excludedModules.toString(16)}`);
     }
+    // #6157: DeviceMetadata.ble_address (protobufjs camelCases it to bleAddress).
+    // Empty string means the firmware predates the field or advertises no BLE
+    // address — treat it as absent so the UI shows nothing.
+    const bleAddress = typeof metadata.bleAddress === 'string' && metadata.bleAddress
+      ? metadata.bleAddress
+      : undefined;
+    localNodeInfo.bleAddress = bleAddress;
+    if (bleAddress) {
+      logger.debug(`📱 Device reports BLE address: ${bleAddress}`);
+    }
+    // #6321: DeviceMetadata.bootloader_version (protobufjs camelCases it).
+    // 0 means not reported — treat it as absent.
+    const bootloaderVersion = typeof metadata.bootloaderVersion === 'number' && metadata.bootloaderVersion > 0
+      ? metadata.bootloaderVersion
+      : undefined;
+    localNodeInfo.bootloaderVersion = bootloaderVersion;
     if (this.isLocalNodeBridged()) {
       logger.debug('🌉 Connected node reports no native WiFi/Ethernet — treating as a bridged node (OTA firmware update disabled)');
     }
@@ -6264,6 +7049,8 @@ class MeshtasticManager implements ISourceManager {
       useAead: channel.settings?.useAead,
       hasModuleSettings: !!channel.settings?.moduleSettings
     });
+
+    this.recordRadioChannel(channel);
 
     if (channel.settings) {
       // Only save channels that are actually configured and useful
@@ -6363,6 +7150,41 @@ class MeshtasticManager implements ISourceManager {
   /**
    * Process MeshPacket protobuf message
    */
+  /**
+   * Emit a `packet:flight` for a packet this source's radio received (#4835).
+   * Skips our own and internal packets, Store & Forward and Virtual Node
+   * replays, and firmware NodeDB replays: only live receptions fly. Sends
+   * nothing on the mesh, writes nothing, and never throws.
+   */
+  private maybeEmitPacketFlight(meshPacket: PacketFlightSourcePacket, context?: ProcessingContext): void {
+    emitPacketFlight(this.sourceId, () => {
+      if (context?.viaStoreForward === true || context?.virtualNodeRequestId != null) return null;
+      const localNodeNum = this.localNodeInfo?.nodeNum ?? null;
+      const fromNum = meshPacket.from ? Number(meshPacket.from) >>> 0 : 0;
+      if (!fromNum || localNodeNum == null || fromNum === localNodeNum) return null;
+      const toNum = meshPacket.to ? Number(meshPacket.to) : null;
+      const portnum = meshPacket.decoded?.portnum ?? 0;
+      if (shouldExcludeFromPacketLog(fromNum, toNum, portnum, localNodeNum)) return null;
+      if (isPhantomInternalPacket(fromNum, localNodeNum, meshPacket.transportMechanism, meshPacket.hopStart)) return null;
+      const transport = resolveRadioPacketTransport(meshPacket);
+      const rxTimeSec = meshPacket.rxTime != null ? Number(meshPacket.rxTime) : null;
+      const packetId = meshPacket.id ? Number(meshPacket.id) : 0;
+      if (isNodeDbReplayForPacketLog(transport, rxTimeSec, meshPacket.rxRssi, Date.now(), { fromNum, packetId })) return null;
+      return buildMeshtasticFlight({
+        sourceId: this.sourceId,
+        fromNum,
+        localNodeNum,
+        relayNode: meshPacket.relayNode,
+        hopStart: meshPacket.hopStart,
+        hopLimit: meshPacket.hopLimit,
+        kind: meshPacket.decoded ? meshtasticProtobufService.getPortNumName(portnum) : 'ENCRYPTED',
+        snr: meshPacket.rxSnr,
+        rssi: meshPacket.rxRssi,
+        viaMqtt: isViaMqtt(transport),
+      });
+    });
+  }
+
   private async processMeshPacket(meshPacket: any, context?: ProcessingContext): Promise<void> {
     logger.debug(`🔄 Processing MeshPacket: ID=${meshPacket.id}, from=${meshPacket.from}, to=${meshPacket.to}`);
 
@@ -6380,7 +7202,8 @@ class MeshtasticManager implements ISourceManager {
           meshPacket.encrypted,
           packetId,
           fromNum,
-          meshPacket.channel
+          meshPacket.channel,
+          meshPacket.to != null ? Number(meshPacket.to) >>> 0 : undefined
         );
 
         if (decryptionResult.success) {
@@ -6650,7 +7473,8 @@ class MeshtasticManager implements ISourceManager {
           resolveRadioPacketTransport(meshPacket),
           dedupRxTime,
           meshPacket.rxRssi,
-          packetLogNow
+          packetLogNow,
+          { fromNum, packetId: dedupPacketId }
         )) {
           // Firmware 2.8 NodeDB replay (#5426): cached history, not a reception.
           logger.debug(`📦 Skipping NodeDB-replay packet-log entry for id ${dedupPacketId} from ${fromNum}`);
@@ -6692,6 +7516,8 @@ class MeshtasticManager implements ISourceManager {
           // Firmware 2.8 XEdDSA signature-verified flag (#3923); undefined
           // (pre-2.8 firmware) stays NULL = unknown.
           xeddsa_signed: meshPacket.xeddsaSigned ?? undefined,
+          // Data.bitfield bit 2 (#6449); absent bitfield stays NULL.
+          is_automation: readIsAutomationBit(meshPacket.decoded?.bitfield),
           // 'tx' ONLY for genuine local transmissions (internal, fresh, no RX
           // metadata). A spoofed packet claiming our node number is a reception.
           direction: spoof.isGenuineLocalTx ? 'tx' : 'rx',
@@ -6717,10 +7543,25 @@ class MeshtasticManager implements ISourceManager {
     // Non-blocking: never delay packet processing on a diagnostics write.
     void this.maybeRecordHeardReflood(meshPacket, this.assessLocalSpoof(meshPacket));
 
+    // Live packet traffic on the map (#4835). Outside the packet_log gate:
+    // it works with logging off and stores nothing. A no-op unless a map is
+    // watching this source.
+    this.maybeEmitPacketFlight(meshPacket, context);
+
     // Cross-source "heard here" links (#5561): this radio hearing one of our
     // OTHER sources' radios. Outside the packet_log gate for the same reason
     // as above. Non-blocking, never throws, sends nothing, emits nothing.
     void maybeRecordMeshtasticLink({
+      sourceId: this.sourceId,
+      localNodeNum: this.localNodeInfo?.nodeNum ?? null,
+      packet: meshPacket,
+      replayed: context?.viaStoreForward === true || context?.virtualNodeRequestId != null,
+    });
+
+    // Direct RF Contacts (#6210): this radio hearing a node at zero hops over
+    // RF (not via MQTT, not a NodeDB replay). Every portnum counts. Outside
+    // the packet_log gate; coalesced in memory, never throws, sends nothing.
+    maybeRecordMeshtasticDirectRf({
       sourceId: this.sourceId,
       localNodeNum: this.localNodeInfo?.nodeNum ?? null,
       packet: meshPacket,
@@ -6752,17 +7593,21 @@ class MeshtasticManager implements ISourceManager {
         fromNum,
         localNodeNum: this.localNodeInfo?.nodeNum,
         rxTimeSec: meshPacket.rxTime != null ? Number(meshPacket.rxTime) : undefined,
+        packetId: meshPacket.id,
         nowMs: Date.now(),
       })) {
         discoveredNodeNum = fromNum;
       }
 
-      // Only update the node's channel from firmware-decoded packets (decryptedBy === 'node').
-      // Server-decrypted packets still have the raw channel hash in meshPacket.channel, not
-      // a valid channel index (0-7), so storing it would corrupt the node's channel field.
-      const channelFromPacket = (decryptedBy === 'node' && meshPacket.channel !== undefined)
-        ? meshPacket.channel
-        : undefined;
+      // Only update the node's channel when our radio decrypted this sender's own
+      // traffic with that channel's key (#5923). Server-decrypted packets carry the
+      // raw channel hash; PKI packets, firmware 2.8 NodeDB replays, spoofed zero-hop
+      // replies and Virtual Node MQTT-proxy envelopes all carry a channel the sender
+      // never used. See utils/nodeChannelEvidence.ts.
+      const channelFromPacket = channelIndexFromPacket(meshPacket, {
+        decryptedBy,
+        fromMqttProxy: context?.fromMqttProxy === true,
+      });
 
       // Stamp the per-packet transport mechanism onto the node row
       // (most-recent wins). Feeds the map's Show RF / UDP / MQTT toggles
@@ -6805,6 +7650,19 @@ class MeshtasticManager implements ISourceManager {
         // "last heard" cannot disagree (incl. the replay-guard omission case,
         // where an undefined lastHeard leaves the stamp untouched too).
         [txColumn]: heardSec,
+        // #5156: the ok_to_mqtt bit of an MQTT-delivered packet (incl. LORA +
+        // via_mqtt downlinks), or the direct-RF stamp. Feeds the opt-in
+        // anonymous-viewer filter; see utils/mqttConsentCapture.ts.
+        ...mqttConsentStamp({
+          transportMechanism: txMech,
+          viaMqtt: meshPacket.viaMqtt,
+          arrivedViaMqtt: context?.fromMqttProxy === true,
+          bitfield: meshPacket.decoded?.bitfield,
+          heardSec,
+          replayed: context?.viaStoreForward === true
+            || context?.virtualNodeRequestId != null
+            || isFirmwareReplayPacket(fromNum, meshPacket.id, meshPacket.rxTime != null ? Number(meshPacket.rxTime) : null),
+        }),
       };
 
       // #5101 P3: per-transport RX counter. Starts from the same gate as the
@@ -6821,7 +7679,10 @@ class MeshtasticManager implements ISourceManager {
       if (
         heardSec !== undefined &&
         fromNum !== this.localNodeInfo?.nodeNum &&
-        isLiveReception(meshPacket.rxTime != null ? Number(meshPacket.rxTime) : undefined, Date.now())
+        isLiveReception(meshPacket.rxTime != null ? Number(meshPacket.rxTime) : undefined, Date.now()) &&
+        // #5426: a 2.8 replay's rx_time is the node's last_heard, so it can
+        // look live; its packet id still gives it away.
+        !isFirmwareReplayPacket(fromNum, meshPacket.id, meshPacket.rxTime != null ? Number(meshPacket.rxTime) : null)
       ) {
         transportTrafficService.recordRx(
           this.sourceId,
@@ -6849,7 +7710,13 @@ class MeshtasticManager implements ISourceManager {
       await databaseService.upsertNodeAsync(nodeData, this.sourceId);
 
       // Capture server-vs-node clock offset for time-offset telemetry
-      if (meshPacket.rxTime && Number(meshPacket.rxTime) > 1600000000) {
+      // Skip firmware 2.8 NodeDB replays: their rx_time is the sender's last_heard,
+      // not a reception time, so they would be sampled as clock skew (#6242).
+      if (
+        meshPacket.rxTime &&
+        Number(meshPacket.rxTime) > 1600000000 &&
+        !isFirmwareReplayPacket(fromNum, meshPacket.id, Number(meshPacket.rxTime))
+      ) {
         const offset = Date.now() / 1000 - Number(meshPacket.rxTime);
         if (Math.abs(offset) < 86400) {
           this.timeOffsetSamples.push(offset);
@@ -6896,6 +7763,14 @@ class MeshtasticManager implements ISourceManager {
       const payload = meshPacket.decoded.payload;
 
       logger.debug(`📨 Processing payload: portnum=${normalizedPortNum} (${meshtasticProtobufService.getPortNumName(portnum)}), payload size=${payload?.length || 0}`);
+
+      // Reliable PKI (#5691): a reply carrying our packet id as request_id,
+      // from the node we asked, settles that PKI exchange as successful.
+      // Routing acks/naks are judged in processRoutingErrorMessage.
+      const replyRequestId = meshPacket.decoded.requestId ? Number(meshPacket.decoded.requestId) : 0;
+      if (replyRequestId && normalizedPortNum !== PortNum.ROUTING_APP) {
+        void this.reliablePki.observeReply(Number(meshPacket.from), replyRequestId);
+      }
 
       if (payload && payload.length > 0 && normalizedPortNum !== undefined) {
         // Use the unified protobuf service to process the payload
@@ -7106,8 +7981,17 @@ class MeshtasticManager implements ISourceManager {
     const throttleKey = `${this.sourceId}::${message}`;
     if (!this.clientNotificationThrottle.shouldEmit(throttleKey, Date.now())) return;
 
+    // Firmware after 2.8.1 explains a refused unsigned name/role change (#5944).
+    // Pass it on structured so the UI can explain it in the viewer's language.
+    const unsigned = parseUnsignedUpdateIgnored(message);
     dataEventEmitter.emitClientNotification(
-      { level: data.level, message, replyId: data.replyId, time: data.time },
+      {
+        level: data.level,
+        message,
+        replyId: data.replyId,
+        time: data.time,
+        ...(unsigned ? { kind: 'unsigned_update_ignored' as const, ...unsigned } : {}),
+      },
       this.sourceId,
     );
   }
@@ -7250,22 +8134,14 @@ class MeshtasticManager implements ISourceManager {
           // This prevents database channels from "shadowing" device channels with the same key (#2375, #2413)
           const dbChannel = await databaseService.channelDatabase.getByIdAsync(context.decryptedChannelId);
           const deviceChannels = await databaseService.channels.getAllChannels(this.sourceId);
-          // Match by BOTH psk AND name. Channels share PSK by default — Meshtastic
-          // ships with the sentinel `AQ==` (single byte 0x01) on every preset
-          // slot. Matching on PSK alone would route every default-PSK packet to
-          // whatever slot scans first (typically slot 0 = primary), no matter
-          // which named slot actually originated the packet. The on-wire channel
-          // hash is `xorHash(name) ^ xorHash(psk)`, so name participates in the
-          // identity — two slots with the same PSK but different names are
-          // genuinely different channels and must not be conflated.
-          const dbName = (dbChannel?.name ?? '').trim();
-          const matchingDeviceChannel = dbChannel?.psk
-            ? deviceChannels.find(dc =>
-                dc.psk === dbChannel.psk
-                && (dc.name ?? '').trim() === dbName
-                && dc.role !== 0,
-              )
-            : null;
+          // Match by BOTH psk AND name (see matchDeviceChannelForDbChannel for
+          // the full rationale — the on-wire hash includes the name, so two
+          // slots sharing the default PSK but differing in name are distinct
+          // channels). A blank-name primary slot compares against the source's
+          // modem-preset name so default-key LongFast traffic lands on Primary
+          // #0 rather than a virtual CHANNEL_DB_OFFSET channel (#6044).
+          const presetName = await this.resolveSourceModemPresetName();
+          const matchingDeviceChannel = this.matchDeviceChannelForDbChannel(dbChannel, deviceChannels, presetName);
 
           if (matchingDeviceChannel) {
             // Device channel has the same PSK — use device channel slot instead of database channel
@@ -7354,6 +8230,9 @@ class MeshtasticManager implements ISourceManager {
           // cryptographically verified this broadcast's signature. Read the same
           // way the Packet Monitor path does (see metadata.xeddsa_signed above).
           xeddsaSigned: meshPacket.xeddsaSigned === true ? true : undefined,
+          // is_automation (Data.bitfield bit 2, #6449): NULL when the bitfield
+          // is absent on the wire, so "unknown" never reads as "human".
+          isAutomation: readIsAutomationBit(meshPacket.decoded?.bitfield),
           // Inbound radio path — message arrived from a meshtastic node over TCP.
           // MQTT-bridged inbound packets are flagged via viaMqtt above; we still
           // attribute the row's ingress to 'tcp_radio' because it arrived via
@@ -7889,6 +8768,69 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
+   * Resolve this source's persisted modem preset to its firmware-derived
+   * channel name ("LongFast", "MediumSlow", …), or `null` when no usable preset
+   * is stored. Used to give a blank-name primary slot its effective on-air name
+   * when matching server-decrypted traffic to a device channel (#6044).
+   *
+   * Best-effort: a missing or non-numeric `lora.preset.<sourceId>` setting (an
+   * early-boot or MQTT-only source with no device config) resolves to `null`,
+   * which the caller treats as a blank name — i.e. no widening, unchanged
+   * behavior. Never throws.
+   */
+  private async resolveSourceModemPresetName(): Promise<string | null> {
+    try {
+      const raw = await databaseService.settings.getSetting(`lora.preset.${this.sourceId}`);
+      const presetNum = raw != null ? Number(raw) : NaN;
+      return Number.isFinite(presetNum) ? modemPresetChannelName(presetNum) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Find the device channel slot that owns a server-decrypted Channel Database
+   * entry's traffic, matching on BOTH psk AND name. Channels share a PSK by
+   * default — Meshtastic ships the sentinel `AQ==` (single byte 0x01) on every
+   * preset slot — so matching on PSK alone would route every default-PSK packet
+   * to whatever slot scans first (typically slot 0 = primary), no matter which
+   * named slot actually originated it. The on-wire channel hash is
+   * `xorHash(name) ^ xorHash(psk)`, so the name participates in the identity:
+   * two slots with the same PSK but different names are genuinely different
+   * channels and must not be conflated (#2375, #2413).
+   *
+   * Blank-primary exception (#6044): a freshly-connected device reports its
+   * primary slot (role 1, id 0) with an empty name until config syncs, while
+   * the auto-seeded channel-DB row carries the firmware-derived preset name
+   * ("LongFast"). PSK matches (`AQ==`) but `"" !== "LongFast"`, so default-key
+   * primary traffic from the MQTT-proxy path lands on a virtual
+   * `CHANNEL_DB_OFFSET` channel instead of Primary #0. We therefore treat a
+   * blank primary's effective name as `presetName` for the comparison. The
+   * widening is narrow and deliberate: only the blank primary slot is affected,
+   * and only when its preset name equals the DB row's name — a named slot, or a
+   * non-matching preset (e.g. MediumSlow), is never conflated with LongFast
+   * traffic. When `presetName` is `null` the effective name stays blank, so the
+   * seeded "LongFast" row does not match and behavior is unchanged.
+   */
+  private matchDeviceChannelForDbChannel<T extends { id: number; name?: string | null; psk?: string | null; role?: number }>(
+    dbChannel: { psk?: string | null; name?: string | null } | null | undefined,
+    deviceChannels: T[],
+    presetName: string | null,
+  ): T | null {
+    if (!dbChannel?.psk) return null;
+    const dbName = (dbChannel.name ?? '').trim();
+    return (
+      deviceChannels.find(dc => {
+        if (dc.psk !== dbChannel.psk || dc.role === 0) return false;
+        const name = (dc.name ?? '').trim();
+        // Only a blank-name PRIMARY slot (role 1, id 0) borrows the preset name.
+        const effectiveName = name === '' && dc.role === 1 && dc.id === 0 ? (presetName ?? '') : name;
+        return effectiveName === dbName;
+      }) ?? null
+    );
+  }
+
+  /**
    * Resolve the broadcast channel slot/index for a packet from its decryption
    * context, falling back to the raw `meshPacket.channel` only when there is no
    * server-decryption context.
@@ -7910,17 +8852,13 @@ class MeshtasticManager implements ISourceManager {
       // This prevents database channels from "shadowing" device channels with the same key (#2375, #2413)
       const dbChannel = await databaseService.channelDatabase.getByIdAsync(context.decryptedChannelId);
       const deviceChannels = await databaseService.channels.getAllChannels(this.sourceId);
-      // Match by BOTH psk AND name (see processTextMessageProtobuf for the
+      // Match by BOTH psk AND name (see matchDeviceChannelForDbChannel for the
       // detailed rationale — the on-wire hash includes the name, so two slots
       // sharing the default PSK but differing in name are distinct channels).
-      const dbName = (dbChannel?.name ?? '').trim();
-      const matchingDeviceChannel = dbChannel?.psk
-        ? deviceChannels.find(dc =>
-            dc.psk === dbChannel.psk
-            && (dc.name ?? '').trim() === dbName
-            && dc.role !== 0,
-          )
-        : null;
+      // Mirrors the TEXT_MESSAGE_APP path, including the blank-primary → preset
+      // name substitution (#6044).
+      const presetName = await this.resolveSourceModemPresetName();
+      const matchingDeviceChannel = this.matchDeviceChannelForDbChannel(dbChannel, deviceChannels, presetName);
 
       if (matchingDeviceChannel) {
         logger.debug(`📡 Server-decrypted packet matches device channel ${matchingDeviceChannel.id} ("${matchingDeviceChannel.name}") — using device channel instead of database channel`);
@@ -8499,6 +9437,18 @@ class MeshtasticManager implements ISourceManager {
       if (replyRequestId) {
         this.resolvePendingTelemetryRequest(replyRequestId);
       }
+      // trigger.telemetry feed. Only live readings: a firmware 2.8 NodeDB
+      // replay (#5034/#5426, hourly and on every reconnect) re-sends old
+      // telemetry and must not fire automations on stale values. Loop guard: a
+      // reading that answers a telemetry request we sent (on any source) is
+      // flagged so telemetry triggers skip it.
+      const rxTimeSec = meshPacket.rxTime != null ? Number(meshPacket.rxTime) : undefined;
+      const liveReading =
+        isLiveReception(rxTimeSec, now) &&
+        !isFirmwareReplayPacket(fromNum, meshPacket.id, rxTimeSec ?? null);
+      const eventMeta: TelemetryEventMeta | undefined = liveReading
+        ? { answersOwnRequest: isAnswerToOwnTelemetryRequest(replyRequestId) }
+        : undefined;
 
       // Track PKI encryption
       await this.trackPKIEncryption(meshPacket, fromNum);
@@ -8550,7 +9500,7 @@ class MeshtasticManager implements ISourceManager {
         // both serial and MQTT ingest write identical telemetryType/unit values.
         await this.saveTelemetryMetrics(
           this.buildCanonicalMetrics('device', deviceMetrics),
-          nodeId, fromNum, timestamp, packetTimestamp, packetId
+          nodeId, fromNum, timestamp, packetTimestamp, packetId, eventMeta
         );
       } else if (telemetry.environmentMetrics) {
         const envMetrics = telemetry.environmentMetrics;
@@ -8564,7 +9514,7 @@ class MeshtasticManager implements ISourceManager {
         // are handled centrally rather than with per-field fallbacks here.
         await this.saveTelemetryMetrics(
           this.buildCanonicalMetrics('environment', envMetrics),
-          nodeId, fromNum, timestamp, packetTimestamp, packetId
+          nodeId, fromNum, timestamp, packetTimestamp, packetId, eventMeta
         );
       } else if (telemetry.powerMetrics) {
         const powerMetrics = telemetry.powerMetrics;
@@ -8584,7 +9534,7 @@ class MeshtasticManager implements ISourceManager {
         // (ch1Voltage … ch8Current, units V / mA from CANONICAL_TELEMETRY_UNITS).
         await this.saveTelemetryMetrics(
           this.buildCanonicalMetrics('power', powerMetrics),
-          nodeId, fromNum, timestamp, packetTimestamp, packetId
+          nodeId, fromNum, timestamp, packetTimestamp, packetId, eventMeta
         );
       } else if (telemetry.airQualityMetrics) {
         const aqMetrics = telemetry.airQualityMetrics;
@@ -8599,7 +9549,7 @@ class MeshtasticManager implements ISourceManager {
         // automatically once their unit is added to CANONICAL_TELEMETRY_UNITS).
         await this.saveTelemetryMetrics(
           this.buildCanonicalMetrics('airQuality', aqMetrics),
-          nodeId, fromNum, timestamp, packetTimestamp, packetId
+          nodeId, fromNum, timestamp, packetTimestamp, packetId, eventMeta
         );
       } else if (telemetry.localStats) {
         const localStats = telemetry.localStats;
@@ -8612,7 +9562,7 @@ class MeshtasticManager implements ISourceManager {
         // in Meshtastic firmware 2.7.25 (#3396).
         await this.saveTelemetryMetrics(
           this.buildCanonicalMetrics('localStats', localStats),
-          nodeId, fromNum, timestamp, packetTimestamp, packetId
+          nodeId, fromNum, timestamp, packetTimestamp, packetId, eventMeta && { ...eventMeta, localStats: true }
         );
         await this.checkAutoHeapManagement(localStats.heapFreeBytes, fromNum);
       } else if (telemetry.hostMetrics) {
@@ -8624,7 +9574,7 @@ class MeshtasticManager implements ISourceManager {
         // — identical to the prior hand-maintained list (#3515).
         await this.saveTelemetryMetrics(
           this.buildCanonicalMetrics('host', hostMetrics),
-          nodeId, fromNum, timestamp, packetTimestamp, packetId
+          nodeId, fromNum, timestamp, packetTimestamp, packetId, eventMeta
         );
       } else if (telemetry.trafficManagementStats) {
         const tmStats = telemetry.trafficManagementStats;
@@ -8635,7 +9585,7 @@ class MeshtasticManager implements ISourceManager {
         // hand-maintained list (#3515).
         await this.saveTelemetryMetrics(
           this.buildCanonicalMetrics('trafficManagement', tmStats),
-          nodeId, fromNum, timestamp, packetTimestamp, packetId
+          nodeId, fromNum, timestamp, packetTimestamp, packetId, eventMeta
         );
       }
 
@@ -9379,6 +10329,16 @@ class MeshtasticManager implements ISourceManager {
 
       const errorName = getRoutingErrorName(errorReason);
 
+      // Reliable PKI (#5691): an ack or nak for one of our PKI exchanges.
+      if (requestId) {
+        void this.reliablePki.observeRouting(
+          fromNum,
+          Number(requestId),
+          typeof errorReason === 'number' ? errorReason : undefined,
+          this.localNodeInfo?.nodeNum,
+        );
+      }
+
       // Resolve any pending admin-command ACK waiter (issue #2608 follow-up).
       // Admin packets set want_response, so the destination node returns a
       // Routing ACK with request_id === our sent packet id. Consume it here so
@@ -9442,6 +10402,14 @@ class MeshtasticManager implements ISourceManager {
               } catch (eventError) {
                 logger.debug('Failed to record delivered message event:', eventError);
               }
+            }
+            // A channel broadcast never gets a target-node ACK (its toNodeId
+            // is the broadcast address), so the local transmit ACK is final.
+            // Release the queue entry now; otherwise it waits in pendingAcks
+            // until the orphan sweep reports a false "ACK timeout" (#6373).
+            // A DM still waits for the target's ACK so retries keep working.
+            if (!isDM) {
+              this.messageQueue.handleAck(requestId);
             }
             return;
           }
@@ -9698,16 +10666,7 @@ class MeshtasticManager implements ISourceManager {
    * Returns the packet id assigned by the protobuf service, or 0 if not
    * connected / encoding failed.
    */
-  async broadcastWaypoint(waypoint: {
-    id: number;
-    latitude: number;
-    longitude: number;
-    expire: number;
-    lockedTo?: number;
-    name?: string;
-    description?: string;
-    icon?: number;
-  }, options: { destination?: number; channel?: number; origin?: SendOrigin; hopLimit?: number | null } = {}): Promise<number> {
+  async broadcastWaypoint(waypoint: WireWaypoint, options: { destination?: number; channel?: number; origin?: SendOrigin; hopLimit?: number | null } = {}): Promise<number> {
     if (!this.isConnected || !this.transport) {
       logger.warn(`[meshtasticManager] broadcastWaypoint skipped: not connected (source ${this.sourceId})`);
       return 0;
@@ -9717,15 +10676,25 @@ class MeshtasticManager implements ISourceManager {
       // hop limit (it used to be a hardcoded 3). A stored/requested value is
       // capped at that limit, so it can only shorten reach, never extend it.
       const hopLimit = this.resolveWaypointHopLimit(options.hopLimit);
+      // Reliable PKI (#5691): a waypoint sent to one node goes PKI when the
+      // radio holds its key.
+      const unicastDest = options.destination !== undefined && options.destination !== 0xffffffff
+        ? options.destination : undefined;
+      const pkiTarget = unicastDest !== undefined && await this.isPkiSendTarget(unicastDest);
+      if (pkiTarget && unicastDest !== undefined) await this.primeBeforePkiSend(unicastDest);
       const { data, packetId } = meshtasticProtobufService.createWaypointMessage(waypoint, {
         destination: options.destination,
         channel: options.channel,
         hopLimit,
+        isAutomation: options.origin === 'automation',
       });
       if (data.length === 0) return 0;
 
       this.recordAutomationPacket(packetId, options.origin);
       await this.transport.send(data);
+      if (pkiTarget && unicastDest !== undefined) {
+        void this.reliablePki.track(packetId, unicastDest, { wantAck: hopLimit !== 0, wantResponse: false });
+      }
 
       const virtualNodeServer = this.virtualNodeServer;
       if (virtualNodeServer) {
@@ -9744,6 +10713,7 @@ class MeshtasticManager implements ISourceManager {
         channel,
         `Waypoint id=${waypoint.id} ${waypoint.name ?? ''}`.trim(),
         { destination, packetId, waypointId: waypoint.id, expire: waypoint.expire },
+        options.origin,
       );
 
       logger.debug(`📍 Waypoint broadcast id=${waypoint.id} (${waypoint.name ?? ''}) packetId=${packetId}`);
@@ -9899,6 +10869,12 @@ class MeshtasticManager implements ISourceManager {
 
       // Track that this node exists in the radio's local database
       this.deviceNodeNums.add(nodeNum);
+      this.deviceNodeFlags.set(nodeNum, {
+        isKeyManuallyVerified: nodeInfo.isKeyManuallyVerified === true,
+        isMuted: nodeInfo.isMuted === true,
+        hasXeddsaSigned: nodeInfo.hasXeddsaSigned === true,
+        heardOnCurrentLora: nodeInfo.heardOnCurrentLora === true,
+      });
 
       // Check if node already exists to determine if we should set isFavorite
       const existingNode = await databaseService.nodes.getNode(nodeNum);
@@ -10405,8 +11381,12 @@ class MeshtasticManager implements ISourceManager {
         );
 
         // Likely-aircraft classification (#5364/#5365): non-throwing,
-        // coalescing queue — see aircraftClassificationService.ts.
-        aircraftClassificationService.schedule(this.sourceId, nodeNumForTelemetry);
+        // coalescing queue — see aircraftClassificationService.ts. A position
+        // carried in a NodeInfo is whatever the radio's NodeDB last stored
+        // (possibly days old, and re-sent on every config sync / PhoneAPI
+        // replay), never a fresh live broadcast — so classify SILENTLY so it
+        // can't fire the became-aircraft event on a stale fix (#6045).
+        aircraftClassificationService.schedule(this.sourceId, nodeNumForTelemetry, 'replay');
       }
     } catch (error) {
       logger.error('❌ Error processing NodeInfo protobuf:', error);
@@ -10426,6 +11406,17 @@ class MeshtasticManager implements ISourceManager {
    */
   isTxEnabled(): boolean {
     return this.actualDeviceConfig?.lora?.txEnabled !== false;
+  }
+
+  /**
+   * #6181: LoRaConfig.transparent_mode as the local radio last reported it.
+   * True means the node runs as a "dumb LoRa modem": it hands every frame up
+   * still encrypted and does no decoding, relaying, ACKs or MQTT, so this
+   * source shows no decoded traffic and its sends fail. False when off, or
+   * when LoRa config has not arrived (proto3 elides false).
+   */
+  isTransparentMode(): boolean {
+    return this.actualDeviceConfig?.lora?.transparentMode === true;
   }
 
   /**
@@ -10541,6 +11532,167 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
+   * The radio's own 32-byte public key, as it reported it in its security
+   * config on this connection. Null when unknown. Deliberately NOT the
+   * `nodes.publicKey` copy in the database, which can be stale (#2275).
+   */
+  private getOwnPublicKeyBytes(): Uint8Array | null {
+    const key = this.actualDeviceConfig?.security?.publicKey;
+    if (!key || key.length !== 32) return null;
+    return key instanceof Uint8Array ? key : new Uint8Array(key);
+  }
+
+  /**
+   * Reliable PKI (#5691): would the radio PKI-encrypt a unicast to this node?
+   * The firmware PKI-encrypts any unicast it originates to a node whose key it
+   * holds, except TRACEROUTE / NODEINFO / ROUTING / POSITION packets
+   * (firmware Router.cpp `wouldEncryptWithPKC`). MeshRadar uses the same
+   * test as `sendTextMessage`: we hold the node's key and no key mismatch is
+   * flagged (a mismatch belongs to the key-repair flow, which sends its own
+   * NodeInfo exchanges).
+   */
+  private async isPkiSendTarget(destination: number | undefined): Promise<boolean> {
+    if (!destination || destination === 0xffffffff) return false;
+    try {
+      const node = await databaseService.nodes.getNode(destination, this.sourceId);
+      return !!node?.publicKey && !node.keyMismatchDetected;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Remember one channel slot as the radio reported it (Avoid PKI, #5711). */
+  private recordRadioChannel(channel: {
+    index?: number;
+    role?: number;
+    settings?: { name?: string; psk?: Uint8Array; useAead?: boolean } | null;
+  }): void {
+    const index = channel?.index;
+    if (typeof index !== 'number' || index < 0 || index > 7) return;
+    const settings = channel.settings;
+    if (!settings) {
+      this.radioChannels.delete(index);
+      return;
+    }
+    this.radioChannels.set(index, {
+      index,
+      // proto3 elides DISABLED (0)
+      role: typeof channel.role === 'number' ? channel.role : 0,
+      name: typeof settings.name === 'string' ? settings.name : '',
+      psk: settings.psk ? new Uint8Array(settings.psk) : new Uint8Array(),
+      useAead: !!settings.useAead,
+    });
+  }
+
+  /**
+   * Reliable PKI (#5711): is "Avoid PKI" in effect for this source? Data
+   * requests then go out channel-encrypted (see {@link channelEncryptRequest})
+   * and are never primed or tracked.
+   */
+  private async isAvoidPkiMode(): Promise<boolean> {
+    try {
+      return (await resolveReliablePkiMode(databaseService.settings, this.sourceId)) === 'avoid';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Avoid PKI (#5711): return `frame` with its `Data` encrypted with the node's
+   * channel key, the way the radio encrypts a channel packet.
+   *
+   * The radio cannot be asked for this: it PKI-encrypts every unicast it
+   * originates to a node whose key it holds, except TRACEROUTE / NODEINFO /
+   * ROUTING / POSITION, and ignores `pki_encrypted = false` (firmware
+   * `Router.cpp` `wouldEncryptWithPKC`). It does send a packet that arrives
+   * already encrypted as is (`Router::send` only encodes `decoded` packets),
+   * so MeshRadar encrypts it first.
+   *
+   * The channel is the node's channel, the same choice key repair makes for
+   * its NodeInfo exchange (`nodes.channel`): the caller's channel when set,
+   * else the stored channel for the node — which is also what the radio itself
+   * would pick for a unicast on channel 0 (`getEffectiveChannelIndex`).
+   *
+   * When the frame cannot be encrypted exactly as the radio would (channel not
+   * reported yet, AEAD channel, ...) the original frame is returned and the
+   * radio encrypts it as usual.
+   */
+  private async channelEncryptRequest(
+    frame: Uint8Array,
+    destination: number,
+    channel: number,
+    label: string,
+  ): Promise<{ frame: Uint8Array; channelEncrypted: boolean }> {
+    const target = `!${(destination >>> 0).toString(16).padStart(8, '0')}`;
+    const fallback = (reason: string) => {
+      logger.debug(`Avoid PKI: ${label} to ${target} sent the normal way (${reason})`);
+      return { frame, channelEncrypted: false };
+    };
+    try {
+      if (!this.localNodeInfo) return fallback('local node unknown');
+      let channelIndex = channel;
+      if (!channelIndex) {
+        const node = await databaseService.nodes.getNode(destination, this.sourceId);
+        const stored = node?.channel;
+        if (typeof stored === 'number' && stored >= 0 && stored <= 7) channelIndex = stored;
+      }
+      const lora = this.actualDeviceConfig?.lora;
+      const resolved = resolveChannelKey(channelIndex, this.radioChannels, lora);
+      if (!resolved.ok) return fallback(resolved.reason);
+      const root = getProtobufRoot();
+      if (!root) return fallback('protobufs not loaded');
+      const encrypted = channelEncryptToRadio(
+        root,
+        frame,
+        resolved.channelKey,
+        this.localNodeInfo.nodeNum,
+        !!lora?.configOkToMqtt,
+      );
+      if (!encrypted) return fallback('frame is not an addressed request');
+      logger.debug(`Avoid PKI: ${label} to ${target} channel-encrypted on channel ${channelIndex}`);
+      return { frame: encrypted, channelEncrypted: true };
+    } catch (error) {
+      return fallback(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /**
+   * Reliable PKI (#5691): before a PKI send, send the node our NodeInfo when
+   * the mode is As needed, the last exchange with it failed, and no priming
+   * went to it from this source in the last hour. Uses the key-repair path
+   * (`sendNodeInfoRequest` on the node's channel, never a PKI DM). Never
+   * throws and never blocks the real send: when priming cannot happen the
+   * caller sends exactly as it would have.
+   */
+  private async primeBeforePkiSend(destination: number): Promise<void> {
+    await this.reliablePki.primeBeforeSend(destination, {
+      isEligibleTarget: async () => {
+        if (this.localNodeInfo && destination === this.localNodeInfo.nodeNum) return false;
+        const node = await databaseService.nodes.getNode(destination, this.sourceId);
+        if (!node?.publicKey || node.keyMismatchDetected) return false;
+        if (node.isIgnored || databaseService.ignoredNodes.isIgnoredCached(destination, this.sourceId)) return false;
+        return true;
+      },
+      txBlockedReason: async () => {
+        if (!this.isConnected || !this.transport) return 'not connected';
+        if (!this.canTransmit()) return 'TX disabled';
+        if (this.rebootMergeInProgress) return 'reboot merge in progress';
+        if (await this.isAutomationAirtimeGated()) return 'airtime cutoff';
+        if (!this.getOwnPublicKeyBytes()) return "radio's public key not known yet";
+        return null;
+      },
+      sendNodeInfo: async () => {
+        // The node's channel, as key repair uses — read here, not carried over
+        // from isEligibleTarget, so this hook does not depend on call order.
+        const node = await databaseService.nodes.getNode(destination, this.sourceId);
+        const channel = node?.channel ?? 0;
+        const { packetId } = await this.sendNodeInfoRequest(destination, channel, { origin: 'automation', includeOwnPublicKey: true });
+        if (!packetId) throw new Error('NodeInfo packet could not be built');
+      },
+    });
+  }
+
+  /**
    * `sendTextMessage` for a send MeshRadar makes on its own (auto-ping
    * replies, ...). Tags the packet as automation-originated (#5414).
    */
@@ -10561,6 +11713,121 @@ class MeshtasticManager implements ISourceManager {
     return this.messageQueue.enqueue(
       text, destination, replyId, onSuccess, onFailure, channel, maxAttemptsOverride, emoji, hopLimitOverride, 'automation',
     );
+  }
+
+  /** Per-source split mutex (#6330); the shared runner holds it per sequence. */
+  private readonly splitSequenceLock = new SplitSequenceLock();
+
+  /**
+   * Skip-if-still-queued state for Timer Triggers and Auto Announce (#6330),
+   * keyed `timer:<id>` / `announce`. This manager is one source, so the keys
+   * are per source. A fire is in flight while its sends are being planned or
+   * split (the 10 s gaps), then its queue item ids are kept until the queue
+   * has sent them all.
+   *
+   * In-memory on purpose: the message queue itself is in-memory, so a restart
+   * drains it, and a fresh process has nothing queued to wait for.
+   */
+  private readonly automationBacklog = new Map<string, { inFlight: boolean; ids: string[] }>();
+
+  /** True while a previous fire for `key` is still being sent or still sits in the queue. */
+  isAutomationBacklogged(key: string): boolean {
+    const entry = this.automationBacklog.get(key);
+    if (!entry) return false;
+    return entry.inFlight || this.messageQueue.hasQueued(entry.ids);
+  }
+
+  /**
+   * Run one Timer Trigger / Auto Announce fire under `key`: queue items that
+   * `sendAutomatedText({ backlogKey: key })` creates during `fn` are tracked
+   * until sent. The caller checks `isAutomationBacklogged` first.
+   */
+  async runAutomationFire<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const entry = { inFlight: true, ids: [] as string[] };
+    this.automationBacklog.set(key, entry);
+    try {
+      return await fn();
+    } finally {
+      entry.inFlight = false;
+    }
+  }
+
+  /**
+   * Send one automated text (Auto Responder, Timer Triggers, Auto Announce,
+   * Automation Engine) fitted to the 200-byte Meshtastic cap (#6330). The
+   * same shared runner as MeshCore's `sendAutomatedText` (#6316).
+   *
+   * Split off: one part per target, cut to the cap with "...". Split on: up
+   * to SPLIT_MAX_PARTS parts marked "(i/N)", SPLIT_PART_GAP_MS apart, the last
+   * part cut with "..." when the text does not fit. A multi-part sequence
+   * holds a per-source mutex so two sequences never interleave.
+   *
+   * Default transport is the per-source message queue, which also spaces its
+   * sends 30 s apart, so on air the parts are at least that far apart; the
+   * queue keeps its retries and delivery callbacks. `direct` sends with
+   * `sendTextMessage` instead (the Automation Engine's channel path), where
+   * the 10 s gap is the real gap.
+   */
+  async sendAutomatedText(
+    text: string,
+    opts: {
+      /** DM to this node. Absent: send to `channels`. */
+      destination?: number;
+      channels?: number[];
+      split: boolean;
+      label: string;
+      /** Reply-to packet id, set on the first part only. */
+      replyId?: number;
+      /** Queue attempts per part (DM verification). */
+      maxAttempts?: number;
+      hopLimitOverride?: number;
+      origin?: SendOrigin;
+      direct?: boolean;
+      /** Record queue ids under this fire key (see runAutomationFire). */
+      backlogKey?: string;
+      /** Trigger identity for the split queue's duplicate drop (M4); default `label`. */
+      sequenceKey?: string;
+    },
+  ): Promise<AutomatedTextResult> {
+    const isDm = opts.destination !== undefined;
+    const plan = planAutomatedTextParts(text, { maxBytes: MAX_MESSAGE_BYTES, split: opts.split });
+    const origin: SendOrigin = opts.origin ?? 'automation';
+    const targets = isDm
+      ? [{ name: `!${opts.destination!.toString(16).padStart(8, '0')}`, channel: undefined as number | undefined }]
+      : (opts.channels ?? []).map((c) => ({ name: `channel ${c}`, channel: c as number | undefined }));
+    return sendAutomatedTextParts(text, plan, targets, {
+      lock: this.splitSequenceLock,
+      gapMs: SPLIT_PART_GAP_MS,
+      sequenceKey: `${opts.sequenceKey ?? opts.label}|${isDm ? `dm:${opts.destination}` : `ch:${(opts.channels ?? []).join(',')}`}`,
+      canTransmit: () => this.canTransmit(),
+      logPrefix: `[Meshtastic:${this.sourceId}]`,
+      label: opts.label,
+      sendPart: async (t, part, i) => {
+        const replyId = i === 0 ? opts.replyId : undefined;
+        const tag = plan.parts.length > 1 ? ` part ${i + 1}/${plan.parts.length}` : '';
+        if (opts.direct) {
+          await this.sendTextMessage(
+            part, t.channel ?? 0, opts.destination, replyId, undefined, undefined, undefined,
+            opts.hopLimitOverride !== undefined ? { hopLimitOverride: opts.hopLimitOverride, origin } : { origin },
+          );
+          return true;
+        }
+        const queueId = this.messageQueue.enqueue(
+          part,
+          isDm ? opts.destination! : 0,
+          replyId,
+          () => logger.debug(`✅ ${opts.label}${tag} delivered to ${t.name}`),
+          (reason: string) => logger.warn(`❌ ${opts.label}${tag} failed to ${t.name}: ${reason}`),
+          t.channel,
+          opts.maxAttempts,
+          undefined,
+          opts.hopLimitOverride,
+          origin,
+        );
+        if (opts.backlogKey) this.automationBacklog.get(opts.backlogKey)?.ids.push(queueId);
+        return true;
+      },
+    });
   }
 
   async sendTextMessage(text: string, channel: number = 0, destination?: number, replyId?: number, emoji?: number, userId?: number, attribution?: { sourceIp?: string | null; sourcePath?: 'http_api' | 'tcp_radio' | 'mqtt_bridge' | 'system' | null }, options?: { hopLimitOverride?: number; origin?: SendOrigin }): Promise<number> {
@@ -10622,12 +11889,18 @@ class MeshtasticManager implements ISourceManager {
         }
       }
 
+      // Reliable PKI (#5691): prime the node with our NodeInfo first when the
+      // last PKI exchange with it failed. No-op unless the mode is As needed.
+      if (pkiEncrypted && destination) {
+        await this.primeBeforePkiSend(destination);
+      }
+
       // #5121: an automated send may pin its hop count. Capped at this node's
       // own hop limit so an override can only shorten reach, never extend it.
       const hopLimit = clampHopLimitOverride(options?.hopLimitOverride, this.getConfiguredHopLimit());
       const zeroHop = hopLimit === 0;
 
-      const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji, pkiEncrypted, hopLimit);
+      const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji, pkiEncrypted, hopLimit, options?.origin === 'automation');
 
       // Remember our own packet id so that if this message is overheard
       // rebroadcast, echoed by MQTT, or replayed by store-and-forward, it isn't
@@ -10638,6 +11911,13 @@ class MeshtasticManager implements ISourceManager {
       this.recordAutomationPacket(messageId, options?.origin);
 
       await this.transport.send(textMessageData);
+
+      // Reliable PKI (#5691): a PKI DM asks for an ack unless it is zero-hop.
+      // A zero-hop DM asks for nothing back, so by the maintainer's rule it
+      // leaves the node's state as it was (track() returns early).
+      if (pkiEncrypted && destination) {
+        void this.reliablePki.track(messageId, destination, { wantAck: !zeroHop, wantResponse: false });
+      }
 
       // Log message sending at INFO level for production visibility
       const destinationInfo = destination ? `node !${destination.toString(16).padStart(8, '0')}` : `channel ${channel}`;
@@ -10650,7 +11930,8 @@ class MeshtasticManager implements ISourceManager {
         destination || 0xffffffff,
         channel,
         `"${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`,
-        { messageId, replyId, emoji }
+        { messageId, replyId, emoji },
+        options?.origin
       );
 
       // Save sent message to database for UI display
@@ -10711,6 +11992,8 @@ class MeshtasticManager implements ISourceManager {
           sourcePath: attribution?.sourcePath ?? 'system',
           // #5101: every outbound Meshtastic message write stamps INTERNAL.
           transportMechanism: TransportMechanism.INTERNAL,
+          // Mirrors the wire (#6449): only an automation send sets the bit.
+          isAutomation: options?.origin === 'automation' ? true : undefined,
         };
 
         await databaseService.messages.insertMessage(message, this.sourceId);
@@ -10759,6 +12042,8 @@ class MeshtasticManager implements ISourceManager {
             requestId: messageId,
             replyId: replyId || null,
             emoji: emoji || null,
+            pkiEncrypted: !!destination && pkiEncrypted,
+            isAutomation: options?.origin === 'automation',
           });
           if (fromRadioData) {
             await virtualNodeServer.broadcastToClients(fromRadioData);
@@ -10796,7 +12081,7 @@ class MeshtasticManager implements ISourceManager {
       // Traceroutes normally let the firmware pick the packet id. An automated
       // one needs a known id so the MQTT bridge can recognise it (#5414).
       const automationId = options?.origin === 'automation' ? randomPacketId() : undefined;
-      const tracerouteData = meshtasticProtobufService.createTracerouteMessage(destination, channel, hopLimit, automationId);
+      const tracerouteData = meshtasticProtobufService.createTracerouteMessage(destination, channel, hopLimit, automationId, options?.origin === 'automation');
       if (automationId !== undefined) this.recordAutomationPacket(automationId, options?.origin);
 
       logger.debug(`🔍 Traceroute packet created: ${tracerouteData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, hopLimit=${hopLimit}`);
@@ -10823,7 +12108,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `Traceroute request to !${destination.toString(16).padStart(8, '0')}`,
-        { destination }
+        { destination },
+        options?.origin
       );
     } catch (error) {
       logger.error('Error sending traceroute:', error);
@@ -10849,35 +12135,15 @@ class MeshtasticManager implements ISourceManager {
     }
 
     try {
-      // Check if the local node has a valid position source
-      // GpsMode enum: 0 = DISABLED, 1 = ENABLED, 2 = NOT_PRESENT
-      const positionConfig = this.actualDeviceConfig?.position;
-      const hasFixedPosition = positionConfig?.fixedPosition === true;
-      const hasGpsEnabled = positionConfig?.gpsMode === 1; // GpsMode.ENABLED
-      const hasValidPositionSource = hasFixedPosition || hasGpsEnabled;
-
-      let localPosition: { latitude: number; longitude: number; altitude?: number | null } | undefined;
-
-      // Only include position data if the node has a valid position source
-      if (hasValidPositionSource) {
-        const localNode = await databaseService.nodes.getNode(this.localNodeInfo.nodeNum);
-        localPosition = (localNode?.latitude && localNode?.longitude) ? {
-          latitude: localNode.latitude,
-          longitude: localNode.longitude,
-          altitude: localNode.altitude
-        } : undefined;
-      }
-
-      logger.debug(`📍 Position exchange: fixedPosition=${hasFixedPosition}, gpsMode=${positionConfig?.gpsMode}, hasValidPositionSource=${hasValidPositionSource}, willSendPosition=${!!localPosition}`);
-
+      // Always an empty request; never attach our coordinates (#6047).
       const { data: positionRequestData, packetId, requestId } = meshtasticProtobufService.createPositionRequestMessage(
         destination,
         channel,
-        localPosition,
-        this.getConfiguredHopLimit()
+        this.getConfiguredHopLimit(),
+        options?.origin === 'automation'
       );
 
-      logger.debug(`📍 Position exchange packet created: ${positionRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, packetId=${packetId}, requestId=${requestId}, position=${localPosition ? `${localPosition.latitude},${localPosition.longitude}` : 'none'}`);
+      logger.debug(`📍 Position exchange packet created: ${positionRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, packetId=${packetId}, requestId=${requestId}`);
 
       this.recordAutomationPacket(packetId, options?.origin);
       await this.transport.send(positionRequestData);
@@ -10901,7 +12167,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `Position exchange with !${destination.toString(16).padStart(8, '0')}`,
-        { destination, packetId, requestId }
+        { destination, packetId, requestId },
+        options?.origin
       );
 
       return { packetId, requestId };
@@ -10916,7 +12183,7 @@ class MeshtasticManager implements ISourceManager {
    * This will request the destination node to send back its user information
    * Similar to "Exchange Node Info" feature in mobile apps - triggers key exchange
    */
-  async sendNodeInfoRequest(destination: number, channel: number = 0, options?: { origin?: SendOrigin }): Promise<{ packetId: number; requestId: number }> {
+  async sendNodeInfoRequest(destination: number, channel: number = 0, options?: { origin?: SendOrigin; includeOwnPublicKey?: boolean }): Promise<{ packetId: number; requestId: number }> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
@@ -10943,13 +12210,17 @@ class MeshtasticManager implements ISourceManager {
         shortName: localNode.shortName || '????',
         hwModel: localNode.hwModel ?? undefined,
         role: localNode.role ?? undefined,
+        // Reliable PKI priming (#5691) only: the radio's own key from its
+        // security config, so the node can store it. Never the DB copy (#2275).
+        publicKey: options?.includeOwnPublicKey ? this.getOwnPublicKeyBytes() ?? undefined : undefined,
       } : undefined;
 
       const { data: nodeInfoRequestData, packetId, requestId } = meshtasticProtobufService.createNodeInfoRequestMessage(
         destination,
         channel,
         localUserInfo,
-        this.getConfiguredHopLimit()
+        this.getConfiguredHopLimit(),
+        options?.origin === 'automation'
       );
 
       logger.debug(`📇 NodeInfo exchange packet created: ${nodeInfoRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, packetId=${packetId}, requestId=${requestId}, userInfo=${localUserInfo ? localUserInfo.longName : 'none'}`);
@@ -10976,7 +12247,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `NodeInfo exchange with !${destination.toString(16).padStart(8, '0')}`,
-        { destination, packetId, requestId }
+        { destination, packetId, requestId },
+        options?.origin
       );
 
       return { packetId, requestId };
@@ -11005,16 +12277,28 @@ class MeshtasticManager implements ISourceManager {
     }
 
     try {
+      // Reliable PKI (#5691): NEIGHBORINFO_APP unicasts go PKI when the radio holds the key.
+      // Avoid PKI (#5711): channel-encrypted instead, never primed or tracked.
+      const avoidPki = await this.isAvoidPkiMode();
+      const pkiTarget = !avoidPki && await this.isPkiSendTarget(destination);
+      if (pkiTarget) await this.primeBeforePkiSend(destination);
+
       const { data: neighborInfoRequestData, packetId, requestId } = meshtasticProtobufService.createNeighborInfoRequestMessage(
         destination,
         channel,
-        this.getConfiguredHopLimit()
+        this.getConfiguredHopLimit(),
+        options?.origin === 'automation'
       );
 
       logger.debug(`🏠 NeighborInfo request packet created: ${neighborInfoRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, packetId=${packetId}, requestId=${requestId}`);
 
+      const { frame } = avoidPki
+        ? await this.channelEncryptRequest(neighborInfoRequestData, destination, channel, 'neighbor info request')
+        : { frame: neighborInfoRequestData };
+
       this.recordAutomationPacket(packetId, options?.origin);
-      await this.transport.send(neighborInfoRequestData);
+      await this.transport.send(frame);
+      if (pkiTarget) void this.reliablePki.track(packetId, destination, { wantAck: true, wantResponse: true });
 
       // Broadcast to virtual node clients (including packet monitor)
       const virtualNodeServer = this.virtualNodeServer;
@@ -11035,7 +12319,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `NeighborInfo request to !${destination.toString(16).padStart(8, '0')}`,
-        { destination, packetId, requestId }
+        { destination, packetId, requestId },
+        options?.origin
       );
 
       return { packetId, requestId };
@@ -11238,18 +12523,34 @@ class MeshtasticManager implements ISourceManager {
     }
 
     try {
+      // Reliable PKI (#5691): TELEMETRY_APP unicasts go PKI when the radio holds
+      // the key. A hijack auto-retry is not primed (the original send was).
+      // Avoid PKI (#5711): channel-encrypted instead, never primed or tracked.
+      const avoidPki = await this.isAvoidPkiMode();
+      const pkiTarget = !avoidPki && await this.isPkiSendTarget(destination);
+      if (pkiTarget && !options?.isAutoRetry) await this.primeBeforePkiSend(destination);
+
       const { data: telemetryRequestData, packetId, requestId } = meshtasticProtobufService.createTelemetryRequestMessage(
         destination,
         channel,
         telemetryType,
-        this.getConfiguredHopLimit()
+        this.getConfiguredHopLimit(),
+        options?.origin === 'automation'
       );
+      recordOwnTelemetryRequest(packetId); // loop guard: its reply must not fire trigger.telemetry
 
       const typeLabel = telemetryType || 'device';
       logger.debug(`📊 Telemetry request packet created: ${telemetryRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, type=${typeLabel}, packetId=${packetId}, requestId=${requestId}`);
 
+      // Only the radio gets the ciphertext; virtual-node clients below still
+      // get the plaintext frame, which is what they display.
+      const { frame } = avoidPki
+        ? await this.channelEncryptRequest(telemetryRequestData, destination, channel, 'telemetry request')
+        : { frame: telemetryRequestData };
+
       this.recordAutomationPacket(packetId, options?.origin);
-      await this.transport.send(telemetryRequestData);
+      await this.transport.send(frame);
+      if (pkiTarget) void this.reliablePki.track(packetId, destination, { wantAck: true, wantResponse: true });
 
       // Broadcast to virtual node clients (including packet monitor)
       const virtualNodeServer = this.virtualNodeServer;
@@ -11270,7 +12571,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `Telemetry request (${typeLabel}) to !${destination.toString(16).padStart(8, '0')}`,
-        { destination, telemetryType: typeLabel, packetId, requestId }
+        { destination, telemetryType: typeLabel, packetId, requestId },
+        options?.origin
       );
 
       // Track this outstanding request so the firmware NeighborInfo-hijack
@@ -11362,6 +12664,7 @@ class MeshtasticManager implements ISourceManager {
           this.localNodeInfo.nodeNum,
           0 // Channel 0 for local node communication
         );
+      recordOwnTelemetryRequest(packetId); // loop guard: its reply must not fire trigger.telemetry
 
       logger.debug(`📊 LocalStats request packet created: ${telemetryRequestData.length} bytes for local node ${this.localNodeInfo.nodeId}, packetId=${packetId}, requestId=${requestId}`);
 
@@ -11392,30 +12695,48 @@ class MeshtasticManager implements ISourceManager {
    * Unlike requestLocalStats() (gateway-only), this targets an arbitrary node and
    * explicitly requests the `local_stats` variant — the firmware reply echoes the
    * requested variant, so a generic request would return DeviceMetrics instead.
-   * Sent as a unicast on the node's channel (shared PSK), NOT a PKI DM: unicast
-   * bypasses the firmware's multi-hop-broadcast role gate (so REPEATER/CLIENT nodes
-   * answer too) and channel routing avoids stale-key fragility. The reply is
-   * persisted by the existing telemetry handler.
+   * Sent as a unicast on the node's channel: unicast bypasses the firmware's
+   * multi-hop-broadcast role gate (so REPEATER/CLIENT nodes answer too). Note the
+   * radio still PKI-encrypts it when it holds the node's key — firmware
+   * `wouldEncryptWithPKC` does not look at the channel for TELEMETRY_APP — so it
+   * is covered by Reliable PKI (#5691); in Avoid PKI mode (#5711) MeshRadar
+   * channel-encrypts it first. The reply is persisted by the existing
+   * telemetry handler.
    */
   async requestRemoteLocalStats(destination: number, channel: number = 0, hopLimit: number = 3, options?: { origin?: SendOrigin }): Promise<{ packetId: number; requestId: number }> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
 
+    // Reliable PKI (#5691): despite going out on the node's channel, a
+    // TELEMETRY_APP unicast is PKI-encrypted by the radio whenever it holds the
+    // node's key (firmware wouldEncryptWithPKC ignores the channel index).
+    // Avoid PKI (#5711): channel-encrypted instead, never primed or tracked.
+    const avoidPki = await this.isAvoidPkiMode();
+    const pkiTarget = !avoidPki && await this.isPkiSendTarget(destination);
+    if (pkiTarget) await this.primeBeforePkiSend(destination);
+
     const { data: telemetryRequestData, packetId, requestId } =
       meshtasticProtobufService.createTelemetryRequestMessage(
         destination,
         channel,
         'localStats',
-        hopLimit
+        hopLimit,
+        options?.origin === 'automation'
       );
+    recordOwnTelemetryRequest(packetId); // loop guard: its reply must not fire trigger.telemetry
 
     if (telemetryRequestData.length === 0) {
       throw new Error('Failed to build remote LocalStats request');
     }
 
+    const { frame } = avoidPki
+      ? await this.channelEncryptRequest(telemetryRequestData, destination, channel, 'remote LocalStats request')
+      : { frame: telemetryRequestData };
+
     this.recordAutomationPacket(packetId, options?.origin);
-    await this.transport.send(telemetryRequestData);
+    await this.transport.send(frame);
+    if (pkiTarget) void this.reliablePki.track(packetId, destination, { wantAck: true, wantResponse: true });
 
     // Broadcast to virtual node clients (including packet monitor) for visibility.
     const virtualNodeServer = this.virtualNodeServer;
@@ -11581,6 +12902,15 @@ class MeshtasticManager implements ISourceManager {
         return;
       }
 
+      // #6449: the sender flagged this as sent by an automation (Data.bitfield
+      // bit 2). Skip it unless the operator opted in, so two bots cannot
+      // acknowledge each other forever. Absent/unknown flag counts as human.
+      if (message?.isAutomation === true
+        && await settings.getSettingForSource(sourceId, 'autoAckRespondToAutomation') !== 'true') {
+        logger.debug(`⏭️ Skipping auto-acknowledge for packet ${packetId}: sender flagged it as automated`);
+        return;
+      }
+
       // A response that waited: the link it was armed on must still be up.
       if (afterWait && (afterWait.generation !== this.autoAckGeneration || !this.isConnected)) {
         logger.debug(`⏭️ Dropping delayed auto-acknowledge for packet ${packetId} on ${sourceId}: source disconnected`);
@@ -11717,13 +13047,16 @@ class MeshtasticManager implements ISourceManager {
           ? message.hopStart - message.hopLimit
           : 0;
 
-      // 2x2 matrix (discussion #3564): {Channel,Direct} × {ZeroHop,MultiHop}.
-      // Message type comes from isDirectMessage (DM vs channel); hop distance
-      // from hopsTraveled. MQTT-relayed packets are never "zero hop" even at 0
-      // hops — they traversed the internet, not a direct RF link, so RF metrics
-      // (SNR/RSSI) and the 0-hop notion don't apply.
-      const isZeroHop = autoAckIsZeroHop(hopsTraveled, message.viaMqtt);
-      const cellKey = autoAckCellKey(isDirectMessage, isZeroHop);
+      // Matrix (discussion #3564, #5796): {Channel,Direct} × {ZeroHop,MultiHop,Ip}.
+      // Message type comes from isDirectMessage (DM vs channel). IP is checked
+      // first: a packet that reached the node over MQTT or multicast UDP lands
+      // in the Ip row whatever its hop count. `message.transportMechanism` is
+      // the value processTextMessageProtobuf stored on the row
+      // (resolveRadioPacketTransport), and `message.viaMqtt` the legacy flag,
+      // so this matches what the Automation Engine sees for the same message.
+      const isIp = autoAckIsIp(message.viaMqtt, message.transportMechanism);
+      const isZeroHop = autoAckIsZeroHop(hopsTraveled, message.viaMqtt, message.transportMechanism);
+      const cellKey = autoAckCellKey(isDirectMessage, isZeroHop, isIp);
 
       // Per-cell toggles. Unset reads as OFF — the matrix is opt-in per cell;
       // migration 093 backfills explicit values for pre-existing configs so they
@@ -11783,7 +13116,9 @@ class MeshtasticManager implements ISourceManager {
         const armed = this.armDelayedAutoAck(
           pendingKey,
           fromNum,
-          autoAckChannelWaitMs(preSendDelaySeconds, this.autoAckRandom()),
+          // Nearer instances get the earlier slot (#5788): the floor rises 3 s
+          // per hop the message travelled to reach this node.
+          autoAckChannelWaitMs(preSendDelaySeconds, this.autoAckRandom(), hopsTraveled),
           (generation) => this.checkAutoAcknowledge(
             message, messageText, channelIndex, false, fromNum, packetId, rxSnr, rxRssi, { generation },
           ),
@@ -11843,7 +13178,13 @@ class MeshtasticManager implements ISourceManager {
         // Hop count emojis: *️⃣ for 0 (direct), 1️⃣-7️⃣ for 1-7+ hops. Shared with the
         // Automation Engine's action.tapback emojiMode=hopCount (src/utils/hopEmoji.ts).
         // `hopsTraveled` is already floored at 0 above, so the fallback is unreachable.
-        const hopEmoji = hopCountEmoji(hopsTraveled) ?? HOP_COUNT_EMOJIS[0];
+        // #5890: the source's chosen glyphs replace *️⃣, and (for an IP packet)
+        // the hop glyph. With no MQTT glyph set, an IP packet keeps its hop glyph.
+        const hopEmojis = parseHopEmojiOverrides(
+          await settings.getSettingForSource(sourceId, 'hopEmojiZeroHop'),
+          await settings.getSettingForSource(sourceId, 'hopEmojiMqtt'),
+        );
+        const hopEmoji = (isIp && hopEmojis.mqtt) || (hopCountEmoji(hopsTraveled, hopEmojis) ?? HOP_COUNT_EMOJIS[0]);
         const tapbackTarget = isDirectMessage
           ? `!${fromNum.toString(16).padStart(8, '0')}`
           : `channel ${channelIndex}`;
@@ -11875,7 +13216,12 @@ class MeshtasticManager implements ISourceManager {
         // Use the direct message template for 0 hops if available, otherwise fall back to standard template
         const autoAckMessageDirect = await settings.getSettingForSource(sourceId, 'autoAckMessageDirect') || '';
         const autoAckMessageStandard = await settings.getSettingForSource(sourceId, 'autoAckMessage') || '🤖 Copy, {NUMBER_HOPS} hops at {TIME}';
-        const autoAckMessage = (hopsTraveled === 0 && autoAckMessageDirect)
+        // Keyed on the ZeroHop cell, not on hopsTraveled === 0: an IP message at
+        // 0 hops (#5796) did not come over a direct RF link, so the 0-hop
+        // template (often carrying {SNR}/{RSSI}) does not fit it. This also
+        // matches the converter, which uses the direct template on ZeroHop
+        // cells only.
+        const autoAckMessage = (isZeroHop && autoAckMessageDirect)
           ? autoAckMessageDirect
           : autoAckMessageStandard;
 
@@ -12040,7 +13386,7 @@ class MeshtasticManager implements ISourceManager {
       const projectRoot = path.resolve(process.cwd());
       scriptsDir = path.join(projectRoot, 'data', 'scripts');
     } else {
-      scriptsDir = path.join(process.env.DATA_DIR || '/data', 'scripts');
+      scriptsDir = dataPath('scripts');
     }
 
     if (!fs.existsSync(scriptsDir)) {
@@ -12572,6 +13918,14 @@ class MeshtasticManager implements ISourceManager {
         return;
       }
 
+      // #6449: skip messages the sender flagged as automated (Data.bitfield
+      // bit 2) unless the operator opted in — a bot-to-bot loop guard.
+      if (message.isAutomation === true
+        && await settings.getSettingForSource(sourceId, 'autoResponderRespondToAutomation') !== 'true') {
+        logger.debug(`⏭️ Skipping auto-responder for packet ${packetId}: sender flagged it as automated`);
+        return;
+      }
+
       // TX-disabled radios cannot send the auto-responder reply; skip quietly (#4294).
       if (!this.canTransmit()) {
         logger.debug('⏭️ Skipping auto-responder - TX disabled on this source');
@@ -12626,6 +13980,12 @@ class MeshtasticManager implements ISourceManager {
       // Try to match message against triggers
       for (let triggerIdx = 0; triggerIdx < triggers.length; triggerIdx++) {
         const trigger = triggers[triggerIdx];
+        // Per-trigger switch (#6405): only an explicit false turns a trigger
+        // off, so triggers saved before the field existed keep working.
+        if (trigger.enabled === false) {
+          logger.debug(`⏭️  Skipping trigger "${trigger.trigger}" - disabled`);
+          continue;
+        }
         // Normalize trigger channels (handles legacy single channel and new multi-channel array format)
         const triggerChannels = normalizeTriggerChannels(trigger);
 
@@ -12646,15 +14006,15 @@ class MeshtasticManager implements ISourceManager {
           }
         }
 
-        // Handle both string and array types for trigger.trigger
-        const patterns = normalizeTriggerPatterns(trigger.trigger);
+        // One shared matcher for both syntaxes (#5924). Pattern mode tries
+        // each comma alternative in turn; regex mode runs the one regex.
         let matchedPattern: string | null = null;
         let extractedParams: Record<string, string> = {};
-
-        // Try each pattern until one matches
-        for (const origPatternStr of patterns) {
-          const m = matchAutoResponderPattern(origPatternStr, message.text);
-          if (m.matched) { extractedParams = m.params; matchedPattern = origPatternStr; break; }
+        const syntax = resolveResponderSyntax(trigger.syntax, 'pattern');
+        const m = matchResponderTrigger({ pattern: trigger.trigger, syntax }, message.text);
+        if (m.matched) {
+          extractedParams = m.params;
+          matchedPattern = m.matchedPattern ?? (Array.isArray(trigger.trigger) ? trigger.trigger[0] : trigger.trigger);
         }
 
         if (matchedPattern) {
@@ -12812,12 +14172,19 @@ class MeshtasticManager implements ISourceManager {
               // Expand tokens in script args if provided
               let scriptArgsList: string[] = [];
               if (trigger.scriptArgs) {
-                const expandedArgs = await this.replaceAcknowledgementTokens(
-                  trigger.scriptArgs, nodeId, message.fromNodeNum, hopsTraveled,
-                  receivedDate, receivedTime, message.channel, isDirectMessage,
-                  message.rxSnr, message.rxRssi, message.viaMqtt, false, message.relayNode
+                // SECURITY (#6090): tokenize the admin template FIRST, then
+                // expand the OTA-sourced tokens (node name, etc.) per argv
+                // element so a crafted node name cannot inject extra arguments
+                // when this auto-responder script fires. See
+                // expandScriptArgsTokens.
+                scriptArgsList = await this.expandScriptArgsTokens(
+                  trigger.scriptArgs,
+                  (part) => this.replaceAcknowledgementTokens(
+                    part, nodeId, message.fromNodeNum, hopsTraveled,
+                    receivedDate, receivedTime, message.channel, isDirectMessage,
+                    message.rxSnr, message.rxRssi, message.viaMqtt, false, message.relayNode
+                  ),
                 );
-                scriptArgsList = this.parseScriptArgs(expandedArgs);
                 logger.debug(`🤖 Script args expanded: ${trigger.scriptArgs} -> ${safeJson(scriptArgsList)}`);
               }
 
@@ -12825,12 +14192,12 @@ class MeshtasticManager implements ISourceManager {
               // Use resolvedPath (actual file path) instead of scriptPath (API format)
               const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath, ...scriptArgsList], {
                 timeout: SCRIPT_AUTO_RESPONDER_TIMEOUT_MS,
-                env: { ...scriptEnv, ...scriptDependencyEnv(ext, scriptEnv) },
+                env: buildScriptChildEnv(scriptEnv, ext),
                 maxBuffer: 1024 * 1024, // 1MB max output
               });
 
               if (stderr) {
-                logger.warn(`🔧 Auto-responder script for "${triggerPattern}" stderr: ${stderr}`);
+                logger.warn(`🔧 Auto-responder script for "${triggerPattern}" stderr: ${scrubScriptSecrets(stderr)}`);
               }
 
               // Support both single response and multiple responses
@@ -12907,10 +14274,10 @@ class MeshtasticManager implements ISourceManager {
               } else if (error.code === 'ENOENT') {
                 logger.error(`🔧 Auto-responder script for "${triggerPattern}" not found: ${scriptPath}`);
               } else {
-                logger.error(`🔧 Auto-responder script for "${triggerPattern}" failed after ${scriptDuration}ms: ${error.message}`);
+                logger.error(`🔧 Auto-responder script for "${triggerPattern}" failed after ${scriptDuration}ms: ${scrubScriptSecrets(String(error.message))}`);
               }
-              if (error.stderr) logger.error(`🔧 Script stderr: ${error.stderr}`);
-              if (error.stdout) logger.warn(`🔧 Script stdout before failure: ${error.stdout.substring(0, 200)}`);
+              if (error.stderr) logger.error(`🔧 Script stderr: ${scrubScriptSecrets(String(error.stderr))}`);
+              if (error.stdout) logger.warn(`🔧 Script stdout before failure: ${scrubScriptSecrets(String(error.stdout)).substring(0, 200)}`);
               return;
             }
 
@@ -13120,25 +14487,12 @@ class MeshtasticManager implements ISourceManager {
             // parseAutoResponderResponse already logged the reason
             return;
           }
-          if (multilineEnabled && responseValue.responses.length === 1) {
-            // Split into multiple messages if enabled — only safe when
-            // the parsed payload was a single response. Multi-response
-            // JSON intentionally bypasses splitting (see Multiple
-            // Responses Support in docs/features/automation.md).
-            responseValue.responses = this.splitMessageForMeshtastic(responseValue.responses[0], 200);
-            if (responseValue.responses.length > 1) {
-              logger.debug(`📝 Split response into ${responseValue.responses.length} messages`);
-            }
-          } else {
-            // Truncate each response and only log when truncation actually changed bytes.
-            responseValue.responses = responseValue.responses.map((oldVal, i) => {
-              const newVal = this.truncateMessageForMeshtastic(oldVal, 200);
-              if (newVal.length !== oldVal.length) {
-                logger.debug(`✂️  Response ${i + 1} truncated from ${oldVal.length} to ${newVal.length} characters`);
-              }
-              return newVal;
-            });
-          }
+          // Multiline (#6330): one parsed response splits through the shared
+          // splitter, up to SPLIT_MAX_PARTS parts marked "(i/N)", 10 s apart
+          // (the queue spaces them further). Multi-response JSON never splits
+          // (see Multiple Responses Support in docs/features/automation.md):
+          // each response is cut to the 200-byte cap.
+          const splitResponse = multilineEnabled && responseValue.responses.length === 1;
 
           // Enqueue all messages for delivery with retry logic
           // Respond on the channel the message came from.
@@ -13152,23 +14506,25 @@ class MeshtasticManager implements ISourceManager {
           // For DMs: use 3 attempts if verifyResponse is enabled, otherwise just 1 attempt
           const maxAttempts = isDM ? (trigger.verifyResponse ? 3 : 1) : 1;
           const target = isDM ? `!${message.fromNodeNum.toString(16).padStart(8, '0')}` : `channel ${message.channel}`;
-          logger.debug(`🤖 Enqueueing ${responseValue.responses.length} auto-response message(s) to ${target}${trigger.verifyResponse ? ' (with verification)' : ''}`);
+          logger.debug(`🤖 Enqueueing ${responseValue.responses.length} auto-response message(s) to ${target}${splitResponse ? ' (split)' : ''}${trigger.verifyResponse ? ' (with verification)' : ''}`);
 
-          responseValue.responses.forEach((msg, index) => {
-            const isFirstMessage = index === 0;
-            this.enqueueAutomation(
-              msg,
-              isDM ? message.fromNodeNum : 0, // destination: node number for DM, 0 for channel
-              isFirstMessage ? packetId : undefined, // Reply to original message for first response
-              () => {
-                logger.debug(`✅ Auto-response ${index + 1}/${responseValue.responses.length} delivered to ${target}`);
-              },
-              (reason: string) => {
-                logger.warn(`❌ Auto-response ${index + 1}/${responseValue.responses.length} failed to ${target}: ${reason}`);
-              },
-              isDM ? undefined : message.channel as number, // channel: undefined for DM, channel number for channel
-              maxAttempts
-            );
+          const responses = responseValue.responses;
+          // Not awaited: a split reply waits between parts, and the packet
+          // handler must not stall on it. Responses go out in order.
+          void (async () => {
+            for (let index = 0; index < responses.length; index++) {
+              await this.sendAutomatedText(responses[index], {
+                ...(isDM ? { destination: message.fromNodeNum } : { channels: [message.channel as number] }),
+                split: splitResponse,
+                label: `Auto-response ${index + 1}/${responses.length}`,
+                // M4: the label is the same for every trigger; key on the trigger.
+                sequenceKey: `auto-responder:${triggerIdx}`,
+                replyId: index === 0 ? packetId : undefined, // Reply to original message for first response
+                maxAttempts,
+              });
+            }
+          })().catch((err: unknown) => {
+            logger.warn(`❌ Auto-response to ${target} failed: ${(err as Error)?.message ?? err}`);
           });
 
           // Record cooldown timestamp
@@ -13900,6 +15256,35 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
+   * SECURITY (#6090; mirrors MISC-06 / #6076 in scriptRoutes): expand an
+   * admin-authored script-args template into argv WITHOUT letting an
+   * OTA-sourced token value split into extra argv elements.
+   *
+   * The script-args template holds tokens like `{SHORT_NAME}` / `{LONG_NAME}`
+   * whose values come from over-the-air mesh traffic (a node's self-reported
+   * name). Expanding the whole template string and THEN splitting it let a
+   * crafted node name carrying spaces or quotes break into additional argv
+   * elements when a configured auto-responder / geofence / timer script trigger
+   * fired — a remote argv-injection vector.
+   *
+   * The fix tokenizes the template into argv FIRST (`parseScriptArgs` — the
+   * quote/space boundaries chosen by the trusted admin author), THEN expands
+   * the template tokens inside each resulting element. Per-element expansion
+   * confines each token's value to the single argument it appears in, so a
+   * hostile OTA name can never add new arguments.
+   *
+   * `expandElement` receives one raw argv token and returns its expanded form;
+   * it must NOT re-split its result.
+   */
+  private async expandScriptArgsTokens(
+    argsTemplate: string,
+    expandElement: (part: string) => Promise<string>,
+  ): Promise<string[]> {
+    const rawParts = this.parseScriptArgs(argsTemplate);
+    return Promise.all(rawParts.map(expandElement));
+  }
+
+  /**
    * Visibility widened from `private` to (default) `public` so `AutoAnnounceService`
    * (#3962 Phase 4.2a PR3 §4b) can call back into it via the injected `mgr`
    * reference. Body/location unmoved — still shared by
@@ -14371,6 +15756,7 @@ class MeshtasticManager implements ISourceManager {
             const responseKeys = Object.keys(moduleConfigResponse).filter(k => k !== 'payloadVariant' && moduleConfigResponse[k] !== undefined);
             responseKeys.forEach((key) => {
               this.actualModuleConfig[key] = moduleConfigResponse[key];
+              this.settleLocalModuleConfigWaiters(key, moduleConfigResponse[key] ?? {});
             });
 
             // Proto3 omits all-default fields, so an empty response means the
@@ -14387,6 +15773,9 @@ class MeshtasticManager implements ISourceManager {
                 }
                 this.pendingModuleConfigRequests.delete(localNodeKey);
                 this.pendingModuleConfigRequests.delete(fromNum);
+                // The node's answer is "all defaults": hand a waiting reader
+                // that, not the (possibly older) cached section.
+                this.settleLocalModuleConfigWaiters(pendingKey, {});
               }
             }
           }
@@ -14669,6 +16058,17 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
+   * Check if the local device firmware supports AEAD (AES-CCM) channels (#5248).
+   *
+   * `ChannelSettings.use_aead` arrived with meshtastic/firmware#9749, first
+   * released in 2.8.1 (`v2.8.1.8e6a88d`). Older firmware ignores the field, so
+   * turning it on would look saved while the channel stays plain.
+   */
+  supportsAeadChannels(): boolean {
+    return this.firmwareVersionAtLeast(2, 8, 1);
+  }
+
+  /**
    * Check if the local device firmware carries the TAK module config (#5613).
    *
    * `ModuleConfig.tak` (oneof field 16, TAK_CONFIG module type 15) is marked
@@ -14711,6 +16111,15 @@ class MeshtasticManager implements ISourceManager {
    */
   async sendFavoriteNode(nodeNum: number, destinationNodeNum?: number): Promise<void> {
     return this.favoritesService.sendFavoriteNode(nodeNum, destinationNodeNum);
+  }
+
+  /**
+   * The add_contact packet that precedes set_favorite_node (#6153), or null
+   * when it must not be sent. Shared with the Admin Commands route so every
+   * favorite path builds it the same way.
+   */
+  async buildFavoritedContactMessage(nodeNum: number, sessionPasskey: Uint8Array): Promise<Uint8Array | null> {
+    return this.favoritesService.buildFavoritedContactMessage(nodeNum, sessionPasskey);
   }
 
   /**
@@ -14906,6 +16315,79 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
+   * Read one module config from the LOCAL node, now, and wait for the answer
+   * (#5745). Sends the same `get_module_config_request` as
+   * `requestModuleConfig`; `processAdminMessage` merges the reply into
+   * `actualModuleConfig` and wakes this caller with the section.
+   *
+   * One admin packet over the local link. Nothing goes on air.
+   *
+   * @returns the module section the node returned (`{}` when every field is
+   *          default), or null when the node did not answer in time, the
+   *          request could not be sent, or the link dropped. Null means
+   *          "unknown", not "defaults".
+   */
+  async readLocalModuleConfig(configType: number, timeoutMs: number = LOCAL_MODULE_READ_TIMEOUT_MS): Promise<Record<string, unknown> | null> {
+    const key = MODULE_FIELD_BY_ADMIN_TYPE[configType];
+    if (!key) {
+      return null;
+    }
+    let settle: (section: Record<string, unknown> | null) => void = () => {};
+    const answer = new Promise<Record<string, unknown> | null>((resolve) => {
+      const timer = setTimeout(() => settle(null), timeoutMs);
+      settle = (section: Record<string, unknown> | null) => {
+        clearTimeout(timer);
+        const rest = (this.localModuleConfigWaiters.get(key) ?? []).filter((w) => w !== settle);
+        if (rest.length > 0) {
+          this.localModuleConfigWaiters.set(key, rest);
+        } else {
+          this.localModuleConfigWaiters.delete(key);
+        }
+        resolve(section);
+      };
+    });
+    this.localModuleConfigWaiters.set(key, [...(this.localModuleConfigWaiters.get(key) ?? []), settle]);
+    try {
+      await this.requestModuleConfig(configType);
+    } catch (error) {
+      logger.warn(`[MeshtasticManager:${this.sourceId}] Could not request local ${key} module config:`, error);
+      settle(null);
+    }
+    return answer;
+  }
+
+  /**
+   * Opt-in "re-apply the Status Message after a reboot" (#5745). Runs once per
+   * connection, from the configComplete callback. Decision and action live in
+   * services/statusMessageReapply.ts; the write is the verified save from #5769.
+   */
+  async maybeReapplyStatusMessage(): Promise<void> {
+    const alreadyAttempted = this.statusReapplyAttempted;
+    this.statusReapplyAttempted = true;
+    const settings = databaseService.settings;
+    await runStatusMessageReapply({
+      sourceId: this.sourceId,
+      getSetting: (key) => settings.getSettingForSource(this.sourceId, key),
+      setSetting: (key, value) => settings.setSourceSetting(this.sourceId, key, value),
+      supported: () => this.supportsStatusMessage(),
+      saveInFlight: () => this.deviceAdminService.isVerifiedSaveInFlight(),
+      readNodeSection: () => this.readLocalModuleConfig(CONFIG_TYPE_MAP.statusmessage.type),
+      saveVerified: (nodeStatus) => this.setGenericModuleConfig('statusmessage', { nodeStatus }, { verify: true }),
+    }, alreadyAttempted);
+  }
+
+  /** Wake every readLocalModuleConfig() caller waiting on `key`. */
+  private settleLocalModuleConfigWaiters(key: string, section: Record<string, unknown> | null): void {
+    // Each waiter removes itself from the map; iterate a copy.
+    [...(this.localModuleConfigWaiters.get(key) ?? [])].forEach((settle) => settle(section));
+  }
+
+  /** The link is gone: no answer is coming. Settle every waiter as "unknown". */
+  private cancelLocalModuleConfigWaiters(): void {
+    [...this.localModuleConfigWaiters.keys()].forEach((key) => this.settleLocalModuleConfigWaiters(key, null));
+  }
+
+  /**
    * Request config from a remote node
    * @param destinationNodeNum The remote node number
    * @param configType The config type to request (DEVICE_CONFIG=0, LORA_CONFIG=5, etc.)
@@ -15011,6 +16493,17 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
+   * Send an admin command to our own node and report a refusal (routing error
+   * code), or null when the node stayed silent, which means it accepted.
+   */
+  async sendLocalAdminAwaitRejection(
+    adminMessagePayload: Uint8Array,
+    timeoutMs: number = 5000
+  ): Promise<{ rejected: number | null }> {
+    return this.adminTransactionService.sendLocalAdminAwaitRejection(adminMessagePayload, timeoutMs);
+  }
+
+  /**
    * Send a set_favorite_node admin command and wait for its ACK. Handles the
    * remote session-passkey handshake exactly like sendFavoriteNode.
    */
@@ -15090,6 +16583,9 @@ class MeshtasticManager implements ISourceManager {
     /** Omit to keep this source's stored value (#5248). */
     useAead?: boolean;
   }): Promise<void> {
+    // Avoid PKI (#5711) must not encrypt with the slot's old key; it falls back
+    // to a normal send until the radio reports the slot again.
+    this.radioChannels.delete(channelIndex);
     return this.deviceAdminService.setChannelConfig(channelIndex, config);
   }
 
@@ -15147,8 +16643,8 @@ class MeshtasticManager implements ISourceManager {
    * Handles: extnotif, storeforward, rangetest, cannedmsg, audio,
    * remotehardware, detectionsensor, paxcounter, serial, ambientlighting
    */
-  async setGenericModuleConfig(moduleType: string, config: any): Promise<void> {
-    return this.deviceAdminService.setGenericModuleConfig(moduleType, config);
+  async setGenericModuleConfig(moduleType: string, config: any, options?: SetModuleConfigOptions): Promise<void> {
+    return this.deviceAdminService.setGenericModuleConfig(moduleType, config, options);
   }
 
   /**
@@ -15300,6 +16796,11 @@ class MeshtasticManager implements ISourceManager {
     } finally {
       this.preConfigChannelSnapshot = [];
     }
+  }
+
+  /** The radio's NodeDB flags for a node, or undefined when the radio did not list it (#5921). */
+  getDeviceNodeFlags(nodeNum: number): DeviceNodeFlags | undefined {
+    return this.deviceNodeFlags.get(nodeNum);
   }
 
   // Check if a node exists in the connected radio's local database
@@ -15490,6 +16991,7 @@ class MeshtasticManager implements ISourceManager {
       emoji: msg.emoji ?? undefined,
       viaMqtt: Boolean(msg.viaMqtt),
       xeddsaSigned: msg.xeddsaSigned ? true : undefined,
+      isAutomation: msg.isAutomation ? true : undefined,
       ackProofStatus: normalizeAckProofStatus(msg.ackProofStatus),
       rxSnr: msg.rxSnr ?? undefined,
       rxRssi: msg.rxRssi ?? undefined,
@@ -15692,37 +17194,15 @@ class MeshtasticManager implements ISourceManager {
 
     // 'stopSchedulers' action (below, through the cron-job clear)
     // Clear any active intervals and pending jitter timeouts
-    if (this.tracerouteJitterTimeout) {
-      clearTimeout(this.tracerouteJitterTimeout);
-      this.tracerouteJitterTimeout = null;
-    }
+    this.stopTracerouteScheduler();
 
-    if (this.tracerouteInterval) {
-      clearInterval(this.tracerouteInterval);
-      this.tracerouteInterval = null;
-    }
-
-    if (this.remoteLocalStatsJitterTimeout) {
-      clearTimeout(this.remoteLocalStatsJitterTimeout);
-      this.remoteLocalStatsJitterTimeout = null;
-    }
-
-    if (this.remoteLocalStatsInterval) {
-      clearInterval(this.remoteLocalStatsInterval);
-      this.remoteLocalStatsInterval = null;
-    }
+    this.stopRemoteLocalStatsScheduler();
 
     this.distanceDeleteScheduler?.stop();
 
-    if (this.remoteAdminScannerInterval) {
-      clearInterval(this.remoteAdminScannerInterval);
-      this.remoteAdminScannerInterval = null;
-    }
+    this.stopRemoteAdminScanner();
 
-    if (this.timeSyncInterval) {
-      clearInterval(this.timeSyncInterval);
-      this.timeSyncInterval = null;
-    }
+    this.stopTimeSyncScheduler();
 
     if (this.autoFavoriteSweepInterval) {
       clearInterval(this.autoFavoriteSweepInterval);
@@ -15797,7 +17277,7 @@ class MeshtasticManager implements ISourceManager {
 
     if (!lqData) {
       // Initialize: LQ = INITIAL_BASE - hops (so 1-hop = 7, 7-hop = 1)
-      const initialQuality = Math.max(1, Math.min(LINK_QUALITY.INITIAL_BASE - 1, LINK_QUALITY.INITIAL_BASE - currentHops));
+      const initialQuality = initialLinkQuality(currentHops);
       lqData = { quality: initialQuality, lastHops: currentHops };
       this.nodeLinkQuality.set(nodeNum, lqData);
 
@@ -15939,5 +17419,9 @@ export { MeshtasticManager };
  * null-object, and only a real source row produces a connection.
  *
  * WP3: no longer registered as the primary; all tcp sources use makeMeshtastic().
+ *
+ * Also published through `fallbackManagerHolder.ts`, so helpers that need it
+ * only at call time do not have to import this module.
  */
 export const fallbackManager = new MeshtasticManager();
+registerFallbackManager(fallbackManager);

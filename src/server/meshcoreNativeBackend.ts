@@ -30,6 +30,12 @@ import {
 import { meshcorePayloadTypeNameOrNull } from '../utils/meshcorePacketDecode.js';
 import { meshCorePacketHashOrUndefined } from './services/meshcoreObserverPacket.js';
 import {
+  parseTraceDataPush,
+  traceDataEventFromPush,
+  type TraceDataBufferReader,
+  type TraceDataResponse,
+} from '../utils/meshcoreTrace.js';
+import {
   deriveMeshCoreChannelHash,
   groupTextBodyMatchesRecv,
   tryDecodeGroupTextPayload,
@@ -40,6 +46,7 @@ import {
   MESHCORE_ERR_CODE_NOT_FOUND,
   MESHCORE_ERR_CODE_TABLE_FULL,
 } from './meshcoreDeviceContactErrors.js';
+import { parseCayenneLpp } from './utils/meshcoreCayenneLpp.js';
 
 /**
  * Error message thrown when a remote answers a login attempt with an explicit
@@ -64,28 +71,8 @@ interface LoginSuccessFields {
 // upstream package; a workspace clone can be aliased via package.json.
 type AnyConnection = any;
 
-/** meshcore.js's internal BufferReader surface, as used by our corrected
- * TraceData(0x89) push parser (see the `trace_path` dispatch case). */
-interface TraceDataBufferReader {
-  readByte(): number;
-  readUInt8(): number;
-  readUInt32LE(): number;
-  readBytes(count: number): Uint8Array;
-  readInt8(): number;
-}
-
-/** Parsed CMD_SEND_TRACE_PATH reply, correcting the pinned meshcore.js's
- * `pathSnrs` over-read for multi-byte hop hashes (#4786). */
-interface TraceDataResponse {
-  reserved: number;
-  pathLen: number;
-  flags: number;
-  tag: number;
-  authCode: number;
-  pathHashes: Uint8Array;
-  pathSnrs: Uint8Array;
-  lastSnr: number;
-}
+/** How long a trace tag this backend sent is remembered as "ours" (#5722). */
+const OWN_TRACE_TAG_TTL_MS = 5 * 60_000;
 
 /** A raw meshcore.js ChannelInfo response (`getChannel()` / `getChannels()`). */
 interface RawDeviceChannel {
@@ -122,7 +109,6 @@ interface MeshCoreJsModule {
     AdvType: { None: number; Chat: number; Repeater: number; Room: number };
     TxtTypes: { Plain: number; CliData: number; SignedPlain: number };
   };
-  CayenneLpp: { parse: (bytes: Uint8Array | number[]) => Array<{ channel: number; type: number; value: any }> };
   /** OTA packet parser used to recover relay-hash chains from LogRxData. */
   Packet: {
     PAYLOAD_TYPE_TXT_MSG: number;
@@ -169,6 +155,22 @@ export interface NativeBackendConfig {
   tcpHost?: string;
   tcpPort?: number;
 }
+
+/**
+ * A `CMD_SEND_RAW_PACKET` failure with a stable code the manager and routes
+ * can map to an HTTP status (#6282): `FIRMWARE_UNSUPPORTED` (Err 1 or a
+ * companion older than v13), `TABLE_FULL` (Err 3), `ILLEGAL_ARG` (Err 6),
+ * `FRAME_INVALID`, `RAW_SEND_FAILED` (any other Err), `TIMEOUT`.
+ */
+export class MeshCoreRawSendError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(message);
+    this.name = 'MeshCoreRawSendError';
+  }
+}
+
+/** First companion protocol version that has `CMD_SEND_RAW_PACKET` (fw 1.16). */
+export const MIN_RAW_PACKET_FW_VER = 13;
 
 export interface BridgeShapedResponse {
   id: string;
@@ -226,6 +228,30 @@ interface ConsumedRxPath {
   rssi?: number;
   rawHex?: string;
   packetHash?: string;
+}
+
+const CONTACT_MSG_RECV_CODE = 7;
+
+/** TXT_TYPE_CLI_COMMAND (fw 1.18.0, #5867): a CLI line for another companion.
+ *  meshcore.js's TxtTypes stops at SignedPlain (2). */
+const TXT_TYPE_CLI_COMMAND = 3;
+
+/** ContactInfo.flags bit that lets this contact run CLI lines on us (#5867). */
+export const CONTACT_FLAG_REMOTE_CLI = 0x10;
+
+/**
+ * Split a raw ContactMsgRecv frame carrying a SignedPlain (room) post:
+ * `[7][pubKeyPrefix x6][pathLen][txtType][senderTimestamp u32le][author x4][body…]`.
+ * The author prefix is raw key bytes and the body is UTF-8 text.
+ */
+export function splitSignedPlainPayload(frame: ArrayLike<number>): { authorPrefixHex: string; body: string } {
+  // meshcore.js's serial and TCP transports hand frames over as plain number[].
+  const bytes = frame instanceof Uint8Array ? frame : Uint8Array.from(frame);
+  const payload = bytes.subarray(13);
+  return {
+    authorPrefixHex: bytesToHex(payload.subarray(0, 4)),
+    body: new TextDecoder().decode(payload.subarray(4)),
+  };
 }
 
 function bytesToHex(bytes: Uint8Array | number[]): string {
@@ -391,7 +417,54 @@ function khzToLibBw(v: number): number {
 
 // ---------------- backend ----------------
 
+/** Bridge commands that read-modify-write the shared SetOtherParams frame (#5773). */
+const OTHER_PARAMS_COMMANDS: ReadonlySet<string> = new Set([
+  'set_advert_loc_policy',
+  'set_telemetry_mode_base',
+  'set_telemetry_mode_loc',
+  'set_telemetry_mode_env',
+  'set_other_params',
+  'set_other_params_raw', // P16 #6285: backup restore, raw byte 1 + optional multi_acks
+  'set_auto_add_contacts',
+  'set_multi_acks', // P8a #6257: 5th byte of SetOtherParams
+]);
+
+/** Factory reset gives up waiting for an OK/ERR after this long (the firmware closes serial first). */
+const FACTORY_RESET_SILENCE_MS = 3000;
+
+type AutoAddExchangeResult =
+  | { kind: 'reply'; config: number; maxHops: number }
+  | { kind: 'ok' }
+  | { kind: 'err' }
+  | { kind: 'timeout' };
+
 export class MeshCoreNativeBackend extends EventEmitter {
+  /** Latest raw ContactMsgRecv frame, awaiting its decoded event (#5774). */
+  private lastContactMsgFrame: Uint8Array | null = null;
+
+  /**
+   * Hand back the raw frame for this decoded ContactMsgRecv event, once.
+   * Returns null unless the frame is the same one: it must carry the same
+   * sender prefix, txtType and sender timestamp, and be long enough to hold a
+   * 4-byte author prefix.
+   */
+  private takeContactMsgFrame(msg: {
+    pubKeyPrefix?: Uint8Array;
+    txtType?: number;
+    senderTimestamp?: number;
+  }): Uint8Array | null {
+    const frame = this.lastContactMsgFrame;
+    this.lastContactMsgFrame = null;
+    if (!frame || frame.length < 17 || !msg?.pubKeyPrefix) return null;
+    for (let i = 0; i < 6; i++) {
+      if (frame[1 + i] !== msg.pubKeyPrefix[i]) return null;
+    }
+    if (frame[8] !== msg.txtType) return null;
+    const ts = (frame[9] | (frame[10] << 8) | (frame[11] << 16) | (frame[12] << 24)) >>> 0;
+    if (ts !== ((msg.senderTimestamp ?? 0) >>> 0)) return null;
+    return frame;
+  }
+
   public readonly sourceId: string;
   private config: NativeBackendConfig;
   private connection: AnyConnection | null = null;
@@ -405,6 +478,9 @@ export class MeshCoreNativeBackend extends EventEmitter {
   private connected: boolean = false;
   private commandSeq: number = 0;
   private drainInFlight: boolean = false;
+  /** Tags of traces this backend sent, so a TraceData push can be told apart
+   *  from one the radio merely overheard (#5722). tag → expiry ms. */
+  private readonly ownTraceTags = new Map<number, number>();
   /**
    * Recent LogRxData-derived TXT_MSG/GRP_TXT packet metadata, oldest-first. The
    * firmware emits LogRxData immediately before dispatching the txt-msg-specific
@@ -813,6 +889,28 @@ export class MeshCoreNativeBackend extends EventEmitter {
     // so the MeshCore Packet Monitor can show full OTA metadata (route
     // type, payload type, relay path, SNR/RSSI, raw bytes). The monitor is
     // opt-in and gated downstream in the manager, so emitting here is cheap.
+    // TraceData (#5722): the firmware pushes this for EVERY completed TRACE the
+    // radio hears, not only replies to traces we sent. Keep the corrected
+    // parser and a listener for the whole session and surface each one as a
+    // `trace_data` bridge event; the manager stores the per-hop SNRs. This is
+    // receive-only: nothing is sent. The per-request listener in the
+    // `trace_path` dispatch case keeps working beside it.
+    if (typeof PushCodes?.TraceData === 'number') {
+      const c = this.connection;
+      c.onTraceDataPush = (bufferReader: TraceDataBufferReader) => {
+        c.emit(PushCodes.TraceData, parseTraceDataPush(bufferReader));
+      };
+      c.on(PushCodes.TraceData, (trace: TraceDataResponse) => {
+        try {
+          const now = Date.now();
+          for (const [t, until] of this.ownTraceTags) if (until <= now) this.ownTraceTags.delete(t);
+          this.emitBridgeEvent('trace_data', traceDataEventFromPush(trace, this.ownTraceTags.has(trace.tag >>> 0)));
+        } catch (err) {
+          logger.debug(`[MeshCoreNative:${this.sourceId}] trace_data push ignored: ${(err as Error).message}`);
+        }
+      });
+    }
+
     if (typeof PushCodes?.LogRxData === 'number' && this.PacketCtor) {
       const PacketCtor = this.PacketCtor;
       const TXT_MSG = PacketCtor.PAYLOAD_TYPE_TXT_MSG;
@@ -927,10 +1025,25 @@ export class MeshCoreNativeBackend extends EventEmitter {
     // source pubkey prefix.
     const txtTypes = this.constants.TxtTypes;
     this.connection.on(ResponseCodes.ContactMsgRecv, (msg: any) => {
+      // Consumed exactly once per decoded event, so one frame's bytes can never
+      // attach to another message. Only room posts use it.
+      const rawFrame = this.takeContactMsgFrame(msg);
       const isCliReply =
         txtTypes && typeof msg.txtType === 'number' && msg.txtType === txtTypes.CliData;
       const isRoomPost =
         txtTypes && typeof msg.txtType === 'number' && msg.txtType === txtTypes.SignedPlain;
+
+      if (msg.txtType === TXT_TYPE_CLI_COMMAND) {
+        // fw 1.18.0 (#5867): a peer sent us a CLI line and its contact entry
+        // lacks the remote-CLI bit, so the firmware handed it to the app
+        // instead of running it. It is not a chat message: storing it as a DM
+        // would let auto-ack / auto-responders answer it over the air.
+        this.consumePendingPath({ kind: 'dm', pubKeyPrefix: msg.pubKeyPrefix, pathLen: msg.pathLen });
+        logger.info(
+          `[MeshCoreNative:${this.sourceId}] dropped a CLI command from ${bytesToHex(msg.pubKeyPrefix)} (remote CLI not allowed for that contact)`,
+        );
+        return;
+      }
 
       if (isRoomPost) {
         // SignedPlain: room server post. The first 4 bytes of the text body
@@ -943,11 +1056,24 @@ export class MeshCoreNativeBackend extends EventEmitter {
         // message — that leak attached a stale SNR/route to an unrelated
         // message (part of issue #3589). We don't surface SNR on room posts.
         this.consumePendingPath({ kind: 'dm', pubKeyPrefix: msg.pubKeyPrefix, pathLen: msg.pathLen });
-        const rawText: string = msg.text ?? '';
-        const authorPrefixHex = Array.from(rawText.substring(0, 4))
-          .map((ch: string) => ch.charCodeAt(0).toString(16).padStart(2, '0'))
-          .join('');
-        const postBody = rawText.substring(4);
+        // meshcore.js decodes the whole payload as UTF-8 before we see it, so
+        // every author-prefix byte >= 0x80 is already U+FFFD in `msg.text`
+        // (#5774). The raw frame, tapped from the 'rx' event that fires just
+        // before the decoded event, is the only source of the true bytes.
+        let authorPrefixHex = '';
+        let postBody: string;
+        if (rawFrame) {
+          const post = splitSignedPlainPayload(rawFrame);
+          authorPrefixHex = post.authorPrefixHex;
+          postBody = post.body;
+        } else {
+          // No matching raw frame: the prefix is unrecoverable. Leave the
+          // author unknown rather than store a corrupted string as a key.
+          logger.debug(
+            `[MeshCoreNative:${this.sourceId}] room post without a matching raw frame; author unknown`,
+          );
+          postBody = String(msg.text ?? '').substring(4);
+        }
 
         this.emitBridgeEvent('room_message', {
           room_pubkey_prefix: bytesToHex(msg.pubKeyPrefix),
@@ -1053,6 +1179,15 @@ export class MeshCoreNativeBackend extends EventEmitter {
     //                        (only when "overwrite oldest" is enabled; it never
     //                        evicts a favourite)
     //   0x90               — a new contact could not be stored: table full
+    // Remember the latest ContactMsgRecv frame: meshcore.js emits 'rx' with the
+    // frame and then, synchronously, the decoded event for that same frame.
+    // The serial and TCP transports emit a plain number[] (not a Uint8Array):
+    // copy it, so later byte operations never meet an array without subarray.
+    this.connection.on('rx', (frame: ArrayLike<number>) => {
+      this.lastContactMsgFrame =
+        frame && frame.length > 0 && frame[0] === CONTACT_MSG_RECV_CODE ? Uint8Array.from(frame) : null;
+    });
+
     const PUSH_CONTACT_DELETED = 0x8F;
     const PUSH_CONTACTS_FULL = 0x90;
     this.connection.on('rx', (frame: Uint8Array) => {
@@ -1365,7 +1500,10 @@ export class MeshCoreNativeBackend extends EventEmitter {
     }
     const id = `${++this.commandSeq}`;
     try {
-      const data = await this.withTimeout(this.dispatch(cmd, params), timeoutMs, cmd);
+      const op = OTHER_PARAMS_COMMANDS.has(cmd)
+        ? this.runOtherParamsOp(() => this.dispatch(cmd, params))
+        : this.dispatch(cmd, params);
+      const data = await this.withTimeout(op, timeoutMs, cmd);
       return { id, success: true, data };
     } catch (err) {
       return {
@@ -1377,8 +1515,29 @@ export class MeshCoreNativeBackend extends EventEmitter {
         ...(err instanceof MeshCoreTraceTimeoutError
           ? { data: { timed_out: true, wait_ms: err.waitMs, suggested_timeout_ms: err.suggestedTimeoutMs } }
           : {}),
+        // #6282: a raw send names its failure so the route can pick a status.
+        ...(err instanceof MeshCoreRawSendError ? { data: { error_code: err.code } } : {}),
       };
     }
+  }
+
+  /**
+   * One at a time for every command that rewrites SetOtherParams (#5773).
+   *
+   * CMD_SET_OTHER_PARAMS (38) carries five settings in one frame, so each
+   * setter is a read-modify-write: read SelfInfo, patch one field, write all
+   * five back. Run together, they all read the same old snapshot and the last
+   * frame to arrive wins, undoing the others. The UI saved three telemetry
+   * modes at once and only one stuck.
+   *
+   * The chain advances however an op settles, so a failure never wedges it.
+   */
+  private otherParamsChain: Promise<unknown> = Promise.resolve();
+
+  private runOtherParamsOp<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.otherParamsChain.then(fn, fn);
+    this.otherParamsChain = run.catch(() => undefined);
+    return run;
   }
 
   private async withTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -1461,6 +1620,132 @@ export class MeshCoreNativeBackend extends EventEmitter {
    * safety net, not a behaviour change, for ops that already bound themselves.
    */
   private static readonly RADIO_OP_BACKSTOP_MS = MESHCORE_RADIO_OP_BACKSTOP_MS;
+
+  /** How long to wait for the radio to answer a raw auto-add frame (58/59). */
+  private static readonly AUTOADD_REPLY_TIMEOUT_MS = 4_000;
+
+  /**
+   * Send one raw auto-add frame and classify the answer from the raw 'rx' tap
+   * (meshcore.js has no helper for 58/59). Call inside runExclusiveRadioOp.
+   * `reply` = RESP_CODE_AUTOADD_CONFIG (25), `ok`/`err` = the generic acks,
+   * `timeout` = silence. Err and timeout both mean "old firmware" to a reader.
+   */
+  private autoAddExchange(
+    c: AnyConnection,
+    frame: Uint8Array,
+  ): Promise<AutoAddExchangeResult> {
+    const K = this.constants!;
+    const RESP_AUTOADD_CONFIG = 25;
+    return new Promise((resolve) => {
+      const done = (v: AutoAddExchangeResult) => {
+        clearTimeout(timer);
+        c.off('rx', onRx);
+        resolve(v);
+      };
+      const onRx = (f: Uint8Array) => {
+        if (!f || f.length < 1) return;
+        if (f[0] === RESP_AUTOADD_CONFIG && f.length >= 3) {
+          done({ kind: 'reply', config: f[1], maxHops: f[2] });
+        } else if (f[0] === K.ResponseCodes.Ok) {
+          done({ kind: 'ok' });
+        } else if (f[0] === K.ResponseCodes.Err) {
+          done({ kind: 'err' });
+        }
+      };
+      const timer = setTimeout(() => done({ kind: 'timeout' }), MeshCoreNativeBackend.AUTOADD_REPLY_TIMEOUT_MS);
+      c.on('rx', onRx);
+      void c.sendToRadioFrame(frame);
+    });
+  }
+
+  /**
+   * Send one frame and wait for the first reply `accept` recognises, or an Err
+   * (reported with its code byte), or silence. Call inside runExclusiveRadioOp.
+   * Frames on the 'rx' tap may be number[] (serial/TCP) or Uint8Array.
+   */
+  private frameExchange<T>(
+    c: AnyConnection,
+    frame: Uint8Array,
+    accept: (f: Uint8Array) => T | undefined,
+    timeoutMs: number,
+  ): Promise<{ kind: 'reply'; value: T } | { kind: 'err'; code: number | null } | { kind: 'timeout' }> {
+    const K = this.constants!;
+    return new Promise((resolve) => {
+      type R = { kind: 'reply'; value: T } | { kind: 'err'; code: number | null } | { kind: 'timeout' };
+      const done = (v: R) => {
+        clearTimeout(timer);
+        c.off('rx', onRx);
+        resolve(v);
+      };
+      const onRx = (raw: Uint8Array | number[]) => {
+        if (!raw || raw.length < 1) return;
+        const f = Uint8Array.from(raw);
+        if (f[0] === K.ResponseCodes.Err) {
+          done({ kind: 'err', code: f.length > 1 ? f[1] : null });
+          return;
+        }
+        const v = accept(f);
+        if (v !== undefined) done({ kind: 'reply', value: v });
+      };
+      const timer = setTimeout(() => done({ kind: 'timeout' }), timeoutMs);
+      c.on('rx', onRx);
+      void c.sendToRadioFrame(frame);
+    });
+  }
+
+  /**
+   * Send one CMD_RUN_CLI_COMMAND (66) frame and wait for RESP_CODE_CLI_REPLY
+   * (29), whose body is the reply text. Call inside runExclusiveRadioOp.
+   * Firmware before protocol v14 answers Err (unknown command).
+   */
+  private cliExchange(
+    c: AnyConnection,
+    command: string,
+    timeoutMs: number,
+  ): Promise<{ kind: 'reply'; text: string } | { kind: 'err' } | { kind: 'timeout' }> {
+    const K = this.constants!;
+    const CMD_RUN_CLI_COMMAND = 66;
+    const RESP_CODE_CLI_REPLY = 29;
+    const body = new TextEncoder().encode(command);
+    const frame = new Uint8Array(1 + body.length);
+    frame[0] = CMD_RUN_CLI_COMMAND;
+    frame.set(body, 1);
+    return new Promise((resolve) => {
+      const done = (v: { kind: 'reply'; text: string } | { kind: 'err' } | { kind: 'timeout' }) => {
+        clearTimeout(timer);
+        c.off('rx', onRx);
+        resolve(v);
+      };
+      const onRx = (f: Uint8Array) => {
+        if (!f || f.length < 1) return;
+        if (f[0] === RESP_CODE_CLI_REPLY) {
+          // Serial/TCP frames are plain number[]: copy before decoding.
+          done({ kind: 'reply', text: new TextDecoder().decode(Uint8Array.from(f).subarray(1)) });
+        } else if (f[0] === K.ResponseCodes.Err) {
+          done({ kind: 'err' });
+        }
+      };
+      const timer = setTimeout(() => done({ kind: 'timeout' }), timeoutMs);
+      c.on('rx', onRx);
+      void c.sendToRadioFrame(frame);
+    });
+  }
+
+  /** Bridge-shaped auto-add payload; `config === null` means unsupported. */
+  private autoAddToData(config: number | null, maxHops: number) {
+    const cfg = config ?? 0;
+    return {
+      supported: config !== null,
+      overwrite_oldest: (cfg & 0x01) !== 0,
+      types: {
+        chat: (cfg & 0x02) !== 0,
+        repeater: (cfg & 0x04) !== 0,
+        room: (cfg & 0x08) !== 0,
+        sensor: (cfg & 0x10) !== 0,
+      },
+      max_hops: config === null ? 0 : maxHops,
+    };
+  }
 
   private runExclusiveRadioOp<T>(fn: () => Promise<T>, label = 'radio-op'): Promise<T> {
     const bounded = (): Promise<T> => {
@@ -1859,7 +2144,13 @@ export class MeshCoreNativeBackend extends EventEmitter {
         // the firmware as twice as many 1-byte hops and the trace times out
         // (#4786). Build the frame ourselves so we can set the real width:
         // [SendTracePath][tag:4 LE][auth:4 LE][flags][path bytes].
-        const tag = Math.floor(Math.random() * 0x1_0000_0000);
+        // The manager picks the tag so it can log the attempt before the reply
+        // (#6276); it is the same 4 random bytes on air, only chosen one layer up.
+        const requestedTag = params.tag;
+        const tag = typeof requestedTag === 'number' && Number.isInteger(requestedTag) && requestedTag >= 0 && requestedTag <= 0xffff_ffff
+          ? requestedTag
+          : Math.floor(Math.random() * 0x1_0000_0000);
+        this.ownTraceTags.set(tag, Date.now() + OWN_TRACE_TAG_TTL_MS);
         const frame = Buffer.alloc(1 + 4 + 4 + 1 + path.length);
         frame.writeUInt8(K.CommandCodes.SendTracePath, 0);
         frame.writeUInt32LE(tag, 1);
@@ -1889,19 +2180,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
           // Install a corrected parser for exactly this request's window.
           const originalOnTraceDataPush = c.onTraceDataPush;
           c.onTraceDataPush = (bufferReader: TraceDataBufferReader) => {
-            const reserved = bufferReader.readByte();
-            const respPathLen = bufferReader.readUInt8();
-            const respFlags = bufferReader.readUInt8();
-            const respPathSz = respFlags & 0x03;
-            const respTag = bufferReader.readUInt32LE();
-            const authCode = bufferReader.readUInt32LE();
-            const pathHashes = bufferReader.readBytes(respPathLen);
-            const hopCount = respPathSz > 0 ? respPathLen >> respPathSz : respPathLen;
-            const pathSnrs = bufferReader.readBytes(hopCount);
-            const lastSnr = bufferReader.readInt8() / 4;
-            c.emit(K.PushCodes.TraceData, {
-              reserved, pathLen: respPathLen, flags: respFlags, tag: respTag, authCode, pathHashes, pathSnrs, lastSnr,
-            });
+            c.emit(K.PushCodes.TraceData, parseTraceDataPush(bufferReader));
           };
 
           // Own timeout (mirrors request_owner/request_regions above): a
@@ -2379,8 +2658,33 @@ export class MeshCoreNativeBackend extends EventEmitter {
         // The firmware addresses the CLI text from its own contact table; a
         // target it doesn't hold fails instantly with no RF (#5349).
         await this.requireDeviceContact(c, fullKey);
-        await c.sendTextMessage(fullKey, text, K.TxtTypes.CliData);
+        // A Companion target (fw 1.18.0+, #5867) runs only TXT_TYPE_CLI_COMMAND
+        // (3); CliData (1) is what repeaters take and what every reply carries.
+        const txtType = params.txt_type === 'command' ? TXT_TYPE_CLI_COMMAND : K.TxtTypes.CliData;
+        await c.sendTextMessage(fullKey, text, txtType);
         return { sent: true };
+      }
+
+      case 'set_contact_remote_cli': {
+        // Set/clear ContactInfo.flags bit 4 (mask 0x10, fw 1.18.0+, #5867):
+        // when set, the companion runs TXT_TYPE_CLI_COMMAND lines from this
+        // contact and replies over the air. Same read-modify-write as the
+        // favourite bit, then a read-back. Local serial write, no RF.
+        const publicKey = await this.resolvePublicKey(params.public_key as string);
+        if (!publicKey) throw new Error('Remote-CLI target not found');
+        const allowed = params.allowed === true;
+        const targetHex = bytesToHex(publicKey);
+        const contacts = (await c.getContacts()) as RawDeviceContact[];
+        const contact = contacts.find((ct) => bytesToHex(ct.publicKey) === targetHex);
+        if (!contact) throw new Error('Remote-CLI target not in device contact list');
+        await this.applyContactFlag(contact, CONTACT_FLAG_REMOTE_CLI, allowed);
+        const back = ((await c.getContacts()) as RawDeviceContact[])
+          .find((ct) => bytesToHex(ct.publicKey) === targetHex);
+        const flags = typeof back?.flags === 'number' ? back.flags : 0;
+        if (((flags & CONTACT_FLAG_REMOTE_CLI) !== 0) !== allowed) {
+          throw new Error('Remote-CLI permission not confirmed on device: read-back shows the old value');
+        }
+        return { ok: true, allowed, flags };
       }
 
       case 'login': {
@@ -2547,21 +2851,30 @@ export class MeshCoreNativeBackend extends EventEmitter {
       case 'set_other_params': {
         // Atomic multi-field SetOtherParams (issue #3904). telemetryMode* accept
         // the raw 2-bit values (numeric pass-through) as well as strings.
-        const manualAddContacts = Number(params.manualAddContacts) ? 1 : 0;
+        // Only bit 0 of manual_add_contacts is the caller's: the per-type
+        // auto-add bits above it are read from a fresh SelfInfo and kept
+        // (P8a #6257, meshcore.js's setOtherParams used to wipe them).
+        const manualBit = Number(params.manualAddContacts) ? 1 : 0;
         const telemetryModeBase = telemetryModeStringToNumber(params.telemetryModeBase ?? 0);
         const telemetryModeLoc = telemetryModeStringToNumber(params.telemetryModeLoc ?? 0);
         const telemetryModeEnv = telemetryModeStringToNumber(params.telemetryModeEnv ?? 0);
         const advLocPolicy = Number(params.advLocPolicy ?? 0) & 0xff;
-        await c.setOtherParams({
-          manualAddContacts,
-          telemetryModeBase,
-          telemetryModeLoc,
-          telemetryModeEnv,
-          advLocPolicy,
-        });
+        const info = (await c.getSelfInfo(10_000).catch(() => null)) as Record<string, unknown> | null;
+        const cached = this.cachedSelfInfo as Record<string, unknown> | null;
+        const rawManual = typeof info?.manualAddContacts === 'number'
+          ? info.manualAddContacts
+          : typeof cached?.manualAddContacts === 'number' ? cached.manualAddContacts : 0;
+        const manualAddContacts = ((rawManual & 0xff) & ~0x01) | manualBit;
+        const telemetryPacked = telemetryModeBase | (telemetryModeLoc << 2) | (telemetryModeEnv << 4);
+        await this.writeOtherParamsFrame(c, K, {
+          manual: manualAddContacts,
+          telemPacked: telemetryPacked,
+          advLoc: advLocPolicy,
+        }, 'Device rejected the other-params setting');
         if (this.cachedSelfInfo) {
           const s = this.cachedSelfInfo as any;
           s.manualAddContacts = manualAddContacts;
+          s.telemetryMode = telemetryPacked;
           s.telemetryModeBase = telemetryModeBase;
           s.telemetryModeLoc = telemetryModeLoc;
           s.telemetryModeEnv = telemetryModeEnv;
@@ -2570,55 +2883,264 @@ export class MeshCoreNativeBackend extends EventEmitter {
         return { ok: true };
       }
 
+      case 'set_other_params_raw': {
+        // P16 #6285: restore of a device-config backup. Byte 1 goes out
+        // VERBATIM (auto-add bits included), unlike set_other_params. The 5th
+        // byte (multi_acks) is sent only when given (the caller limits it to
+        // 0 or 1 on firmware >= 7) and is read back like set_multi_acks.
+        // Local serial write, no RF.
+        const manual = Number(params.manualAddContactsRaw);
+        if (!Number.isInteger(manual) || manual < 0 || manual > 255) {
+          throw new Error('Invalid manual_add_contacts byte');
+        }
+        const mode = (v: unknown): number => telemetryModeStringToNumber(v ?? 0);
+        const base = mode(params.telemetryModeBase);
+        const loc = mode(params.telemetryModeLoc);
+        const env = mode(params.telemetryModeEnv);
+        const advLoc = Number(params.advLocPolicy ?? 0) & 0xff;
+        const telemPacked = base | (loc << 2) | (env << 4);
+        let multiAcks: number | undefined;
+        if (params.multiAcks !== undefined) {
+          multiAcks = Number(params.multiAcks);
+          if (!Number.isInteger(multiAcks) || multiAcks < 0 || multiAcks > 1) {
+            throw new Error(`Invalid multi_acks value: ${params.multiAcks}`);
+          }
+        }
+        await this.writeOtherParamsFrame(c, K, {
+          manual, telemPacked, advLoc, ...(multiAcks !== undefined ? { multiAcks } : {}),
+        }, 'Device rejected the restored settings');
+        let readback: number | null = null;
+        if (multiAcks !== undefined) {
+          const back = (await c.getSelfInfo(10_000).catch(() => null)) as Record<string, unknown> | null;
+          readback = typeof back?.multiAcks === 'number' ? back.multiAcks : null;
+        }
+        if (this.cachedSelfInfo) {
+          const s: Record<string, unknown> = this.cachedSelfInfo;
+          s.manualAddContacts = manual;
+          s.telemetryMode = telemPacked;
+          s.telemetryModeBase = base;
+          s.telemetryModeLoc = loc;
+          s.telemetryModeEnv = env;
+          s.advLocPolicy = advLoc;
+          if (readback !== null) s.multiAcks = readback;
+        }
+        return { ok: true, multi_acks: readback };
+      }
+
       case 'set_auto_add_contacts': {
         // Toggle auto-add (#5502): bit 0 of NodePrefs.manual_add_contacts.
         // Firmware: isAutoAddEnabled() == (manual_add_contacts & 1) == 0. The
         // higher bits are per-type auto-add flags, and SetOtherParams(38)
         // rewrites the telemetry modes and advert location policy in the same
         // frame, so this is a read-modify-write against a FRESH SelfInfo.
-        // meshcore.js's setOtherParams writes `manualAddContacts ? 1 : 0`,
-        // which would wipe the higher bits, so the frame is built here:
-        // [38][manual_add_contacts][telemetry modes, packed][advert loc policy].
-        // A 4-byte frame leaves later fields (multi_acks) untouched.
         // Local serial write — nothing is transmitted.
         const enabled = params.enabled === true;
-        const info = (await c.getSelfInfo(10_000)) as Record<string, unknown> | null;
-        if (!info || typeof info.manualAddContacts !== 'number') {
-          throw new Error('Could not read the current device settings');
-        }
-        const current = info.manualAddContacts & 0xff;
-        const next = enabled ? current & ~0x01 : current | 0x01;
-        const bits2 = (v: unknown): number => (typeof v === 'number' ? v : 0) & 0b11;
-        const telemetryPacked = typeof info.telemetryMode === 'number'
-          ? info.telemetryMode & 0xff
-          : bits2(info.telemetryModeBase) | (bits2(info.telemetryModeLoc) << 2) | (bits2(info.telemetryModeEnv) << 4);
-        const advLocPolicy = Number(info.advLocPolicy ?? 0) & 0xff;
-        await new Promise<void>((resolve, reject) => {
-          const onOk = () => {
-            c.off(K.ResponseCodes.Ok, onOk);
-            c.off(K.ResponseCodes.Err, onErr);
-            resolve();
-          };
-          const onErr = () => {
-            c.off(K.ResponseCodes.Ok, onOk);
-            c.off(K.ResponseCodes.Err, onErr);
-            reject(new Error('Device rejected the auto-add setting'));
-          };
-          c.once(K.ResponseCodes.Ok, onOk);
-          c.once(K.ResponseCodes.Err, onErr);
-          // 38 = CMD_SET_OTHER_PARAMS.
-          c.sendToRadioFrame(Uint8Array.from([38, next & 0xff, telemetryPacked, advLocPolicy]));
-        });
+        const cur = await this.readOtherParams(c);
+        const next = enabled ? cur.manual & ~0x01 : cur.manual | 0x01;
+        await this.writeOtherParamsFrame(c, K, {
+          manual: next,
+          telemPacked: cur.telemPacked,
+          advLoc: cur.advLoc,
+        }, 'Device rejected the auto-add setting');
         if (this.cachedSelfInfo) {
           const s: Record<string, unknown> = this.cachedSelfInfo;
           s.manualAddContacts = next;
-          s.telemetryMode = telemetryPacked;
-          s.telemetryModeBase = telemetryPacked & 0b11;
-          s.telemetryModeLoc = (telemetryPacked >> 2) & 0b11;
-          s.telemetryModeEnv = (telemetryPacked >> 4) & 0b11;
-          s.advLocPolicy = advLocPolicy;
+          s.telemetryMode = cur.telemPacked;
+          s.telemetryModeBase = cur.telemPacked & 0b11;
+          s.telemetryModeLoc = (cur.telemPacked >> 2) & 0b11;
+          s.telemetryModeEnv = (cur.telemPacked >> 4) & 0b11;
+          s.advLocPolicy = cur.advLoc;
         }
         return { manual_add_contacts: next, auto_add: (next & 0x01) === 0 };
+      }
+
+      case 'set_multi_acks': {
+        // P8a #6257: 5th byte of SetOtherParams (companion-v1.7.4+). Older
+        // firmware ignores it, so read SelfInfo back and report what the
+        // device kept: the manager turns a mismatch into MULTI_ACKS_UNSUPPORTED.
+        // Local serial write; the AIRTIME effect is why the route caps it at 1.
+        const value = Number(params.value);
+        if (!Number.isInteger(value) || value < 0 || value > 255) {
+          throw new Error(`Invalid multi_acks value: ${params.value}`);
+        }
+        const cur = await this.readOtherParams(c);
+        await this.writeOtherParamsFrame(c, K, {
+          manual: cur.manual,
+          telemPacked: cur.telemPacked,
+          advLoc: cur.advLoc,
+          multiAcks: value,
+        }, 'Device rejected the multi-ACKs setting');
+        const back = (await c.getSelfInfo(10_000).catch(() => null)) as Record<string, unknown> | null;
+        const readback = typeof back?.multiAcks === 'number' ? back.multiAcks : null;
+        if (this.cachedSelfInfo && readback !== null) {
+          this.cachedSelfInfo.multiAcks = readback;
+        }
+        return { multi_acks: readback, requested: value };
+      }
+
+      case 'set_device_pin': {
+        // P8a #6257: CMD_SET_DEVICE_PIN (37) [37][u32 LE pin]. No meshcore.js
+        // helper. Firmware accepts 0 or 100000-999999 (else ERR); applies
+        // after the next boot. Local serial write, no RF.
+        const pin = Number(params.pin);
+        if (!Number.isInteger(pin) || (pin !== 0 && (pin < 100000 || pin > 999999))) {
+          throw new Error('BLE PIN must be 0 or 100000-999999');
+        }
+        const frame = new Uint8Array(5);
+        frame[0] = 37;
+        new DataView(frame.buffer).setUint32(1, pin, true);
+        await this.rawOkErr(c, K, frame, 'Device rejected the BLE PIN');
+        return { ok: true, pin };
+      }
+
+      case 'factory_reset': {
+        // P8a #6257: CMD_FACTORY_RESET (51) [51]['r','e','s','e','t']. The
+        // firmware disables serial BEFORE formatting, so the OK may never
+        // arrive: resolve on OK, on disconnect, or after 3 s of silence.
+        // ERR fails. Local only, but it wipes identity, prefs, channels,
+        // contacts. The caller audits first.
+        const frame = Uint8Array.from([51, 0x72, 0x65, 0x73, 0x65, 0x74]);
+        const how = await new Promise<'ok' | 'disconnected' | 'silence'>((resolve, reject) => {
+          const cleanup = () => {
+            clearTimeout(timer);
+            c.off(K.ResponseCodes.Ok, onOk);
+            c.off(K.ResponseCodes.Err, onErr);
+            this.off('disconnected', onDisc);
+          };
+          const onOk = () => { cleanup(); resolve('ok'); };
+          const onErr = () => { cleanup(); reject(new Error('Device rejected the factory reset')); };
+          const onDisc = () => { cleanup(); resolve('disconnected'); };
+          const timer = setTimeout(() => { cleanup(); resolve('silence'); }, FACTORY_RESET_SILENCE_MS);
+          c.once(K.ResponseCodes.Ok, onOk);
+          c.once(K.ResponseCodes.Err, onErr);
+          this.once('disconnected', onDisc);
+          c.sendToRadioFrame(frame);
+        });
+        return { ok: true, how };
+      }
+
+      case 'get_autoadd_config': {
+        // CMD_GET_AUTOADD_CONFIG (59) -> RESP_CODE_AUTOADD_CONFIG (25). Older
+        // firmware answers Err or nothing: report `supported: false`.
+        // Local serial read, no RF. Uses the shared radio-op lock because the
+        // raw frame has no tag to match its reply against (the generic
+        // runOtherParamsOp lock is not on this tree).
+        const reply = await this.runExclusiveRadioOp(
+          () => this.autoAddExchange(c, Uint8Array.from([59])),
+          'get_autoadd_config',
+        );
+        return reply.kind === 'reply'
+          ? this.autoAddToData(reply.config, reply.maxHops)
+          : this.autoAddToData(null, 0);
+      }
+
+      case 'set_autoadd_config': {
+        // CMD_SET_AUTOADD_CONFIG (58): [58][autoadd_config][autoadd_max_hops].
+        // Read-modify-write inside ONE radio op: fetch the current bytes, apply
+        // only the fields given, send both bytes, read back what the device
+        // kept. Local serial write, no RF.
+        const patch = params as {
+          overwrite_oldest?: unknown;
+          types?: Record<string, unknown>;
+          max_hops?: unknown;
+        };
+        return await this.runExclusiveRadioOp(async () => {
+          const cur = await this.autoAddExchange(c, Uint8Array.from([59]));
+          if (cur.kind !== 'reply') return this.autoAddToData(null, 0);
+          let config = cur.config;
+          const setBit = (bit: number, v: unknown) => {
+            if (typeof v === 'boolean') config = v ? config | bit : config & ~bit;
+          };
+          setBit(0x01, patch.overwrite_oldest);
+          setBit(0x02, patch.types?.chat);
+          setBit(0x04, patch.types?.repeater);
+          setBit(0x08, patch.types?.room);
+          setBit(0x10, patch.types?.sensor);
+          let maxHops = cur.maxHops;
+          if (patch.max_hops !== undefined && patch.max_hops !== null) {
+            const n = Number(patch.max_hops);
+            if (!Number.isInteger(n) || n < 0 || n > 64) {
+              throw new Error('max_hops must be a whole number from 0 to 64');
+            }
+            maxHops = n;
+          }
+          const ack = await this.autoAddExchange(c, Uint8Array.from([58, config & 0xff, maxHops & 0xff]));
+          if (ack.kind === 'err') throw new Error('Device rejected the auto-add options');
+          if (ack.kind === 'timeout') throw new Error('Device did not answer the auto-add options');
+          const back = await this.autoAddExchange(c, Uint8Array.from([59]));
+          if (back.kind !== 'reply') throw new Error('Could not read back the auto-add options');
+          return this.autoAddToData(back.config, back.maxHops);
+        }, 'set_autoadd_config');
+      }
+
+      case 'run_cli': {
+        // CMD_RUN_CLI_COMMAND (66) -> RESP_CODE_CLI_REPLY (29), companion
+        // protocol v14+ (fw 1.18.0, #5866). The device runs the line through
+        // its own text CLI and answers in the same frame exchange. Local serial
+        // only: none of the companion's CLI verbs transmit. The reply carries
+        // no tag, so it shares the radio-op lock like the auto-add frames.
+        const text = String(params.command ?? '');
+        const timeoutMs = Number(params.timeout_ms) > 0 ? Number(params.timeout_ms) : 5_000;
+        const reply = await this.runExclusiveRadioOp(
+          () => this.cliExchange(c, text, timeoutMs),
+          'run_cli',
+        );
+        if (reply.kind === 'err') throw new Error('Device rejected the CLI command');
+        if (reply.kind === 'timeout') throw new Error(`CLI command timed out after ${timeoutMs}ms`);
+        return { reply: reply.text };
+      }
+
+      case 'send_raw_packet': {
+        // CMD_SEND_RAW_PACKET (65), companion v13+ (fw 1.16, #6282). The caller
+        // hands us a finished packet frame `[65][priority][raw packet]`; the
+        // radio queues it as is (no route bits, no transport codes, not marked
+        // seen). This puts energy on the air, so it is an RF command: it is in
+        // RF_BRIDGE_COMMANDS and blocked in receive-only mode.
+        if (this.cachedFirmwareVer == null || this.cachedFirmwareVer < MIN_RAW_PACKET_FW_VER) {
+          throw new MeshCoreRawSendError(
+            'FIRMWARE_UNSUPPORTED',
+            `Raw packet send needs companion protocol v${MIN_RAW_PACKET_FW_VER}+ (device reports ` +
+              `${this.cachedFirmwareVer == null ? 'unknown' : 'v' + this.cachedFirmwareVer})`,
+          );
+        }
+        const hex = typeof params.frame_hex === 'string' ? params.frame_hex : '';
+        const frame = /^([0-9a-f]{2})+$/i.test(hex) ? Uint8Array.from(Buffer.from(hex, 'hex')) : null;
+        // 176 = firmware MAX_FRAME_SIZE; longer frames corrupt silently on serial.
+        if (!frame || frame[0] !== 65 || frame.length < 4 || frame.length > 176) {
+          throw new MeshCoreRawSendError('FRAME_INVALID', 'Invalid raw packet frame');
+        }
+        const res = await this.runExclusiveRadioOp(
+          () => this.frameExchange(c, frame, (f) => (f[0] === K.ResponseCodes.Ok ? true : undefined), 5_000),
+          'send_raw_packet',
+        );
+        if (res.kind === 'timeout') throw new MeshCoreRawSendError('TIMEOUT', 'Raw packet send timed out');
+        if (res.kind === 'err') {
+          if (res.code === 1) throw new MeshCoreRawSendError('FIRMWARE_UNSUPPORTED', 'Device does not support raw packet send');
+          if (res.code === 3) throw new MeshCoreRawSendError('TABLE_FULL', 'Device send queue is full');
+          if (res.code === 6) throw new MeshCoreRawSendError('ILLEGAL_ARG', 'Device rejected the raw packet');
+          throw new MeshCoreRawSendError('RAW_SEND_FAILED', `Device rejected the raw packet (err ${res.code ?? '?'})`);
+        }
+        return { sent: true };
+      }
+
+      case 'get_default_flood_scope': {
+        // CMD_GET_DEFAULT_FLOOD_SCOPE (64) -> RESP_CODE_DEFAULT_FLOOD_SCOPE (28):
+        // `[28][name 31][key 16]`, or just `[28]` when the node has no default.
+        // Local read, no RF. Needed to mirror `sendFloodScoped` on a raw send.
+        if (this.cachedFirmwareVer != null && this.cachedFirmwareVer < 11) return { default: null };
+        const res = await this.runExclusiveRadioOp(
+          () => this.frameExchange(c, Uint8Array.from([64]), (f) => (f[0] === 28 ? f : undefined), 5_000),
+          'get_default_flood_scope',
+        );
+        if (res.kind === 'timeout') throw new Error('get_default_flood_scope timed out');
+        if (res.kind === 'err') return { default: null };
+        const f = res.value;
+        if (f.length < 1 + 31 + 16) return { default: null };
+        const nameBytes = f.subarray(1, 32);
+        const nul = nameBytes.indexOf(0);
+        const name = Buffer.from(nameBytes.subarray(0, nul < 0 ? nameBytes.length : nul)).toString('utf8');
+        const key = Buffer.from(f.subarray(32, 48)).toString('hex');
+        return { default: { name, key_hex: key } };
       }
 
       case 'get_stats': {
@@ -2640,7 +3162,24 @@ export class MeshCoreNativeBackend extends EventEmitter {
 
       case 'device_query': {
         // SupportedCompanionProtocolVersion = 1
-        const info = await c.deviceQuery(1);
+        // meshcore.js drops the trailing `client_repeat` (v9+, byte 80) and
+        // `path_hash_mode` (v10+, byte 81) bytes into `manufacturerModel`, so
+        // tap the raw DeviceInfo frame (RESP 13) for them (#6282).
+        let rawInfo: Uint8Array | null = null;
+        const tapInfo = (raw: Uint8Array | number[]) => {
+          if (raw && raw.length >= 1 && raw[0] === 13) rawInfo = Uint8Array.from(raw);
+        };
+        c.on?.('rx', tapInfo);
+        let info: Awaited<ReturnType<typeof c.deviceQuery>>;
+        try {
+          info = await c.deviceQuery(1);
+        } finally {
+          c.off?.('rx', tapInfo);
+        }
+        const rawFrame = rawInfo as Uint8Array | null;
+        const fwv = typeof info?.firmwareVer === 'number' ? info.firmwareVer : 0;
+        const repeat = rawFrame && fwv >= 9 && rawFrame.length > 80 ? rawFrame[80] !== 0 : undefined;
+        const pathHashMode = rawFrame && fwv >= 10 && rawFrame.length > 81 ? rawFrame[81] : undefined;
         // The upstream meshcore.js library reads the entire remainder of the
         // DeviceInfo frame as `manufacturerModel`. Newer firmware packs the
         // hardware model name and a firmware-version string (e.g. "v1.7.0") as
@@ -2671,6 +3210,8 @@ export class MeshCoreNativeBackend extends EventEmitter {
           ver: verString,
           max_contacts: maxContacts,
           max_channels: maxChannels,
+          repeat,
+          path_hash_mode: pathHashMode,
         };
       }
 
@@ -2688,8 +3229,10 @@ export class MeshCoreNativeBackend extends EventEmitter {
           () => c.sendBinaryRequest(publicKey, [reqType]),
           'request_telemetry',
         );
-        const mod = await loadMeshCoreJs();
-        const records = mod.CayenneLpp.parse(responseData);
+        // Decode locally rather than with meshcore.js's CayenneLpp.parse(),
+        // which stops at the first type it does not know (e.g. altitude) and
+        // drops every sensor after it (#6389).
+        const records = parseCayenneLpp(responseData);
         // `raw` is the undecoded Cayenne-LPP payload. The Virtual Node relays it
         // verbatim in a TelemetryResponse(0x8B) push so the connecting app can
         // decode it itself, without us round-tripping through `records` (#3904).
@@ -3024,6 +3567,60 @@ export class MeshCoreNativeBackend extends EventEmitter {
     }
   }
 
+  /** Fresh SelfInfo -> the raw SetOtherParams fields (P8a #6257). */
+  private async readOtherParams(c: AnyConnection): Promise<{ manual: number; telemPacked: number; advLoc: number }> {
+    const info = (await c.getSelfInfo(10_000)) as Record<string, unknown> | null;
+    if (!info || typeof info.manualAddContacts !== 'number') {
+      throw new Error('Could not read the current device settings');
+    }
+    const bits2 = (v: unknown): number => (typeof v === 'number' ? v : 0) & 0b11;
+    const telemPacked = typeof info.telemetryMode === 'number'
+      ? info.telemetryMode & 0xff
+      : bits2(info.telemetryModeBase) | (bits2(info.telemetryModeLoc) << 2) | (bits2(info.telemetryModeEnv) << 4);
+    return {
+      manual: info.manualAddContacts & 0xff,
+      telemPacked,
+      advLoc: Number(info.advLocPolicy ?? 0) & 0xff,
+    };
+  }
+
+  /** Send a raw frame and wait for the generic Ok / Err response. */
+  private rawOkErr(c: AnyConnection, K: MeshCoreJsModule['Constants'], frame: Uint8Array, errMsg: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const onOk = () => {
+        c.off(K.ResponseCodes.Ok, onOk);
+        c.off(K.ResponseCodes.Err, onErr);
+        resolve();
+      };
+      const onErr = () => {
+        c.off(K.ResponseCodes.Ok, onOk);
+        c.off(K.ResponseCodes.Err, onErr);
+        reject(new Error(errMsg));
+      };
+      c.once(K.ResponseCodes.Ok, onOk);
+      c.once(K.ResponseCodes.Err, onErr);
+      c.sendToRadioFrame(frame);
+    });
+  }
+
+  /**
+   * The one writer of CMD_SET_OTHER_PARAMS (38):
+   * `[38][manual_add_contacts raw byte][telemetry packed][advert loc policy][multi_acks?]`.
+   * `manual` is the RAW byte (auto-add bits kept). Without `multiAcks` the
+   * frame is 4 bytes and the firmware leaves multi_acks untouched. Callers
+   * run inside runOtherParamsOp (a read-modify-write needs it).
+   */
+  private writeOtherParamsFrame(
+    c: AnyConnection,
+    K: MeshCoreJsModule['Constants'],
+    f: { manual: number; telemPacked: number; advLoc: number; multiAcks?: number },
+    errMsg: string,
+  ): Promise<void> {
+    const bytes = [38, f.manual & 0xff, f.telemPacked & 0xff, f.advLoc & 0xff];
+    if (f.multiAcks !== undefined) bytes.push(f.multiAcks & 0xff);
+    return this.rawOkErr(c, K, Uint8Array.from(bytes), errMsg);
+  }
+
   // ---------------- selfInfo / contact helpers ----------------
 
   private selfInfoToBridgeShape(): Record<string, unknown> | null {
@@ -3043,6 +3640,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
       longitude: fixedToDegrees(info.advLon),
       adv_loc_policy: info.advLocPolicy,
       manual_add_contacts: (info as any).manualAddContacts,
+      multi_acks: info.multiAcks,
       telemetry_mode_base: (info as any).telemetryModeBase,
       telemetry_mode_loc: (info as any).telemetryModeLoc,
       telemetry_mode_env: (info as any).telemetryModeEnv,
@@ -3096,12 +3694,21 @@ export class MeshCoreNativeBackend extends EventEmitter {
    * record via AddUpdateContact only when the bit actually changes. Shared by
    * the `set_contact_favorite` and `set_contacts_favorite` dispatch cases.
    */
-  private async applyContactFavorite(
+  private applyContactFavorite(
     contact: RawDeviceContact,
     favorite: boolean,
   ): Promise<{ changed: boolean; flags: number }> {
+    return this.applyContactFlag(contact, 0x01, favorite);
+  }
+
+  /** Set or clear one ContactInfo.flags bit, keeping the others. */
+  private async applyContactFlag(
+    contact: RawDeviceContact,
+    mask: number,
+    on: boolean,
+  ): Promise<{ changed: boolean; flags: number }> {
     const currentFlags = typeof contact.flags === 'number' ? contact.flags : 0;
-    const newFlags = (favorite ? (currentFlags | 0x01) : (currentFlags & ~0x01)) & 0xff;
+    const newFlags = (on ? (currentFlags | mask) : (currentFlags & ~mask)) & 0xff;
     const changed = newFlags !== currentFlags;
     if (changed && this.connection) {
       await this.connection.addOrUpdateContact(

@@ -28,9 +28,11 @@ import { useAuth } from '../../contexts/AuthContext';
 import { UiIcon } from '../icons';
 import { DRAG_HANDLE_TOUCH_STYLE } from '../dragHandleStyle';
 import SidebarFooter from '../SidebarFooter';
+import { MarkAllReadButton } from '../messages/MarkAllReadButton';
 import styles from './DashboardSidebar.module.css';
 import MqttProxyWarning from './MqttProxyWarning';
 import { isAnyMeshCoreSourceType } from '../../utils/nodeTypeCategory';
+import type { TranslateFn } from '../../types/translate';
 
 // Narrow, LOCAL slices of `source.config` / the status poll for the compact
 // Analyzer Observer badge (#5014 Phase 2 WP3 §4.9) — not imports of a
@@ -168,7 +170,7 @@ interface DashboardSidebarProps {
 function getActivityBadge(
   total: number,
   active: number | undefined,
-  t: (key: string, opts?: any) => string,
+  t: TranslateFn,
 ): { count: string; window: string; tone: 'live' | 'partial' | 'idle'; title: string } | null {
   if (active === undefined || total <= 0) return null;
   // Live = >50% of heard nodes still active; partial = some but minority;
@@ -211,6 +213,10 @@ function getStatusInfo(
     // The broker kept rejecting the login and the source gave up (#5596).
     // "Connecting" would be a lie: nothing is retrying.
     return { dotClass: 'disconnected', label: t('source.status_auth_stopped') };
+  }
+  if (status.evictionStopped && !status.connected) {
+    // An MQTT bridge the broker kept evicting gave up (#5893). Nothing retries.
+    return { dotClass: 'disconnected', label: t('source.status_eviction_stopped') };
   }
   if (status.connected) {
     return { dotClass: 'connected', label: t('source.status_connected') };
@@ -325,7 +331,7 @@ const KebabMenu: React.FC<KebabMenuProps> = ({
           setOpen((v) => !v);
         }}
       >
-        ⋮
+        <UiIcon name="more" size={16} />
       </button>
       {open && (
         <div className="dashboard-kebab-menu">
@@ -509,24 +515,6 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
     [unreadBySource],
   );
 
-  /**
-   * Confirm only above a threshold. A stray tap that clears three badges costs
-   * nothing; one that silently clears a 200-message backlog is unrecoverable —
-   * read state has no undo. Below the threshold a prompt is just friction on
-   * the action people press most.
-   */
-  const MARK_ALL_CONFIRM_THRESHOLD = 50;
-  const handleMarkAllDmsRead = () => {
-    if (!onMarkAllDmsRead) return;
-    if (totalUnreadDms >= MARK_ALL_CONFIRM_THRESHOLD) {
-      const ok = window.confirm(
-        t('source.mark_all_dms_read_confirm', { count: totalUnreadDms }),
-      );
-      if (!ok) return;
-    }
-    onMarkAllDmsRead();
-  };
-
   // On mobile, wrap source selection so the drawer auto-closes after tap.
   const handleSelectSource = (id: string) => {
     onSelectSource(id);
@@ -702,15 +690,16 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
             the common case — which is also what keeps both controls fitting on
             a narrow screen. */}
         {isAuthenticated && onMarkAllDmsRead && totalUnreadDms > 0 && (
-          <button
+          <MarkAllReadButton
             className="dashboard-add-source-btn"
             style={{ marginLeft: 6, padding: '2px 8px', fontSize: 11 }}
-            onClick={handleMarkAllDmsRead}
+            onMarkAll={() => onMarkAllDmsRead()}
             disabled={markAllDmsReadPending}
             title={t('source.mark_all_dms_read_help')}
-          >
-            {t('source.mark_all_dms_read')}
-          </button>
+            label={t('source.mark_all_dms_read')}
+            unreadCount={totalUnreadDms}
+            confirmMessage={t('source.mark_all_dms_read_confirm', { count: totalUnreadDms })}
+          />
         )}
       </div>
 
@@ -800,6 +789,16 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
                   </span>
                 ) : null;
               })()}
+              {!isUnified && source.type === 'meshcore_mqtt_broker' && typeof status?.clientCount === 'number' && (
+                // Embedded MeshCore broker (#6197): observers connected now.
+                // Per-connection diagnostics live on the source's Overview tab.
+                <span
+                  className="dashboard-source-card-badge"
+                  title={t('meshcore.broker.card_badge_title', 'Observers connected to this broker')}
+                >
+                  {t('meshcore.broker.card_badge', '{{count}} obs', { count: status.clientCount })}
+                </span>
+              )}
               {!isUnified && source.type === 'meshcore' && (() => {
                 // Compact Analyzer Observer indicator (#5014 Phase 2 WP3 §4.9).
                 // Zero new requests: `status.observer` rides the already-polled
@@ -1028,9 +1027,12 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
                 // A bridge whose gateway publishers stopped gets the button
                 // even while its subscriber is connected: the click restarts
                 // only the stopped gateways.
-                ((((source.config as any)?.autoConnect === false || status?.authStopped === true) &&
+                ((((source.config as any)?.autoConnect === false ||
+                  status?.authStopped === true ||
+                  status?.evictionStopped === true) &&
                   !status?.connected) ||
-                  (status?.authStoppedGatewayCount ?? 0) > 0) &&
+                  (status?.authStoppedGatewayCount ?? 0) > 0 ||
+                  (status?.evictionStoppedGatewayCount ?? 0) > 0) &&
                 onConnectSource && (() => {
                   const pending = connectingIds?.has(source.id) === true;
                   const gatewaysOnly = status?.connected === true;
@@ -1043,7 +1045,7 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
                         if (!pending) onConnectSource(source.id);
                       }}
                       title={
-                        (status?.authStopped
+                        (status?.authStopped || status?.evictionStopped
                           ? (status as { permissionMessage?: string | null }).permissionMessage
                           : null) ??
                         (gatewaysOnly ? t('source.retry_gateways_help') : t('source.connect_help'))

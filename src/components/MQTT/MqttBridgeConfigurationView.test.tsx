@@ -25,6 +25,7 @@ vi.mock('react-i18next', async () => {
 const { state } = vi.hoisted(() => ({
   state: {
     canWrite: true,
+    savedPresets: { canManage: false, presets: [] } as { canManage: boolean; presets: unknown[] },
     fetch: null as unknown as ReturnType<typeof import('vitest')['vi']['fn']>,
     saveBar: null as null | {
       id: string;
@@ -50,6 +51,22 @@ vi.mock('../../hooks/useCsrfFetch', () => {
   return { useCsrfFetch: () => csrfFetch };
 });
 vi.mock('../../init', () => ({ appBasename: '' }));
+vi.mock('../../hooks/useMqttBrokerPresets', () => {
+  const action = () => ({ mutateAsync: vi.fn(), isPending: false });
+  return {
+    useMqttBrokerPresets: () => state.savedPresets,
+    useCreateBrokerPreset: action,
+    useUpdateBrokerPreset: action,
+    useDeleteBrokerPreset: action,
+  };
+});
+vi.mock('./MqttRootFinder', () => ({
+  MqttRootFinder: (props: { disabled?: boolean; defaultRegionRoot: string; onPickRoot: (r: string) => void }) => (
+    <button type="button" disabled={props.disabled} data-region={props.defaultRegionRoot} onClick={() => props.onPickRoot('msh/US/WA')}>
+      find-topics-stub
+    </button>
+  ),
+}));
 vi.mock('../../hooks/useDashboardData', () => ({ useSourceStatuses: () => new Map() }));
 vi.mock('../BBoxMapEditor', () => ({ default: () => <div data-testid="bbox-editor" /> }));
 vi.mock('../../hooks/useSaveBar', () => ({
@@ -118,6 +135,7 @@ const saveButton = () => screen.getByRole('button', { name: 'Save' });
 
 beforeEach(() => {
   state.canWrite = true;
+  state.savedPresets = { canManage: false, presets: [] };
   state.saveBar = null;
   installFetch({ config: STORED_CONFIG });
 });
@@ -301,5 +319,192 @@ describe('MQTT bridge setup: gated on sources:write', () => {
     await renderSection();
     expect(state.saveBar?.hasChanges).toBe(false);
     expect(puts()).toEqual([]);
+  });
+});
+
+/** The shared PresetPicker chips (#5831): the pressed chip, and a click on one. */
+const presetChips = (root: ParentNode) => root.querySelector('[data-testid="broker-preset-picker"]') as HTMLElement;
+const chosenPreset = (root: ParentNode) =>
+  (presetChips(root).querySelector('[aria-pressed="true"]') as HTMLElement | null)?.dataset.presetId;
+const pickPreset = (root: ParentNode, id: string) =>
+  fireEvent.click(presetChips(root).querySelector(`[data-preset-id="${id}"]`) as HTMLElement);
+
+describe('MQTT bridge setup: broker presets (#5689)', () => {
+  const passwordField = () => screen.getByPlaceholderText('••••••••') as HTMLInputElement;
+
+  it('opens on Custom… for a URL that matches no preset, and on the preset for one that does', async () => {
+    await renderSection();
+    expect(chosenPreset(document)).toBe('custom');
+    fireEvent.change(urlField(), { target: { value: 'mqtts://mqtt.meshtastic.org:8883' } });
+    expect(chosenPreset(document)).toBe('meshtastic_public_tls');
+  });
+
+  it('fills the URL with scheme and port, sends nothing, and keeps the typed username', async () => {
+    await renderSection();
+    pickPreset(document, 'meshtastic_public_tls');
+    expect(screen.getByDisplayValue('mqtts://mqtt.meshtastic.org:8883')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('bridge-user')).toBeInTheDocument();
+    // A password is stored (admin view), so the field stays blank and says why.
+    expect(passwordField().value).toBe('');
+    expect(screen.getByTestId('broker-preset-kept').textContent).toMatch(/password is saved/);
+    // Fields it does not own stay as loaded.
+    expect(screen.getByDisplayValue('msh/US/#')).toBeInTheDocument();
+    expect(puts()).toHaveLength(0);
+    await waitFor(() => expect(state.saveBar?.hasChanges).toBe(true));
+  });
+
+  it('fills an empty login when no password is stored, and Save sends it', async () => {
+    installFetch({ config: { ...STORED_CONFIG, upstream: { url: 'mqtt://upstream.example:1883' } } });
+    await renderSection();
+    pickPreset(document, 'meshtastic_public');
+    expect(passwordField().value).toBe('large4cats');
+    expect(screen.queryByTestId('broker-preset-kept')).toBeNull();
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(puts()).toHaveLength(1));
+    const upstream = (puts()[0].body as { config: { upstream: unknown } }).config.upstream;
+    expect(upstream).toEqual({ url: 'mqtt://mqtt.meshtastic.org:1883', username: 'meshdev', password: 'large4cats' });
+  });
+
+  it('a non-admin editor: the preset neither blanks nor replaces the masked secret', async () => {
+    installFetch({ config: MASKED_CONFIG, maskedConfigFields: MASKED_FIELDS });
+    await renderSection();
+    pickPreset(document, 'meshtastic_public');
+    expect(passwordField().value).toBe('');
+    expect(screen.getByTestId('broker-preset-kept')).toBeInTheDocument();
+    expect(puts()).toHaveLength(0);
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(puts()).toHaveLength(1));
+    const upstream = (puts()[0].body as { config: { upstream: Record<string, unknown> } }).config.upstream;
+    // Missing, not '' or null or the preset's password: the server's merge
+    // decides about the stored secret, exactly as for a hand-typed URL.
+    expect('password' in upstream).toBe(false);
+    expect('username' in upstream).toBe(false);
+    expect(upstream).toEqual({ url: 'mqtt://mqtt.meshtastic.org:1883' });
+  });
+
+  it('Custom… leaves the URL as typed', async () => {
+    await renderSection();
+    pickPreset(document, 'custom');
+    expect(urlField().value).toBe('mqtt://upstream.example:1883');
+    expect(puts()).toHaveLength(0);
+  });
+
+  it('a reader cannot pick a preset', async () => {
+    state.canWrite = false;
+    await renderSection();
+    presetChips(document).querySelectorAll('button').forEach((b) => expect((b as HTMLButtonElement).disabled).toBe(true));
+  });
+});
+
+/** A saved preset (#5794) as a non-admin editor gets it: no login, only that it has one. */
+const SAVED_FOR_EDITOR = {
+  id: 7,
+  name: 'Florida Mesh Broker',
+  host: 'broker.fl-mesh.org',
+  port: 1883,
+  tls: false,
+  rootTopic: 'msh/US/FL',
+  hasUsername: true,
+  hasPassword: true,
+};
+
+const savedChips = () => screen.getByTestId('broker-preset-saved-picker');
+
+describe('MQTT bridge setup: saved broker presets (#5794)', () => {
+  it('a non-admin: fills URL and subscription, leaves the login blank, and Save sends the preset id', async () => {
+    state.savedPresets = { canManage: false, presets: [SAVED_FOR_EDITOR] };
+    installFetch({ config: { ...MASKED_CONFIG, upstream: { url: 'mqtt://upstream.example:1883' } } });
+    await renderSection();
+    expect(screen.queryByTestId('broker-preset-save-as')).toBeNull();
+    expect(screen.queryByTestId('broker-preset-manage')).toBeNull();
+
+    fireEvent.click(savedChips().querySelector('[data-preset-id="saved:7"]') as HTMLElement);
+    expect(screen.getByDisplayValue('mqtt://broker.fl-mesh.org:1883')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('msh/US/FL/#')).toBeInTheDocument();
+    expect(screen.getByTestId('broker-preset-kept').textContent).toMatch(/added when you save/);
+    expect(savedChips().querySelector('[aria-pressed="true"]')?.getAttribute('data-preset-id')).toBe('saved:7');
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(puts()).toHaveLength(1));
+    const upstream = (puts()[0].body as { config: { upstream: Record<string, unknown> } }).config.upstream;
+    expect(upstream).toEqual({ url: 'mqtt://broker.fl-mesh.org:1883', brokerPresetId: 7 });
+  });
+
+  it('does not send the preset id once the URL no longer reaches the preset', async () => {
+    state.savedPresets = { canManage: false, presets: [SAVED_FOR_EDITOR] };
+    installFetch({ config: { ...MASKED_CONFIG, upstream: { url: 'mqtt://upstream.example:1883' } } });
+    await renderSection();
+    fireEvent.click(savedChips().querySelector('[data-preset-id="saved:7"]') as HTMLElement);
+    fireEvent.change(screen.getByDisplayValue('mqtt://broker.fl-mesh.org:1883'), {
+      target: { value: 'mqtt://elsewhere.example:1883' },
+    });
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(puts()).toHaveLength(1));
+    const upstream = (puts()[0].body as { config: { upstream: Record<string, unknown> } }).config.upstream;
+    expect('brokerPresetId' in upstream).toBe(false);
+  });
+
+  it('an admin gets the login filled in directly, plus Save as / Manage', async () => {
+    state.savedPresets = {
+      canManage: true,
+      presets: [{ ...SAVED_FOR_EDITOR, username: 'fluser', password: 'flpass' }],
+    };
+    installFetch({ config: { ...STORED_CONFIG, upstream: { url: 'mqtt://upstream.example:1883' } } });
+    await renderSection();
+    expect(screen.getByTestId('broker-preset-save-as')).toBeInTheDocument();
+    expect(screen.getByTestId('broker-preset-manage')).toBeInTheDocument();
+    fireEvent.click(savedChips().querySelector('[data-preset-id="saved:7"]') as HTMLElement);
+    expect((screen.getByPlaceholderText('••••••••') as HTMLInputElement).value).toBe('flpass');
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(puts()).toHaveLength(1));
+    const upstream = (puts()[0].body as { config: { upstream: Record<string, unknown> } }).config.upstream;
+    expect(upstream).toEqual({ url: 'mqtt://broker.fl-mesh.org:1883', username: 'fluser', password: 'flpass' });
+  });
+
+  it('Save as preset opens prefilled from the form', async () => {
+    state.savedPresets = { canManage: true, presets: [] };
+    await renderSection();
+    fireEvent.click(screen.getByTestId('broker-preset-save-as'));
+    const dialog = await screen.findByTestId('save-broker-preset-dialog');
+    expect((dialog.querySelector('#save-broker-preset-host') as HTMLInputElement).value).toBe('upstream.example');
+    expect((dialog.querySelector('#save-broker-preset-port') as HTMLInputElement).value).toBe('1883');
+    expect((dialog.querySelector('#save-broker-preset-username') as HTMLInputElement).value).toBe('bridge-user');
+    expect((dialog.querySelector('#save-broker-preset-rootTopic') as HTMLInputElement).value).toBe('msh/US');
+    // The stored password is not in the form, so the dialog says so.
+    expect(screen.getByTestId('save-broker-preset-no-password')).toBeInTheDocument();
+  });
+});
+
+describe('MQTT root finder on the bridge subscriptions (#6287)', () => {
+  const stubButton = () => screen.getByRole('button', { name: 'find-topics-stub' }) as HTMLButtonElement;
+  const subs = () => screen.getByDisplayValue('msh/US/#') as HTMLTextAreaElement;
+
+  it('seeds the search from the first subscription and sends no request on mount', async () => {
+    await renderSection();
+    expect(stubButton().dataset.region).toBe('msh/US');
+    expect(puts()).toHaveLength(0);
+  });
+
+  it('a pick replaces a single <root>/# line and saves nothing', async () => {
+    await renderSection();
+    fireEvent.click(stubButton());
+    expect(screen.getByDisplayValue('msh/US/WA/#')).toBeTruthy();
+    expect(puts()).toHaveLength(0);
+  });
+
+  it('a pick appends when there are several lines', async () => {
+    await renderSection();
+    fireEvent.change(subs(), { target: { value: 'msh/US/#\nmsh/EU_868/#' } });
+    fireEvent.click(stubButton());
+    expect((screen.getByDisplayValue(/msh\/US\/WA\/#/) as HTMLTextAreaElement).value).toBe(
+      'msh/US/#\nmsh/EU_868/#\nmsh/US/WA/#',
+    );
+  });
+
+  it('is disabled without sources:write', async () => {
+    state.canWrite = false;
+    await renderSection();
+    expect(stubButton().disabled).toBe(true);
   });
 });

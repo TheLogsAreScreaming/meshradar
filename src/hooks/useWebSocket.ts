@@ -13,6 +13,7 @@ import { mergeNodeUpdate } from './mergeNodeUpdate';
 import type { DeviceInfo, Channel } from '../types/device';
 import { appBasename } from '../init';
 import { useSource } from '../contexts/SourceContext';
+import { PortNum } from '../server/constants/meshtastic.js';
 
 /**
  * WebSocket connection state
@@ -53,6 +54,11 @@ export interface MeshCoreMessageEvent {
   sourceId?: string;
   expectedAckCrc?: number;
   estTimeout?: number;
+  /** 'text' (default) or 'room_post'. */
+  messageType?: string;
+  /** Ack state of our own DM or room post, stamped by the server (#5682). */
+  deliveryStatus?: 'sent' | 'delivered' | 'failed';
+  roundTripMs?: number;
 }
 
 /**
@@ -192,7 +198,7 @@ interface TracerouteCompleteEvent {
  */
 /**
  * Debounce window for the full-poll invalidation fallback used by
- * routing:update and telemetry:batch (see scheduleDebouncedPollInvalidate).
+ * routing:update (see scheduleDebouncedPollInvalidate).
  */
 const POLL_INVALIDATE_DEBOUNCE_MS = 2000;
 
@@ -222,6 +228,24 @@ export function useWebSocket(enabled: boolean = true): WebSocketState {
     });
   }, [queryClient, sourceId]);
 
+  // Helper to merge a coalesced `node:batch` (nodeNum → changed fields) into
+  // the cache in one pass. Nodes not yet in the cache are skipped, as for
+  // `node:updated`; the next poll brings new nodes in.
+  const updateNodesInCache = useCallback((batch: Record<string, Partial<DeviceInfo>>) => {
+    const key = sourcePollQueryKey(sourceId);
+    queryClient.setQueryData<PollData>(key, (old) => {
+      if (!old?.nodes) return old;
+      let changed = false;
+      const updatedNodes = old.nodes.map((node) => {
+        const update = batch[node.nodeNum];
+        if (!update) return node;
+        changed = true;
+        return mergeNodeUpdate(node, update);
+      });
+      return changed ? { ...old, nodes: updatedNodes } : old;
+    });
+  }, [queryClient, sourceId]);
+
   // Helper to add a new message to the cache
   // Messages are ordered newest-first, so new messages go at the beginning
   const addMessageToCache = useCallback((message: RawMessage) => {
@@ -231,7 +255,7 @@ export function useWebSocket(enabled: boolean = true): WebSocketState {
     // become messages[0]; the next poll then evicts them, which makes the
     // newest-message-id tracker in App.tsx think the previously-seen text
     // message at the new messages[0] is "new" and play the chime. (#2867)
-    if (message.portnum === 70 /* TRACEROUTE_APP */) {
+    if (message.portnum === PortNum.TRACEROUTE_APP) {
       return;
     }
 
@@ -330,12 +354,11 @@ export function useWebSocket(enabled: boolean = true): WebSocketState {
     });
   }, [queryClient, sourceId]);
 
-  // routing:update and telemetry:batch (below) can't be merged into the
-  // cache from their event payloads without risking wrong data — see the
-  // handlers themselves for why — so they fall back to invalidating the
-  // full poll query. Debounce that invalidation so a burst of either event
-  // (the server itself batches telemetry every 1s, and a bulk send can
-  // trigger many acks in quick succession) collapses into one ~3MB refetch
+  // routing:update (below) can't be merged into the cache from its event
+  // payload without risking wrong data — see the handler for why — so it
+  // falls back to invalidating the full poll query. Debounce that
+  // invalidation so a burst (a bulk send can trigger many acks in quick
+  // succession) collapses into one ~3MB refetch
   // instead of one per event. usePoll's own 30s WebSocket-connected backup
   // poll already bounds worst-case staleness, so an unbounded trailing
   // debounce (no max-wait) is fine here.
@@ -429,6 +452,12 @@ export function useWebSocket(enabled: boolean = true): WebSocketState {
       updateNodeInCache(data.nodeNum, data.node);
     });
 
+    // Coalesced node changes from high-volume ingest (MQTT), one event per
+    // source every ~2 s.
+    socket.on('node:batch', (data: Record<string, Partial<DeviceInfo>>) => {
+      updateNodesInCache(data);
+    });
+
     socket.on('message:new', (data: RawMessage) => {
       addMessageToCache(data);
       void queryClient.invalidateQueries({ queryKey: ['unreadCounts'] });
@@ -460,17 +489,13 @@ export function useWebSocket(enabled: boolean = true): WebSocketState {
       scheduleDebouncedPollInvalidate();
     });
 
-    // Can't merge: payload is raw per-metric telemetry rows (DbTelemetry —
-    // e.g. { telemetryType: 'batteryLevel', value: 85 }), not poll's
-    // aggregated nodes[].deviceMetrics/environmentMetrics shape, and there's
-    // no client-side telemetryType→field mapping to reconstruct it correctly.
-    // (Node-level metrics themselves already stay live via node:updated,
-    // which the ingest path emits separately — this event mainly exists to
-    // refresh telemetryNodes membership for newly-telemetry-bearing nodes.)
-    // Debounced full-poll invalidation instead.
-    socket.on('telemetry:batch', (_data: { [nodeNum: number]: unknown[] }) => {
-      scheduleDebouncedPollInvalidate();
-    });
+    // telemetry:batch is deliberately NOT handled. The server emits it for the
+    // automation engine (trigger.telemetry). Its rows can't be merged into the
+    // poll cache (raw per-metric rows, not nodes[].deviceMetrics), and the old
+    // fallback, a debounced full-poll invalidation, would refetch the ~3MB poll
+    // after almost every telemetry packet on a busy mesh. Node-level metrics
+    // stay live via node:updated, and usePoll's 30s backup poll picks up
+    // telemetryNodes membership.
 
     socket.on('firmware:status', (data: unknown) => {
       // Store firmware update status for the FirmwareUpdateSection to consume
@@ -501,7 +526,7 @@ export function useWebSocket(enabled: boolean = true): WebSocketState {
     };
   // pollKey is derived from sourceId (primitive) — omit it here to avoid a new array
   // reference on every render triggering socket reconnects.
-  }, [enabled, queryClient, sourceId, updateNodeInCache, addMessageToCache, updateConnectionInCache, updateChannelInCache, addTracerouteToCache, scheduleDebouncedPollInvalidate]);
+  }, [enabled, queryClient, sourceId, updateNodeInCache, updateNodesInCache, addMessageToCache, updateConnectionInCache, updateChannelInCache, addTracerouteToCache, scheduleDebouncedPollInvalidate]);
 
   return state;
 }

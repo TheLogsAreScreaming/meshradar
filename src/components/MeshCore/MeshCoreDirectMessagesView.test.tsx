@@ -19,13 +19,17 @@ vi.mock('react-i18next', async () => {
   return createReactI18nextMock(t);
 });
 
-vi.mock('../../contexts/AuthContext', () => ({
+vi.mock('../../contexts/AuthContext', async () => ({
+  AuthContext: (await import('react')).createContext(null),
   useAuth: () => ({ hasPermission: () => true }),
 }));
 
 vi.mock('../../contexts/SettingsContext', () => ({
   useNodeListStyle: () => 'monochrome',
   useSettings: () => ({ timeFormat: '24', dateFormat: 'MM/DD/YYYY', temperatureUnit: 'F', telemetryVisualizationHours: 48 }),
+  // LinkPreview (mounted inside rendered message bubbles) reads this.
+  useSettingsOptional: () => ({ linkPreviewsEnabled: false }),
+  useOptionalMuteSettings: () => null,
 }));
 
 const csrfFetchMock = vi.fn();
@@ -95,8 +99,13 @@ function makeActions(overrides: Partial<MeshCoreActions> = {}): MeshCoreActions 
     getRemoteAdminCapability: vi.fn().mockResolvedValue(null),
     forgetRemoteCredential: vi.fn().mockResolvedValue(true),
     getRemoteStatus: vi.fn().mockResolvedValue(null),
+    // #6186: server-backed DM history + thread list.
+    fetchDmMessages: vi.fn().mockResolvedValue({ messages: [], hasMore: false }),
+    fetchDmPeers: vi.fn().mockResolvedValue([]),
+    fetchRoomMessages: vi.fn().mockResolvedValue({ messages: [], hasMore: false }),
+    fetchRoomStats: vi.fn().mockResolvedValue([]),
     ...overrides,
-  };
+  } as unknown as MeshCoreActions;
 }
 
 function makeStatus(): ConnectionStatus {
@@ -125,6 +134,7 @@ const realContact: MeshCoreContact = {
 const messages: MeshCoreMessage[] = [];
 
 beforeEach(() => {
+  try { localStorage.removeItem('meshcoreDmSort'); } catch { /* ignore */ }
   csrfFetchMock.mockReset();
   csrfFetchMock.mockResolvedValue(
     new Response(
@@ -157,12 +167,17 @@ describe('MeshCoreDirectMessagesView — per-node telemetry-config panel', () =>
       expect(screen.getByText('Telemetry Retrieval')).toBeTruthy();
     });
 
-    // Panel made its GET against the per-node telemetry-config endpoint.
+    // Panel made its GET against the per-node telemetry-config endpoint. The
+    // view also fetches /api/settings for the Required Repeaters list (#6194),
+    // so locate the telemetry-config call among all calls rather than assuming
+    // it is the first.
     expect(csrfFetchMock).toHaveBeenCalled();
-    const calledUrl = csrfFetchMock.mock.calls[0][0] as string;
+    const calledUrl = csrfFetchMock.mock.calls
+      .map((c) => c[0] as string)
+      .find((u) => u.includes('/telemetry-config'));
+    expect(calledUrl).toBeTruthy();
     expect(calledUrl).toContain('/api/sources/src-a/meshcore/nodes/');
     expect(calledUrl).toContain(REAL_PK);
-    expect(calledUrl).toContain('/telemetry-config');
   });
 
   it('does NOT render the telemetry-retrieval panel when sourceId is not provided (singleton mode)', () => {
@@ -202,7 +217,13 @@ describe('MeshCoreDirectMessagesView — per-node telemetry-config panel', () =>
     fireEvent.click(screen.getByText('Prefix Pete'));
 
     expect(screen.queryByText('Telemetry Retrieval')).toBeNull();
-    expect(csrfFetchMock).not.toHaveBeenCalled();
+    // The per-node telemetry-config endpoint must not be hit for a prefix-only
+    // key. (The view may still fetch /api/settings for Required Repeaters,
+    // which is unrelated — #6194.)
+    const telemetryCalls = csrfFetchMock.mock.calls
+      .map((c) => c[0] as string)
+      .filter((u) => u.includes('/telemetry-config'));
+    expect(telemetryCalls).toHaveLength(0);
   });
 
   it('mounts the TelemetryGraphs component with the selected pubkey when sourceId is set', async () => {
@@ -287,11 +308,99 @@ describe('MeshCoreDirectMessagesView — per-node telemetry-config panel', () =>
     fireEvent.change(dropdown, { target: { value: 'name' } });
     // Direction starts 'desc' — click the direction button (titled
     // "Descending" in that state) to flip to ascending.
-    fireEvent.click(screen.getByTitle('Descending'));
+    fireEvent.click(screen.getByTitle('nodes.descending'));
 
     const names = Array.from(document.querySelectorAll('.mc-node-row .mc-node-row-name'))
       .map((el) => el.querySelector('.mc-node-row-display-name')?.textContent || '');
     expect(names).toEqual(['alpha', 'Bravo', 'Charlie']);
+  });
+
+  it('sorts DM peers by public key (lowercase hex) when "Public key" is selected (#6185)', () => {
+    const contactsList: MeshCoreContact[] = [
+      { publicKey: REAL_PK, advName: 'Charlie', advType: 1, lastSeen: 1000 },
+      { publicKey: REAL_PK_2, advName: 'alpha', advType: 1, lastSeen: 3000 },
+      { publicKey: 'c'.repeat(64), advName: 'Bravo', advType: 1, lastSeen: 2000 },
+    ];
+
+    render(
+      <MeshCoreDirectMessagesView
+        messages={[]}
+        contacts={contactsList}
+        status={makeStatus()}
+        actions={makeActions()}
+      />,
+    );
+
+    const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
+    fireEvent.change(dropdown, { target: { value: 'publicKey' } });
+    // Direction starts 'desc' — flip to ascending for natural hex order.
+    fireEvent.click(screen.getByTitle('nodes.descending'));
+
+    const names = Array.from(document.querySelectorAll('.mc-node-row .mc-node-row-name'))
+      .map((el) => el.querySelector('.mc-node-row-display-name')?.textContent || '');
+    // aaa…(Charlie) < bbb…(alpha) < ccc…(Bravo)
+    expect(names).toEqual(['Charlie', 'alpha', 'Bravo']);
+  });
+
+  it('compares DM peer public keys case-insensitively (#6185)', () => {
+    // 'B'.repeat(64) (ASCII 66) sorts BEFORE 'a'.repeat(64) (ASCII 97) by raw
+    // byte order but AFTER it once both are lowercased, so a lowercase compare
+    // puts the 'a' peer first. Both are valid 64-char hex keys.
+    const contactsList: MeshCoreContact[] = [
+      { publicKey: 'B'.repeat(64), advName: 'PeerB', advType: 1, lastSeen: 1000 },
+      { publicKey: 'a'.repeat(64), advName: 'PeerA', advType: 1, lastSeen: 2000 },
+    ];
+
+    render(
+      <MeshCoreDirectMessagesView
+        messages={[]}
+        contacts={contactsList}
+        status={makeStatus()}
+        actions={makeActions()}
+      />,
+    );
+
+    const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
+    fireEvent.change(dropdown, { target: { value: 'publicKey' } });
+    fireEvent.click(screen.getByTitle('nodes.descending'));
+
+    const names = Array.from(document.querySelectorAll('.mc-node-row .mc-node-row-name'))
+      .map((el) => el.querySelector('.mc-node-row-display-name')?.textContent || '');
+    expect(names).toEqual(['PeerA', 'PeerB']);
+  });
+
+  it('keeps favorited peers pinned when the user switches to public-key sort (#6185)', () => {
+    const contactsList: MeshCoreContact[] = [
+      { publicKey: REAL_PK, advName: 'Charlie', advType: 1, lastSeen: 1000 },
+      { publicKey: REAL_PK_2, advName: 'alpha', advType: 1, lastSeen: 2000 },
+      { publicKey: 'c'.repeat(64), advName: 'Bravo', advType: 1, lastSeen: 3000 },
+    ];
+    // 'Bravo' (ccc…) is favorited — it would sort LAST under public-key/asc, so
+    // the favorite pin must override that and float it to the top.
+    const nodes: MeshCoreNode[] = [
+      { publicKey: REAL_PK, name: 'Charlie', advType: 1, isFavorite: false },
+      { publicKey: REAL_PK_2, name: 'alpha', advType: 1, isFavorite: false },
+      { publicKey: 'c'.repeat(64), name: 'Bravo', advType: 1, isFavorite: true },
+    ];
+
+    render(
+      <MeshCoreDirectMessagesView
+        messages={[]}
+        contacts={contactsList}
+        nodes={nodes}
+        status={makeStatus()}
+        actions={makeActions()}
+      />,
+    );
+
+    const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
+    fireEvent.change(dropdown, { target: { value: 'publicKey' } });
+    fireEvent.click(screen.getByTitle('nodes.descending'));
+
+    const names = Array.from(document.querySelectorAll('.mc-node-row .mc-node-row-name'))
+      .map((el) => el.querySelector('.mc-node-row-display-name')?.textContent || '');
+    // Bravo pinned first despite sorting last by key; the rest follow in hex order.
+    expect(names).toEqual(['Bravo', 'Charlie', 'alpha']);
   });
 
   // Issue #3620: favorited MeshCore nodes pin to the top of the DM contact
@@ -358,7 +467,7 @@ describe('MeshCoreDirectMessagesView — per-node telemetry-config panel', () =>
     const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
     fireEvent.change(dropdown, { target: { value: 'name' } });
     // Flip from the default 'desc' to ascending.
-    fireEvent.click(screen.getByTitle('Descending'));
+    fireEvent.click(screen.getByTitle('nodes.descending'));
 
     const names = Array.from(document.querySelectorAll('.mc-node-row .mc-node-row-name'))
       .map((el) => el.querySelector('.mc-node-row-display-name')?.textContent || '');
@@ -717,5 +826,148 @@ describe('MeshCoreDirectMessagesView — receive-only mode (#4547 Phase 2 WP3)',
     const input = screen.getByPlaceholderText('Type a message…');
     expect(input).not.toBeDisabled();
     expect(input).not.toHaveAttribute('title');
+  });
+});
+
+describe('MeshCoreDirectMessagesView — server-backed DM history (#6186)', () => {
+  it("shows a peer's DM history even when 100+ newer channel messages fill the window", async () => {
+    const SELF = 'self'.padEnd(64, '0');
+    const buriedDm: MeshCoreMessage = {
+      id: 'buried-dm', fromPublicKey: REAL_PK, toPublicKey: SELF,
+      text: 'buried message', timestamp: 1, messageType: 'text',
+    } as unknown as MeshCoreMessage;
+    // 150 newer channel messages — the window that used to evict the DM.
+    const noise: MeshCoreMessage[] = Array.from({ length: 150 }, (_, i) => ({
+      id: `chan-${i}`, fromPublicKey: 'channel-1', toPublicKey: 'channel-1',
+      text: `noise ${i}`, timestamp: 100 + i, messageType: 'channel',
+    })) as unknown as MeshCoreMessage[];
+    const fetchDmMessages = vi.fn().mockResolvedValue({ messages: [buriedDm], hasMore: false });
+
+    render(
+      <MeshCoreDirectMessagesView
+        messages={noise}
+        contacts={[realContact]}
+        status={makeStatus()}
+        actions={makeActions({ fetchDmMessages })}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    fireEvent.click(screen.getByText('Remote Bob'));
+
+    // The DM pane loads this peer's history from the server, not the window.
+    await waitFor(() => {
+      expect(fetchDmMessages).toHaveBeenCalledWith(REAL_PK, expect.objectContaining({ offset: 0 }));
+    });
+    await waitFor(() => {
+      expect(screen.getByText('buried message')).toBeTruthy();
+    });
+    // Channel noise never leaks into the DM pane.
+    expect(screen.queryByText('noise 0')).toBeNull();
+  });
+});
+
+// #6212 follow-up: the DM view folds the server-backed history into the live
+// window exactly like the channel view. Relay evidence (heardBy, #6194) is
+// monotonic, so a confirmation on one copy must survive even when the other
+// copy — the one that wins the dedupe — carries none. Mirrors the channel
+// test "keeps the history confirmation when the live copy has no heardBy".
+describe('MeshCoreDirectMessagesView — DM relay confirmation survives the history/live merge (#6212)', () => {
+  it('keeps the history copy\'s heardBy when the live copy has none', async () => {
+    const SELF = 'self'.padEnd(64, '0');
+    // A DM WE sent, old enough to clear the resend cooldown.
+    const base = {
+      id: 'dm-relay-send', fromPublicKey: SELF, toPublicKey: REAL_PK,
+      text: 'relay dm', timestamp: Date.now() - 60_000,
+      senderTimestamp: Math.floor(Date.now() / 1000) - 60, messageType: 'text',
+    } as unknown as MeshCoreMessage;
+    // Server backlog (#6186) carries the relay confirmation…
+    const historyCopy = {
+      ...base, heardBy: [{ hash: 'ab', name: 'R1', snr: 3, hops: 0 }],
+    } as unknown as MeshCoreMessage;
+    // …but the live window holds the SAME id WITHOUT heardBy. The live copy
+    // wins the dedupe, so a plain copy-wins fold would erase the confirmation.
+    const liveCopy = { ...base } as unknown as MeshCoreMessage;
+    const fetchDmMessages = vi.fn().mockResolvedValue({ messages: [historyCopy], hasMore: false });
+
+    render(
+      <MeshCoreDirectMessagesView
+        messages={[liveCopy]}
+        contacts={[realContact]}
+        status={makeStatus()}
+        actions={makeActions({ fetchDmMessages, resendMessage: vi.fn() } as Partial<MeshCoreActions>)}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+
+    fireEvent.click(screen.getByText('Remote Bob'));
+    await waitFor(() => {
+      expect(fetchDmMessages).toHaveBeenCalledWith(REAL_PK, expect.objectContaining({ offset: 0 }));
+    });
+    await waitFor(() => expect(screen.getAllByText('relay dm').length).toBeGreaterThan(0));
+
+    // The merged copy keeps the relay: the heard-by antenna counts the one
+    // repeater (not 0), and — heard by a repeater — the resend button stays
+    // hidden. Without the merge the badge would read 0 and resend would return.
+    const badge = await screen.findByTestId('mc-heard-by-badge');
+    expect(badge.textContent).toContain('1');
+    expect(screen.queryByRole('button', { name: 'Resend' })).toBeNull();
+  });
+});
+
+
+// #6259 WP-D: shared DM filter, last-message preview, stat chips.
+describe('MeshCoreDirectMessagesView — DM list parity (#6259)', () => {
+  const SELF = 'f'.repeat(64);
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+  const contacts: MeshCoreContact[] = [
+    { publicKey: A, advName: 'Alpha', advType: 1, lastSeen: 1, snr: 6.5, pathLen: 2, latitude: 1, longitude: 2 } as MeshCoreContact,
+    { publicKey: B, advName: 'Bravo', advType: 1, lastSeen: 1 } as MeshCoreContact,
+  ];
+  const nodes = [{ publicKey: B, isFavorite: true }] as unknown as MeshCoreNode[];
+  const dm = (id: string, from: string, to: string, text: string, ts: number) =>
+    ({ id, fromPublicKey: from, toPublicKey: to, text, timestamp: ts, messageType: 'text' }) as unknown as MeshCoreMessage;
+  const status = () => ({ ...makeStatus(), localNode: { publicKey: SELF } }) as ConnectionStatus;
+  const names = (): string[] =>
+    Array.from(document.querySelectorAll('.mc-node-row .mc-node-row-display-name')).map((el) => el.textContent || '');
+  const renderView = (messages: MeshCoreMessage[]) =>
+    render(
+      <MeshCoreDirectMessagesView messages={messages} contacts={contacts} nodes={nodes} status={status()} actions={makeActions()} />,
+    );
+
+  it('shows the last message preview and stat chips on rows', () => {
+    renderView([dm('1', A, SELF, 'hello there', Date.now() - 1000)]);
+    expect(screen.getAllByText('hello there').length).toBeGreaterThan(0);
+    expect(document.body.textContent).toContain('6.5dB');
+    expect(document.body.textContent).toContain('2 nodes.hop');
+  });
+
+  it('shows the no-messages placeholder for a peer with no message', () => {
+    renderView([dm('1', A, SELF, 'hi', Date.now())]);
+    expect(screen.getAllByText('messages.no_messages_preview').length).toBe(1);
+  });
+
+  it('filters by favorites, with-position and recent', () => {
+    renderView([
+      dm('1', A, SELF, 'new', Date.now() - 1000),
+      dm('2', B, SELF, 'old', Date.now() - 3 * 24 * 3600 * 1000),
+    ]);
+    const filter = screen.getByTitle('messages.filter_conversations_title') as HTMLSelectElement;
+    expect(Array.from(filter.options).map((o) => o.value)).toEqual(['all', 'unread', 'recent', 'favorites', 'withPosition']);
+    fireEvent.change(filter, { target: { value: 'favorites' } });
+    expect(names()).toEqual(['Bravo']);
+    fireEvent.change(filter, { target: { value: 'withPosition' } });
+    expect(names()).toEqual(['Alpha']);
+    fireEvent.change(filter, { target: { value: 'recent' } });
+    expect(names()).toEqual(['Alpha']);
+  });
+
+  it('persists the sort choice under meshcoreDmSort', () => {
+    renderView([]);
+    fireEvent.change(screen.getByTitle('Sort by'), { target: { value: 'name' } });
+    expect(JSON.parse(localStorage.getItem('meshcoreDmSort') || '{}').field).toBe('name');
   });
 });

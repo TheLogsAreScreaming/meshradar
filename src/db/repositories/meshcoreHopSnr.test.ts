@@ -1,0 +1,299 @@
+/**
+ * MeshCoreHopSnrRepository (#5722) on SQLite, PostgreSQL and MySQL, with the
+ * table built by migration 201 itself (run twice: it must be idempotent).
+ *
+ * PostgreSQL / MySQL run against the test containers on 5433 / 3307, each in a
+ * private database. They skip silently without the containers — confirm via
+ * the JSON reporter's numPendingTests.
+ */
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import Database from 'better-sqlite3';
+import { drizzle as drizzleSqlite } from 'drizzle-orm/better-sqlite3';
+import { drizzle as drizzlePostgres } from 'drizzle-orm/node-postgres';
+import { drizzle as drizzleMysql } from 'drizzle-orm/mysql2';
+import * as schema from '../schema/index.js';
+import { MeshCoreHopSnrRepository, EXPLORER_ROW_SCAN_LIMIT, type MeshCoreHopSnrRow } from './meshcoreHopSnr.js';
+import {
+  migration as migration201,
+  runMigration201Postgres,
+  runMigration201Mysql,
+} from '../../server/migrations/201_create_meshcore_hop_snr.js';
+import {
+  postgresAvailable,
+  mysqlAvailable,
+  createIsolatedPostgresDatabase,
+  createIsolatedMysqlDatabase,
+} from './test-utils.js';
+import { createTestDb } from '../../server/test-helpers/testDb.js';
+
+const SRC_A = 'src-a';
+const SRC_B = 'src-b';
+const K1 = 'a'.repeat(64);
+const K2 = 'b'.repeat(64);
+// Above 2^31: PG/MySQL INTEGER would overflow, the columns must be BIGINT.
+const TAG = 0xfedcba98;
+
+const row = (over: Partial<MeshCoreHopSnrRow> = {}): MeshCoreHopSnrRow => ({
+  sourceId: SRC_A,
+  traceTag: TAG,
+  authCode: 0xffffffff,
+  hopIndex: 0,
+  hopCount: 2,
+  hashBytes: 1,
+  senderPublicKey: K1,
+  senderHash: 'aa',
+  senderCandidates: 1,
+  receiverPublicKey: K2,
+  receiverHash: 'bb',
+  receiverCandidates: 1,
+  snrQuarterDb: -37,
+  initiated: false,
+  timestamp: 5000,
+  ...over,
+});
+
+function runRepoSuite(getRepo: () => MeshCoreHopSnrRepository, clear: () => Promise<void>) {
+  let repo: MeshCoreHopSnrRepository;
+  beforeEach(async () => {
+    await clear();
+    repo = getRepo();
+  });
+
+  it('requires a sourceId', async () => {
+    await expect(repo.getRecent('', 0)).rejects.toThrow(/sourceId/);
+    await expect(repo.insertHops('', [row()])).rejects.toThrow(/sourceId/);
+  });
+
+  it('round-trips a row exactly: unsigned 32-bit ids, negative SNR, nulls, booleans', async () => {
+    await repo.insertHops(SRC_A, [
+      row(),
+      row({ hopIndex: 1, senderPublicKey: null, senderHash: null, senderCandidates: 0, receiverPublicKey: null, receiverHash: 'c3', receiverCandidates: 2, initiated: true, snrQuarterDb: 48 }),
+    ]);
+    const rows = await repo.getRecent(SRC_A, 0);
+    expect(rows).toHaveLength(2);
+    const first = rows.find((r) => r.hopIndex === 0)!;
+    expect(first).toMatchObject({
+      sourceId: SRC_A, traceTag: TAG, authCode: 0xffffffff, hopCount: 2, hashBytes: 1,
+      senderPublicKey: K1, senderHash: 'aa', senderCandidates: 1,
+      receiverPublicKey: K2, receiverHash: 'bb', receiverCandidates: 1,
+      snrQuarterDb: -37, initiated: false, timestamp: 5000,
+    });
+    const second = rows.find((r) => r.hopIndex === 1)!;
+    expect(second).toMatchObject({
+      senderPublicKey: null, senderHash: null, senderCandidates: 0,
+      receiverPublicKey: null, receiverHash: 'c3', receiverCandidates: 2,
+      snrQuarterDb: 48, initiated: true,
+    });
+  });
+
+  it('hasTrace matches tag + auth inside the window, per source', async () => {
+    await repo.insertHops(SRC_A, [row()]);
+    expect(await repo.hasTrace(SRC_A, TAG, 0xffffffff, 4000)).toBe(true);
+    expect(await repo.hasTrace(SRC_A, TAG, 0xffffffff, 6000)).toBe(false);
+    expect(await repo.hasTrace(SRC_A, TAG, 1, 0)).toBe(false);
+    expect(await repo.hasTrace(SRC_B, TAG, 0xffffffff, 0)).toBe(false);
+  });
+
+  it('node history returns rows where the node is either end, newest first, per source', async () => {
+    await repo.insertHops(SRC_A, [
+      row({ timestamp: 1000 }),
+      row({ timestamp: 3000, senderPublicKey: K2, receiverPublicKey: K1 }),
+      row({ timestamp: 2000, senderPublicKey: 'c'.repeat(64), receiverPublicKey: 'd'.repeat(64) }),
+    ]);
+    await repo.insertHops(SRC_B, [row({ sourceId: SRC_B, timestamp: 9000 })]);
+    const rows = await repo.getHistoryForNode(SRC_A, K1, 0);
+    expect(rows.map((r) => r.timestamp)).toEqual([3000, 1000]);
+    expect(await repo.getHistoryForNode(SRC_A, K1, 2500)).toHaveLength(1);
+    expect((await repo.getRecent(SRC_A, 0)).every((r) => r.sourceId === SRC_A)).toBe(true);
+  });
+
+  it('deleteLink clears one directional link at any age, only on that source (#5970)', async () => {
+    const C = 'c'.repeat(64);
+    await repo.insertHops(SRC_A, [
+      row({ timestamp: 1 }), // K1 -> K2, very old
+      row({ timestamp: 4000 }), // K1 -> K2
+      row({ timestamp: 3000, senderPublicKey: K2, receiverPublicKey: K1 }), // reverse direction
+      row({ timestamp: 2000, receiverPublicKey: C }), // K1 -> C, another link
+      row({ timestamp: 2500, senderPublicKey: null, senderHash: 'ee', senderCandidates: 0, receiverPublicKey: K1 }),
+      row({ timestamp: 2600, senderPublicKey: null, senderHash: 'ff', senderCandidates: 2, receiverPublicKey: K1 }),
+      row({ timestamp: 2700, senderPublicKey: null, senderHash: null, senderCandidates: 0, receiverPublicKey: K1 }),
+    ]);
+    await repo.insertHops(SRC_B, [row({ sourceId: SRC_B, timestamp: 9000 })]);
+    const key = (k: string) => ({ publicKey: k, hash: null });
+    const links = async () => (await repo.getRecent(SRC_A, 0))
+      .map((r) => `${r.senderPublicKey?.[0] ?? r.senderHash ?? '?'}>${r.receiverPublicKey?.[0] ?? '?'}`).sort();
+
+    await expect(repo.deleteLink('', key(K1), key(K2))).rejects.toThrow(/sourceId/);
+    await expect(repo.deleteLink(SRC_A, { publicKey: null, hash: 'ee' }, { publicKey: null, hash: null })).rejects.toThrow(/publicKey/);
+
+    expect(await repo.deleteLink(SRC_A, key(K1), key(K2))).toBe(2);
+    expect(await links()).toEqual(['?>a', 'a>c', 'b>a', 'ee>a', 'ff>a']);
+    // Source B keeps its K1 -> K2 row.
+    expect(await repo.getHistoryForNode(SRC_B, K1, 0)).toHaveLength(1);
+    expect(await repo.deleteLink(SRC_A, key(K1), key(K2))).toBe(0);
+
+    // A hash end matches only rows with no resolved key and that hash.
+    expect(await repo.deleteLink(SRC_A, { publicKey: null, hash: 'ee' }, key(K1))).toBe(1);
+    // The unknown end matches only rows with neither key nor hash.
+    expect(await repo.deleteLink(SRC_A, { publicKey: null, hash: null }, key(K1))).toBe(1);
+    expect(await links()).toEqual(['a>c', 'b>a', 'ff>a']);
+  });
+
+  it('getLatestInitiatedTraceFor returns the newest sent trace of the contact in hop order, per source (WP4 #6260)', async () => {
+    const t = (tag: number, hopIndex: number, over: Partial<MeshCoreHopSnrRow> = {}) =>
+      row({ traceTag: tag, hopIndex, initiated: true, ...over });
+    await repo.insertHops(SRC_A, [
+      // older sent trace
+      t(1, 0, { timestamp: 1000 }),
+      // newest sent trace: two hops, inserted out of order
+      t(2, 1, { timestamp: 9000, senderPublicKey: K2, receiverPublicKey: K1 }),
+      t(2, 0, { timestamp: 9000, senderPublicKey: K1, receiverPublicKey: K2 }),
+      // newer but overheard (not initiated): ignored
+      row({ traceTag: 3, hopIndex: 0, initiated: false, timestamp: 9500 }),
+      // a different trace that does not involve K1/K2 as ends
+      t(4, 0, { timestamp: 9800, senderPublicKey: 'c'.repeat(64), receiverPublicKey: 'd'.repeat(64) }),
+    ]);
+    await repo.insertHops(SRC_B, [row({ sourceId: SRC_B, traceTag: 5, initiated: true, timestamp: 9900 })]);
+    const got = await repo.getLatestInitiatedTraceFor(SRC_A, K1, 0);
+    expect(got.map((r) => [r.traceTag, r.hopIndex])).toEqual([[2, 0], [2, 1]]);
+    expect(got[0].traceTag).toBe(2);
+    expect(await repo.getLatestInitiatedTraceFor(SRC_A, K1, 9001)).toEqual([]);
+    expect(await repo.getLatestInitiatedTraceFor(SRC_A, 'e'.repeat(64), 0)).toEqual([]);
+    expect((await repo.getLatestInitiatedTraceFor(SRC_B, K1, 0)).map((r) => r.traceTag)).toEqual([5]);
+  });
+
+  it('getResolvedLinks returns only fully keyed rows, newest first, limited, per source (WP4 #6260)', async () => {
+    await repo.insertHops(SRC_A, [
+      row({ timestamp: 1000 }),
+      row({ timestamp: 3000, hopIndex: 1 }),
+      row({ timestamp: 4000, receiverPublicKey: null }),
+      row({ timestamp: 5000, senderPublicKey: null }),
+      row({ timestamp: 6000, hopIndex: 2, initiated: true }),
+    ]);
+    await repo.insertHops(SRC_B, [row({ sourceId: SRC_B, timestamp: 7000 })]);
+    expect((await repo.getResolvedLinks(SRC_A, 0)).map((r) => r.timestamp)).toEqual([6000, 3000, 1000]);
+    expect((await repo.getResolvedLinks(SRC_A, 2000)).map((r) => r.timestamp)).toEqual([6000, 3000]);
+    expect(await repo.getResolvedLinks(SRC_A, 0, 1)).toHaveLength(1);
+    expect(await repo.getResolvedLinks(SRC_B, 0)).toHaveLength(1);
+  });
+
+  it('getInitiatedTracesForExplorer groups initiated traces, newest first, and flags both truncation caps (#6276)', async () => {
+    const t = (tag: number, hopIndex: number, ts: number, over: Partial<MeshCoreHopSnrRow> = {}) =>
+      row({ traceTag: tag, hopIndex, initiated: true, timestamp: ts, ...over });
+    await repo.insertHops(SRC_A, [
+      t(1, 0, 1000), t(1, 1, 1000),
+      t(2, 1, 2000), t(2, 0, 2000),
+      row({ traceTag: 3, hopIndex: 0, initiated: false, timestamp: 3000 }),
+    ]);
+    await repo.insertHops(SRC_B, [row({ sourceId: SRC_B, traceTag: 9, initiated: true, timestamp: 4000 })]);
+    const all = await repo.getInitiatedTracesForExplorer(SRC_A, 0, 10);
+    expect(all.truncated).toBe(false);
+    expect(all.traces.map((g) => g.map((r) => [r.traceTag, r.hopIndex]))).toEqual([
+      [[2, 0], [2, 1]],
+      [[1, 0], [1, 1]],
+    ]);
+    // Trace cap: a third trace exists beyond the limit.
+    const capped = await repo.getInitiatedTracesForExplorer(SRC_A, 0, 1);
+    expect(capped.truncated).toBe(true);
+    expect(capped.traces).toHaveLength(1);
+    // Exactly the cap is not truncation.
+    expect((await repo.getInitiatedTracesForExplorer(SRC_A, 0, 2)).truncated).toBe(false);
+    expect((await repo.getInitiatedTracesForExplorer(SRC_A, 1500, 10)).traces).toHaveLength(1);
+    expect((await repo.getInitiatedTracesForExplorer(SRC_B, 0, 10)).traces).toHaveLength(1);
+    expect(await repo.getInitiatedTracesForExplorer(SRC_A, 0, 0)).toEqual({ traces: [], truncated: false });
+    await expect(repo.getInitiatedTracesForExplorer('', 0, 5)).rejects.toThrow(/sourceId/);
+  });
+
+  it('getInitiatedTracesForExplorer flags the row scan cap (#6276)', async () => {
+    const rows: MeshCoreHopSnrRow[] = [];
+    for (let i = 0; i < EXPLORER_ROW_SCAN_LIMIT + 1; i++) {
+      rows.push(row({ traceTag: i + 1, initiated: true, timestamp: 10_000 + i }));
+    }
+    for (let i = 0; i < rows.length; i += 1000) await repo.insertHops(SRC_A, rows.slice(i, i + 1000));
+    const r = await repo.getInitiatedTracesForExplorer(SRC_A, 0, EXPLORER_ROW_SCAN_LIMIT + 10);
+    expect(r.truncated).toBe(true);
+    expect(r.traces).toHaveLength(EXPLORER_ROW_SCAN_LIMIT);
+  });
+
+  it('retention and source deletion touch only that source', async () => {
+    await repo.insertHops(SRC_A, [row({ timestamp: 1000 }), row({ timestamp: 9000 })]);
+    await repo.insertHops(SRC_B, [row({ sourceId: SRC_B, timestamp: 1000 })]);
+    await repo.deleteOlderThan(SRC_A, 5000);
+    expect((await repo.getRecent(SRC_A, 0)).map((r) => r.timestamp)).toEqual([9000]);
+    expect(await repo.getRecent(SRC_B, 0)).toHaveLength(1);
+    await repo.deleteBySourceId(SRC_A);
+    expect(await repo.getRecent(SRC_A, 0)).toEqual([]);
+    expect(await repo.getRecent(SRC_B, 0)).toHaveLength(1);
+  });
+}
+
+describe('MeshCoreHopSnrRepository — SQLite (migration registry)', () => {
+  let t: ReturnType<typeof createTestDb>;
+  beforeAll(() => { t = createTestDb(); });
+  afterAll(() => { t.sqlite.close(); });
+
+  it('migration 201 is idempotent on SQLite', () => {
+    expect(() => migration201.up(t.sqlite)).not.toThrow();
+    expect(() => migration201.up(t.sqlite)).not.toThrow();
+  });
+
+  runRepoSuite(
+    () => new MeshCoreHopSnrRepository(t.db, 'sqlite'),
+    async () => { t.sqlite.prepare('DELETE FROM meshcore_hop_snr').run(); },
+  );
+});
+
+describe('MeshCoreHopSnrRepository — bare SQLite table from migration 201', () => {
+  const sqlite = new Database(':memory:');
+  migration201.up(sqlite);
+  migration201.up(sqlite);
+  const db = drizzleSqlite(sqlite, { schema });
+  afterAll(() => sqlite.close());
+  runRepoSuite(
+    () => new MeshCoreHopSnrRepository(db, 'sqlite'),
+    async () => { sqlite.prepare('DELETE FROM meshcore_hop_snr').run(); },
+  );
+});
+
+describe.skipIf(!postgresAvailable)('MeshCoreHopSnrRepository — PostgreSQL (container)', () => {
+  let pool: import('pg').Pool;
+  let cleanup: (() => Promise<void>) | undefined;
+  let db: ReturnType<typeof drizzlePostgres>;
+
+  beforeAll(async () => {
+    ({ pool, cleanup } = await createIsolatedPostgresDatabase('mig201'));
+    const client = await pool.connect();
+    try {
+      await runMigration201Postgres(client);
+      await runMigration201Postgres(client); // idempotent
+    } finally {
+      client.release();
+    }
+    db = drizzlePostgres(pool, { schema });
+  });
+  afterAll(async () => { await cleanup?.(); });
+
+  runRepoSuite(
+    () => new MeshCoreHopSnrRepository(db as never, 'postgres'),
+    async () => { await pool.query('DELETE FROM meshcore_hop_snr'); },
+  );
+});
+
+describe.skipIf(!mysqlAvailable)('MeshCoreHopSnrRepository — MySQL (container)', () => {
+  let pool: import('mysql2/promise').Pool;
+  let cleanup: (() => Promise<void>) | undefined;
+  let db: ReturnType<typeof drizzleMysql>;
+
+  beforeAll(async () => {
+    ({ pool, cleanup } = await createIsolatedMysqlDatabase('mig201'));
+    await runMigration201Mysql(pool);
+    await runMigration201Mysql(pool); // idempotent
+    db = drizzleMysql(pool, { schema, mode: 'default' });
+  });
+  afterAll(async () => { await cleanup?.(); });
+
+  runRepoSuite(
+    () => new MeshCoreHopSnrRepository(db as never, 'mysql'),
+    async () => { await pool.query('DELETE FROM meshcore_hop_snr'); },
+  );
+});

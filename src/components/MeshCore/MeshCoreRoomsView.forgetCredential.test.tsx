@@ -14,6 +14,8 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MeshCoreRoomsView } from './MeshCoreRoomsView';
 import type { MeshCoreContact } from '../../utils/meshcoreHelpers';
 
+let permissionGranted = true;
+
 vi.mock('react-i18next', async () => {
   const { createReactI18nextMock } = await import('../../test/mockI18n');
   const t = (key: string, fallback?: string | Record<string, unknown>) => {
@@ -23,8 +25,9 @@ vi.mock('react-i18next', async () => {
   return createReactI18nextMock(t);
 });
 
-vi.mock('../../contexts/AuthContext', () => ({
-  useAuth: () => ({ hasPermission: () => true }),
+vi.mock('../../contexts/AuthContext', async () => ({
+  AuthContext: (await import('react')).createContext(null),
+  useAuth: () => ({ hasPermission: () => permissionGranted }),
 }));
 
 const ROOM_PK = 'b'.repeat(64);
@@ -50,6 +53,8 @@ function makeActions(overrides?: Record<string, unknown>) {
     }),
     loginRoom: vi.fn().mockResolvedValue({ success: true }),
     sendRoomPost: vi.fn().mockResolvedValue(true),
+    fetchRoomMessages: vi.fn().mockResolvedValue({ messages: [], hasMore: false }),
+    fetchRoomStats: vi.fn().mockResolvedValue([]),
     forgetRoomCredential: vi.fn().mockResolvedValue(true),
     getRoomSyncConfig: vi.fn().mockResolvedValue({
       enabled: false,
@@ -149,5 +154,93 @@ describe('MeshCoreRoomsView — forget saved password', () => {
 
     expect(await screen.findByText(/went unanswered/i)).toBeInTheDocument();
     expect(screen.queryByText(/refused by this room server/i)).not.toBeInTheDocument();
+  });
+
+  // #6408: with no saved password, auto-sync re-joins with a blank-password
+  // ACL login. When the room refuses that, tell the user to log in again.
+  it('asks for the password again when a blank-password re-join was refused', async () => {
+    const actions = makeActions({
+      getRoomCredentials: vi.fn().mockResolvedValue({ canRemember: true, stored: [] }),
+    });
+    renderView(actions);
+    await waitFor(() => expect(actions.getRoomCredentials).toHaveBeenCalled());
+    fireEvent.click(screen.getByText('Test Room'));
+
+    expect(await screen.findByText(/back in without a password/i)).toBeInTheDocument();
+    expect(screen.queryByText(/refused by this room server/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('MeshCoreRoomsView — auto-sync without a login (#6267)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('shows the toggle on the login card for a saved credential and saves via sync-config only', async () => {
+    const actions = makeActions();
+    renderView(actions);
+    await waitFor(() => expect(actions.getRoomCredentials).toHaveBeenCalled());
+    fireEvent.click(screen.getByText('Test Room'));
+    await screen.findByText('Forget saved password');
+    actions.loginRoom.mockClear();
+    actions.loginRoomWithSaved.mockClear();
+
+    fireEvent.click(screen.getByLabelText('Auto-sync'));
+    fireEvent.click(await screen.findByText('Save'));
+
+    await waitFor(() =>
+      expect(actions.setRoomSyncConfig).toHaveBeenCalledWith(ROOM_PK, true, 60),
+    );
+    expect(actions.loginRoom).not.toHaveBeenCalled();
+    expect(actions.loginRoomWithSaved).not.toHaveBeenCalled();
+  });
+
+  it('saves OFF without any login call', async () => {
+    const actions = makeActions({
+      getRoomSyncConfig: vi.fn().mockResolvedValue({
+        enabled: true, intervalMinutes: 120, failureCount: 0, lastError: null,
+      }),
+    });
+    renderView(actions);
+    await waitFor(() => expect(actions.getRoomCredentials).toHaveBeenCalled());
+    fireEvent.click(screen.getByText('Test Room'));
+    await screen.findByText('Forget saved password');
+    actions.loginRoom.mockClear();
+    actions.loginRoomWithSaved.mockClear();
+
+    fireEvent.click(await screen.findByLabelText('Auto-sync'));
+    fireEvent.click(await screen.findByText('Save'));
+
+    await waitFor(() =>
+      expect(actions.setRoomSyncConfig).toHaveBeenCalledWith(ROOM_PK, false, 120),
+    );
+    expect(actions.loginRoom).not.toHaveBeenCalled();
+    expect(actions.loginRoomWithSaved).not.toHaveBeenCalled();
+  });
+
+  it('hides the toggle when no credential is saved', async () => {
+    const actions = makeActions({
+      getRoomCredentials: vi.fn().mockResolvedValue({ canRemember: true, stored: [] }),
+      getRoomSyncConfig: vi.fn().mockResolvedValue(null),
+    });
+    renderView(actions);
+    await waitFor(() => expect(actions.getRoomCredentials).toHaveBeenCalled());
+    fireEvent.click(screen.getByText('Test Room'));
+    await screen.findByPlaceholderText(/Password/);
+    expect(screen.queryByLabelText('Auto-sync')).not.toBeInTheDocument();
+  });
+
+  it('hides the toggle without configuration write permission', async () => {
+    permissionGranted = false;
+    try {
+      const actions = makeActions();
+      renderView(actions);
+      await waitFor(() => expect(actions.getRoomCredentials).toHaveBeenCalled());
+      fireEvent.click(screen.getByText('Test Room'));
+      await screen.findByText('Forget saved password');
+      expect(screen.queryByLabelText('Auto-sync')).not.toBeInTheDocument();
+    } finally {
+      permissionGranted = true;
+    }
   });
 });

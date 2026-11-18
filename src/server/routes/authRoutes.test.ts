@@ -17,11 +17,14 @@ import { PermissionTestHelper } from '../test-helpers/permissionTestHelper.js';
 import { UserTestHelper } from '../test-helpers/userTestHelper.js';
 import { migration as baselineMigration } from '../migrations/001_v37_baseline.js';
 import { migration as sourceIdPermsMigration } from '../migrations/022_add_source_id_to_permissions.js';
+import { migration as passkeysMigration } from '../migrations/207_create_user_passkeys.js';
 import authRoutes from './authRoutes.js';
+import { __setPublicInstanceConfigForTest, __resetPublicInstanceConfigForTest } from '../services/publicInstanceConfig.js';
+import { resetEnvironmentConfig } from '../config/environment.js';
 
 // Mock the DatabaseService to prevent auto-initialization
 vi.mock('../../services/database.js', () => ({
-  default: {}
+  default: { getSetting: () => null }
 }));
 
 import DatabaseService from '../../services/database.js';
@@ -55,6 +58,8 @@ describe('Authentication Routes', () => {
     baselineMigration.up(db);
     // Add sourceId column to permissions (migration 022)
     sourceIdPermsMigration.up(db);
+    // Passkey columns on users (migration 207, #5841)
+    passkeysMigration.up(db);
 
     const drizzleDb = drizzle(db, { schema });
     const authRepo = new AuthRepository(drizzleDb, 'sqlite');
@@ -75,6 +80,10 @@ describe('Authentication Routes', () => {
     });
     (DatabaseService as any).drizzleDbType = 'sqlite';
     (DatabaseService as any).updatePasswordAsync = async (userId: number, newPassword: string) => userModel.updatePassword(userId, newPassword);
+    // Passkey-only switch (#5841): change-password reads it.
+    (DatabaseService as any).getPasskeyOnlyStateAsync = async (userId: number) => authRepo.getPasskeyOnlyState(userId);
+    // Session invalidation on password change (#6077).
+    (DatabaseService as any).deleteSessionsByUserIdAsync = vi.fn().mockResolvedValue(0);
 
     app.use('/api/auth', authRoutes);
   });
@@ -217,6 +226,30 @@ describe('Authentication Routes', () => {
       expect(response.body.user).toBeNull();
     });
 
+    it('includes the public-instance config for anonymous viewers only', async () => {
+      __setPublicInstanceConfigForTest({ enabled: true, hideLongNames: false });
+      try {
+        const anon = await agent.get('/api/auth/status').expect(200);
+        expect(anon.body.publicInstance).toEqual({
+          enabled: true, hideLongNames: false, hidePublicKeys: true, roundTimestamps: true, hideMessageText: true,
+        });
+      } finally {
+        __resetPublicInstanceConfigForTest();
+      }
+    });
+
+    it('omits the public-instance config when signed in', async () => {
+      __setPublicInstanceConfigForTest({ enabled: true });
+      try {
+        await agent.post('/api/auth/login').send({ username: 'testuser', password: 'password123' }).expect(200);
+        const res = await agent.get('/api/auth/status').expect(200);
+        expect(res.body.authenticated).toBe(true);
+        expect(res.body.publicInstance).toBeUndefined();
+      } finally {
+        __resetPublicInstanceConfigForTest();
+      }
+    });
+
     it('should return authenticated status when logged in', async () => {
       // Login first
       await agent
@@ -322,6 +355,28 @@ describe('Authentication Routes', () => {
         .expect(200);
 
       expect(loginResponse.body.success).toBe(true);
+    });
+
+    it('invalidates other sessions but keeps the current one (#6077)', async () => {
+      (DatabaseService as any).deleteSessionsByUserIdAsync.mockClear();
+
+      await agent
+        .post('/api/auth/login')
+        .send({ username: 'testuser', password: 'password123' });
+
+      await agent
+        .post('/api/auth/change-password')
+        .send({ currentPassword: 'password123', newPassword: 'newpassword456' })
+        .expect(200);
+
+      // Called with the authenticated user's id and a current-session sid to
+      // preserve (the second argument is defined, not undefined).
+      expect((DatabaseService as any).deleteSessionsByUserIdAsync).toHaveBeenCalledTimes(1);
+      const [calledUserId, exceptSid] =
+        (DatabaseService as any).deleteSessionsByUserIdAsync.mock.calls[0];
+      expect(calledUserId).toBe(testUser.id);
+      expect(typeof exceptSid).toBe('string');
+      expect(exceptSid.length).toBeGreaterThan(0);
     });
 
     it('should reject password change with wrong current password', async () => {
@@ -1005,17 +1060,64 @@ describe('Authentication Routes', () => {
   });
 
   describe('GET /check-default-password', () => {
-    it('should return isDefaultPassword=false when admin uses non-default password', async () => {
-      // admin user already created with 'admin123' which is not 'changeme'
-      const response = await request(app)
-        .get('/api/auth/check-default-password');
+    // #6082: the endpoint is gated to authenticated admins so anonymous
+    // scanners cannot discover an instance still on admin/changeme. A helper
+    // logs in as the given admin credentials before querying.
+    const adminAgentChecking = async (username: string, password: string) => {
+      const a = request.agent(app);
+      await a.post('/api/auth/login').send({ username, password }).expect(200);
+      return a.get('/api/auth/check-default-password');
+    };
 
+    it('does NOT reveal default-password status to anonymous callers (#6082)', async () => {
+      // Admin is on the default password, but an unauthenticated probe must not
+      // learn that — it always gets false.
+      db.prepare('DELETE FROM users').run();
+      await userModel.create({
+        username: 'admin',
+        password: 'changeme',
+        email: 'admin2@example.com',
+        authProvider: 'local',
+        isAdmin: true
+      });
+
+      const response = await request(app).get('/api/auth/check-default-password');
+      expect(response.status).toBe(200);
+      expect(response.body.isDefaultPassword).toBe(false);
+    });
+
+    it('does NOT reveal default-password status to a non-admin user (#6082)', async () => {
+      db.prepare('DELETE FROM users').run();
+      await userModel.create({
+        username: 'admin',
+        password: 'changeme',
+        email: 'admin2@example.com',
+        authProvider: 'local',
+        isAdmin: true
+      });
+      const normal = await userModel.create({
+        username: 'normal',
+        password: 'normalpass1',
+        email: 'normal@example.com',
+        authProvider: 'local',
+        isAdmin: false
+      });
+      await permissionModel.grantDefaultPermissions(normal.id, false);
+
+      const response = await adminAgentChecking('normal', 'normalpass1');
+      expect(response.status).toBe(200);
+      expect(response.body.isDefaultPassword).toBe(false);
+    });
+
+    it('returns isDefaultPassword=false to an admin using a non-default password', async () => {
+      // admin user already created with 'admin123' which is not 'changeme'
+      const response = await adminAgentChecking('admin', 'admin123');
       expect(response.status).toBe(200);
       expect(response.body).toHaveProperty('isDefaultPassword');
       expect(response.body.isDefaultPassword).toBe(false);
     });
 
-    it('should return isDefaultPassword=true when admin uses "changeme"', async () => {
+    it('returns isDefaultPassword=true to an admin when admin uses "changeme"', async () => {
       // Create admin with 'changeme' password
       db.prepare('DELETE FROM users').run();
       await userModel.create({
@@ -1026,21 +1128,63 @@ describe('Authentication Routes', () => {
         isAdmin: true
       });
 
-      const response = await request(app)
-        .get('/api/auth/check-default-password');
-
+      const response = await adminAgentChecking('admin', 'changeme');
       expect(response.status).toBe(200);
       expect(response.body.isDefaultPassword).toBe(true);
     });
 
-    it('should return isDefaultPassword=false when no admin user exists', async () => {
-      db.prepare('DELETE FROM users').run();
+    // ADMIN_USERNAME renames the first admin (#5874); the warning must follow it.
+    describe('with ADMIN_USERNAME set', () => {
+      const prev = process.env.ADMIN_USERNAME;
+      beforeEach(() => {
+        process.env.ADMIN_USERNAME = 'operator';
+        resetEnvironmentConfig();
+        db.prepare('DELETE FROM users').run();
+      });
+      afterEach(() => {
+        if (prev === undefined) delete process.env.ADMIN_USERNAME;
+        else process.env.ADMIN_USERNAME = prev;
+        resetEnvironmentConfig();
+      });
 
-      const response = await request(app)
-        .get('/api/auth/check-default-password');
+      it('returns true when the custom-named admin still uses "changeme"', async () => {
+        await userModel.create({
+          username: 'operator',
+          password: 'changeme',
+          email: 'op@example.com',
+          authProvider: 'local',
+          isAdmin: true
+        });
+        const response = await adminAgentChecking('operator', 'changeme');
+        expect(response.status).toBe(200);
+        expect(response.body.isDefaultPassword).toBe(true);
+      });
 
-      expect(response.status).toBe(200);
-      expect(response.body.isDefaultPassword).toBe(false);
+      it('returns false when the custom-named admin has another password', async () => {
+        await userModel.create({
+          username: 'operator',
+          password: 'a-real-password',
+          email: 'op@example.com',
+          authProvider: 'local',
+          isAdmin: true
+        });
+        const response = await adminAgentChecking('operator', 'a-real-password');
+        expect(response.status).toBe(200);
+        expect(response.body.isDefaultPassword).toBe(false);
+      });
+
+      it('ignores a literal "admin" user with "changeme" when ADMIN_USERNAME names someone else', async () => {
+        await userModel.create({
+          username: 'admin',
+          password: 'changeme',
+          email: 'admin3@example.com',
+          authProvider: 'local',
+          isAdmin: true
+        });
+        const response = await adminAgentChecking('admin', 'changeme');
+        expect(response.status).toBe(200);
+        expect(response.body.isDefaultPassword).toBe(false);
+      });
     });
   });
 

@@ -12,11 +12,17 @@ import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
 import { isMeshCoreManager } from '../sourceManagerTypes.js';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
-import { requireAuth, optionalAuth, requirePermission, hasPermission } from '../auth/authMiddleware.js';
+import { requireAuth, optionalAuth, requirePermission, hasPermission, requireAdmin } from '../auth/authMiddleware.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { ChannelReorderPlanError } from '../meshcoreChannelReorder.js';
 import type { ResourceType } from '../../types/permission.js';
 import { meshcoreDeviceLimiter } from '../middleware/rateLimiters.js';
+import type { AutoAddConfigPatch } from '../meshcoreManager.js';
+import { isMeshCoreDeviceCommandError, MESHCORE_DEVICE_COMMAND_ERROR_STATUS } from '../errors/meshcoreDeviceCommandError.js';
+import { readRepeaterSettings, writeRepeaterSettings, type RepeaterCliTransport } from '../services/meshcoreRepeaterSettingsService.js';
+import { getRepeaterGates, validateRepeaterPatch, getRepeaterSettingDef } from '../../utils/meshcoreRepeaterSettings.js';
+import { MeshCoreDeviceType } from '../meshcoreManager.js';
+import { readSenderNamePolicy, writeSenderNamePolicy, validateSenderNamePolicyInput } from '../utils/meshcoreSenderNamePolicy.js';
 import { managerFor, isValidName, isValidRadioParams, auditMeshcoreEvent } from './meshcoreRouteShared.js';
 
 const router = Router({ mergeParams: true });
@@ -117,6 +123,59 @@ router.post(
     } catch (error) {
       logger.error('[API] Error setting default scope:', error);
       res.status(500).json({ success: false, error: 'Failed to update setting' });
+    }
+  },
+);
+
+/**
+ * GET /api/sources/:id/meshcore/config/sender-names (#6282)
+ *
+ * The per-source sender-name override policy: `{ enabled, allowedNames }`.
+ * Default is off with no names. Impersonation risk: a caller who passes this
+ * list can post on a channel as that name (GRP_TXT carries no sender proof).
+ */
+router.get(
+  '/config/sender-names',
+  optionalAuth(),
+  requirePermission('configuration', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      return ok(res, await readSenderNamePolicy(req.params.id));
+    } catch (error) {
+      logger.error('[API] Error reading sender-name policy:', error);
+      return fail(res, 500, 'INTERNAL_ERROR', 'Failed to read setting');
+    }
+  },
+);
+
+/**
+ * PUT /api/sources/:id/meshcore/config/sender-names (#6282)
+ * Body: `{ enabled: boolean, allowedNames: string[] }` (up to 16 names, each
+ * 1-31 bytes, NFC, no ':' / control / bidi / zero-width / leading '#').
+ * Replaces the whole policy. Audited (names only).
+ */
+router.put(
+  '/config/sender-names',
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    const parsed = validateSenderNamePolicyInput(req.body);
+    if (!parsed.ok) return fail(res, 400, 'INVALID_INPUT', parsed.message);
+    try {
+      const before = await readSenderNamePolicy(req.params.id);
+      await writeSenderNamePolicy(req.params.id, parsed.policy);
+      auditMeshcoreEvent(req, 'meshcore_sender_names_updated', 'configuration', {
+        sourceId: req.params.id,
+        enabledBefore: before.enabled,
+        enabled: parsed.policy.enabled,
+        allowedNamesBefore: before.allowedNames,
+        allowedNames: parsed.policy.allowedNames,
+      });
+      return ok(res, parsed.policy);
+    } catch (error) {
+      logger.error('[API] Error saving sender-name policy:', error);
+      return fail(res, 500, 'INTERNAL_ERROR', 'Failed to update setting');
     }
   },
 );
@@ -254,7 +313,8 @@ router.delete(
 /**
  * POST /api/sources/:id/meshcore/config/sync-time
  *
- * Sync the device's RTC to the server's current time. Companion only.
+ * Sync the device's RTC to the server's current time. Companion and Repeater
+ * (Repeater: `time <epoch>`, forward only; a clock that is ahead gives 409 CLOCK_AHEAD).
  */
 router.post(
   '/config/sync-time',
@@ -276,9 +336,15 @@ router.post(
               : 'Device rejected the time-sync command',
           });
         }
+        if (result.reason === 'clock-ahead') {
+          return fail(
+            res, 409, 'CLOCK_AHEAD',
+            'The device clock is ahead of the server clock and the firmware cannot move it backwards. Check the server time, or reset the device clock from the console.',
+          );
+        }
         return res.status(409).json({
           success: false,
-          error: 'Sync time failed — source disconnected or not a Companion device',
+          error: 'Sync time failed — source disconnected or not a Companion or Repeater device',
         });
       }
       res.json({ success: true, message: 'Device time synced' });
@@ -314,7 +380,7 @@ router.post(
       if (!ok) {
         return res.status(409).json({
           success: false,
-          error: 'Reboot failed — source disconnected or not a Companion device',
+          error: 'Reboot failed — source disconnected or not a Companion or Repeater device',
         });
       }
       auditMeshcoreEvent(req, 'meshcore_reboot', 'configuration', {
@@ -344,7 +410,7 @@ router.get(
       if (!hex) {
         return res.status(409).json({
           success: false,
-          error: 'Export private key failed — source disconnected or not a Companion device',
+          error: 'Export private key failed — source disconnected, unsupported firmware or not a Companion or Repeater device',
         });
       }
       auditMeshcoreEvent(req, 'meshcore_export_private_key', 'configuration', {
@@ -352,6 +418,8 @@ router.get(
       });
       res.json({ success: true, data: { privateKey: hex } });
     } catch (error) {
+      const handled = failDeviceCommand(res, error);
+      if (handled) return handled;
       logger.error('[API] Error exporting private key:', error);
       res.status(500).json({ success: false, error: 'Failed to export private key' });
     }
@@ -362,14 +430,16 @@ router.get(
  * POST /api/sources/:id/meshcore/config/private-key
  *
  * Import an Ed25519 private key onto the device. Replaces the device
- * identity. DESTRUCTIVE + SECURITY-SENSITIVE — requires confirm:true.
+ * identity. DESTRUCTIVE + SECURITY-SENSITIVE — admin only (both protocols, P9
+ * #6255) and requires confirm:true. Repeater: `set prv.key` then reboot; the
+ * identity tracker pins the expected key so no own-key alert fires.
  * Body: { privateKey: string (128-char hex), confirm: true }
  */
 router.post(
   '/config/private-key',
   meshcoreDeviceLimiter,
   requireAuth(),
-  requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }),
+  requireAdmin(),
   async (req: Request, res: Response) => {
     try {
       const { privateKey, confirm } = req.body as { privateKey?: string; confirm?: boolean };
@@ -390,7 +460,7 @@ router.post(
       if (!ok) {
         return res.status(409).json({
           success: false,
-          error: 'Import private key failed — source disconnected or not a Companion device',
+          error: 'Import private key failed — source disconnected, unsupported firmware or not a Companion or Repeater device',
         });
       }
       auditMeshcoreEvent(req, 'meshcore_import_private_key', 'configuration', {
@@ -398,6 +468,8 @@ router.post(
       });
       res.json({ success: true, message: 'Private key imported — device identity changed' });
     } catch (error) {
+      const handled = failDeviceCommand(res, error);
+      if (handled) return handled;
       logger.error('[API] Error importing private key:', error);
       res.status(500).json({ success: false, error: 'Failed to import private key' });
     }
@@ -507,7 +579,7 @@ router.post('/config/radio', meshcoreDeviceLimiter, requireAuth(), requirePermis
 
 /**
  * POST /api/meshcore/config/coords
- * Set device GPS coordinates (companion only)
+ * Set device GPS coordinates (Companion; Repeater via `set lat` / `set lon` with readback)
  * Requires authentication - modifies device configuration
  */
 router.post('/config/coords', meshcoreDeviceLimiter, requireAuth(), requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
@@ -605,6 +677,337 @@ router.post('/config/auto-add-contacts', meshcoreDeviceLimiter, requireAuth(), r
   } catch (error) {
     logger.error('[API] Error setting auto-add contacts:', error);
     return fail(res, 500, 'AUTO_ADD_UPDATE_FAILED', 'Config error');
+  }
+});
+
+/** Map a Companion device-command failure to the envelope; null when it is not one. */
+function failDeviceCommand(res: Response, error: unknown): Response | null {
+  if (!isMeshCoreDeviceCommandError(error)) return null;
+  return fail(res, MESHCORE_DEVICE_COMMAND_ERROR_STATUS[error.code] ?? 502, error.code, error.message);
+}
+
+/**
+ * GET /api/sources/:id/meshcore/config/ble-pin
+ *
+ * The Companion's Bluetooth PIN (DeviceInfo, v3+). A pairing credential, so it
+ * needs configuration:write. `pin` is null when the radio does not report it.
+ */
+router.get('/config/ble-pin', requireAuth(), requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const pin = await managerFor(req, res).getBlePin();
+    return ok(res, { pin });
+  } catch (error) {
+    const handled = failDeviceCommand(res, error);
+    if (handled) return handled;
+    logger.error('[API] Error reading BLE PIN:', error);
+    return fail(res, 500, 'BLE_PIN_READ_FAILED', 'Failed to read the BLE PIN');
+  }
+});
+
+/**
+ * POST /api/sources/:id/meshcore/config/ble-pin
+ *
+ * Body: { pin } where pin is 0 (firmware default) or 100000-999999. Takes
+ * effect after the radio's next boot. Local serial write, no RF.
+ */
+router.post('/config/ble-pin', meshcoreDeviceLimiter, requireAuth(), requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const pin = (req.body as { pin?: unknown } | undefined)?.pin;
+    if (typeof pin !== 'number' || !Number.isInteger(pin) || (pin !== 0 && (pin < 100000 || pin > 999999))) {
+      return fail(res, 400, 'INVALID_PIN', 'pin must be 0 or a 6-digit number from 100000 to 999999');
+    }
+    await managerFor(req, res).setBlePin(pin);
+    auditMeshcoreEvent(req, 'meshcore_set_ble_pin', 'configuration', { sourceId: req.params.id });
+    return ok(res, { pin, appliesAfterReboot: true });
+  } catch (error) {
+    const handled = failDeviceCommand(res, error);
+    if (handled) return handled;
+    logger.error('[API] Error setting BLE PIN:', error);
+    return fail(res, 500, 'BLE_PIN_UPDATE_FAILED', 'Failed to set the BLE PIN');
+  }
+});
+
+/**
+ * POST /api/sources/:id/meshcore/config/multi-acks
+ *
+ * Body: { value } 0 or 1. Each extra ACK is another direct transmission per
+ * received ACK-wanting DM (repeated by every return hop), so the value is
+ * capped at 1. Needs firmware code 7+ and the radio must keep the value
+ * (else 409 MULTI_ACKS_UNSUPPORTED).
+ */
+router.post('/config/multi-acks', meshcoreDeviceLimiter, requireAuth(), requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const value = (req.body as { value?: unknown } | undefined)?.value;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 1) {
+      return fail(res, 400, 'INVALID_VALUE', 'value must be 0 or 1');
+    }
+    const multiAcks = await managerFor(req, res).setMultiAcks(value);
+    auditMeshcoreEvent(req, 'meshcore_set_multi_acks', 'configuration', { sourceId: req.params.id, value: multiAcks });
+    return ok(res, { multiAcks });
+  } catch (error) {
+    const handled = failDeviceCommand(res, error);
+    if (handled) return handled;
+    logger.error('[API] Error setting multi-acks:', error);
+    return fail(res, 500, 'MULTI_ACKS_UPDATE_FAILED', 'Failed to set multi-ACKs');
+  }
+});
+
+/** Sources with a Repeater settings write in progress (one at a time per source). Process-local, like the source managers it guards. */
+const repeaterWritesInFlight = new Set<string>();
+
+/** Local serial transport over the manager's CLI (`RepeaterCliTransport`, P9 #6255). */
+function localRepeaterTransport(manager: ReturnType<typeof managerFor>): RepeaterCliTransport {
+  return {
+    mode: 'local',
+    run: (cmd, o) => manager.runRepeaterCli(cmd, { secret: o?.secret, timeout: o?.timeoutMs }),
+  };
+}
+
+/** Connected Repeater check for the structured settings routes; null = ok, else the sent response. */
+function requireConnectedRepeater(res: Response, manager: ReturnType<typeof managerFor>): Response | null {
+  const status = manager.getConnectionStatus();
+  if (!status.connected) {
+    return fail(res, 409, 'SOURCE_NOT_CONNECTED', 'Connect the repeater to read or change its settings');
+  }
+  if (status.deviceType !== MeshCoreDeviceType.REPEATER) {
+    return fail(res, 409, 'NOT_REPEATER', 'Structured repeater settings are only available on Repeater sources');
+  }
+  return null;
+}
+
+function repeaterFirmware(manager: ReturnType<typeof managerFor>): { ver: string | null; gates: ReturnType<typeof getRepeaterGates> } {
+  const ver = manager.getLocalNode()?.ver ?? null;
+  return { ver, gates: getRepeaterGates(ver) };
+}
+
+/**
+ * GET /api/sources/:id/meshcore/config/repeater-settings
+ *
+ * Structured Repeater settings, read over the local serial CLI (no RF). The
+ * guest password is reported only as `guestPasswordSet`; the admin password is
+ * never returned. Response `data`: `{ values, guestPasswordSet, errors,
+ * capabilities: { powerOff, keyExport, keyImport }, firmware }`.
+ */
+router.get(
+  '/config/repeater-settings',
+  optionalAuth(),
+  requirePermission('configuration', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const manager = managerFor(req, res);
+      const refused = requireConnectedRepeater(res, manager);
+      if (refused) return refused;
+      const { ver, gates } = repeaterFirmware(manager);
+      const read = await readRepeaterSettings(localRepeaterTransport(manager), gates);
+      return ok(res, {
+        values: read.values,
+        guestPasswordSet: read.guestPasswordSet,
+        errors: read.errors,
+        capabilities: { powerOff: gates.powerOff, keyExport: gates.keyExport, keyImport: gates.keyImport },
+        firmware: ver,
+      });
+    } catch (error) {
+      logger.error('[API] Error reading repeater settings:', error);
+      return fail(res, 500, 'REPEATER_SETTINGS_READ_FAILED', 'Failed to read the repeater settings');
+    }
+  },
+);
+
+/**
+ * PATCH /api/sources/:id/meshcore/config/repeater-settings
+ *
+ * Partial update. Body fields are the setting keys (lat, lon, advertInterval,
+ * floodAdvertInterval, floodMax, repeat, af, rxDelay, txDelay, directTxDelay,
+ * adminPassword, guestPassword, allowReadOnly). Validated first (400
+ * VALIDATION with `field`), then only changed keys are `set` and everything
+ * is read back. Local serial CLI: no RF. One request = one limiter hit.
+ * Response `data`: `{ ok, results, values, guestPasswordSet, drifted }`;
+ * `results[key] = { ok, changed, value?, error?, code? }`.
+ */
+router.patch(
+  '/config/repeater-settings',
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    const sourceId = req.params.id;
+    try {
+      const manager = managerFor(req, res);
+      const body = req.body;
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length === 0) {
+        return fail(res, 400, 'VALIDATION', 'Send at least one setting to change');
+      }
+      // Validate BEFORE the connection check, against the known firmware (open gates when unknown).
+      const { gates } = repeaterFirmware(manager);
+      const validation = validateRepeaterPatch(body as Record<string, unknown>, gates);
+      if (!validation.ok) {
+        const first = validation.errors[0];
+        return fail(res, 400, 'VALIDATION', first.message, { field: first.field, errors: validation.errors });
+      }
+      const refused = requireConnectedRepeater(res, manager);
+      if (refused) return refused;
+      if (repeaterWritesInFlight.has(sourceId)) {
+        return fail(res, 409, 'WRITE_IN_PROGRESS', 'Another settings save is still running on this repeater');
+      }
+      repeaterWritesInFlight.add(sourceId);
+      try {
+        const transport = localRepeaterTransport(manager);
+        const current = (await readRepeaterSettings(transport, gates)).values;
+        const result = await writeRepeaterSettings(transport, gates, current, body as Record<string, unknown>);
+        const changed: Record<string, unknown> = {};
+        for (const [key, r] of Object.entries(result.results)) {
+          if (!r?.changed) continue;
+          changed[key] = getRepeaterSettingDef(key)?.secret
+            ? '[changed]'
+            : validation.values[key as keyof typeof validation.values];
+        }
+        auditMeshcoreEvent(req, 'meshcore_repeater_settings_update', 'configuration', {
+          sourceId,
+          changed,
+          failed: Object.entries(result.results).filter(([, r]) => r && !r.ok).map(([k]) => k),
+        });
+        return ok(res, {
+          ok: result.ok,
+          results: result.results,
+          values: result.read.values,
+          guestPasswordSet: result.read.guestPasswordSet,
+          drifted: result.drifted,
+        });
+      } finally {
+        repeaterWritesInFlight.delete(sourceId);
+      }
+    } catch (error) {
+      logger.error('[API] Error updating repeater settings:', error);
+      return fail(res, 500, 'REPEATER_SETTINGS_WRITE_FAILED', 'Failed to update the repeater settings');
+    }
+  },
+);
+
+/**
+ * POST /api/sources/:id/meshcore/config/power-off
+ *
+ * Power the radio off until it is power-cycled by hand. Admin only, Body:
+ * { confirm: true }. Repeater firmware >= 1.15 or Companion protocol >= 14,
+ * else 409 FIRMWARE_UNSUPPORTED. Audited BEFORE the command is sent. Local, no RF.
+ */
+router.post('/config/power-off', meshcoreDeviceLimiter, requireAuth(), requireAdmin(), async (req: Request, res: Response) => {
+  try {
+    if ((req.body as { confirm?: unknown } | undefined)?.confirm !== true) {
+      return fail(res, 400, 'DANGER_CONFIRM_REQUIRED', 'Power-off requires confirm:true - the radio stays off until it is power-cycled by hand');
+    }
+    const manager = managerFor(req, res);
+    auditMeshcoreEvent(req, 'meshcore_power_off', 'configuration', { sourceId: req.params.id });
+    await manager.powerOff();
+    return ok(res, { powerOffSent: true });
+  } catch (error) {
+    const handled = failDeviceCommand(res, error);
+    if (handled) return handled;
+    logger.error('[API] Error sending power-off:', error);
+    return fail(res, 500, 'POWER_OFF_FAILED', 'Failed to send the power-off command');
+  }
+});
+
+/**
+ * POST /api/sources/:id/meshcore/config/factory-reset
+ *
+ * Wipes the Companion (identity, settings, channels, contacts) and reboots it.
+ * Admin only. Body: { confirm: true }. Audited BEFORE the command is sent.
+ * Local serial command, no RF; MeshRadar's own history is kept.
+ */
+router.post('/config/factory-reset', meshcoreDeviceLimiter, requireAuth(), requireAdmin(), async (req: Request, res: Response) => {
+  try {
+    if ((req.body as { confirm?: unknown } | undefined)?.confirm !== true) {
+      return fail(res, 400, 'DANGER_CONFIRM_REQUIRED', 'Factory reset requires confirm:true - this erases the radio and replaces its identity');
+    }
+    const manager = managerFor(req, res);
+    auditMeshcoreEvent(req, 'meshcore_factory_reset', 'configuration', { sourceId: req.params.id });
+    await manager.factoryReset();
+    return ok(res, { resetSent: true });
+  } catch (error) {
+    const handled = failDeviceCommand(res, error);
+    if (handled) return handled;
+    logger.error('[API] Error sending factory reset:', error);
+    return fail(res, 500, 'FACTORY_RESET_FAILED', 'Failed to send the factory reset');
+  }
+});
+
+/**
+ * GET /api/sources/:id/meshcore/config/autoadd-config
+ *
+ * The companion's auto-add options (#5777): overwrite-oldest, per-type bits and
+ * max hops. `supported: false` on firmware without commands 58/59 (a normal
+ * answer, not an error). Local serial read, no RF.
+ */
+router.get('/config/autoadd-config', optionalAuth(), requirePermission('nodes', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const result = await managerFor(req, res).getAutoAddConfig();
+    if (!result.ok) {
+      return fail(res, 409, 'SOURCE_NOT_CONNECTED', result.error);
+    }
+    return ok(res, result.config);
+  } catch (error) {
+    logger.error('[API] Error reading auto-add options:', error);
+    return fail(res, 500, 'AUTOADD_READ_FAILED', 'Failed to read the auto-add options');
+  }
+});
+
+/**
+ * POST /api/sources/:id/meshcore/config/autoadd-config
+ * Body: { overwriteOldest?: boolean, types?: { chat?, repeater?, room?, sensor?: boolean },
+ *         maxHops?: integer 0-64 }
+ *
+ * Change the companion's auto-add options (#5777). Only the fields sent
+ * change; the radio's other bits are kept. Local serial write, no RF.
+ */
+router.post('/config/autoadd-config', meshcoreDeviceLimiter, requireAuth(), requirePermission('configuration', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { overwriteOldest?: unknown; types?: unknown; maxHops?: unknown };
+    const patch: AutoAddConfigPatch = {};
+    if (body.overwriteOldest !== undefined) {
+      if (typeof body.overwriteOldest !== 'boolean') {
+        return fail(res, 400, 'INVALID_INPUT', 'overwriteOldest must be true or false');
+      }
+      patch.overwriteOldest = body.overwriteOldest;
+    }
+    if (body.types !== undefined) {
+      if (typeof body.types !== 'object' || body.types === null || Array.isArray(body.types)) {
+        return fail(res, 400, 'INVALID_INPUT', 'types must be an object');
+      }
+      const types: AutoAddConfigPatch['types'] = {};
+      for (const [k, v] of Object.entries(body.types as Record<string, unknown>)) {
+        if (!['chat', 'repeater', 'room', 'sensor'].includes(k) || typeof v !== 'boolean') {
+          return fail(res, 400, 'INVALID_INPUT', 'types takes chat, repeater, room and sensor as true or false');
+        }
+        types[k as 'chat' | 'repeater' | 'room' | 'sensor'] = v;
+      }
+      patch.types = types;
+    }
+    if (body.maxHops !== undefined) {
+      if (typeof body.maxHops !== 'number' || !Number.isInteger(body.maxHops) || body.maxHops < 0 || body.maxHops > 64) {
+        return fail(res, 400, 'INVALID_INPUT', 'maxHops must be a whole number from 0 to 64');
+      }
+      patch.maxHops = body.maxHops;
+    }
+    if (Object.keys(patch).length === 0) {
+      return fail(res, 400, 'INVALID_INPUT', 'Send at least one of overwriteOldest, types or maxHops');
+    }
+    const manager = managerFor(req, res);
+    const result = await manager.setAutoAddConfig(patch);
+    if (!result.ok) {
+      const code = /need a connected/.test(result.error) ? 'SOURCE_NOT_CONNECTED' : 'AUTOADD_UPDATE_FAILED';
+      return fail(res, code === 'SOURCE_NOT_CONNECTED' ? 409 : 502, code, result.error);
+    }
+    if (!result.config.supported) {
+      return fail(res, 409, 'AUTOADD_UNSUPPORTED', 'This firmware does not support auto-add options');
+    }
+    auditMeshcoreEvent(req, 'meshcore_autoadd_config', 'configuration', {
+      sourceId: req.params.id,
+      ...patch,
+    });
+    return ok(res, result.config);
+  } catch (error) {
+    logger.error('[API] Error setting auto-add options:', error);
+    return fail(res, 500, 'AUTOADD_UPDATE_FAILED', 'Failed to update the auto-add options');
   }
 });
 

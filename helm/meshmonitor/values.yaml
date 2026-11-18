@@ -123,11 +123,10 @@ httpRoute:
 # MeshMonitor 4.0 manages additional sources via the Dashboard → Sources UI;
 # changing these values after bootstrap does NOT reconfigure the existing source.
 env:
-  # IP address of the bootstrap source (seeds the first source on a fresh install)
-  meshtasticNodeIp: "192.168.1.100"
-
-  # Enable HTTPS connection to node (optional)
-  meshtasticUseTls: "false"
+  # IP address of the bootstrap source (optional). When set, seeds the first
+  # source on a fresh install. Leave empty to add sources from the UI instead;
+  # MESHTASTIC_NODE_IP is then not set at all.
+  meshtasticNodeIp: ""
 
   # Environment mode (optional)
   nodeEnv: "production"
@@ -157,17 +156,6 @@ env:
 #           name: meshmonitor-secrets
 #           key: session-secret
 extraEnv: []
-
-# Auto-upgrade configuration (Docker only)
-# Note: Kubernetes deployments should use kubectl/helm for upgrades
-autoupgrade:
-  # Enable auto-upgrade feature in the application UI
-  # When enabled, an "Upgrade Now" button appears in the update notification banner
-  enabled: false
-
-  # Note: For Docker deployments, use docker-compose.upgrade.yml overlay
-  # For Kubernetes, this setting only enables the UI feature - actual upgrades
-  # should be performed via standard Kubernetes deployment updates
 
 # Persistent storage for SQLite database
 persistence:
@@ -254,7 +242,9 @@ reticulum:
   mode: "attach"
 
   # Host path to the RNS config dir (attach mode only), hostPath-mounted
-  # read-only into the bridge container at /rns. Requires the node running the
+  # read-write into the bridge container at /rns. RNS writes <configdir>/storage
+  # even as a shared-instance client (issue #5954), so the bridge must run as
+  # the directory's owner: set securityContext.runAsUser/runAsGroup below. Requires the node running the
   # pod to actually have this path (e.g. a DaemonSet-style single-node
   # deployment, or a nodeSelector pinning the pod to the host running rnsd).
   configDir: "/root/.reticulum"
@@ -269,3 +259,11 @@ reticulum:
   # BRIDGE_HOST/BRIDGE_PORT for the container env -- those are the names the
   # bridge actually reads (bridge/meshmonitor_rns_bridge/config.py).
   bind: "127.0.0.1:8765"
+
+  # securityContext for the bridge container only. In attach mode, run it as
+  # the owner of configDir so RNS can write <configdir>/storage, e.g.
+  # runAsUser: 0 / runAsGroup: 0 for the default /root/.reticulum. Empty keeps
+  # the image's own unprivileged user, which suits tcp_peer mode.
+  securityContext: {}
+  #   runAsUser: 0
+  #   runAsGroup: 0

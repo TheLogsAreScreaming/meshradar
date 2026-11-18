@@ -34,18 +34,48 @@ import { bboxToFormStrings } from '../../pages/DashboardPage.bboxSeed';
 import { useSourceStatuses } from '../../hooks/useDashboardData';
 import { formatRelativeTime } from '../../utils/datetime';
 import { UiIcon } from '../icons';
+import { PasswordField } from '../shared/config/PasswordField';
 import { useSaveBar } from '../../hooks/useSaveBar';
 import { MQTT_BRIDGE_SETTINGS_HASH } from '../../utils/tabHashRedirect';
 import styles from './MqttBridgeConfigurationView.module.css';
+import { MqttDocsLinks } from './MqttDocsLinks';
 import {
   buildBridgeConfig,
   formFromBridgeConfig,
   emptyBridgeForm,
   BRIDGE_MODES,
   BRIDGE_FORWARDING_MODES,
+  BRIDGE_CLIENT_ID_PATTERN,
   type BridgeConfigForm,
   type UplinkTopicMode,
 } from './mqttBridgeConfig';
+import BrokerPresetSelector from './BrokerPresetSelector';
+import { MqttRootFinder } from './MqttRootFinder';
+import { MqttRootFieldError } from './MqttRootFieldError';
+import { applyRootToSubscriptions, defaultBridgeRegionRoot } from './mqttRootDefaults';
+import {
+  applyPresetToBridge,
+  matchBridgePreset,
+  type BrokerPreset,
+  type KeptCredentials,
+} from './brokerPresets';
+import type { BrokerPresetDraft } from './SavedBrokerPresetDialogs';
+import { parseBridgeUrl } from '../../utils/mqttBrokerEndpoint';
+
+/**
+ * Is a password saved for this bridge that the form does not show? The form
+ * never round-trips it (an admin's GET carries it in `config`, a non-admin
+ * editor's names it in `maskedConfigFields`, #5635).
+ */
+function hasStoredPassword(src: { config?: unknown; maskedConfigFields?: unknown } | null | undefined): boolean {
+  if (isMaskedField(src, 'upstream.password')) return true;
+  const pw = (src?.config as { upstream?: { password?: unknown } } | undefined)?.upstream?.password;
+  return typeof pw === 'string' && pw !== '';
+}
+
+function isMaskedField(src: { maskedConfigFields?: unknown } | null | undefined, path: string): boolean {
+  return Array.isArray(src?.maskedConfigFields) && src.maskedConfigFields.includes(path);
+}
 
 /**
  * Shape of the geo-filter-observability fields we read off GET
@@ -59,6 +89,11 @@ interface GeoFilterSourceStatus {
   /** Bridge-level uplink policy drops (outside the filter chain). */
   uplinkOkToMqttDrops?: number;
   uplinkAutomationDrops?: number;
+  uplinkBridgeRelayDrops?: number;
+  /** #5893: uplinks dropped while the upstream connection was down. */
+  uplinkDisconnectedDrops?: number;
+  /** #5893: another bridge shares this parent broker + upstream in per_gateway mode. */
+  sharedUpstreamWarning?: string | null;
   lastGeoSweep?: {
     timestamp: number;
     scanned: number;
@@ -73,6 +108,15 @@ interface SourceSummary {
   id: string;
   name: string;
   type: string;
+  /** Only the parent broker's gateway id is read (#5893); absent when not shown. */
+  config?: { gateway?: { nodeId?: unknown } } | null;
+}
+
+/** #5893: a broker source's gateway id as `!xxxxxxxx`, or null when unknown. */
+function brokerGatewayClientId(broker: SourceSummary | undefined): string | null {
+  const id = broker?.config?.gateway?.nodeId;
+  if (typeof id !== 'string' || !BRIDGE_CLIENT_ID_PATTERN.test(id)) return null;
+  return '!' + id.replace(/^!/, '').toLowerCase();
 }
 
 interface MqttBridgeConfigurationViewProps {
@@ -98,6 +142,10 @@ function bboxFromForm(g: BridgeConfigForm['geo']): BBoxValue | null {
   return nums;
 }
 
+/** #5893: help text under the single-mode Client ID input. */
+const CLIENT_ID_HELP =
+  "Leave blank for the default mm-bridge-… ID. Strict community brokers accept only !xxxxxxxx (8 hex digits); set one here so the broker sees a single connection from MeshRadar. It must not match an ID another client uses on that broker: your radio's own MQTT module, another MeshRadar, or another bridge source. A duplicate makes the broker evict one of them, and after 5 evictions in 10 minutes this bridge stops reconnecting.";
+
 const labelStyle: React.CSSProperties = { fontSize: 11, color: 'var(--color-text-subtle)', marginTop: 4 };
 
 export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewProps> = ({
@@ -117,6 +165,9 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
   const lastGeoSweep = geoStatus?.lastGeoSweep ?? null;
   const uplinkOkToMqttDrops = geoStatus?.uplinkOkToMqttDrops ?? 0;
   const uplinkAutomationDrops = geoStatus?.uplinkAutomationDrops ?? 0;
+  const uplinkBridgeRelayDrops = geoStatus?.uplinkBridgeRelayDrops ?? 0;
+  const uplinkDisconnectedDrops = geoStatus?.uplinkDisconnectedDrops ?? 0;
+  const sharedUpstreamWarning = geoStatus?.sharedUpstreamWarning ?? null;
 
   const [form, setForm] = useState<BridgeConfigForm>(emptyBridgeForm());
   // The form as last loaded or saved: what "unsaved changes" is measured
@@ -133,6 +184,10 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
   // Raw loaded config — passed as `base` on save so any config sub-keys this
   // page doesn't render (e.g. node/portnum filters) are preserved, not wiped.
   const baseConfigRef = useRef<Record<string, any> | null>(null);
+  const [passwordStored, setPasswordStored] = useState(false);
+  const [usernameMasked, setUsernameMasked] = useState(false);
+  // A saved preset (#5794) whose hidden login the server fills in on save.
+  const [serverFillPreset, setServerFillPreset] = useState<BrokerPreset | null>(null);
 
   // Shallow patch helper for the form state.
   const patch = useCallback(
@@ -162,6 +217,8 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
         const src = await srcRes.json();
         if (cancelled) return;
         baseConfigRef.current = (src?.config as Record<string, any>) ?? {};
+        setPasswordStored(hasStoredPassword(src));
+        setUsernameMasked(isMaskedField(src, 'upstream.username'));
         setForm(formFromBridgeConfig(src?.config));
         setSavedForm(formFromBridgeConfig(src?.config));
         if (listRes.ok) {
@@ -209,6 +266,14 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
       setSaveError(t(result.error.key, result.error.fallback));
       return;
     }
+    // Only while the URL still reaches that preset; the server checks again.
+    if (
+      result.config &&
+      serverFillPreset?.savedId !== undefined &&
+      matchBridgePreset(form.url, [serverFillPreset])
+    ) {
+      result.config.upstream = { ...result.config.upstream, brokerPresetId: serverFillPreset.savedId };
+    }
     setSaving(true);
     try {
       const res = await csrfFetch(`${appBasename}/api/sources/${sourceId}`, {
@@ -224,8 +289,11 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
       // Re-hydrate from the server's stored config (clears the password field
       // and reflects any server-side normalization).
       baseConfigRef.current = (updated?.config as Record<string, any>) ?? {};
+      setPasswordStored(hasStoredPassword(updated));
+      setUsernameMasked(isMaskedField(updated, 'upstream.username'));
       setForm(formFromBridgeConfig(updated?.config));
       setSavedForm(formFromBridgeConfig(updated?.config));
+      setServerFillPreset(null);
       setSaved(true);
     } catch (err) {
       logger.error('Failed to save bridge config:', err);
@@ -233,7 +301,7 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
     } finally {
       setSaving(false);
     }
-  }, [form, sourceId, csrfFetch, t]);
+  }, [form, sourceId, csrfFetch, t, serverFillPreset]);
 
   // One section of the page's shared save bar. `hasChanges` is false until the
   // user edits a field, so opening the page or saving another section never
@@ -252,6 +320,33 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
     onSave: handleSave,
     onDismiss: handleDismiss,
   });
+
+  // Broker presets (#5689): fill URL and login only, never save by themselves,
+  // and never type over or blank a stored password the form does not show.
+  const applyBrokerPreset = useCallback(
+    (preset: BrokerPreset): KeptCredentials => {
+      const { fields, kept } = applyPresetToBridge(
+        preset,
+        { url: form.url, username: form.username, password: form.password },
+        { passwordStored, usernameStored: usernameMasked },
+      );
+      setForm((prev) => ({ ...prev, ...fields }));
+      setServerFillPreset(kept.serverFill ? preset : null);
+      setSaved(false);
+      return kept;
+    },
+    [form.url, form.username, form.password, passwordStored, usernameMasked],
+  );
+
+  // "Save as preset" (#5794, admins): the URL's endpoint, the login as shown,
+  // and the root of a single `<root>/#` subscription.
+  const getPresetDraft = useCallback((): BrokerPresetDraft | null => {
+    const endpoint = parseBridgeUrl(form.url);
+    if (!endpoint) return null;
+    const subs = form.subscriptions.split('\n').map((x) => x.trim()).filter(Boolean);
+    const root = subs.length === 1 && subs[0].endsWith('/#') ? subs[0].slice(0, -2) : '';
+    return { ...endpoint, username: form.username, password: form.password, rootTopic: root };
+  }, [form.url, form.subscriptions, form.username, form.password]);
 
   const selectedChannels = form.uplinkChannels ?? [];
   const toggleChannel = (name: string, checked: boolean) => {
@@ -305,10 +400,12 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
   }
 
   const attached = !!form.brokerId;
+  const parentGatewayClientId = brokerGatewayClientId(brokers.find((b) => b.id === form.brokerId));
 
   return (
     <div id={MQTT_BRIDGE_SETTINGS_SECTION_ID} className={sectionClass}>
       {heading}
+      <MqttDocsLinks />
       {!canWrite && (
         <p className={styles.readOnly} role="status">
           {t(
@@ -347,6 +444,15 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
             )}
           </span>
         </label>
+        <BrokerPresetSelector
+          id="mqttBridgeBrokerPreset"
+          layout="dashboard"
+          disabled={!canWrite}
+          matchPreset={(candidates) => matchBridgePreset(form.url, candidates)}
+          onApplyPreset={applyBrokerPreset}
+          getDraft={getPresetDraft}
+          draftPasswordNotIncluded={passwordStored && form.password === ''}
+        />
         <label className="dashboard-form-field">
           <span className="dashboard-form-label">{t('source.form.mqtt_upstream_url', 'Upstream URL')}</span>
           <input
@@ -370,9 +476,8 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
         </label>
         <label className="dashboard-form-field">
           <span className="dashboard-form-label">{t('source.form.mqtt_password', 'Password')}</span>
-          <input
+          <PasswordField
             className="dashboard-form-input"
-            type="password"
             value={form.password}
             disabled={!canWrite}
             onChange={(e) => patch('password', e.target.value)}
@@ -403,7 +508,7 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
           <span style={labelStyle}>
             {t(
               'source.form.mqtt_bridge_mode_help',
-              'Use "Publish only" for public servers (e.g. mqtt.meshtastic.org) that reject SUBSCRIBE — avoids permission-denied noise. "Subscribe only" disables uplink forwarding for read-only monitoring.',
+              'Bidirectional brings the upstream server\'s traffic down to the parent broker (and from there to any radios with Downlink Enabled) and sends local traffic up. "Publish only" sends up and brings nothing down; use it for servers that reject SUBSCRIBE. "Subscribe only" brings traffic down and never sends anything up, for read-only monitoring.',
             )}
           </span>
         </label>
@@ -432,6 +537,51 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
             )}
           </span>
         </label>
+        {sharedUpstreamWarning && form.forwardingMode === 'per_gateway' && (
+          <p className={styles.warning} role="status">
+            <UiIcon name="alert" size={14} />{' '}
+            {t(
+              'source.form.mqtt_bridge_shared_upstream_warning',
+              'Another bridge source uses the same parent broker and upstream URL in per_gateway mode. Both connect with the same Client IDs, so the upstream broker will keep evicting one for the other. Keep one bridge per broker and upstream, or switch one to Single.',
+            )}
+          </p>
+        )}
+        {form.forwardingMode === 'single' && (
+          <div className="dashboard-form-field">
+            <label className="dashboard-form-label" htmlFor="mqttBridgeClientId">
+              {t('source.form.mqtt_bridge_client_id', 'Upstream Client ID (optional)')}
+            </label>
+            <div className={styles.clientIdRow}>
+              <input
+                id="mqttBridgeClientId"
+                className={`dashboard-form-input ${styles.clientIdInput}`}
+                type="text"
+                value={form.clientId ?? ''}
+                disabled={!canWrite}
+                spellCheck={false}
+                autoComplete="off"
+                onChange={(e) => patch('clientId', e.target.value)}
+                placeholder={parentGatewayClientId ?? '!a1b2c3d4'}
+              />
+              {parentGatewayClientId && (
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={!canWrite || form.clientId === parentGatewayClientId}
+                  onClick={() => patch('clientId', parentGatewayClientId)}
+                >
+                  {t('source.form.mqtt_bridge_client_id_use_gateway', "Use the parent broker's gateway ID")}
+                </button>
+              )}
+            </div>
+            <span style={labelStyle}>
+              {t(
+                'source.form.mqtt_bridge_client_id_help',
+                CLIENT_ID_HELP,
+              )}
+            </span>
+          </div>
+        )}
         <label className="dashboard-form-field" style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8 }}>
           <input
             type="checkbox"
@@ -477,6 +627,56 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
                 { automation: uplinkAutomationDrops, okToMqtt: uplinkOkToMqttDrops },
               )}
             </span>
+            <span style={{ ...labelStyle, display: 'block' }}>
+              {t(
+                'source.form.mqtt_bridge_disconnected_drops',
+                'Dropped while the upstream connection was down: {{count}}',
+                { count: uplinkDisconnectedDrops },
+              )}
+            </span>
+          </span>
+        </label>
+        <label className="dashboard-form-field" style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={form.skipRaise}
+            disabled={!canWrite}
+            onChange={(e) => patch('skipRaise', e.target.checked)}
+            style={{ marginTop: 3 }}
+          />
+          <span>
+            <span className="dashboard-form-label" style={{ display: 'block' }}>
+              {t('source.form.mqtt_bridge_skip_raise', 'Skip raise on packets from this bridge')}
+            </span>
+            <span style={labelStyle}>
+              {t(
+                'source.form.mqtt_bridge_skip_raise_help',
+                "The parent broker's \"Raise hop count for backhaul\" never raises packets this bridge brings in; its clamp still applies. Use it for an upstream such as mqtt.meshtastic.org that you want to watch but not re-flood on your local mesh.",
+              )}
+            </span>
+          </span>
+        </label>
+        <label className="dashboard-form-field" style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={form.relayOtherBridges}
+            disabled={!canWrite}
+            onChange={(e) => patch('relayOtherBridges', e.target.checked)}
+            style={{ marginTop: 3 }}
+          />
+          <span>
+            <span className="dashboard-form-label" style={{ display: 'block' }}>
+              {t('source.form.mqtt_bridge_relay_other_bridges', 'Relay traffic from other bridges')}
+            </span>
+            <span style={labelStyle}>
+              {t(
+                'source.form.mqtt_bridge_relay_other_bridges_help',
+                'Off: this bridge uplinks only traffic that started on your side (your nodes and local MQTT clients). Packets another bridge on the same broker brought down from its upstream are not sent to this upstream. Turn on only to relay one upstream broker into another on purpose.',
+              )}
+            </span>
+            <span style={{ ...labelStyle, display: 'block' }}>
+              {t('source.form.mqtt_bridge_relay_drops', 'Not relayed so far: {{count}}', { count: uplinkBridgeRelayDrops })}
+            </span>
           </span>
         </label>
       </CollapsibleSection>
@@ -495,6 +695,34 @@ export const MqttBridgeConfigurationView: React.FC<MqttBridgeConfigurationViewPr
             onChange={(e) => patch('subscriptions', e.target.value)}
           />
         </label>
+        {form.subscriptions
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => l.endsWith('/#') && !l.includes('+'))
+          .map((l) => (
+            <MqttRootFieldError key={l} warn value={l.slice(0, -2)} />
+          ))}
+        <MqttRootFinder
+          context="bridge"
+          sourceId={sourceId}
+          disabled={!canWrite}
+          currentRoot={form.subscriptions.split('\n')[0]?.trim() ?? ''}
+          defaultRegionRoot={defaultBridgeRegionRoot(form.subscriptions)}
+          getTarget={() =>
+            form.url.trim()
+              ? {
+                  broker: { url: form.url },
+                  username: form.username,
+                  password: form.password,
+                  brokerPresetId:
+                    serverFillPreset?.savedId !== undefined && matchBridgePreset(form.url, [serverFillPreset])
+                      ? serverFillPreset.savedId
+                      : null,
+                }
+              : null
+          }
+          onPickRoot={(root) => patch('subscriptions', applyRootToSubscriptions(form.subscriptions, root))}
+        />
         <fieldset style={{ border: '1px solid var(--color-surface-hover)', borderRadius: 6, padding: '8px 12px 12px', margin: '8px 0' }}>
           <legend style={{ fontSize: 12, padding: '0 6px', color: 'var(--color-text-subtle)' }}>
             <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>

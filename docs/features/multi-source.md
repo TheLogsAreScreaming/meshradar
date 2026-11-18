@@ -10,10 +10,10 @@ Multi-Source lets a single MeshMonitor deployment talk to **multiple meshes at o
 
 A **source** is one upstream connection MeshMonitor speaks to. Each source has:
 
-- A **type** — `meshtastic_tcp`, `meshcore`, `mqtt_broker` (embedded MQTT broker hosting locally-connected clients), or `mqtt_bridge` (MQTT client to one upstream broker, optionally attached to a sibling `mqtt_broker` for fan-out — see [Embedded MQTT Broker & Bridge](/features/mqtt-broker)). Serial and BLE Meshtastic nodes connect through the Serial Bridge / BLE Bridge sidecars and appear as `meshtastic_tcp` sources pointing at the bridge container. MeshCore connects directly — USB or TCP through the UI. No sidecar either way.
+- A **type**: `meshtastic_tcp`, `meshcore`, `meshcore_mqtt` (reads a MeshCore region feed, no radio; see [MeshCore MQTT Ingest](/features/meshcore-mqtt-ingest)), `meshcore_mqtt_broker` (embedded broker MeshCore observers publish to, no radio; see [MeshCore MQTT Broker](/features/meshcore-mqtt-broker)), `mqtt_broker` (embedded MQTT broker hosting locally-connected clients), `mqtt_bridge` (MQTT client to one upstream broker, optionally attached to a sibling `mqtt_broker` for fan-out; see [Embedded MQTT Broker & Bridge](/features/mqtt-broker)), or `reticulum`. Serial and BLE Meshtastic nodes connect through the Serial Bridge / BLE Bridge sidecars and appear as `meshtastic_tcp` sources pointing at the bridge container. MeshCore connects directly — USB or TCP through the UI. No sidecar either way.
 - Its own **connection settings** (host, port, device path, credentials)
 - Its own **scheduler** (auto-responder, auto-announce, auto-traceroute, auto-ack)
-- Its own **Virtual Node** endpoint (TCP sources only)
+- Its own **Virtual Node** endpoint (`meshtastic_tcp` and `meshcore` sources)
 - Its own **permissions** — which users can see/write to it
 
 Sources are stored in the database and managed through the UI, not environment variables.
@@ -22,12 +22,14 @@ Sources are stored in the database and managed through the UI, not environment v
 
 ### Bootstrap (first run)
 
-On first startup, MeshMonitor creates a single `meshtastic_tcp` source from these environment variables:
+On first startup, MeshMonitor creates a `meshtastic_tcp` source named "Default" from these environment variables:
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `MESHTASTIC_NODE_IP` | `192.168.1.100` | Hostname or IP of your node |
+| `MESHTASTIC_NODE_IP` | _unset_ | Hostname or IP of your node. Unset → the Default source is created **disabled**, pointing at the placeholder `meshtastic.local` |
 | `MESHTASTIC_TCP_PORT` | `4403` | TCP port |
+
+For a MeshCore node, `MESHCORE_TCP_HOST` or `MESHCORE_SERIAL_PORT` creates a "Default MeshCore" source as well (see [MeshCore Default Source](/configuration/#meshcore-default-source)). With only the MeshCore vars set, the disabled Meshtastic placeholder is skipped.
 
 After that first boot, **the env vars are informational only**. Changing them won't rename or reconfigure the existing source — use the UI instead. This keeps your single-node `docker-compose.yml` familiar while unlocking multi-node.
 
@@ -38,7 +40,7 @@ Open the **Sources sidebar** on the dashboard (admin only) to:
 - **Add source** — click the **+** button next to the Sources header, choose a type, fill in connection details, save
 - **Edit** — rename, re-host, re-port, toggle Virtual Node, or change other per-source settings
 - **Enable / Disable** — pause an upstream connection without deleting it
-- **Delete** — remove the connection and its source-scoped data
+- **Delete** — remove the connection and its source-scoped data. For a MeshCore source this includes the stored device identity key and the channel slots with their secrets.
 
 ![Source options menu with Edit, Enable/Disable, and Delete actions](/images/features/sources-options-menu.png)
 
@@ -84,23 +86,26 @@ Nearly every top-level view has a **source picker** in the header. It controls w
 
 - **Single-source mode** — pick one source; the view shows only that source's nodes, messages, telemetry, and traceroutes
 - **Unified mode** (where available) — combines messages/telemetry/traceroutes across all sources while still tagging each row with its originating source
+  - On **Unified Messages**, pick **All Channels** in the channel list to read every channel you can open in one feed. Each message carries a tag with its channel and a pill for each source that heard it. Direct messages are left out; read those on the source's own Messages tab.
+  - A MeshCore message heard by several of your sources shows as **one row**, with a pill for each source that heard it. Only sources you can read are counted.
+  - The **left border** of each message shows its mesh protocol: green for Meshtastic (MQTT sources included), orange for MeshCore, the accent colour for Reticulum. Hover the card to read the protocol name. The **source pills** keep one colour per source, so you can still tell which source heard a message. Channel and DM views on a single source draw the same protocol stripe on each message.
 
 Your picker choice persists per view and per user.
 
 ## Virtual Node
 
-Virtual Node is a MeshMonitor feature that lets mobile Meshtastic apps connect *through* MeshMonitor instead of directly to the node. In 4.0 it is **per-source**.
+Virtual Node is a MeshMonitor feature that lets mobile Meshtastic and MeshCore apps connect *through* MeshMonitor instead of directly to the node. In 4.0 it is **per-source**.
 
-- Only `meshtastic_tcp` sources support Virtual Node — MeshCore and MQTT sources ignore VN settings
+- `meshtastic_tcp` sources serve the Meshtastic apps. `meshcore` sources (since 4.11) serve the MeshCore app; see [MeshCore Virtual Node](/configuration/virtual-node#meshcore-virtual-node). MQTT sources have no Virtual Node.
 - Each source can expose its own VN endpoint on its own port
 - Ports must be unique across sources — the API rejects collisions with HTTP 409
 
 ### Enabling on a source
 
-1. Open **Dashboard → Edit Source** on the TCP source you want to expose
+1. Open **Dashboard → Edit Source** on the source you want to expose
 2. Expand the **Virtual Node** section
 3. Toggle it on
-4. Choose a port (the previous global default was `4404`)
+4. Choose a port (Meshtastic default `4404`, MeshCore `5000`)
 5. Decide whether to allow admin commands through the VN (reduces security — leave off unless you know you need it)
 6. Save
 
@@ -124,8 +129,44 @@ services:
 The [Docker Compose Configurator](/configurator) publishes one VN host port by default (`4404`). Match the VN port you choose in the UI to one of the published host ports.
 
 ::: warning Breaking change from 3.x
-The old global env vars — `ENABLE_VIRTUAL_NODE`, `VIRTUAL_NODE_PORT`, `VIRTUAL_NODE_ALLOW_ADMIN_COMMANDS` — **were removed** and no longer have any effect. If you upgraded from 3.x, re-enable VN on each source you want to expose.
+The old global env vars no longer drive the Virtual Node at runtime. `VIRTUAL_NODE_ALLOW_ADMIN_COMMANDS` **was removed**. `ENABLE_VIRTUAL_NODE` and `VIRTUAL_NODE_PORT` only seed the **Default** source when MeshMonitor first creates it (with `MESHTASTIC_NODE_IP` set); after that they do nothing. See [Headless installs](/configuration/virtual-node#headless-installs-first-boot-env-vars). Re-enable VN in the UI on any other source you want to expose.
 :::
+
+## Passive Mode
+
+Passive Mode is a per-source option for Meshtastic TCP sources, in **Dashboard → Edit Source**. Use it for a large or fragile node, such as a router with a big NodeDB, that closes the TCP link while MeshMonitor syncs.
+
+With Passive Mode on, MeshMonitor:
+
+- **Keeps its cached node list and config across a disconnect.**
+- **Skips the full NodeDB download on reconnect.** It asks the node for its config only, so packets keep flowing without the full NodeDB stream. It does this only after one full sync has finished; until then, every connect does a full sync.
+- **Sends no follow-up requests to the node** after a sync: no LoRa or module config requests, no time sync, no remote admin scanner, and no remote LocalStats polling. The config-only request already returns the LoRa and module config.
+
+The **Resync staleness window** (default 4 hours) sets how long the cache stays valid after a disconnect. A reconnect after a longer gap does a full sync again. **Resync** in the source's menu forces one full sync at any time.
+
+## One TCP client per node
+
+A Meshtastic node serves **one** TCP client at a time. When a second client connects, the node closes the first. Two clients pointed at one node take turns knocking each other off, so neither gets a stable link.
+
+MeshMonitor logs a warning when:
+
+- two enabled Meshtastic TCP sources point at the same host and port (at startup, and when you save a source), or
+- the node closes the link within seconds of connecting, several times in a row.
+
+See the [FAQ](/faq#my-meshtastic-tcp-source-keeps-connecting-and-disconnecting) for how to find the other client.
+
+## Default Meshtastic source
+
+Some requests name no source: an API call to `POST /api/messages/send` without a `sourceId`, the v1 `default` source alias, and device pages opened without a source. They go to one Meshtastic TCP source, the **default**.
+
+By default this is **Automatic**: the first Meshtastic TCP source started at boot (sidebar order). To pick one yourself, an admin opens **Global Settings → Default Meshtastic source** and chooses a source. The change applies at once, without a restart, and survives restarts.
+
+- If the chosen source is disabled, not connected at boot, or set to not auto-connect, Automatic applies until it is running again. Then it takes over again on its own.
+- Deleting the chosen source resets the setting to Automatic.
+- Anything that names a source (a source page, an automation, an API call with `sourceId`) keeps using that source.
+- The section shows which source a source-less request uses right now.
+
+![Default Meshtastic source setting](/images/features/5245-default-meshtastic-source.png)
 
 ## Per-Source Permissions
 
@@ -156,6 +197,11 @@ Everything that used to be a single global setting is now per-source:
 | Permissions | ✅ |
 | Notifications / Apprise | ✅ (admins and subscribers receive per-source events) |
 
+Two display choices are remembered too:
+
+- **Show MQTT/Bridge Messages** in the Channels view is saved per user and per source. Turning it on for one source leaves the others as they were. MeshMonitor saves it to your account, so it follows you to another browser. Anonymous users keep it in the browser only.
+- **Unified Messages** remembers the channel you last picked in its selector, per browser. It restores that channel on your next visit when the channel still exists, or when you chose **All channels**. If you never pick one, the page chooses as before.
+
 For global behavior that isn't source-specific (theme, language, map center, push VAPID keys, session policy), use the new **Global Settings** page — the gear icon in the dashboard sidebar footer.
 
 ## Migration from 3.x
@@ -163,7 +209,7 @@ For global behavior that isn't source-specific (theme, language, map center, pus
 If you're upgrading from 3.x:
 
 1. **Keep your env vars** — `MESHTASTIC_NODE_IP` / `MESHTASTIC_TCP_PORT` still seed the first source on a fresh install
-2. **Drop removed VN env vars** — `ENABLE_VIRTUAL_NODE`, `VIRTUAL_NODE_PORT`, `VIRTUAL_NODE_ALLOW_ADMIN_COMMANDS` do nothing in 4.0
+2. **Check your VN env vars** — `VIRTUAL_NODE_ALLOW_ADMIN_COMMANDS` does nothing in 4.0. `ENABLE_VIRTUAL_NODE` / `VIRTUAL_NODE_PORT` apply only when MeshMonitor creates the Default source, and never turn on admin commands
 3. **Re-enable VN per source** — Dashboard → Edit Source → Virtual Node on each TCP source you want to expose
 4. **Review permissions** — the per-source permission matrix may need admin review for non-admin users
 5. **Back up first** — use System Backup from the Settings page before upgrading. The sources table is included.
@@ -184,7 +230,7 @@ GET /api/v1/sources/{sourceId}/packets
 GET /api/v1/sources/{sourceId}/status
 ```
 
-Use `"default"` as `{sourceId}` to target the primary source. All v1 requests require `Authorization: Bearer mm_v1_...`. See the [API Reference](/development/api-reference) for complete documentation.
+Use `"default"` as `{sourceId}` to target the [default Meshtastic source](#default-meshtastic-source) when one is set and your token can read it, else the oldest enabled source your token can read. All v1 requests require `Authorization: Bearer mm_v1_...`. See the [API Reference](/development/api-reference) for complete documentation.
 
 ## Related
 

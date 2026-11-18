@@ -27,7 +27,7 @@ jobs:
           submodules: recursive
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: '24'
           cache: 'npm'
@@ -38,7 +38,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2
         with:
           workspaces: 'desktop/src-tauri'
 
@@ -46,6 +46,10 @@ jobs:
         run: npm install --legacy-peer-deps
 
       - name: Build main project (frontend)
+        # Vite needs more than the ~2 GB default heap of the macOS runners
+        # (the build ran out of memory there at v4.17.0-rc9).
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: npm run build
 
       # Fails when the entry stylesheet lacks the theme rules (#5558: the
@@ -59,6 +63,8 @@ jobs:
           npx tsc --project tsconfig.server.json
           New-Item -ItemType Directory -Force -Path "dist/server/routes/v1"
           Copy-Item "src/server/routes/v1/openapi.yaml" "dist/server/routes/v1/"
+          # The offline geocoder's data ships as compiled modules (#6336).
+          foreach ($f in "admin1.data.js", "cities.data.js") { if (-not (Test-Path "dist/server/data/geo/$f")) { throw "dist/server/data/geo/$f missing (#6336)" } }
         shell: pwsh
 
       - name: Download Node.js for bundling
@@ -95,7 +101,7 @@ jobs:
         run: npm install
 
       - name: Setup Python for Apprise sidecar
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
           python-version: '3.12'
 
@@ -147,7 +153,7 @@ jobs:
 
       - name: Upload EXE to release
         if: steps.rename_artifacts.outputs.EXE_PATH
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3
         with:
           tag_name: ${{ steps.get_version.outputs.TAG }}
           files: ${{ steps.rename_artifacts.outputs.EXE_PATH }}
@@ -155,7 +161,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload checksums to release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3
         with:
           tag_name: ${{ steps.get_version.outputs.TAG }}
           files: ${{ steps.checksums.outputs.CHECKSUM_FILE }}
@@ -163,7 +169,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifacts for debugging
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: meshradar-desktop-windows-release
           path: desktop/src-tauri/target/release/bundle/nsis/*.exe
@@ -182,7 +188,7 @@ jobs:
           submodules: recursive
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: '24'
           cache: 'npm'
@@ -193,7 +199,7 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2
         with:
           workspaces: 'desktop/src-tauri'
 
@@ -257,6 +263,10 @@ jobs:
         run: npm install --legacy-peer-deps
 
       - name: Build main project (frontend)
+        # Vite needs more than the ~2 GB default heap of the macOS runners
+        # (the build ran out of memory there at v4.17.0-rc9).
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: npm run build
 
       # Fails when the entry stylesheet lacks the theme rules (#5558: the
@@ -270,6 +280,8 @@ jobs:
           npx tsc --project tsconfig.server.json
           mkdir -p dist/server/routes/v1
           cp src/server/routes/v1/openapi.yaml dist/server/routes/v1/
+          # The offline geocoder's data ships as compiled modules (#6336).
+          for f in admin1.data.js cities.data.js; do test -f "dist/server/data/geo/$f" || { echo "::error::dist/server/data/geo/$f missing (#6336)"; exit 1; }; done
 
       - name: Download Node.js for bundling (ARM64)
         run: |
@@ -369,7 +381,7 @@ jobs:
         run: npm install
 
       - name: Setup Python for Apprise sidecar
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
           python-version: '3.12'
 
@@ -514,7 +526,7 @@ jobs:
 
       - name: Upload DMG to release
         if: steps.rename_artifacts.outputs.DMG_PATH
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3
         with:
           tag_name: ${{ steps.get_version.outputs.TAG }}
           files: ${{ steps.rename_artifacts.outputs.DMG_PATH }}
@@ -522,7 +534,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload checksums to release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3
         with:
           tag_name: ${{ steps.get_version.outputs.TAG }}
           files: ${{ steps.checksums.outputs.CHECKSUM_FILE }}
@@ -530,14 +542,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifacts for debugging
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: meshradar-desktop-macos-arm64-release
           path: desktop/src-tauri/target/release/bundle/dmg/*.dmg
           retention-days: 30
 
   build-macos-x64:
-    runs-on: macos-14
+    # macos-latest (arm64) cross-compiles the x86_64 bundle; the explicit
+    # `macos-14` label was retired by GitHub ("configuration
+    # macos-14-arm64-us-default is not supported"), which cancelled this job
+    # instantly on v4.17.3-rc3 and rc4. Same fix as desktop-ci.yml (#6231).
+    runs-on: macos-latest
     timeout-minutes: 120
     permissions:
       contents: write
@@ -549,7 +565,7 @@ jobs:
           submodules: recursive
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: '24'
           cache: 'npm'
@@ -560,7 +576,7 @@ jobs:
           targets: x86_64-apple-darwin
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2
         with:
           workspaces: 'desktop/src-tauri'
 
@@ -624,6 +640,10 @@ jobs:
         run: npm install --legacy-peer-deps
 
       - name: Build main project (frontend)
+        # Vite needs more than the ~2 GB default heap of the macOS runners
+        # (the build ran out of memory there at v4.17.0-rc9).
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: npm run build
 
       # Fails when the entry stylesheet lacks the theme rules (#5558: the
@@ -637,6 +657,8 @@ jobs:
           npx tsc --project tsconfig.server.json
           mkdir -p dist/server/routes/v1
           cp src/server/routes/v1/openapi.yaml dist/server/routes/v1/
+          # The offline geocoder's data ships as compiled modules (#6336).
+          for f in admin1.data.js cities.data.js; do test -f "dist/server/data/geo/$f" || { echo "::error::dist/server/data/geo/$f missing (#6336)"; exit 1; }; done
 
       # NOTE: No Apprise sidecar is bundled for the x86_64 macOS release. This job
       # cross-compiles to x86_64 on an Apple Silicon (arm64) runner and PyInstaller
@@ -762,7 +784,7 @@ jobs:
         run: npm install
 
       # Build the Tauri app (app bundle only, we'll create DMG after re-signing)
-      # IMPORTANT: --target is required because this runs on ARM64 (macos-14) but builds for x64
+      # IMPORTANT: --target is required because this runs on ARM64 (macos-latest) but builds for x64
       - name: Build Tauri app (release)
         working-directory: desktop
         env:
@@ -901,7 +923,7 @@ jobs:
 
       - name: Upload DMG to release
         if: steps.rename_artifacts.outputs.DMG_PATH
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3
         with:
           tag_name: ${{ steps.get_version.outputs.TAG }}
           files: ${{ steps.rename_artifacts.outputs.DMG_PATH }}
@@ -909,7 +931,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload checksums to release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3  # v3
         with:
           tag_name: ${{ steps.get_version.outputs.TAG }}
           files: ${{ steps.checksums.outputs.CHECKSUM_FILE }}
@@ -917,7 +939,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifacts for debugging
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: meshradar-desktop-macos-x64-release
           path: desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg

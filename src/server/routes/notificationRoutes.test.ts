@@ -74,6 +74,8 @@ vi.mock('../../services/database.js', () => ({
     },
     notifications: {
       getUserPreferences: vi.fn(),
+      getMeshPreferences: vi.fn(async () => null),
+      setPushSourceIds: vi.fn(async () => undefined),
     },
   },
 }));
@@ -209,6 +211,8 @@ describe('notificationRoutes - push', () => {
       whitelist: ['Hi', 'Help'],
       usingDefaults: true,
       sourceFallback: false,
+      isOverride: false,
+      usingMeshDefault: false,
     });
   });
 
@@ -221,7 +225,7 @@ describe('notificationRoutes - push', () => {
 
     const res = await request(app).get('/push/preferences?sourceId=src-x');
 
-    expect(res.body).toEqual({ enableWebPush: false, usingDefaults: false, sourceFallback: false });
+    expect(res.body).toEqual({ enableWebPush: false, usingDefaults: false, sourceFallback: false, isOverride: true, usingMeshDefault: false });
     expect(mockNotif.resolveNotificationPreferencesAsync).toHaveBeenLastCalledWith(expect.any(Number), 'src-x');
   });
 
@@ -322,6 +326,22 @@ describe('notificationRoutes - push', () => {
 
     it('rejects a non-boolean flag', async () => {
       expect((await post({ notifyOnWaypoint: 'yes' })).status).toBe(400);
+    });
+
+    it('saves the MeshCore mention flag, off unless sent', async () => {
+      expect((await post({})).status).toBe(200);
+      expect(mockNotif.saveUserNotificationPreferencesAsync.mock.calls[0][1].notifyOnMention).toBe(false);
+      expect((await post({ notifyOnMention: true })).status).toBe(200);
+      expect(mockNotif.saveUserNotificationPreferencesAsync.mock.calls[1][1].notifyOnMention).toBe(true);
+      expect((await post({ notifyOnMention: 'yes' })).status).toBe(400);
+    });
+
+    it('saves the automatic-trace flag, off unless sent (M3)', async () => {
+      expect((await post({})).status).toBe(200);
+      expect(mockNotif.saveUserNotificationPreferencesAsync.mock.calls[0][1].notifyOnAutoTrace).toBe(false);
+      expect((await post({ notifyOnAutoTrace: true })).status).toBe(200);
+      expect(mockNotif.saveUserNotificationPreferencesAsync.mock.calls[1][1].notifyOnAutoTrace).toBe(true);
+      expect((await post({ notifyOnAutoTrace: 'yes' })).status).toBe(400);
     });
 
     it('rejects a zero or negative radius, which would silently match nothing', async () => {

@@ -23,12 +23,15 @@ import { formatLocationSource } from '../../../utils/nodeHelpers';
 import type { TimeFormat, DateFormat } from '../../../contexts/SettingsContext';
 import { useNodeListStyle } from '../../../contexts/SettingsContext';
 import { nodeColorStyle } from '../../../utils/nodeColor';
-import type { NodeCardModel, NodeSourceRef } from './nodeCardModel';
-import { UiIcon, type UiIconName } from '../../icons';
+import type { NodeCardModel, NodeSourceRef, NodeGatewayRef } from './nodeCardModel';
+import { useGatewayNameIndex, resolveGatewayLabel, gatewayChipText } from './gatewayLabel';
+import { UiIcon, batteryIconName, type UiIconName } from '../../icons';
 import { formatAircraftSummary } from '../../../utils/aircraftClassification';
 import { SignFlipNotice } from '../../SignFlipNotice';
 import FlightMatchLine from '../../FlightMatchLine';
 import { useSource } from '../../../contexts/SourceContext';
+import { hopCountLabel } from '../../../utils/hopLabel';
+import { usePublicInstanceView } from '../../../hooks/usePublicInstanceView';
 
 /* ------------------------------------------------------------------ */
 /* Header                                                              */
@@ -142,6 +145,34 @@ export interface SignalItemsProps {
   distanceUnit?: 'km' | 'mi' | 'nm';
 }
 
+/** Battery percentage and/or voltage grid items. Voltage is set only for
+ *  MeshCore (batteryMv/1000); Meshtastic models leave it unset. */
+export const BatteryItem: React.FC<{ model: NodeCardModel; showPluggedIn?: boolean }> = ({
+  model,
+  showPluggedIn = false,
+}) => {
+  const { t } = useTranslation();
+  const isPluggedIn = showPluggedIn && model.battery === 101;
+  return (
+    <>
+      {model.battery != null && (
+        <div className="node-popup-item">
+          <span className="node-popup-icon"><UiIcon name={isPluggedIn ? 'batteryCharging' : batteryIconName(Math.min(model.battery, 100))} /></span>
+          <span className="node-popup-value">
+            {isPluggedIn ? t('node_popup.power_plugged', 'Plugged In') : `${model.battery}%`}
+          </span>
+        </div>
+      )}
+      {model.voltage != null && (
+        <div className="node-popup-item">
+          <span className="node-popup-icon"><UiIcon name="zap" /></span>
+          <span className="node-popup-value">{model.voltage.toFixed(2)}V</span>
+        </div>
+      )}
+    </>
+  );
+};
+
 /** Hops / SNR / battery / altitude grid items. */
 export const SignalItems: React.FC<SignalItemsProps> = ({
   model,
@@ -155,7 +186,6 @@ export const SignalItems: React.FC<SignalItemsProps> = ({
   const hops = model.hops;
   const hasAltitude = showAltitude && model.altitude != null;
   const showHopsRow = showHops && hops != null && hops < 999;
-  const isPluggedIn = showPluggedIn && model.battery === 101;
   // Position accuracy + location source (#4176). Hidden when unset/disabled.
   const precisionBits = model.positionPrecisionBits;
   const showPrecision = precisionBits != null && precisionBits > 0;
@@ -184,14 +214,7 @@ export const SignalItems: React.FC<SignalItemsProps> = ({
           </span>
         </div>
       )}
-      {model.battery != null && (
-        <div className="node-popup-item">
-          <span className="node-popup-icon"><UiIcon name={isPluggedIn ? 'batteryCharging' : 'battery'} /></span>
-          <span className="node-popup-value">
-            {isPluggedIn ? t('node_popup.power_plugged', 'Plugged In') : `${model.battery}%`}
-          </span>
-        </div>
-      )}
+      <BatteryItem model={model} showPluggedIn={showPluggedIn} />
       {showAltitude && model.altitude != null && (
         <div className="node-popup-item">
           <span className="node-popup-icon"><UiIcon name="altitude" /></span>
@@ -220,7 +243,18 @@ export const SignalItems: React.FC<SignalItemsProps> = ({
           <span className="node-popup-value">{t('node_popup.aircraft_aged_out', 'Aged out (likely aircraft)')}</span>
         </div>
       )}
-      {showAltitude && model.aircraftFixed && (
+      {/* #5715: a person's mark reads differently from the sweep's. */}
+      {showAltitude && model.aircraftManualMark && (
+        <div className="node-popup-item node-popup-item-full" data-testid="node-popup-aircraft-manual">
+          <span className="node-popup-icon"><UiIcon name="aircraft" /></span>
+          <span className="node-popup-value">
+            {model.aircraftManualMark === 'not_aircraft'
+              ? t('aircraft_mark.note_not_aircraft', 'Marked as not aircraft')
+              : t('aircraft_mark.note_aircraft', 'Marked as aircraft')}
+          </span>
+        </div>
+      )}
+      {showAltitude && model.aircraftFixed && !model.aircraftManualMark && (
         <div className="node-popup-item node-popup-item-full" data-testid="node-popup-aircraft-fixed">
           <span className="node-popup-icon"><UiIcon name="aircraft" /></span>
           <span className="node-popup-value">{t('node_popup.aircraft_fixed', 'Reclassified as fixed')}</span>
@@ -272,6 +306,7 @@ export const PositionItem: React.FC<PositionItemProps> = ({
   dateFormat = 'MM/DD/YYYY',
 }) => {
   const { t } = useTranslation();
+  const publicView = usePublicInstanceView();
   return (
     <div className="node-popup-item node-popup-item-full">
       <span className="node-popup-icon"><UiIcon name="location" /></span>
@@ -284,7 +319,7 @@ export const PositionItem: React.FC<PositionItemProps> = ({
           >
             {' · '}
             {t('node_popup.position_updated', 'Updated {{when}}', {
-              when: formatRelativeTime(positionTimestamp, timeFormat, dateFormat, false),
+              when: formatRelativeTime(positionTimestamp, timeFormat, dateFormat, false, { coarseHour: publicView.coarseTime }),
             })}
           </span>
         )}
@@ -319,9 +354,10 @@ export const LastHeardFooter: React.FC<LastHeardFooterProps> = ({
   dateFormat,
 }) => {
   const { t } = useTranslation();
+  const publicView = usePublicInstanceView();
   if (lastHeard == null) return null;
   const format = (secs: number) => mode === 'relative'
-    ? formatRelativeTime(secs * 1000, timeFormat, dateFormat, true)
+    ? formatRelativeTime(secs * 1000, timeFormat, dateFormat, true, { coarseHour: publicView.coarseTime })
     : formatDateTime(new Date(secs * 1000), timeFormat, dateFormat);
   return (
     <>
@@ -345,13 +381,17 @@ export const LastHeardFooter: React.FC<LastHeardFooterProps> = ({
 
 export interface SourcesListProps {
   sources?: NodeSourceRef[];
+  /** Gateways that relayed this node, nested under their owning MQTT source (#6175). */
+  gateways?: NodeGatewayRef[];
   nodeId?: string;
   onSourceSelect?: (source: NodeSourceRef, nodeId: string | undefined) => void;
 }
 
 /** "Seen by N sources" clickable rows, Dashboard/MapAnalysis (unified) only. */
-export const SourcesList: React.FC<SourcesListProps> = ({ sources, nodeId, onSourceSelect }) => {
+export const SourcesList: React.FC<SourcesListProps> = ({ sources, gateways, nodeId, onSourceSelect }) => {
   const { t } = useTranslation();
+  // #6386: show the gateway's short name on its chip when the viewer knows it.
+  const gatewayNames = useGatewayNameIndex();
   if (!sources || sources.length === 0) return null;
 
   const label = t('node_popup.sources_seen_by', {
@@ -359,25 +399,60 @@ export const SourcesList: React.FC<SourcesListProps> = ({ sources, nodeId, onSou
     defaultValue: `Seen by ${sources.length} source${sources.length !== 1 ? 's' : ''}`,
   });
 
+  // #6175: group gateway chips by their owning source so each MQTT source row
+  // shows which gateway(s) relayed the node — the direct fix for "Seen by shows
+  // only the broker". Newest gateway first (the merge already sorted them).
+  const gatewaysBySource = new Map<string, NodeGatewayRef[]>();
+  for (const g of gateways ?? []) {
+    const bucket = gatewaysBySource.get(g.sourceId);
+    if (bucket) bucket.push(g);
+    else gatewaysBySource.set(g.sourceId, [g]);
+  }
+
   return (
     <div className="node-popup-sources">
       <div className="node-popup-sources-title">{label}</div>
       {sources.map((s) => {
         const clickable = !!onSourceSelect;
+        const sourceGateways = gatewaysBySource.get(s.sourceId) ?? [];
         return (
-          <button
-            key={s.sourceId}
-            type="button"
-            className="node-popup-source-row node-popup-source-row-button"
-            disabled={!clickable}
-            onClick={clickable ? () => onSourceSelect!(s, nodeId) : undefined}
-            title={clickable ? `Open Node Details for ${s.sourceName}` : undefined}
-          >
-            <span className={`node-popup-protocol-badge protocol-${s.protocol.toLowerCase()}`}>
-              {s.protocol}
-            </span>
-            <span className="node-popup-source-name">{s.sourceName}</span>
-          </button>
+          <div key={s.sourceId} className="node-popup-source-group">
+            <button
+              type="button"
+              className="node-popup-source-row node-popup-source-row-button"
+              disabled={!clickable}
+              onClick={clickable ? () => onSourceSelect!(s, nodeId) : undefined}
+              title={clickable ? `Open Node Details for ${s.sourceName}` : undefined}
+            >
+              <span className={`node-popup-protocol-badge protocol-${s.protocol.toLowerCase()}`}>
+                {s.protocol}
+              </span>
+              <span className="node-popup-source-name">{s.sourceName}</span>
+            </button>
+            {sourceGateways.length > 0 && (
+              <div className="node-popup-gateways">
+                <span className="node-popup-gateways-label">
+                  {t('node_popup.gateways_via', {
+                    count: sourceGateways.length,
+                    defaultValue: `via ${sourceGateways.length} gateway${sourceGateways.length !== 1 ? 's' : ''}`,
+                  })}
+                </span>
+                {sourceGateways.map((g) => {
+                  const gw = resolveGatewayLabel(g.gatewayId, g.gatewayNodeNum, gatewayNames);
+                  const named = gw.longName ?? gw.shortName;
+                  return (
+                    <span
+                      key={`${g.sourceId}:${g.gatewayId}`}
+                      className="node-popup-gateway-chip"
+                      title={named ? `${named} (${g.gatewayId})` : g.gatewayId}
+                    >
+                      {gatewayChipText(gw)}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         );
       })}
     </div>
@@ -390,12 +465,6 @@ export const SourcesList: React.FC<SourcesListProps> = ({ sources, nodeId, onSou
 
 export interface MeshCoreDetailsProps {
   model: NodeCardModel;
-}
-
-function hopCountLabel(hops: number | null | undefined): string {
-  if (hops === null || hops === undefined) return 'Unknown';
-  if (hops === 0) return 'Direct';
-  return `${hops} hop${hops > 1 ? 's' : ''}`;
 }
 
 /** Hardware literal + Key/RSSI/SNR/Path/Route grid items, MeshCore only. */
@@ -434,6 +503,7 @@ export const MeshCoreDetails: React.FC<MeshCoreDetailsProps> = ({ model }) => {
           <span className="node-popup-value">{hopCountLabel(mc.pathLen)}</span>
         </div>
       )}
+      <BatteryItem model={model} />
       {model.signFlipReported && (
         <SignFlipNotice
           variant="popup"

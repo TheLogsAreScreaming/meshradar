@@ -64,6 +64,10 @@ export const userNotificationPreferencesSqlite = sqliteTable('user_notification_
   // radius so a user hears about their own area rather than the whole mesh.
   // A NULL centre means "use this source's own node position".
   notifyOnWaypoint: integer('notify_on_waypoint', { mode: 'boolean' }).default(false),
+  // MeshCore @[Name] mentions of the source's own node. Opt-in.
+  notifyOnMention: integer('notify_on_mention', { mode: 'boolean' }).default(false),
+  // Automatic MeshCore traces / path discoveries (M3). Opt-in.
+  notifyOnAutoTrace: integer('notify_on_auto_trace', { mode: 'boolean' }).default(false),
   waypointRadiusKm: real('waypoint_radius_km').default(10),
   waypointCenterLat: real('waypoint_center_lat'),
   waypointCenterLon: real('waypoint_center_lon'),
@@ -81,6 +85,17 @@ export const userNotificationPreferencesSqlite = sqliteTable('user_notification_
   // `{{ token }}` syntax; see src/utils/notificationTemplate.ts.
   messageTitleTemplate: text('message_title_template'),
   messageBodyTemplate: text('message_body_template'),
+  // Message text length per service (#6278). NULL = the default of 100.
+  messageTextMaxPush: integer('message_text_max_push'),
+  messageTextMaxApprise: integer('message_text_max_apprise'),
+  // Mesh-wide default row only (sourceId MESH_PREFERENCES_SOURCE_ID, #5729).
+  // JSON array of the source ids Web Push may notify from; NULL = every
+  // source the user can read.
+  pushSourceIds: text('push_source_ids'),
+  // Mesh-wide default row only: false until the user saves mesh-wide
+  // settings. A row made by migration 235 only to hold `pushSourceIds` has
+  // false here, and its other columns are then ignored.
+  meshDefaultsSaved: integer('mesh_defaults_saved', { mode: 'boolean' }).default(false),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),
 }, (t) => ({
@@ -103,6 +118,8 @@ export const userNotificationPreferencesPostgres = pgTable('user_notification_pr
   lowBatteryVoltageThreshold: pgInteger('lowBatteryVoltageThreshold').default(3300),
   notifyOnServerEvents: pgBoolean('notifyOnServerEvents').default(false),
   notifyOnWaypoint: pgBoolean('notifyOnWaypoint').default(false),
+  notifyOnMention: pgBoolean('notifyOnMention').default(false),
+  notifyOnAutoTrace: pgBoolean('notifyOnAutoTrace').default(false),
   waypointRadiusKm: pgDouble('waypointRadiusKm').default(10),
   waypointCenterLat: pgDouble('waypointCenterLat'),
   waypointCenterLon: pgDouble('waypointCenterLon'),
@@ -118,6 +135,10 @@ export const userNotificationPreferencesPostgres = pgTable('user_notification_pr
   mutedDMs: pgText('mutedDMs'),
   messageTitleTemplate: pgText('messageTitleTemplate'),
   messageBodyTemplate: pgText('messageBodyTemplate'),
+  messageTextMaxPush: pgInteger('messageTextMaxPush'),
+  messageTextMaxApprise: pgInteger('messageTextMaxApprise'),
+  pushSourceIds: pgText('pushSourceIds'),
+  meshDefaultsSaved: pgBoolean('meshDefaultsSaved').default(false),
   createdAt: pgBigint('createdAt', { mode: 'number' }).notNull(),
   updatedAt: pgBigint('updatedAt', { mode: 'number' }).notNull(),
 }, (t) => ({
@@ -172,6 +193,8 @@ export const userNotificationPreferencesMysql = mysqlTable('user_notification_pr
   lowBatteryVoltageThreshold: myInt('lowBatteryVoltageThreshold').default(3300),
   notifyOnServerEvents: myBoolean('notifyOnServerEvents').default(false),
   notifyOnWaypoint: myBoolean('notifyOnWaypoint').default(false),
+  notifyOnMention: myBoolean('notifyOnMention').default(false),
+  notifyOnAutoTrace: myBoolean('notifyOnAutoTrace').default(false),
   waypointRadiusKm: myDouble('waypointRadiusKm').default(10),
   waypointCenterLat: myDouble('waypointCenterLat'),
   waypointCenterLon: myDouble('waypointCenterLon'),
@@ -187,6 +210,10 @@ export const userNotificationPreferencesMysql = mysqlTable('user_notification_pr
   mutedDMs: myText('mutedDMs'),
   messageTitleTemplate: myText('messageTitleTemplate'),
   messageBodyTemplate: myText('messageBodyTemplate'),
+  messageTextMaxPush: myInt('messageTextMaxPush'),
+  messageTextMaxApprise: myInt('messageTextMaxApprise'),
+  pushSourceIds: myText('pushSourceIds'),
+  meshDefaultsSaved: myBoolean('meshDefaultsSaved').default(false),
   createdAt: myBigint('createdAt', { mode: 'number' }).notNull(),
   updatedAt: myBigint('updatedAt', { mode: 'number' }).notNull(),
 }, (t) => ({

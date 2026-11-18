@@ -4,15 +4,20 @@
  * Handles all node-related database operations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, gt, lt, isNull, or, desc, asc, and, isNotNull, ne, sql, inArray, count, countDistinct } from 'drizzle-orm';
+import { eq, gt, gte, lt, isNull, or, desc, asc, and, isNotNull, ne, sql, inArray, count, countDistinct, getTableColumns } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase, SourceScope, SourceSetScope } from './base.js';
 import { DatabaseType, DbNode } from '../types.js';
 import { logger } from '../../utils/logger.js';
 import { isValidNodeNum } from '../../server/constants/meshtastic.js';
 import { isBlankMacAddr } from '../../utils/nodeFieldBlanks.js';
+import { NodeNameHistoryRepository, isMeshtasticRename } from './nodeNameHistory.js';
 import type { TransportCounts } from '../../utils/transportSeries.js';
 import type { AircraftBasis } from '../../utils/aircraftClassification.js';
 import { resolveFirstHeard } from '../../utils/firstHeard.js';
+import { applyMeshtasticNodeNameSanitizer } from '../../utils/nodeNameSanitizerRuntime.js';
+
+/** Max ids per `IN (...)` in the batched node lookups below. */
+const NODE_LOOKUP_BATCH = 500;
 
 /**
  * Hook for keeping an external in-memory node cache coherent with PG/MySQL writes.
@@ -96,7 +101,17 @@ export interface AircraftReclassifyRow {
   /** Phase 2 "confirmed fixed" anchor (D4); both null when not marked. */
   aircraftFixedLatitude: number | null;
   aircraftFixedLongitude: number | null;
+  /** #5715 manual mark ('not_aircraft' | 'aircraft'); null when none. */
+  aircraftManualMark: string | null;
 }
+
+/**
+ * A manual aircraft mark to store (#5715) — see
+ * {@link NodesRepository.setAircraftManualMark}. `null` clears it.
+ */
+export type AircraftManualMarkWrite =
+  | { mode: 'not_aircraft'; atMs: number; byUserId: number | null; lat: number; lon: number }
+  | { mode: 'aircraft'; atMs: number; byUserId: number | null };
 
 /**
  * One flagged node as read by {@link NodesRepository.listAircraftAgeOutCandidates}
@@ -113,6 +128,8 @@ export interface AircraftAgeOutCandidate {
   isFavorite: boolean;
   isIgnored: boolean;
   aircraftAgedOutAt: number | null;
+  /** #5715: the sweep's fixed rule skips a node a person marked 'aircraft'. */
+  aircraftManualMark: string | null;
   positionOverrideEnabled: boolean | null;
   latitudeOverride: number | null;
   longitudeOverride: number | null;
@@ -120,6 +137,25 @@ export interface AircraftAgeOutCandidate {
   latitude: number | null;
   longitude: number | null;
   altitude: number | null;
+}
+
+/**
+ * Restricts getAllNodes to nodes with at least one "live" row across
+ * `sourceIds` (see NodesRepository.liveNodeNumsQuery). The dashboard age cut
+ * (#6032) keeps every row of a node when any row passes, so it filters on
+ * nodeNum, not on the row itself.
+ */
+export interface LiveNodeFilter {
+  sourceIds: string[];
+  /** Unix seconds. */
+  minLastHeard: number;
+  keepNodeNums: number[];
+  /**
+   * The nodeNums getLiveNodeNums returned for this filter. When set they are
+   * bound as a list, so a caller reading several sources runs the "which nodes
+   * are live" scan once instead of once per source.
+   */
+  nodeNums?: number[];
 }
 
 /**
@@ -323,10 +359,18 @@ export class NodesRepository extends BaseRepository {
     if (validNums.length === 0) return map;
 
     const { nodes } = this.tables;
-    const result = await this.db
-      .select({ nodeNum: nodes.nodeNum, longName: nodes.longName, shortName: nodes.shortName })
-      .from(nodes)
-      .where(and(inArray(nodes.nodeNum, validNums), inArray(nodes.sourceId, sourceIds)));
+    const uniqueNums = [...new Set(validNums)];
+    const result: Array<{ nodeNum: unknown; longName: string | null; shortName: string | null }> = [];
+    // Batched so a large page never exceeds a backend's bound-parameter cap.
+    for (let i = 0; i < uniqueNums.length; i += NODE_LOOKUP_BATCH) {
+      const batch = uniqueNums.slice(i, i + NODE_LOOKUP_BATCH);
+      result.push(
+        ...(await this.db
+          .select({ nodeNum: nodes.nodeNum, longName: nodes.longName, shortName: nodes.shortName })
+          .from(nodes)
+          .where(and(inArray(nodes.nodeNum, batch), inArray(nodes.sourceId, sourceIds)))),
+      );
+    }
 
     for (const row of result) {
       // nodeNum is BIGINT on PG/MySQL and arrives as a string there — coerce
@@ -345,6 +389,40 @@ export class NodesRepository extends BaseRepository {
       });
     }
     return map;
+  }
+
+  /**
+   * The channel each of these nodeIds was last heard on, for the rows that
+   * exist in `sourceId` (or on any source for ALL_SOURCES). One entry per
+   * matching row; a nodeId with no row is absent.
+   *
+   * Exists so a route that only needs "which of these senders may the viewer
+   * see?" does not load and map every node on the source (the unread badge
+   * polls loaded ~17k rows to answer about a handful of DM senders).
+   */
+  async getNodeChannelsByNodeIds(
+    nodeIds: readonly string[],
+    sourceId: SourceScope,
+  ): Promise<Array<{ nodeId: string; channel: number | null }>> {
+    const unique = [...new Set(nodeIds.filter((id) => typeof id === 'string' && id.length > 0))];
+    if (unique.length === 0) return [];
+    const { nodes } = this.tables;
+    const out: Array<{ nodeId: string; channel: number | null }> = [];
+    for (let i = 0; i < unique.length; i += NODE_LOOKUP_BATCH) {
+      const batch = unique.slice(i, i + NODE_LOOKUP_BATCH);
+      const rows = await this.db
+        .select({ nodeId: nodes.nodeId, channel: nodes.channel })
+        .from(nodes)
+        .where(and(inArray(nodes.nodeId, batch), this.withSourceScope(nodes, sourceId)));
+      for (const row of rows as Array<{ nodeId: string | null; channel: unknown }>) {
+        if (typeof row.nodeId !== 'string') continue;
+        out.push({
+          nodeId: row.nodeId,
+          channel: row.channel === null || row.channel === undefined ? null : Number(row.channel),
+        });
+      }
+    }
+    return out;
   }
 
   /**
@@ -413,6 +491,29 @@ export class NodesRepository extends BaseRepository {
       });
     }
     return out;
+  }
+
+  /**
+   * One node's identity fields on every source that holds it (#5729). The
+   * new-node alert uses it to tell whether a user already heard of the node
+   * from another source they can read. Unscoped by design: the caller filters
+   * by the user's permitted sources and never shows the list.
+   */
+  async getNodeIdentityAcrossSources(
+    nodeNum: number,
+  ): Promise<Array<{ sourceId: string; longName: string | null; shortName: string | null; hwModel: number | null }>> {
+    if (!isValidNodeNum(nodeNum)) return [];
+    const { nodes } = this.tables;
+    const rows = await this.db
+      .select({ sourceId: nodes.sourceId, longName: nodes.longName, shortName: nodes.shortName, hwModel: nodes.hwModel })
+      .from(nodes)
+      .where(eq(nodes.nodeNum, nodeNum));
+    return rows.map((row: { sourceId: string; longName: string | null; shortName: string | null; hwModel: number | null }) => ({
+      sourceId: row.sourceId,
+      longName: row.longName ?? null,
+      shortName: row.shortName ?? null,
+      hwModel: row.hwModel == null ? null : Number(row.hwModel),
+    }));
   }
 
   /**
@@ -491,17 +592,83 @@ export class NodesRepository extends BaseRepository {
   }
 
   /**
-   * Get all nodes ordered by update time
+   * Get all nodes ordered by update time.
+   *
+   * `omitColumns` leaves the named columns out of the SELECT, so the rows
+   * come back without those keys. The dashboard bundle uses it to skip
+   * columns no dashboard view reads: on a large mesh (18k rows, 93 columns)
+   * reading and copying the unused ones was a large share of each poll.
    */
-  async getAllNodes(sourceId: SourceSetScope): Promise<DbNode[]> {
+  async getAllNodes(
+    sourceId: SourceSetScope,
+    opts?: { omitColumns?: readonly string[]; liveAcross?: LiveNodeFilter },
+  ): Promise<DbNode[]> {
     const { nodes } = this.tables;
-    const result = await this.db
-      .select()
+    const omit = opts?.omitColumns;
+    const live = opts?.liveAcross;
+    const query = omit && omit.length > 0
+      ? this.db.select(
+          Object.fromEntries(
+            Object.entries(getTableColumns(nodes)).filter(([key]) => !omit.includes(key)),
+          ) as ReturnType<typeof getTableColumns<typeof nodes>>,
+        )
+      : this.db.select();
+    const result = await query
       .from(nodes)
-      .where(this.withSourceScope(nodes, sourceId))
-      .orderBy(desc(nodes.updatedAt));
+      .where(live
+        ? and(
+            this.withSourceScope(nodes, sourceId),
+            inArray(nodes.nodeNum, live.nodeNums ?? this.liveNodeNumsQuery(live)),
+          )
+        : this.withSourceScope(nodes, sourceId))
+      // nodeNum breaks updatedAt ties, so a `liveAcross` read (a different
+      // query plan) returns its rows in the same order as the full read.
+      .orderBy(desc(nodes.updatedAt), asc(nodes.nodeNum));
 
     return this.normalizeBigInts(result) as DbNode[];
+  }
+
+  /**
+   * nodeNums with at least one row in `filter.sourceIds` that is heard since
+   * `minLastHeard`, a favourite, an aged-out aircraft, or in `keepNodeNums`.
+   * A subquery, so the caller's row order and single round-trip are kept.
+   */
+  private liveNodeNumsQuery(filter: LiveNodeFilter) {
+    const { nodes } = this.tables;
+    const conds = [
+      gte(nodes.lastHeard, filter.minLastHeard),
+      eq(nodes.isFavorite, true),
+      isNotNull(nodes.aircraftAgedOutAt),
+    ];
+    if (filter.keepNodeNums.length > 0) conds.push(inArray(nodes.nodeNum, filter.keepNodeNums));
+    return this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(and(inArray(nodes.sourceId, filter.sourceIds), or(...conds)));
+  }
+
+  /** The distinct nodeNums liveNodeNumsQuery selects (see LiveNodeFilter.nodeNums). */
+  async getLiveNodeNums(filter: LiveNodeFilter): Promise<number[]> {
+    const rows: Array<{ nodeNum: unknown }> = await this.liveNodeNumsQuery(filter);
+    return [...new Set(rows.map((r) => Number(r.nodeNum)))];
+  }
+
+  /**
+   * Row count per `channel` for one source. Lets a caller that reads only
+   * some rows (getAllNodes `liveAcross`) still report how many rows a
+   * channel-permission filter would pass over the whole source.
+   */
+  async countNodesByChannel(sourceId: SourceScope): Promise<Array<{ channel: number | null; count: number }>> {
+    const { nodes } = this.tables;
+    const rows = await this.db
+      .select({ channel: nodes.channel, count: count() })
+      .from(nodes)
+      .where(this.withSourceScope(nodes, sourceId))
+      .groupBy(nodes.channel);
+    return rows.map((r: { channel: unknown; count: unknown }) => ({
+      channel: r.channel == null ? null : Number(r.channel),
+      count: Number(r.count),
+    }));
   }
 
   /**
@@ -668,6 +835,46 @@ export class NodesRepository extends BaseRepository {
    * - Update path: coerceBigintField needed for MySQL/Postgres BIGINT timestamps (harmless for SQLite, now unified)
    * - Insert path: MySQL uses onDuplicateKeyUpdate vs onConflictDoUpdate
    */
+  private nameHistoryRepo: NodeNameHistoryRepository | null = null;
+
+  /**
+   * Record a rename in `node_name_history` (#5862). Best-effort: a failure
+   * here must never fail the node write that triggered it.
+   */
+  private async recordRenameIfChanged(
+    existing: DbNode,
+    next: { longName?: string | null; shortName?: string | null },
+    sourceId: string,
+    now: number,
+  ): Promise<void> {
+    if (!isMeshtasticRename(existing, next, existing.nodeId)) return;
+    try {
+      this.nameHistoryRepo ??= new NodeNameHistoryRepository(this.db, this.dbType);
+      await this.nameHistoryRepo.record({
+        sourceId,
+        protocol: 'meshtastic',
+        nodeKey: String(Number(existing.nodeNum)),
+        oldLongName: existing.longName ?? null,
+        newLongName: next.longName ?? null,
+        oldShortName: existing.shortName ?? null,
+        newShortName: next.shortName ?? null,
+        changedAt: now,
+      });
+    } catch (error) {
+      logger.warn(`Failed to record name history for node ${existing.nodeId} on ${sourceId}:`, error);
+    }
+  }
+
+  /** Remove rename history alongside nodes (#5862). Best-effort, like the write. */
+  private async dropNameHistory(op: (repo: NodeNameHistoryRepository) => Promise<void>): Promise<void> {
+    try {
+      this.nameHistoryRepo ??= new NodeNameHistoryRepository(this.db, this.dbType);
+      await op(this.nameHistoryRepo);
+    } catch (error) {
+      logger.warn('Failed to remove node name history:', error);
+    }
+  }
+
   async upsertNode(nodeData: Partial<DbNode>, sourceId?: string): Promise<void> {
     if (nodeData.nodeNum === undefined || nodeData.nodeNum === null || !nodeData.nodeId) {
       logger.error('Cannot upsert node: missing nodeNum or nodeId');
@@ -681,9 +888,15 @@ export class NodesRepository extends BaseRepository {
     // real source row (see issue #2902).
     const effectiveSourceId = sourceId ?? (nodeData as { sourceId?: string }).sourceId ?? 'default';
 
+    // #6382: opt-in node-name anti-spam. Every Meshtastic ingest path (TCP
+    // NodeInfo, device NodeDB sync, MQTT broker/bridge) writes names here, so
+    // this is the one seam. A no-op when the feature is off or for our own node.
+    const upsertNodeNum: number = nodeData.nodeNum;
+    nodeData = applyMeshtasticNodeNameSanitizer(nodeData, effectiveSourceId);
+
     const now = this.now();
     const { nodes } = this.tables;
-    const existingNode = await this.getNode(nodeData.nodeNum, effectiveSourceId);
+    const existingNode = await this.getNode(upsertNodeNum, effectiveSourceId);
 
     if (existingNode) {
       // Treat '' (and null/undefined) as "not provided" for string identity
@@ -720,6 +933,11 @@ export class NodesRepository extends BaseRepository {
           transportLastRf: nodeData.transportLastRf ?? existingNode.transportLastRf,
           transportLastMqtt: nodeData.transportLastMqtt ?? existingNode.transportLastMqtt,
           transportLastUdp: nodeData.transportLastUdp ?? existingNode.transportLastUdp,
+          // #5156: MQTT consent + direct-RF stamp. Carried forward, so a packet
+          // whose bitfield we could not read never erases the last known bit.
+          mqttOkToMqtt: nodeData.mqttOkToMqtt ?? existingNode.mqttOkToMqtt,
+          mqttOkToMqttAt: this.coerceBigintField(nodeData.mqttOkToMqttAt ?? existingNode.mqttOkToMqttAt),
+          rfDirectLastHeard: this.coerceBigintField(nodeData.rfDirectLastHeard ?? existingNode.rfDirectLastHeard),
           isStoreForwardServer: nodeData.isStoreForwardServer ?? existingNode.isStoreForwardServer,
           macaddr: macOrExisting(nodeData.macaddr, existingNode.macaddr),
           latitude: nodeData.latitude ?? existingNode.latitude,
@@ -738,7 +956,11 @@ export class NodesRepository extends BaseRepository {
           snr: nodeData.snr ?? existingNode.snr,
           rssi: nodeData.rssi ?? existingNode.rssi,
           firmwareVersion: nodeData.firmwareVersion ?? existingNode.firmwareVersion,
-          channel: nodeData.channel ?? existingNode.channel,
+          // #5923: an admin-locked channel is not changed by traffic. Only
+          // setNodeChannel() writes it while locked.
+          channel: existingNode.channelLocked
+            ? existingNode.channel
+            : (nodeData.channel ?? existingNode.channel),
           isFavorite: existingNode.favoriteLocked
             ? existingNode.isFavorite
             : (nodeData.isFavorite ?? existingNode.isFavorite),
@@ -787,6 +1009,17 @@ export class NodesRepository extends BaseRepository {
           updatedAt: now,
         })
         .where(and(eq(nodes.nodeNum, nodeData.nodeNum), eq(nodes.sourceId, effectiveSourceId)));
+
+      // #5862: log a rename (real name to real name) for Node Details.
+      await this.recordRenameIfChanged(
+        existingNode,
+        {
+          longName: nameOrExisting(nodeData.longName, existingNode.longName),
+          shortName: nameOrExisting(nodeData.shortName, existingNode.shortName),
+        },
+        effectiveSourceId,
+        now,
+      );
     } else {
       // Insert new node - coerce BIGINT fields for PostgreSQL
       const newNode = {
@@ -809,6 +1042,9 @@ export class NodesRepository extends BaseRepository {
         transportLastRf: this.coerceBigintField(nodeData.transportLastRf),
         transportLastMqtt: this.coerceBigintField(nodeData.transportLastMqtt),
         transportLastUdp: this.coerceBigintField(nodeData.transportLastUdp),
+        mqttOkToMqtt: nodeData.mqttOkToMqtt ?? null,
+        mqttOkToMqttAt: this.coerceBigintField(nodeData.mqttOkToMqttAt),
+        rfDirectLastHeard: this.coerceBigintField(nodeData.rfDirectLastHeard),
         isStoreForwardServer: nodeData.isStoreForwardServer ?? null,
         // #5231: see the conflict-path note below — zero MACs store as null.
         macaddr: isBlankMacAddr(nodeData.macaddr) ? null : nodeData.macaddr,
@@ -889,6 +1125,9 @@ export class NodesRepository extends BaseRepository {
         transportLastRf: this.coerceBigintField(nodeData.transportLastRf),
         transportLastMqtt: this.coerceBigintField(nodeData.transportLastMqtt),
         transportLastUdp: this.coerceBigintField(nodeData.transportLastUdp),
+        mqttOkToMqtt: nodeData.mqttOkToMqtt ?? null,
+        mqttOkToMqttAt: this.coerceBigintField(nodeData.mqttOkToMqttAt),
+        rfDirectLastHeard: this.coerceBigintField(nodeData.rfDirectLastHeard),
         isStoreForwardServer: nodeData.isStoreForwardServer ?? null,
         // #5231: an all-zero MAC joins '' as "not reported" — firmware
         // deprecated `User.macaddr` in 2.1.x and many nodes send six zero bytes.
@@ -943,12 +1182,60 @@ export class NodesRepository extends BaseRepository {
       await this.upsert(nodes, newNode, [nodes.nodeNum, nodes.sourceId], upsertSet);
     }
 
-    await this.syncCacheNode(nodeData.nodeNum, effectiveSourceId);
+    await this.syncCacheNode(upsertNodeNum, effectiveSourceId);
   }
 
   /**
    * Generic update for a node's fields
    */
+  /**
+   * One page of node names across every source, ordered by (sourceId, nodeNum),
+   * for the node-name anti-spam re-scan (#6382). Keyset paging: pass the last
+   * row of the previous page as `after`.
+   */
+  async listNodeNamesPage(
+    after: { sourceId: string; nodeNum: number } | null,
+    limit: number,
+  ): Promise<Array<{ nodeNum: number; nodeId: string; sourceId: string; longName: string | null; shortName: string | null }>> {
+    const { nodes } = this.tables;
+    const where = after
+      ? or(gt(nodes.sourceId, after.sourceId), and(eq(nodes.sourceId, after.sourceId), gt(nodes.nodeNum, after.nodeNum)))
+      : undefined;
+    const rows = await this.db
+      .select({ nodeNum: nodes.nodeNum, nodeId: nodes.nodeId, sourceId: nodes.sourceId, longName: nodes.longName, shortName: nodes.shortName })
+      .from(nodes)
+      .where(where)
+      .orderBy(asc(nodes.sourceId), asc(nodes.nodeNum))
+      .limit(limit);
+    return rows.map((r: { nodeNum: unknown; nodeId: string; sourceId: string | null; longName: string | null; shortName: string | null }) => ({
+      nodeNum: Number(r.nodeNum),
+      nodeId: r.nodeId,
+      sourceId: r.sourceId ?? 'default',
+      longName: r.longName ?? null,
+      shortName: r.shortName ?? null,
+    }));
+  }
+
+  /**
+   * Overwrite one row's names (#6382 re-scan). Only the given fields change;
+   * this is a clean-up, so it records no rename history.
+   */
+  async setNodeNames(
+    nodeNum: number,
+    sourceId: string,
+    names: { longName?: string; shortName?: string },
+  ): Promise<void> {
+    const { nodes } = this.tables;
+    const set: Record<string, unknown> = { updatedAt: this.now() };
+    if (names.longName !== undefined) set.longName = names.longName;
+    if (names.shortName !== undefined) set.shortName = names.shortName;
+    await this.db
+      .update(nodes)
+      .set(set)
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+    await this.syncCacheNode(nodeNum, sourceId);
+  }
+
   async updateNode(nodeNum: number, updates: Partial<Omit<DbNode, 'nodeNum'>>): Promise<void> {
     const { nodes } = this.tables;
     await this.db
@@ -988,6 +1275,40 @@ export class NodesRepository extends BaseRepository {
     }
 
     return affected;
+  }
+
+  /**
+   * #5156: record the `ok_to_mqtt` bit read from an MQTT-delivered packet of
+   * `nodeNum` on `sourceId`. UPDATE only: a node row this source does not hold
+   * yet is left alone (its next packet records it). Skips the node cache on
+   * purpose: this runs per MQTT packet, and the anonymous-viewer filter reads
+   * the columns straight from the table (`getMqttConsentWithheldNodeNums`).
+   */
+  async recordMqttConsent(nodeNum: number, sourceId: string, okToMqtt: boolean, atSec: number): Promise<void> {
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set({ mqttOkToMqtt: okToMqtt, mqttOkToMqttAt: this.coerceBigintField(atSec) })
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+  }
+
+  /**
+   * #5156: node numbers on `sourceId` whose latest readable MQTT consent bit is
+   * FALSE and that this source has never heard over direct RF. These are the
+   * nodes the opt-in anonymous-viewer filter hides. Unknown consent (NULL)
+   * never matches.
+   */
+  async getMqttConsentWithheldNodeNums(sourceId: string): Promise<number[]> {
+    const { nodes } = this.tables;
+    const rows = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(and(
+        eq(nodes.sourceId, sourceId),
+        eq(nodes.mqttOkToMqtt, false),
+        isNull(nodes.rfDirectLastHeard),
+      ));
+    return (rows as Array<{ nodeNum: number | bigint }>).map((r) => Number(r.nodeNum));
   }
 
   /**
@@ -1293,6 +1614,8 @@ export class NodesRepository extends BaseRepository {
     await this.db
       .delete(nodes)
       .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+    // #5862: the node's rename history on this source goes with it.
+    await this.dropNameHistory(h => h.deleteForNode('meshtastic', String(nodeNum), sourceId));
 
     this.removeCacheNode(nodeNum, sourceId);
     return true;
@@ -1361,6 +1684,25 @@ export class NodesRepository extends BaseRepository {
       .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
 
     await this.syncCacheNode(nodeNum, sourceId);
+  }
+
+  /**
+   * Set or clear a node's channel by hand, and its lock (#5923), scoped to
+   * sourceId. `channel: null` clears it. While `channelLocked` is true,
+   * upsertNode() keeps the stored channel. Returns false when no row matched.
+   */
+  async setNodeChannel(nodeNum: number, sourceId: string, channel: number | null, channelLocked: boolean): Promise<boolean> {
+    const existing = await this.getNode(nodeNum, sourceId);
+    if (!existing) return false;
+    const { nodes } = this.tables;
+
+    await this.db
+      .update(nodes)
+      .set({ channel, channelLocked, updatedAt: this.now() })
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+
+    await this.syncCacheNode(nodeNum, sourceId);
+    return true;
   }
 
   /**
@@ -1456,8 +1798,10 @@ export class NodesRepository extends BaseRepository {
       : baseSelect);
     if (sourceId) {
       await this.db.delete(nodes).where(eq(nodes.sourceId, sourceId));
+      await this.dropNameHistory(h => h.deleteForSourceProtocol(sourceId, 'meshtastic'));
     } else {
       await this.db.delete(nodes);
+      await this.dropNameHistory(h => h.deleteAllForProtocol('meshtastic'));
     }
     this.clearCacheAll();
     return result.length;
@@ -2153,6 +2497,34 @@ export class NodesRepository extends BaseRepository {
   /**
    * Get inactive monitored nodes — nodes in the given nodeId list whose lastHeard is before the cutoff
    */
+  /**
+   * Was node `nodeNum` heard at or after `sinceSeconds` on ANY of `sourceIds`?
+   * The inactive-node alert asks this across the sources a user can read
+   * before it calls a node inactive (#5729): a node one source stopped
+   * hearing is not inactive while another source still hears it.
+   */
+  async heardOnAnySource(nodeNum: number, sourceIds: string[], sinceSeconds: number): Promise<boolean> {
+    if (sourceIds.length === 0) return false;
+    try {
+      const { nodes } = this.tables;
+      const rows = await this.db
+        .select({ nodeNum: nodes.nodeNum })
+        .from(nodes)
+        .where(and(
+          eq(nodes.nodeNum, nodeNum),
+          inArray(nodes.sourceId, sourceIds),
+          isNotNull(nodes.lastHeard),
+          gte(nodes.lastHeard, sinceSeconds),
+        ))
+        .limit(1);
+      return rows.length > 0;
+    } catch (error) {
+      // Fail toward "heard": a failed read must not raise a false alert.
+      logger.error('Failed to query node last-heard across sources:', error);
+      return true;
+    }
+  }
+
   async getInactiveMonitoredNodes(
     nodeIds: string[],
     cutoffSeconds: number,
@@ -2270,11 +2642,12 @@ export class NodesRepository extends BaseRepository {
         longitude: nodes.longitude,
         aircraftFixedLatitude: nodes.aircraftFixedLatitude,
         aircraftFixedLongitude: nodes.aircraftFixedLongitude,
+        aircraftManualMark: nodes.aircraftManualMark,
       })
       .from(nodes)
       .where(and(
         eq(nodes.sourceId, sourceId),
-        or(isNotNull(nodes.altitude), isNotNull(nodes.likelyAircraft)),
+        or(isNotNull(nodes.altitude), isNotNull(nodes.likelyAircraft), isNotNull(nodes.aircraftManualMark)),
       ));
 
     return rows.map((r: typeof rows[number]) => ({ ...r, nodeNum: Number(r.nodeNum) }));
@@ -2318,6 +2691,8 @@ export class NodesRepository extends BaseRepository {
         // Phase 2: disabling detection also drops the "confirmed fixed" mark.
         // Aged-out ignores (`aircraftAgedOutAt`) are deliberately kept.
         isNotNull(nodes.aircraftFixedAt),
+        // #5715: so does a manual mark — it overrides a classifier that is off.
+        isNotNull(nodes.aircraftManualMark),
       ),
     );
     // Node numbers are needed only for the cache sync below; the UPDATE uses
@@ -2340,6 +2715,9 @@ export class NodesRepository extends BaseRepository {
         aircraftFixedAt: null,
         aircraftFixedLatitude: null,
         aircraftFixedLongitude: null,
+        aircraftManualMark: null,
+        aircraftManualMarkAt: null,
+        aircraftManualMarkBy: null,
       })
       .where(classified);
 
@@ -2395,6 +2773,11 @@ export class NodesRepository extends BaseRepository {
    * Set (or, with `null`, clear) the "confirmed fixed" mark (D4). Setting it
    * also clears `likelyAircraft`, since the fixed rule says the node is not an
    * aircraft. Clearing it leaves `likelyAircraft` alone for the classifier.
+   *
+   * #5715: a 'not_aircraft' manual mark lives on this anchor, so clearing the
+   * anchor (the classifier's >1 km release) clears that mark too. Setting an
+   * automatic anchor never touches a manual mark; callers set manual anchors
+   * through {@link setAircraftManualMark}.
    */
   async setAircraftFixed(
     nodeNum: number,
@@ -2410,6 +2793,73 @@ export class NodesRepository extends BaseRepository {
           likelyAircraft: false,
         }
       : { aircraftFixedAt: null, aircraftFixedLatitude: null, aircraftFixedLongitude: null };
+    await this.db
+      .update(nodes)
+      .set(set)
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+    if (!fixed) {
+      await this.db
+        .update(nodes)
+        .set({ aircraftManualMark: null, aircraftManualMarkAt: null, aircraftManualMarkBy: null })
+        .where(and(
+          eq(nodes.nodeNum, nodeNum),
+          eq(nodes.sourceId, sourceId),
+          eq(nodes.aircraftManualMark, 'not_aircraft'),
+        ));
+    }
+    await this.syncCacheNode(nodeNum, sourceId);
+  }
+
+  /**
+   * Set or clear a person's aircraft mark (#5715) in one write.
+   *
+   *  - 'not_aircraft': anchors the fixed mark at the given position and clears
+   *    `likelyAircraft`, exactly like the sweep's fixed rule, but tagged as
+   *    manual. Released, like any anchor, by a move of more than 1 km.
+   *  - 'aircraft': sets `likelyAircraft` and drops any fixed anchor, since the
+   *    two disagree. Holds until cleared.
+   *  - null: drops the manual mark AND any fixed anchor (manual or automatic),
+   *    leaving `likelyAircraft` for the classifier to recompute.
+   *
+   * Does not bump `updatedAt` (not node activity).
+   */
+  async setAircraftManualMark(
+    nodeNum: number,
+    sourceId: string,
+    mark: AircraftManualMarkWrite | null,
+  ): Promise<void> {
+    const { nodes } = this.tables;
+    let set: Record<string, unknown>;
+    if (mark === null) {
+      set = {
+        aircraftManualMark: null,
+        aircraftManualMarkAt: null,
+        aircraftManualMarkBy: null,
+        aircraftFixedAt: null,
+        aircraftFixedLatitude: null,
+        aircraftFixedLongitude: null,
+      };
+    } else if (mark.mode === 'not_aircraft') {
+      set = {
+        aircraftManualMark: 'not_aircraft',
+        aircraftManualMarkAt: this.coerceBigintField(mark.atMs),
+        aircraftManualMarkBy: mark.byUserId,
+        aircraftFixedAt: this.coerceBigintField(mark.atMs),
+        aircraftFixedLatitude: mark.lat,
+        aircraftFixedLongitude: mark.lon,
+        likelyAircraft: false,
+      };
+    } else {
+      set = {
+        aircraftManualMark: 'aircraft',
+        aircraftManualMarkAt: this.coerceBigintField(mark.atMs),
+        aircraftManualMarkBy: mark.byUserId,
+        aircraftFixedAt: null,
+        aircraftFixedLatitude: null,
+        aircraftFixedLongitude: null,
+        likelyAircraft: true,
+      };
+    }
     await this.db
       .update(nodes)
       .set(set)
@@ -2434,6 +2884,7 @@ export class NodesRepository extends BaseRepository {
         isFavorite: nodes.isFavorite,
         isIgnored: nodes.isIgnored,
         aircraftAgedOutAt: nodes.aircraftAgedOutAt,
+        aircraftManualMark: nodes.aircraftManualMark,
         positionOverrideEnabled: nodes.positionOverrideEnabled,
         latitudeOverride: nodes.latitudeOverride,
         longitudeOverride: nodes.longitudeOverride,

@@ -6,43 +6,38 @@
 
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
-import { authenticateLocal, changePassword } from '../auth/localAuth.js';
+import {
+  authenticateLocal,
+  changePassword,
+  setPasswordAfterRecovery,
+  PasswordLoginDisabledError,
+} from '../auth/localAuth.js';
+import { fail } from '../utils/apiResponse.js';
 import {
   isOIDCEnabled,
   generateAuthorizationUrl,
   handleOIDCCallback,
   generateRandomString
 } from '../auth/oidcAuth.js';
-import { requireAuth } from '../auth/authMiddleware.js';
+import { requireAuth, optionalAuth } from '../auth/authMiddleware.js';
 import { authLimiter } from '../middleware/rateLimiters.js';
 import { mfaService } from '../services/mfa.js';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
 import { getEnvironmentConfig } from '../config/environment.js';
 import { notifyAccessChange } from '../../db/accessChanges.js';
+import { stripUserSecrets } from '../utils/userSecrets.js';
+import { regenerateSession } from '../auth/regenerateSession.js';
+import { getPublicInstanceConfig } from '../services/publicInstanceConfig.js';
 
 const router = Router();
 
-function regenerateSession(req: Request): Promise<void> {
-  // Preserve CSRF token across session regeneration so the frontend's
-  // cached token remains valid after login (session regeneration creates
-  // a new session ID but should not invalidate the CSRF token)
-  const csrfToken = req.session.csrfToken;
-  return new Promise((resolve, reject) => {
-    req.session.regenerate((err) => {
-      if (err) reject(err);
-      else {
-        if (csrfToken) {
-          req.session.csrfToken = csrfToken;
-        }
-        resolve();
-      }
-    });
-  });
-}
-
 // Get authentication status
-router.get('/status', async (req: Request, res: Response) => {
+// This can be the browser's first request after signing in through a reverse proxy.
+// Without optionalAuth(), the proxy identity has not been bound to the session,
+// so the response says authenticated: false and the UI shows the login screen.
+// Authenticate this request before reading the session below.
+router.get('/status', optionalAuth(), async (req: Request, res: Response) => {
   try {
     const envConfig = getEnvironmentConfig();
     const localAuthDisabled = envConfig.disableLocalAuth;
@@ -84,6 +79,8 @@ router.get('/status', async (req: Request, res: Response) => {
         oidcEnabled: isOIDCEnabled(),
         localAuthDisabled,
         anonymousDisabled,
+        // Anonymous viewers only (#5156): tells the UI which details are redacted.
+        publicInstance: { ...getPublicInstanceConfig() },
         ...branding,
       });
     }
@@ -110,6 +107,8 @@ router.get('/status', async (req: Request, res: Response) => {
         oidcEnabled: isOIDCEnabled(),
         localAuthDisabled,
         anonymousDisabled,
+        // Anonymous viewers only (#5156): tells the UI which details are redacted.
+        publicInstance: { ...getPublicInstanceConfig() },
         ...branding,
       });
     }
@@ -118,11 +117,13 @@ router.get('/status', async (req: Request, res: Response) => {
     const permissions = await databaseService.getUserPermissionSetsBySourceAsync(user.id);
 
     // Don't send sensitive fields to client
-    const { passwordHash, mfaSecret, mfaBackupCodes, ...safeUser } = user;
+    const safeUser = stripUserSecrets(user);
 
     return res.json({
       authenticated: true,
       user: safeUser,
+      // Signed in with a passkey recovery code: the UI asks for a new password (#5841).
+      passwordChangeRequired: req.session.passwordChangeRequired === true,
       permissions,
       oidcEnabled: isOIDCEnabled(),
       localAuthDisabled,
@@ -135,10 +136,21 @@ router.get('/status', async (req: Request, res: Response) => {
   }
 });
 
-// Check if admin is using default password
-router.get('/check-default-password', async (_req: Request, res: Response) => {
+// Check if admin is using default password.
+// Gated to authenticated admins (#6082): exposing the default-password status
+// to anonymous callers advertises an exploitable instance (admin/changeme) to
+// internet scanners. Only an admin can act on the warning, and the banner that
+// reads it is shown post-login, so this change keeps the UX intact. Anyone not
+// an authenticated admin gets a non-revealing `false`.
+router.get('/check-default-password', optionalAuth(), async (req: Request, res: Response) => {
   try {
-    const admin = await databaseService.findUserByUsernameAsync('admin');
+    if (!req.user?.isAdmin) {
+      return res.json({ isDefaultPassword: false });
+    }
+
+    // ADMIN_USERNAME names the first admin (#5874), so look that user up
+    // rather than the literal 'admin'.
+    const admin = await databaseService.findUserByUsernameAsync(getEnvironmentConfig().adminUsername);
 
     if (!admin || !admin.passwordHash) {
       // No admin user or no password hash - not using default
@@ -310,7 +322,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
     );
 
     // Don't send sensitive fields to client
-    const { passwordHash, mfaSecret, mfaBackupCodes, ...safeUser } = user;
+    const safeUser = stripUserSecrets(user);
 
     return res.json({
       success: true,
@@ -377,7 +389,10 @@ router.post('/verify-mfa', authLimiter, async (req: Request, res: Response) => {
     }
 
     const user = await databaseService.findUserByIdAsync(pendingUserId);
-    if (!user || !user.isActive || !user.mfaEnabled || !user.mfaSecret) {
+    // A pending MFA step only ever follows a password login, so a passkey-only
+    // account (#5841) cannot finish one, even if password login was turned off
+    // between the two steps. Same reply as any other bad state.
+    if (!user || !user.isActive || !user.mfaEnabled || !user.mfaSecret || user.passwordLoginDisabled) {
       req.session.pendingMfaUserId = undefined;
       return res.status(401).json({ error: 'Invalid MFA state' });
     }
@@ -387,18 +402,27 @@ router.post('/verify-mfa', authLimiter, async (req: Request, res: Response) => {
     if (token) {
       verified = mfaService.verifyToken(user.mfaSecret, token);
     } else if (backupCode) {
-      const hashedCodes: string[] = JSON.parse(user.mfaBackupCodes || '[]');
+      const storedCodes = user.mfaBackupCodes ?? '[]';
+      const hashedCodes: string[] = JSON.parse(storedCodes);
       const remaining = await mfaService.verifyBackupCode(backupCode, hashedCodes);
       if (remaining !== null) {
-        verified = true;
-        await databaseService.consumeBackupCodeAsync(user.id, JSON.stringify(remaining));
-        void databaseService.auditLogAsync(
+        // Atomic consume closes a TOCTOU race (#6075): two concurrent requests
+        // with the same code both verify, but only the first CAS write wins.
+        const consumed = await databaseService.consumeBackupCodeAsync(
           user.id,
-          'mfa_backup_code_used',
-          'auth',
-          JSON.stringify({ username: user.username, action: 'login' }),
-          req.ip || null
+          storedCodes,
+          JSON.stringify(remaining)
         );
+        if (consumed) {
+          verified = true;
+          void databaseService.auditLogAsync(
+            user.id,
+            'mfa_backup_code_used',
+            'auth',
+            JSON.stringify({ username: user.username, action: 'login' }),
+            req.ip || null
+          );
+        }
       }
     }
 
@@ -435,7 +459,7 @@ router.post('/verify-mfa', authLimiter, async (req: Request, res: Response) => {
     );
 
     // Don't send sensitive fields to client
-    const { passwordHash, mfaSecret, mfaBackupCodes, ...safeUser } = user;
+    const safeUser = stripUserSecrets(user);
 
     return res.json({
       success: true,
@@ -452,14 +476,20 @@ router.post('/change-password', requireAuth(), async (req: Request, res: Respons
   try {
     const { currentPassword, newPassword } = req.body;
 
-    if (!currentPassword || !newPassword) {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    // A session that signed in with a passkey recovery code may set a new
+    // password without the old one (#5841). The flag lives in the server-side
+    // session, never in the request, and only that user's own session has it.
+    const afterRecovery =
+      req.session?.passwordChangeRequired === true && req.session.userId === req.user.id;
+
+    if (!newPassword || (!currentPassword && !afterRecovery)) {
       return res.status(400).json({
         error: 'Current password and new password are required'
       });
-    }
-
-    if (!req.user) {
-      return res.status(401).json({ error: 'Not authenticated' });
     }
 
     if (req.user.authProvider !== 'local') {
@@ -474,7 +504,27 @@ router.post('/change-password', requireAuth(), async (req: Request, res: Respons
       });
     }
 
-    await changePassword(req.user.id, currentPassword, newPassword);
+    // Passkey-only account (#5841): no password to change.
+    const loginState = await databaseService.getPasskeyOnlyStateAsync(req.user.id);
+    if (loginState?.passwordLoginDisabled) {
+      return fail(res, 403, 'PASSWORD_LOGIN_DISABLED', new PasswordLoginDisabledError().message);
+    }
+
+    if (afterRecovery) {
+      await setPasswordAfterRecovery(req.user.id, String(newPassword));
+    } else {
+      await changePassword(req.user.id, currentPassword, newPassword);
+    }
+    req.session.passwordChangeRequired = undefined;
+
+    // Invalidate the user's other active sessions (#6077) so a stolen cookie
+    // stops working the moment its owner changes the password. The current
+    // session (the one making this request) is preserved by sid.
+    try {
+      await databaseService.deleteSessionsByUserIdAsync(req.user.id, req.sessionID);
+    } catch (err) {
+      logger.warn('Failed to invalidate other sessions after password change:', err);
+    }
 
     return res.json({
       success: true,

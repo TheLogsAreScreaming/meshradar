@@ -50,6 +50,11 @@ vi.mock('../services/database.js', () => ({
       }),
     },
     handleAutoWelcomeEnabled: vi.fn(() => 0),
+    // defaultMeshtasticSourceId (#5245) is checked against the sources table:
+    // any id reads as a Meshtastic TCP source here.
+    sources: {
+      getSource: vi.fn(async (id: string) => ({ id, name: id, type: 'meshtastic_tcp', enabled: true })),
+    },
     sourcePkiKeys: {
       deleteAll: vi.fn(async () => 0),
     },
@@ -138,8 +143,11 @@ function validTestValue(key: string, suffix = ''): string {
     autoAckChannels: '0,1',
     autoAckIgnoredNodes: '!b29fa8d4,!a1b2c3d4',
     autoAckMaxResponses: '3',
+    hopEmojiZeroHop: '0️⃣',
+    hopEmojiMqtt: '🌐',
     maxNodeAgeHours: '24',
     maxInfraNodeAgeHours: '168',
+    securityDeadNodeDays: '14',
     txTargetMaxAgeHoursWhenUnlimited: '48',
     inactiveNodeThresholdHours: '24',
     inactiveNodeCheckIntervalMinutes: '60',
@@ -149,6 +157,9 @@ function validTestValue(key: string, suffix = ''): string {
     automationAirtimeCutoffThreshold: '30',
     automationAirtimeCutoffSource: 'neighbors',
     automationAirtimeCutoffNeighborMaxHops: '1',
+    automationAirtimeCutoffNeighborMode: 'auto',
+    automationAirtimeCutoffNeighborSampleCount: '4',
+    automationAirtimeCutoffNeighborNodes: '[1,2,3]',
     autoResponderTriggers: JSON.stringify([
       { id: '1', trigger: 'test', responseType: 'text', response: 'hi' },
     ]),
@@ -178,6 +189,7 @@ function validTestValue(key: string, suffix = ''): string {
     telemetryFavorites: JSON.stringify(['temperature']),
     telemetryCustomOrder: JSON.stringify(['temperature', 'humidity']),
     dashboardWidgets: JSON.stringify([]),
+    dashboardChartYRange: JSON.stringify({ '!abcd1234-voltage': { min: 3, max: 4.2 } }),
     autoAnnounceSchedule: JSON.stringify({ start: '08:00', end: '18:00' }),
     autoAnnounceNodeInfoChannels: '0',
     autoDeleteByDistanceIntervalHours: '24',
@@ -218,6 +230,27 @@ function validTestValue(key: string, suffix = ''): string {
     // known one (INVALID_ADSB_FEED otherwise).
     adsbMatchEnabled: 'true',
     adsbFeed: 'adsb.fi',
+    // MeshWars forwarder: the URL must be http(s) (INVALID_MESHWARS_BASE_URL).
+    meshwarsBaseUrl: 'https://meshwars.example.org',
+    // Ducting overlay (#5734): strict boolean.
+    ductingOverlayEnabled: 'true',
+    // MQTT root directory refresh (#6337): strict boolean.
+    mqttRootDirectoryRefreshEnabled: 'true',
+    // Reliable PKI (#5691): enums, INVALID_RELIABLE_PKI_MODE otherwise.
+    reliablePkiMode: 'asNeeded',
+    reliablePkiSourceMode: 'off',
+    // Node-name anti-spam (#6382): strict booleans, a JSON pattern list that
+    // RE2 compiles, and a placeholder of at most 24 bytes.
+    nodeNameSanitizeEnabled: 'true',
+    nodeNameSanitizeBuiltins: 'false',
+    nodeNameSanitizeCustomPatterns: '["spam.example"]',
+    nodeNameSanitizePlaceholder: '[x]',
+    // Public-instance mode (#5156): booleans stored as '1'/'0'.
+    publicInstanceModeEnabled: '1',
+    publicInstanceHideLongNames: '0',
+    publicInstanceHidePublicKeys: '0',
+    publicInstanceRoundTimestamps: '0',
+    publicInstanceHideMessageText: '0',
   };
 
   if (key in VALID_VALUES) {
@@ -524,6 +557,9 @@ describe('Settings Persistence', () => {
         // MeshCore CLI console reply-timeout (#4027) — loaded directly by
         // SettingsTab and read server-side by the /cli routes, not via SettingsContext.
         'meshcoreCliTimeoutSeconds',
+        // Cross-source hop resolution (#5909) — loaded directly by SettingsTab
+        // and read server-side by the MeshCore hop-candidates route only.
+        'meshcoreCrossSourceHopResolution',
         // Remote-admin retry attempts (#4487) — same shape: SettingsTab loads it
         // straight from the settings API, and only the admin routes read it when
         // deciding whether to re-send a timed-out command. No frontend state
@@ -553,12 +589,22 @@ describe('Settings Persistence', () => {
         // at runtime by the public GET /api/privacy/links endpoint rather than
         // through SettingsContext.
         'privacyPolicyUrl', 'termsOfServiceUrl', 'contactUrl',
+        // Public-instance mode (#5156 Phase 1) — loaded directly by SettingsTab
+        // into its own initial* snapshots (admin-only fields, no global hook).
+        // Read server-side by publicInstanceConfig.
+        'publicInstanceModeEnabled', 'publicInstanceHideLongNames',
+        'publicInstanceHidePublicKeys', 'publicInstanceRoundTimestamps',
+        'publicInstanceHideMessageText',
         // Coverage Report retention window (#5277 P1 WP2) — loaded directly by
         // SettingsTab into its own initial* snapshot (GLOBAL_ONLY_SETTINGS_KEYS,
         // settings:write-gated field, no SettingsContext hook), same pattern as
         // adminRetryAttempts above. Read server-side only by
         // coverageRetentionService via the bare-key getSettingAsync.
         'coverage_retention_days',
+        // Direct RF Contacts retention window (#6210) — same pattern as
+        // coverage_retention_days above; read server-side only by
+        // directRfContactsRetentionService.
+        'direct_rf_contacts_retention_days',
         // Likely-aircraft detection (#5364/#5365 Phase 1 WP5) — loaded
         // directly by SettingsTab into its own initial* snapshot (per-source,
         // no SettingsContext hook), same Category C pattern as
@@ -568,6 +614,8 @@ describe('Settings Persistence', () => {
         // Aircraft age-out (#5364/#5365 Phase 2) — same Category C pattern;
         // read server-side by aircraftAgeOutService.
         'aircraftAgeOutEnabled', 'aircraftAgeOutHours', 'aircraftAgeOutAction',
+        // #5704 — same pattern; read server-side by aircraftPositionRequestService.
+        'aircraftPositionRequestsEnabled',
         // Sign-flipped position correction (#5363) — same Category C pattern;
         // read server-side by signFlipCorrection.ts when node payloads are built.
         'signFlipCorrectionEnabled', 'signFlipCorrectionRangeKm',
@@ -576,6 +624,19 @@ describe('Settings Persistence', () => {
         // elevation pair; read server-side by adsbMatchService. The flag is
         // also read publicly by useAdsbMatchEnabled() via a direct fetch.
         'adsbMatchEnabled', 'adsbFeed', 'adsb_api_token',
+        // Ducting overlay (#5734) — same Category C pattern; read
+        // server-side by ductingRoutes and publicly by useDuctingEnabled().
+        'ductingOverlayEnabled',
+        // MQTT root directory refresh (#6337) — same Category C pattern; read
+        // server-side by the root finder's directoryProvider.
+        'mqttRootDirectoryRefreshEnabled',
+        // OpenSky credentials (#5877), same pattern.
+        'adsb_opensky_client_id', 'adsb_opensky_client_secret',
+        // Virtual Node message replay (#6160) — loaded directly by SettingsTab
+        // into its own initial* snapshot (global, settings:write-gated, no
+        // SettingsContext hook), same Category C pattern as ductingOverlayEnabled
+        // above. Read server-side only by VirtualNodeServer via getSetting.
+        'virtualNodeReplayEnabled', 'virtualNodeReplayExcludeIps',
         // Translation settings (global) — loaded directly by SettingsTab into
         // its initial* snapshot; read server-side by translationService.
         'translationEnabled', 'translationProvider', 'translationDefaultLanguage',

@@ -91,9 +91,15 @@ const COLUMN_MAPPINGS: Record<string, Record<string, string>> = {
     waypoint_radius_km: 'waypointRadiusKm',
     waypoint_center_lat: 'waypointCenterLat',
     waypoint_center_lon: 'waypointCenterLon',
+    // MeshCore mention alerts: same reason as the waypoint four.
+    notify_on_mention: 'notifyOnMention',
+    notify_on_auto_trace: 'notifyOnAutoTrace',
     // #5593 message-notification templates — same reason as the waypoint four.
     message_title_template: 'messageTitleTemplate',
     message_body_template: 'messageBodyTemplate',
+    // #6278 message text length
+    message_text_max_push: 'messageTextMaxPush',
+    message_text_max_apprise: 'messageTextMaxApprise',
     prefix_with_node_name: 'prefixWithNodeName',
     enable_apprise: 'appriseEnabled',             // Old: enable_apprise → New: appriseEnabled
     apprise_urls: 'appriseUrls',

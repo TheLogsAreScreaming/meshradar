@@ -8,8 +8,8 @@
  */
 import { logger } from '../../../utils/logger.js';
 import databaseService from '../../../services/database.js';
-import { dataEventEmitter, type DataEvent, type NodeAircraftData, type NodeUpdateData, type NodeDiscoveredData, type MeshCoreNodeChangedData, type MeshCoreNodeEventFacts } from '../dataEventEmitter.js';
-import type { DbMessage, DbTelemetry } from '../../../services/database.js';
+import { dataEventEmitter, type DataEvent, type NodeAircraftData, type NodeClockOffsetData, type NodeUpdateData, type NodeDiscoveredData, type MeshCoreNodeChangedData, type NeighborSightingData, type MeshCoreNodeEventFacts, type TelemetryEventRow } from '../dataEventEmitter.js';
+import type { DbMessage } from '../../../services/database.js';
 import type { MeshCoreMessage } from '../../meshcoreManager.js';
 import type { ReticulumMessageRow } from '../../../db/repositories/reticulum.js';
 import { AutomationEngineService } from './automationEngineService.js';
@@ -76,6 +76,7 @@ export async function startAutomationEngine(): Promise<void> {
     deps: createMeshActionDeps(),
     data: createMeshNodeDataProvider(),
     homeAnchorsRepo: databaseService.automationHomeAnchorsRepo,
+    fireStateRepo: databaseService.automationFireStateRepo,
     estimateHomeFromHistory: async (nodeNum, thresholdMeters) => {
       const est = await estimateHomeFromNodeHistory(nodeNum, thresholdMeters);
       return est ? { latitude: est.latitude, longitude: est.longitude } : null;
@@ -107,7 +108,11 @@ function subscribe(): void {
  * An ignored MeshCore message (#5408) is stored and shown collapsed, but it
  * must not trigger automations. Its bus event carries `filtered: 'ignore'`.
  */
-export function shouldRouteMeshCoreMessageToAutomations(message: Pick<MeshCoreMessage, 'filtered'>): boolean {
+export function shouldRouteMeshCoreMessageToAutomations(
+  message: Pick<MeshCoreMessage, 'filtered'>,
+): boolean {
+  // A reaction row (#5759) is let through; the per-rule opt-in
+  // (`includeMeshCoreReactions`) is enforced in meshCoreMessageMatchesFilter.
   return !message.filtered;
 }
 
@@ -201,6 +206,14 @@ export async function routeEventToEngine(e: AutomationEngineService, event: Data
       break;
     }
 
+    case 'neighbor:sighting': {
+      // Confirmed new neighbour (#6274): the neighbour watch saw a pending
+      // neighbour again. Fire trigger.neighborAdded for the rules whose
+      // confirmHours this sighting crosses. State lives in the DB ledger.
+      await e.onNeighborSighting(event.data as NeighborSightingData, sourceId);
+      break;
+    }
+
     case 'node:powerChanged': {
       // Device Health (#4558 Phase C): the telemetry-save seam detected a node's
       // batteryLevel cross the firmware powered threshold (> 100). Fire
@@ -211,6 +224,13 @@ export async function routeEventToEngine(e: AutomationEngineService, event: Data
       break;
     }
 
+    case 'node:clockOffset': {
+      // #6273: a passive MeshCore clock sample. Detection history lives in the
+      // telemetry table; the engine only applies each rule's threshold.
+      const data = event.data as NodeClockOffsetData;
+      await e.onClockOffset(data.publicKey, data.offsetSeconds, data.previousOffsets, data.sampleSource, sourceId);
+      break;
+    }
     case 'node:aircraft': {
       // Likely-aircraft classification (#5364/#5365 Phase 1 WP3): the
       // classification-queue seam detected a genuine transition into the
@@ -234,11 +254,17 @@ export async function routeEventToEngine(e: AutomationEngineService, event: Data
     }
 
     case 'telemetry:batch': {
-      const batch = event.data as Record<string, DbTelemetry[]>;
+      const batch = event.data as Record<string, TelemetryEventRow[]>;
       for (const [nodeNumStr, readings] of Object.entries(batch)) {
         const nodeNum = Number(nodeNumStr);
         for (const r of readings) {
-          await e.onTelemetry(nodeNum, r.telemetryType, r.value, r.unit, sourceId);
+          await e.onTelemetry(nodeNum, r.telemetryType, r.value, r.unit, sourceId, {
+            answersOwnRequest: r.answersOwnRequest === true,
+            localStats: r.localStats === true,
+            ...(r.meshcorePublicKey
+              ? { meshcore: { publicKey: r.meshcorePublicKey, name: r.meshcoreName ?? null, advType: r.meshcoreAdvType ?? null } }
+              : {}),
+          });
         }
       }
       break;

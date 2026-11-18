@@ -8,7 +8,8 @@ import {
   formatMessageTime,
   getMessageDateSeparator,
   shouldShowDateSeparator,
-  formatChartAxisTimestamp
+  formatChartAxisTimestamp,
+  getCachedDateTimeFormat
 } from './datetime';
 
 describe('datetime utilities', () => {
@@ -101,6 +102,19 @@ describe('datetime utilities', () => {
       // so assert it's a time rather than pinning the value.
       expect(formatTimeOrDate(new Date('2024-03-15T00:00:00'), '24')).toMatch(/^(00|24):00$/);
       expect(formatTimeOrDate(new Date('2024-03-14T23:59:00'), '24', 'MM/DD/YYYY')).toBe('03/14/2024');
+    });
+  });
+
+  describe('formatRelativeTime coarseHour', () => {
+    it('reports anything under an hour as within the last hour', () => {
+      const now = Date.now();
+      expect(formatRelativeTime(now - 5 * 60_000, '24', 'MM/DD/YYYY', false, { coarseHour: true })).toBe('within the last hour');
+      expect(formatRelativeTime(now - 10_000, '24', 'MM/DD/YYYY', false, { coarseHour: true })).toBe('within the last hour');
+    });
+    it('is unchanged at an hour or more, and without the option', () => {
+      const now = Date.now();
+      expect(formatRelativeTime(now - 2 * 3600_000, '24', 'MM/DD/YYYY', false, { coarseHour: true })).toBe('2 hours ago');
+      expect(formatRelativeTime(now - 5 * 60_000)).toBe('5 minutes ago');
     });
   });
 
@@ -287,5 +301,63 @@ describe('datetime utilities', () => {
       const result = formatChartAxisTimestamp(timestamp, [start, end], '12');
       expect(result).toMatch(/Mar 15 2:30\s*PM/i);
     });
+  });
+});
+
+describe('formatter cache (perf: one Intl.DateTimeFormat per locale + options)', () => {
+  // Midnight, noon, single-digit and late-evening hours, across a DST boundary.
+  const dates = [
+    new Date(2024, 0, 1, 0, 0),
+    new Date(2024, 0, 1, 0, 5),
+    new Date(2024, 2, 10, 2, 30),
+    new Date(2024, 5, 15, 9, 7),
+    new Date(2024, 5, 15, 12, 0),
+    new Date(2024, 10, 3, 1, 59),
+    new Date(2024, 11, 31, 23, 59),
+  ];
+
+  it('formatTime matches toLocaleTimeString for 12 h and 24 h', () => {
+    for (const d of dates) {
+      expect(formatTime(d, '12')).toBe(
+        d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
+      );
+      expect(formatTime(d, '24')).toBe(
+        d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
+      );
+    }
+  });
+
+  it('formatTime still returns "Invalid Date" for an invalid date instead of throwing', () => {
+    const bad = new Date(NaN);
+    expect(formatTime(bad, '12')).toBe(bad.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }));
+    expect(formatTime(bad, '24')).toBe('Invalid Date');
+  });
+
+  it('getCachedDateTimeFormat matches toLocaleString across locales and options', () => {
+    const optionSets: Intl.DateTimeFormatOptions[] = [
+      { hour: 'numeric', minute: '2-digit', hour12: true },
+      { hour: '2-digit', minute: '2-digit', hour12: false },
+      { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' },
+      { year: 'numeric', month: 'long', day: 'numeric' },
+    ];
+    const locales: Array<string | string[] | undefined> = [undefined, [], 'en-US', 'en-GB', 'de-DE', 'ja-JP'];
+    for (const locale of locales) {
+      for (const options of optionSets) {
+        const formatter = getCachedDateTimeFormat(locale, options);
+        for (const d of dates) {
+          expect(formatter.format(d)).toBe(d.toLocaleString(locale, options));
+        }
+      }
+    }
+  });
+
+  it('reuses one instance per locale + options and keeps distinct keys apart', () => {
+    const a = getCachedDateTimeFormat('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const b = getCachedDateTimeFormat('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const c = getCachedDateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    const d = getCachedDateTimeFormat('de-DE', { hour: '2-digit', minute: '2-digit', hour12: false });
+    expect(a).toBe(b);
+    expect(a).not.toBe(c);
+    expect(a).not.toBe(d);
   });
 });

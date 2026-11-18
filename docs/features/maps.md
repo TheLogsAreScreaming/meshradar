@@ -41,6 +41,47 @@ Each node is represented on the map with a marker that provides visual informati
 - **Per-node color** *(New in 4.15.2)*:
   - Every node gets a deterministic color derived from its NodeNum using the same algorithm the official Meshtastic app uses. The color is applied to the map pin and to the matching node's row in the sidebar list, so a node is easy to pick out at a glance across the map and the list. Signal-quality color coding above still applies where the underlying color is used as a fill — the per-node color drives the pin's outline / accent so the two signals don't collide.
 
+#### Role markers and badges
+
+A Meshtastic node's device role changes its marker, so you can tell fixed infrastructure from a moving asset at a glance. Every map (source Map tab, Dashboard, Map Analysis and embed maps) uses the same rules.
+
+Infrastructure roles replace the pin with a glyph:
+
+| Role | Marker |
+|---|---|
+| Router (and the deprecated Router Client and Repeater) | Router tower |
+| Router (Late) | Router tower with a clock |
+| Client (Base) | Base station: a house with an antenna |
+
+Other roles keep the normal pin and gain a small badge in its bottom-left corner:
+
+| Role | Badge |
+|---|---|
+| Tracker, TAK Tracker | Arrow: sends its position often, so follow its trail |
+| Lost and Found | Life buoy on a solid orange disc, so a lost device stands out |
+| Sensor | Thermometer: a telemetry-first station |
+| TAK | Crosshair |
+| Client (Mute) | Muted speaker: does not relay packets for others |
+
+Client and Client (Hidden) stay plain. Badges follow the light or dark theme. The other corners belong to other badges (likely aircraft top-left, cannot receive DMs top-right, and the infrastructure glyph bottom-right in the official pin style), so nothing overlaps. The map legend lists each marker under **Node Roles**. The 3D map draws the infrastructure glyphs but not the corner badges.
+
+![Role markers and badges on the map, with the legend](/images/features/6008-role-markers.png)
+
+#### Battery icons
+
+The node list, the header status, the map node popup and ATAK contact cards pick the battery icon from the charge level:
+
+| Charge | Icon |
+|---|---|
+| Under 10% | Empty (warning) |
+| 10% to 50% | Low |
+| 50% to 85% | Medium |
+| Over 85% | Full |
+| On external power | Charging |
+| Unknown | Plain outline |
+
+![Node list with battery icons by charge level](/images/features/5946-battery-level-icons.png)
+
 #### Node Popups
 
 Click any node marker to view detailed information:
@@ -48,7 +89,7 @@ Click any node marker to view detailed information:
 - Node name (long name and short name)
 - Node ID (hexadecimal and decimal)
 - Hardware model with device image
-- Battery level and voltage
+- Battery level and voltage, with an icon for the charge level (under 10%, 10-50%, 50-85%, over 85%). A node on external power shows a charging icon.
 - Signal quality (SNR and RSSI)
 - Last heard timestamp
 - Device role
@@ -191,7 +232,7 @@ Not drawn:
 
 You need read access to **both** sources to see an edge, and both radios'
 positions must be visible to you on the map. Links are kept for the Coverage
-retention period (Settings, Coverage Report) and are not part of backups. They
+retention period (Settings, Coverage Report) and are included in system backups. They
 start filling from the moment this version runs; there is no backfill.
 
 The same toggle works in the 3D view. The choice is saved in your browser.
@@ -253,6 +294,54 @@ You need read access to both **nodes** and **traceroutes** on the source, and
 both nodes' positions must be visible to you on the map. A hidden or private
 node yields no line.
 
+### Live packet traffic {#live-packet-traffic}
+
+**Live packet traffic** (Map Features, off by default) shows packets as they
+arrive. Each packet a source receives draws a dot that flies, in about
+three seconds, from where it came from to the node that heard it. A ring
+then pulses out from that node as the dot fades. It is on the source **Map** tab (Meshtastic and MQTT sources), the
+**Dashboard** map (every source you can read, each in its source colour on the
+Unified map) and the **MeshCore** map. It is not on the 3D view, the embed map
+or Map Analysis.
+
+![Live packet traffic on the map](/images/features/4835-live-packet-traffic.png)
+
+What a dot flies along:
+
+| Source | Line |
+|---|---|
+| Meshtastic | Heard direct (0 hops): sender to your node. Relayed: the last relay to your node, when the packet's relay byte matches exactly one node on the map. |
+| MQTT | Sender to each gateway that heard it, one dot per gateway. With hops, the last relay to the gateway, by the same rule. |
+| MeshCore | A flood with hops: the last path hash to your companion, when it matches exactly one contact on the map. Heard direct: the sender to your companion, when the frame names it (adverts carry the full key; direct messages carry a one-byte hash, which must match one contact). |
+
+| Style | Meaning |
+|---|---|
+| Solid | The last hop is known: the sender heard direct, or a relay matched exactly one node |
+| Dashed and dimmer | **Via mesh**: the packet took hops, but the last relay is not known (no relay byte, or it matches several nodes or none), so the line runs from the sender. A Meshtastic packet your node got over its MQTT uplink is also dashed. |
+
+A packet is skipped when either end has no position on that map. Dots only
+use the nodes the map already shows you, so a flight never reveals a node or
+a position you could not otherwise see. A MeshCore channel message names no
+sender in the clear, so it is drawn only when its last hop resolves.
+
+**Max dots** sets how many dots a second the map draws for you: 1, 2, 5, 10,
+25, 50 or **All** (the default). Packets past that rate are dropped from the
+map, not from the server. Your
+browser also caps the dots in flight at 200 at once; a new one past the cap
+finishes the oldest first. The toggle and the rate are saved in your browser.
+
+Under the slider, a readout counts the last minute's packets: how many
+arrived, how many were drawn, how many were skipped because an end has no
+position on the map, and how many went over your **Max dots** limit. If it
+says **no packets yet**, the sources on that map have heard nothing in the
+last minute; if most land under **no position**, the senders or gateways are
+not on the map.
+
+You need **Packet Monitor read** (`packetmonitor:read`) on a source to see its
+traffic. It works with packet logging off and stores nothing. MeshMonitor
+sends the events only while a map has the layer on, so it costs nothing when
+no one watches, and it never transmits on the mesh.
+
 ### Waypoints
 
 Waypoints — Meshtastic's `WAYPOINT_APP` pins — render directly on the per-source dashboard map and the Map Analysis canvas, using each waypoint's emoji as its icon. Users with `waypoints:write` can create, edit, and delete waypoints in place from the **Map Features** panel. The same panel has a **Show Waypoints** checkbox (default on) that toggles waypoint marker visibility per-user — persisted alongside the other map feature toggles. See the dedicated [Waypoints](/features/waypoints) page for the full workflow, permissions, and REST API.
@@ -294,6 +383,19 @@ Estimation itself is configured in **Global Settings → Position Estimation**,
 including a **Maximum acceptable accuracy** cutoff that discards low-confidence
 guesses. See the dedicated [Position Estimation](/features/position-estimation)
 page.
+
+### Tropospheric ducting overlay {#tropospheric-ducting-overlay}
+
+The overlay shades the map where the lower air bends radio further than usual, from a NOAA GFS forecast. It helps you spot when a long path may open. It is off until an admin turns on **Enable the ducting overlay (contacts NOAA)** in [Global Settings](/features/settings#tropospheric-ducting-overlay).
+
+With it on, the **Ducting** toggle appears in Map Features on the Map tab, the Dashboard map and a MeshCore source's Map tab (Companion and Repeater). MeshMonitor saves the toggle per browser.
+
+- **Scrubber.** Drag the slider to pick a forecast time, from now to +72 hours. It labels the step (`+N h`), the valid time in your time zone and the GFS run. The map loads a step after you stop moving the slider.
+- **Legend.** Normal air has no fill. A light tint marks super-refractive air (gradient at or below -79 N/km). A stronger tint in the caution color marks a duct (at or below -157 N/km), stronger for a stronger duct. Sub-refractive air has no fill, because it shortens range.
+- **Area.** The forecast covers the busiest group of nodes you can see on the map, up to 20 degrees on a side. When your sources have a local node with a position you may see, MeshMonitor centres the area on those nodes first. It uses only nodes you may see, so two viewers can get different areas. On a MeshCore source's map, the area comes from that source's contacts you may see on the map, centred on the source's own radio when it has a position.
+- **Caveat.** GFS pressure levels sit 200 to 500 m apart near the ground, so a sharp duct can read weaker than it is.
+
+The server fetches a forecast step from NOAA only when a viewer opens a step it has not cached: one HTTPS request each, at most 25 per 6-hour GFS cycle. MeshMonitor sends nothing over the mesh. While the setting is off, the forecast route answers `403` with code `DUCTING_DISABLED`.
 
 ### Node Age Filter
 
@@ -358,7 +460,7 @@ The control appears in both the Nodes map and the Dashboard map, and the chosen 
 
 **Show aged-out** — a checkbox under the three modes. When [age-out](/features/settings#age-out-and-reclassify-as-fixed) ignores a likely aircraft, the node drops off the map like any ignored node. Tick **Show aged-out** to draw those nodes again, faded and with the aircraft badge. It only brings back aircraft ignored by age-out; manual and geo ignores stay hidden. The hint line shows how many aged-out nodes the map would draw with your other filters applied. The setting is saved in your browser and applies to both maps and Map Analysis.
 
-A node's popup and details say **Aged out (likely aircraft)** while it is aged out, and **Reclassified as fixed** once the sweep has decided it is a fixed node.
+A node's popup and details say **Aged out (likely aircraft)** while it is aged out, and **Reclassified as fixed** once the sweep has decided it is a fixed node. To correct the detector yourself, see [Marking a node by hand](/features/settings#aircraft-manual-mark).
 
 #### Flight trails
 
@@ -386,10 +488,14 @@ The line links to the flight on the feed's own map. Parts the feed doesn't repor
 
 **How it looks up a flight**
 
-- A lookup happens only when a node **becomes** a likely aircraft, and at most **two lookups per flagging**.
+- Lookups start only when a node **becomes** a likely aircraft: **two lookups**, then up to **six re-checks** per flagging (at most eight in all).
 - Lookup 1 runs when the node is flagged. A hit shows as **Possible match**.
 - Lookup 2 runs on the node's next live position, 1 to 30 minutes later. If it names the same aircraft again, the line changes to **Matched**.
-- After that nothing more is looked up until the node is flagged again. The count is stored in the database, so a restart or a settings save doesn't reset it.
+- After that, a live position re-checks the match when the node has moved more than 10 km from where the last lookup ran, or 15 minutes have passed since it:
+  - the same aircraft refreshes the callsign, speed, heading and altitude (a flight number can change mid-flight);
+  - a different aircraft shows as **Possible match** with the new one;
+  - no aircraft twice in a row clears the match.
+- After six re-checks nothing more is looked up until the node is flagged again. The counts are stored in the database, so a restart or a settings save doesn't reset them, and a restart alone never triggers a lookup.
 - MeshMonitor picks the nearest aircraft within a radius that grows with the age of the node's fix (5 to 90 km) and within 300 m of the node's altitude. If two aircraft are about equally close, it shows nothing rather than guess.
 - **A match only confirms.** No match never clears the likely-aircraft flag: light aircraft, balloons and drones often carry no ADS-B.
 
@@ -399,8 +505,11 @@ The line links to the flight on the feed's own map. Parts the feed doesn't repor
 |---|---|
 | **adsb.lol** *(default)* | Open data under the ODbL. |
 | **adsb.fi** | For personal, non-commercial use only. |
+| **OpenSky Network** | Non-commercial and research use only. Credit: *Data: The OpenSky Network*. Needs a free OpenSky account. |
 
 airplanes.live is not offered: it refused anonymous requests when this feature was built. The optional **API key** field is for adsb.lol's announced future key; leave it empty unless adsb.lol asks for one. Only admins can see the key.
+
+**OpenSky Network** needs an API client: log in to OpenSky, open your Account page, create an API client, and paste its **client ID** and **client secret** into Settings. There is no anonymous mode: the feed cannot be picked or saved without both. MeshMonitor swaps them for a 30-minute token, kept in memory only, and never sends the adsb.lol API key to OpenSky. OpenSky has no aircraft type or registration, so its matches show the callsign and ICAO hex only. OpenSky spends credits from a daily quota; when it runs out, OpenSky says how long to wait, and MeshMonitor pauses OpenSky lookups for that long (at most 24 hours). The pause is saved, so a restart does not end it early.
 
 **What it sends, and how often**
 

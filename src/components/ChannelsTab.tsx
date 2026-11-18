@@ -13,40 +13,60 @@ import { useIsMobileViewport } from '../hooks/useIsMobileViewport';
 import { Channel } from '../types/device';
 import { MeshMessage } from '../types/message';
 import { ResourceType } from '../types/permission';
+import { MuteMenu } from './notifications/MuteMenu';
+import { MarkAllReadButton } from './messages/MarkAllReadButton';
 import { TimeFormat, DateFormat, useSettings, useNotificationMuteSettings } from '../contexts/SettingsContext';
 import { formatPrecisionAccuracy } from '../utils/distance';
 import apiService, { type ChannelDatabaseEntry } from '../services/api';
-import { formatMessageTime, getMessageDateSeparator, shouldShowDateSeparator } from '../utils/datetime';
+import { getMessageDateSeparator, shouldShowDateSeparator } from '../utils/datetime';
 import { getMessageSortTime } from '../utils/messageSort';
-import { getUtf8ByteLength, formatByteCount } from '../utils/text';
-import { isReplyTo, isTapbackMessage, isTapbackOf } from '../utils/messageReplies';
-import { SenderAvatar, SenderNameButton } from './SenderAvatar';
+import { isTapbackMessage } from '../utils/messageReplies';
 import { scrollInputIntoView } from '../utils/scrollInputIntoView';
-import { applyHomoglyphOptimization } from '../utils/homoglyph';
-import { renderMessageWithLinks } from '../utils/linkRenderer';
-import MentionAutocomplete from './mentions/MentionAutocomplete';
-import { useMentionAutocomplete } from '../hooks/useMentionAutocomplete';
 import { mentionCandidatesFromNodes } from '../utils/mentionCandidates';
-import { useAutoResizeTextarea } from '../hooks/useAutoResizeTextarea';
-import HopCountDisplay from './HopCountDisplay';
 import AeadBadge from './channels/AeadBadge';
-import LinkPreview from './LinkPreview';
-import { MessageEmojiButton } from './MessageEmojiButton';
+import MessageComposeInput from './MessageComposeInput';
+import { useComposeDraftStore } from '../contexts/composeDraftStore';
 import { logger } from '../utils/logger';
-import { MessageStatusIndicator } from './MessageStatusIndicator';
 import MessageDetailsModal from './diagnostics/MessageDetailsModal';
 import type { MessageDirection } from '../utils/deliveryDiagnostics/types';
 import { useNodes } from '../hooks/useServerData';
 import { UiIcon } from './icons';
-import UnreadDivider from './messages/UnreadDivider';
 import { resolveUnreadAnchorId, shouldSuppressDivider } from '../utils/unreadAnchor';
 import { useUnreadDividerAnchors } from '../contexts/MessagingContext';
 import { TranslateModal } from './translation/TranslateModal';
-import { TranslatedMessage } from './translation/TranslatedMessage';
 import { useViewTranslations } from '../hooks/useViewTranslations';
 // Default PSK value (publicly known key - not truly secure) — shared
 // definition lives in utils/publicChannel.ts (#4705).
-import { DEFAULT_PUBLIC_PSK } from '../utils/publicChannel';
+import { pskEncryptionStatus } from '../utils/publicChannel';
+import { useSource } from '../contexts/SourceContext';
+import { sourceTypeMeshProtocol } from '../utils/meshProtocol';
+import { ChannelMessageRow } from './messages/ChannelMessageRow';
+import type { MessageRowActions, MessageRowNames } from './messages/DmMessageRow';
+import {
+  buildResponseIndex,
+  repliedMessageFor,
+  tapbacksFor,
+  useNodeNamesToken,
+} from './messages/messageRowSupport';
+import type { TranslatedMessageState } from './translation/TranslatedMessage';
+import { getUserDisplayName } from '../utils/nodeHelpers';
+import { PortNum } from '../server/constants/meshtastic.js';
+
+/** The latest handlers behind the stable row callbacks (see `rowActions`). */
+interface RowLatest {
+  getNodeName: (nodeId: string) => string;
+  getNodeShortName: (nodeId: string) => string;
+  handleSenderClick: (nodeId: string, event?: React.MouseEvent | React.KeyboardEvent) => void;
+  handleRelayClick: (msg: MeshMessage, direction: MessageDirection) => Promise<void>;
+  handleResendMessage: (msg: MeshMessage) => Promise<void>;
+  handleDeleteMessage: (msg: MeshMessage) => Promise<void>;
+  handleSendTapback: (emoji: string, msg: MeshMessage) => void;
+  setReplyingTo: (msg: MeshMessage | null) => void;
+  setEmojiPickerMessage: (msg: MeshMessage | null) => void;
+  translateMessage: (msgId: string, text: string, targetLang?: string) => Promise<void>;
+  dismissTranslation: (msgId: string) => void;
+  setDetailsState: (state: { message: MeshMessage; direction: MessageDirection } | null) => void;
+}
 
 // Offset for Channel Database channels
 // IMPORTANT: This value must match CHANNEL_DB_OFFSET in src/server/constants/meshtastic.ts
@@ -58,15 +78,7 @@ type EncryptionStatus = 'none' | 'default' | 'secure';
 
 // Helper to determine encryption status from a raw PSK (used for virtual /
 // channel-database entries where we have the key locally).
-const getEncryptionStatus = (psk: string | undefined | null): EncryptionStatus => {
-  if (!psk || psk === '') {
-    return 'none'; // No encryption
-  }
-  if (psk === DEFAULT_PUBLIC_PSK) {
-    return 'default'; // Default/public key - not secure
-  }
-  return 'secure'; // Custom key - encrypted
-};
+const getEncryptionStatus = (psk: string | undefined | null): EncryptionStatus => pskEncryptionStatus(psk);
 
 // Resolve encryption status for a Channel: prefer the server-derived
 // `encryptionStatus` field (always present and safe to expose) and fall
@@ -125,9 +137,8 @@ export interface ChannelsTabProps {
   showMqttMessages: boolean;
   setShowMqttMessages: (show: boolean) => void;
 
-  // Message input
-  newMessage: string;
-  setNewMessage: (message: string) => void;
+  // Message input. The draft text itself is NOT a prop: MessageComposeInput
+  // reads it from the compose-draft store, so typing re-renders only the box.
   replyingTo: MeshMessage | null;
   setReplyingTo: (message: MeshMessage | null) => void;
 
@@ -204,8 +215,6 @@ export default function ChannelsTab({
   selectedChannelRef,
   showMqttMessages,
   setShowMqttMessages,
-  newMessage,
-  setNewMessage,
   replyingTo,
   setReplyingTo,
   unreadCounts,
@@ -237,6 +246,9 @@ export default function ChannelsTab({
   mqttReadOnly = false,
 }: ChannelsTabProps) {
   const { t } = useTranslation();
+  // Protocol stripe on each bubble (#5744). No source type (legacy
+  // single-source view) reads as Meshtastic.
+  const meshProtocol = sourceTypeMeshProtocol(useSource().sourceType);
   const { nodes } = useNodes();
   // Status message per sender, for the avatar badge (#5645). One pass over the
   // node list rather than a lookup per message row.
@@ -253,7 +265,6 @@ export default function ChannelsTab({
   // Drives the red "New messages" divider below.
   const { channel: pinnedFirstUnreadChannel } = useUnreadDividerAnchors();
 
-  const [showMuteMenu, setShowMuteMenu] = useState<number | null>(null);
   // Mobile overflow ("⋯") menu — collapses info / notifications / mark-all-read
   // / Show-MQTT into a single kebab next to the selector on narrow screens (#3385).
   const [showChannelMenu, setShowChannelMenu] = useState(false);
@@ -270,47 +281,58 @@ export default function ChannelsTab({
   // not, and the JS must not disagree with the sheet.
   const isMobileViewport = useIsMobileViewport();
 
-  const handleMuteChannel = async (channelId: number, muteUntil: number | null) => {
-    await muteChannel(channelId, muteUntil);
-    setShowMuteMenu(null);
-    setShowChannelMenu(false);
-  };
-
-  const handleUnmuteChannel = async (channelId: number) => {
-    await unmuteChannel(channelId);
-    setShowMuteMenu(null);
-    setShowChannelMenu(false);
-  };
-
   // Refs
   const channelMessageInputRef = useRef<HTMLTextAreaElement>(null);
-
-  useAutoResizeTextarea(channelMessageInputRef, newMessage);
 
   // #5276: `@` mention autocomplete over the nodes this source knows.
   const mentionCandidates = useMemo(
     () => mentionCandidatesFromNodes(nodes, currentNodeId),
     [nodes, currentNodeId]
   );
-  const mentions = useMentionAutocomplete({
-    value: newMessage,
-    onChange: setNewMessage,
-    textareaRef: channelMessageInputRef,
-    candidates: mentionCandidates,
-  });
+  // The memoized message rows (ChannelMessageRow) get their name lookups and
+  // callbacks through these, so a poll that changes no name and no handler
+  // leaves every row's props equal. Each call reads the latest function from
+  // `rowLatestRef`, which the render body fills in just before it returns.
+  const rowLatestRef = useRef<RowLatest | null>(null);
+  const namesToken = useNodeNamesToken(nodes);
+  const rowNames = useMemo<MessageRowNames>(() => ({
+    token: namesToken,
+    name: (nodeId) => rowLatestRef.current!.getNodeName(nodeId),
+    short: (nodeId) => rowLatestRef.current!.getNodeShortName(nodeId),
+    // Channel rows show no "Long (SHRT)" label; kept for the shared type.
+    label: (nodeId) => rowLatestRef.current!.getNodeName(nodeId),
+  }), [namesToken]);
+  const rowActions = useMemo<MessageRowActions>(() => ({
+    senderClick: (nodeId, event) => rowLatestRef.current!.handleSenderClick(nodeId, event),
+    relayClick: (msg, direction) => { void rowLatestRef.current!.handleRelayClick(msg, direction ?? 'received'); },
+    resend: (msg) => { void rowLatestRef.current!.handleResendMessage(msg); },
+    reply: (msg) => {
+      rowLatestRef.current!.setReplyingTo(msg);
+      channelMessageInputRef.current?.focus();
+    },
+    emoji: (msg) => rowLatestRef.current!.setEmojiPickerMessage(msg),
+    translate: (msgId, text, lang) => { void rowLatestRef.current!.translateMessage(msgId, text, lang); },
+    dismissTranslation: (msgId) => rowLatestRef.current!.dismissTranslation(msgId),
+    remove: (msg) => { void rowLatestRef.current!.handleDeleteMessage(msg); },
+    tapback: (emoji, msg) => rowLatestRef.current!.handleSendTapback(emoji, msg),
+    showDetails: (msg) => rowLatestRef.current!.setDetailsState({ message: msg, direction: 'sent' }),
+  }), []);
+
   // Resolves a mention token to the node's CURRENT name at render time, so a
-  // rename shows through in old messages.
+  // rename shows through in old messages. Keyed on the names token rather than
+  // the name lookup, so it stays the same object across polls that rename no
+  // one (it is a row prop).
   const mentionRenderOptions = useMemo(() => ({
     resolveNodeName: (nodeId: string) => {
-      const name = getNodeName(nodeId);
+      const name = rowNames.name(nodeId);
       return name && name !== nodeId ? name : undefined;
     },
     // Pass the real event: handleSenderClick measures event.currentTarget to
     // place the node popup next to what was clicked.
     onMentionClick: (nodeId: string, event: React.MouseEvent | React.KeyboardEvent) =>
-      handleSenderClick(nodeId, event as React.MouseEvent),
+      rowActions.senderClick(nodeId, event),
     selfNodeId: currentNodeId,
-  }), [getNodeName, handleSenderClick, currentNodeId]);
+  }), [rowNames, rowActions, currentNodeId]);
 
   // State for "Jump to Bottom" button
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
@@ -351,11 +373,9 @@ export default function ChannelsTab({
     void fetchHomoglyphSetting();
   }, []);
 
-  // Memoize byte count to avoid redundant homoglyph optimization on each render
-  const byteCountDisplay = useMemo(() => {
-    const message = homoglyphEnabled ? applyHomoglyphOptimization(newMessage) : newMessage;
-    return formatByteCount(getUtf8ByteLength(message));
-  }, [newMessage, homoglyphEnabled]);
+  // One-off reads/writes of the compose draft (bell, translate). Doesn't
+  // subscribe: only MessageComposeInput re-renders on a keystroke.
+  const composeDraftStore = useComposeDraftStore();
 
   // Compute auto-position channel: lowest-index channel with positionPrecision > 0
   const autoPositionChannelId = useMemo(() => {
@@ -371,7 +391,7 @@ export default function ChannelsTab({
     return {
       nodeNum: node.nodeNum,
       nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}`,
-      longName: node.user?.longName || `Node ${node.nodeNum}`,
+      longName: getUserDisplayName(node.user, node.nodeNum),
       shortName: node.user?.shortName || node.nodeNum.toString(16).padStart(8, '0').slice(-4),
       hopsAway: node.hopsAway,
       role: typeof node.user?.role === 'string' ? parseInt(node.user.role, 10) : node.user?.role,
@@ -641,7 +661,7 @@ export default function ChannelsTab({
   const channelSendActionButtons = (
     <>
       <button
-        onClick={() => { void onSendBell?.(selectedChannel, newMessage); setNewMessage(''); }}
+        onClick={() => { void onSendBell?.(selectedChannel, composeDraftStore.get()); composeDraftStore.set(''); }}
         disabled={txDisabled}
         className="send-btn channel-action-btn"
         title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : 'Send alert bell'}
@@ -671,6 +691,26 @@ export default function ChannelsTab({
       )}
     </>
   );
+
+  // Latest handlers and name lookups for the stable `rowNames` / `rowActions`.
+  rowLatestRef.current = {
+    getNodeName,
+    getNodeShortName,
+    handleSenderClick,
+    handleRelayClick,
+    handleResendMessage,
+    handleDeleteMessage,
+    handleSendTapback,
+    setReplyingTo,
+    setEmojiPickerMessage,
+    translateMessage,
+    dismissTranslation,
+    setDetailsState,
+  };
+
+  // A channel is open and its per-channel actions (info, mute, mark-all-read)
+  // apply. Shared by the inline actions and the overflow menu.
+  const hasOpenChannel = shouldShowData() && availableChannels.length > 0 && selectedChannel !== -1;
 
   return (
     <div className="tab-content channels-tab-content">
@@ -764,84 +804,21 @@ export default function ChannelsTab({
               >
                 {t('channels.info_link')}
               </a>
-              {/* Mute button */}
-              <div style={{ position: 'relative' }}>
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => setShowMuteMenu(showMuteMenu === selectedChannel ? null : selectedChannel)}
-                  title={isChannelMuted(selectedChannel) ? t('notifications.mute_channel_active', 'Muted — click to change') : t('notifications.mute_channel', 'Mute notifications')}
-                  style={{ padding: '0.4rem 0.55rem', fontSize: '0.9rem' }}
-                  aria-label={isChannelMuted(selectedChannel) ? 'Muted' : 'Mute channel'}
-                >
-                  <UiIcon name={isChannelMuted(selectedChannel) ? 'muted' : 'notifications'} />
-                </button>
-                {showMuteMenu === selectedChannel && (
-                  <>
-                    <div
-                      style={{ position: 'fixed', inset: 0, zIndex: 999 }}
-                      onClick={() => setShowMuteMenu(null)}
-                    />
-                    <div style={{
-                      position: 'absolute',
-                      top: '100%',
-                      right: 0,
-                      marginTop: '4px',
-                      background: 'var(--color-surface)',
-                      border: '1px solid var(--color-surface-active)',
-                      borderRadius: '4px',
-                      zIndex: 1000,
-                      minWidth: '180px',
-                      boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
-                      overflow: 'hidden',
-                    }}>
-                      {isChannelMuted(selectedChannel) && (
-                        <button
-                          style={{ display: 'block', width: '100%', padding: '0.5rem 1rem', background: 'none', border: 'none', color: 'var(--color-text)', cursor: 'pointer', textAlign: 'left', fontSize: '0.85rem' }}
-                          onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-hover)')}
-                          onMouseLeave={e => (e.currentTarget.style.background = 'none')}
-                          onClick={() => handleUnmuteChannel(selectedChannel)}
-                        >
-                          <UiIcon name="unmute" /> {t('notifications.unmute', 'Unmute')}
-                        </button>
-                      )}
-                      <button
-                        style={{ display: 'block', width: '100%', padding: '0.5rem 1rem', background: 'none', border: 'none', color: 'var(--color-text)', cursor: 'pointer', textAlign: 'left', fontSize: '0.85rem' }}
-                        onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-hover)')}
-                        onMouseLeave={e => (e.currentTarget.style.background = 'none')}
-                        onClick={() => handleMuteChannel(selectedChannel, null)}
-                      >
-                        <UiIcon name="muted" /> {t('notifications.mute_indefinite', 'Mute indefinitely')}
-                      </button>
-                      <button
-                        style={{ display: 'block', width: '100%', padding: '0.5rem 1rem', background: 'none', border: 'none', color: 'var(--color-text)', cursor: 'pointer', textAlign: 'left', fontSize: '0.85rem' }}
-                        onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-hover)')}
-                        onMouseLeave={e => (e.currentTarget.style.background = 'none')}
-                        onClick={() => handleMuteChannel(selectedChannel, Date.now() + 60 * 60 * 1000)}
-                      >
-                        <UiIcon name="time" /> {t('notifications.mute_1h', 'Mute for 1 hour')}
-                      </button>
-                      <button
-                        style={{ display: 'block', width: '100%', padding: '0.5rem 1rem', background: 'none', border: 'none', color: 'var(--color-text)', cursor: 'pointer', textAlign: 'left', fontSize: '0.85rem' }}
-                        onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-surface-hover)')}
-                        onMouseLeave={e => (e.currentTarget.style.background = 'none')}
-                        onClick={() => handleMuteChannel(selectedChannel, Date.now() + 7 * 24 * 60 * 60 * 1000)}
-                      >
-                        <UiIcon name="calendar" /> {t('notifications.mute_1w', 'Mute for 1 week')}
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
-              <button
+              <MuteMenu
+                muted={isChannelMuted(selectedChannel)}
+                onMute={(until) => muteChannel(selectedChannel, until)}
+                onUnmute={() => unmuteChannel(selectedChannel)}
+                buttonClassName="btn btn-secondary"
+                buttonStyle={{ padding: '0.4rem 0.55rem', fontSize: '0.9rem' }}
+                alignRight
+              />
+              <MarkAllReadButton
                 className="btn btn-secondary"
-                onClick={() => {
-                  void markMessagesAsRead(undefined, selectedChannel);
-                }}
+                onMarkAll={() => markMessagesAsRead(undefined, selectedChannel)}
                 title={t('channels.mark_all_read_title')}
+                label={t('channels.mark_all_read_button')}
                 style={{ padding: '0.4rem 0.75rem', fontSize: '0.9rem', whiteSpace: 'nowrap' }}
-              >
-                {t('channels.mark_all_read_button')}
-              </button>
+              />
             </div>
           )}
           {/* MeshBeacon invitations (#4723, #5232) — an offer to join a channel
@@ -867,8 +844,11 @@ export default function ChannelsTab({
           {/* Mobile overflow ("⋯") menu — collapses info / notifications /
               mark-all-read / Show-MQTT into one kebab beside the selector.
               Hidden on desktop via CSS; the inline controls above are hidden on
-              mobile so only one of the two is ever visible (#3385). */}
-          {shouldShowData() && availableChannels.length > 0 && selectedChannel !== -1 && (
+              mobile so only one of the two is ever visible (#3385). The menu
+              also renders with no channel open (e.g. while disconnected) when
+              it carries the MQTT toggle, because CSS hides the inline toggle on
+              phones, portrait and landscape alike (#4173 review N2). */}
+          {(hasOpenChannel || !mqttReadOnly) && (
             <div className="channel-overflow">
               <button
                 className="btn btn-secondary channel-overflow-btn"
@@ -887,18 +867,22 @@ export default function ChannelsTab({
                     onClick={() => setShowChannelMenu(false)}
                   />
                   <div className="channel-overflow-menu">
-                    <button
-                      className="channel-overflow-item"
-                      onClick={() => { setShowChannelMenu(false); handleInfoLinkClick(selectedChannel); }}
-                    >
-                      <UiIcon name="info" /> {t('channels.info_link')}
-                    </button>
-                    <button
-                      className="channel-overflow-item"
-                      onClick={() => { setShowChannelMenu(false); void markMessagesAsRead(undefined, selectedChannel); }}
-                    >
-                      <UiIcon name="checkAll" /> {t('channels.mark_all_read_button')}
-                    </button>
+                    {hasOpenChannel && (
+                      <>
+                        <button
+                          className="channel-overflow-item"
+                          onClick={() => { setShowChannelMenu(false); handleInfoLinkClick(selectedChannel); }}
+                        >
+                          <UiIcon name="info" /> {t('channels.info_link')}
+                        </button>
+                        <button
+                          className="channel-overflow-item"
+                          onClick={() => { setShowChannelMenu(false); void markMessagesAsRead(undefined, selectedChannel); }}
+                        >
+                          <UiIcon name="checkAll" /> {t('channels.mark_all_read_button')}
+                        </button>
+                      </>
+                    )}
                     {!mqttReadOnly && (
                       <button
                         className="channel-overflow-item"
@@ -907,33 +891,19 @@ export default function ChannelsTab({
                         <UiIcon name={showMqttMessages ? 'check' : 'close'} /> {t('channels.show_mqtt_messages')}
                       </button>
                     )}
-                    <div className="channel-overflow-divider" />
-                    {isChannelMuted(selectedChannel) && (
-                      <button
-                        className="channel-overflow-item"
-                        onClick={() => handleUnmuteChannel(selectedChannel)}
-                      >
-                        <UiIcon name="unmute" /> {t('notifications.unmute', 'Unmute')}
-                      </button>
+                    {hasOpenChannel && (
+                      <>
+                        <div className="channel-overflow-divider" />
+                        <MuteMenu
+                          variant="items"
+                          muted={isChannelMuted(selectedChannel)}
+                          onMute={(until) => muteChannel(selectedChannel, until)}
+                          onUnmute={() => unmuteChannel(selectedChannel)}
+                          itemClassName="channel-overflow-item"
+                          onDone={() => setShowChannelMenu(false)}
+                        />
+                      </>
                     )}
-                    <button
-                      className="channel-overflow-item"
-                      onClick={() => handleMuteChannel(selectedChannel, null)}
-                    >
-                      <UiIcon name="muted" /> {t('notifications.mute_indefinite', 'Mute indefinitely')}
-                    </button>
-                    <button
-                      className="channel-overflow-item"
-                      onClick={() => handleMuteChannel(selectedChannel, Date.now() + 60 * 60 * 1000)}
-                    >
-                      <UiIcon name="time" /> {t('notifications.mute_1h', 'Mute for 1 hour')}
-                    </button>
-                    <button
-                      className="channel-overflow-item"
-                      onClick={() => handleMuteChannel(selectedChannel, Date.now() + 7 * 24 * 60 * 60 * 1000)}
-                    >
-                      <UiIcon name="calendar" /> {t('notifications.mute_1w', 'Mute for 1 week')}
-                    </button>
                   </div>
                 </>
               )}
@@ -1160,7 +1130,7 @@ export default function ChannelsTab({
 
                       // Filter traceroutes from Primary channel (channel 0)
                       if (messageChannel === 0) {
-                        messagesForChannel = messagesForChannel.filter(msg => msg.portnum !== 70);
+                        messagesForChannel = messagesForChannel.filter(msg => msg.portnum !== PortNum.TRACEROUTE_APP);
                       }
 
                       // Sort messages by server-side receipt time (#3187)
@@ -1198,221 +1168,56 @@ export default function ChannelsTab({
                       })();
 
                       return messagesForChannel && messagesForChannel.length > 0 ? (
-                        messagesForChannel.map((msg, index) => {
-                          const isMine = isMyMessage(msg);
-                          // Reply / tapback rules live in utils/messageReplies — the
-                          // Auto-Acknowledge response cap counts with the same ones.
-                          const repliedMessage = (channelMessages[messageChannel] || []).find(m => isReplyTo(msg, m)) ?? null;
-                          const isReaction = isTapbackMessage(msg);
+                        (() => {
+                          // Reactions and quoted parents come from the FULL
+                          // channel list (unfiltered), one pass instead of a
+                          // filter + find per row. Rules: utils/messageReplies
+                          // via messageRowSupport.
+                          const responseIndex = buildResponseIndex(channelMessages[messageChannel] || []);
+                          const today = new Date().toDateString();
+                          const canWrite = hasPermission(`channel_${selectedChannel}` as ResourceType, 'write');
+                          const isDeviceChannel = selectedChannel >= 0 && selectedChannel < CHANNEL_DB_OFFSET;
+                          return messagesForChannel.map((msg, index) => {
+                            // Hide reactions (tapbacks) from main message list
+                            if (isTapbackMessage(msg)) return null;
 
-                          // Hide reactions (tapbacks) from main message list
-                          if (isReaction) {
-                            return null;
-                          }
+                            // Check if we should show a date separator
+                            const currentDate = new Date(msg.timestamp);
+                            const prevMsg = index > 0 ? messagesForChannel[index - 1] : null;
+                            const prevDate = prevMsg ? new Date(prevMsg.timestamp) : null;
+                            const dateSeparator = shouldShowDateSeparator(prevDate, currentDate)
+                              ? getMessageDateSeparator(currentDate, dateFormat)
+                              : null;
+                            const translation: TranslatedMessageState | undefined = translatedMessages[msg.id];
 
-                          // Find ALL reactions in the full channel message list
-                          const allChannelMessages = channelMessages[messageChannel] || [];
-                          const reactions = allChannelMessages.filter(m => isTapbackOf(m, msg));
-
-                          // Check if we should show a date separator
-                          const currentDate = new Date(msg.timestamp);
-                          const prevMsg = index > 0 ? messagesForChannel[index - 1] : null;
-                          const prevDate = prevMsg ? new Date(prevMsg.timestamp) : null;
-                          const showSeparator = shouldShowDateSeparator(prevDate, currentDate);
-
-                          return (
-                            <React.Fragment key={msg.id}>
-                              {showSeparator && (
-                                <div className="date-separator">
-                                  <span className="date-separator-text">
-                                    {getMessageDateSeparator(currentDate, dateFormat)}
-                                  </span>
-                                </div>
-                              )}
-                              {/* Red "New messages" line, directly above the
-                                  oldest message unseen at entry (#4607). */}
-                              {unreadAnchorId === msg.id && <UnreadDivider />}
-                              <div
-                                className={`message-bubble-container ${isMine ? 'mine' : 'theirs'}`}
-                                data-message-id={msg.id}
-                              >
-                                {!isMine && (
-                                  <SenderAvatar
-                                    shortName={getNodeShortName(msg.from)}
-                                    status={statusByNodeId.get(msg.from)}
-                                    title={t('channels.sender_click_title', { name: getNodeName(msg.from) })}
-                                    onActivate={e => handleSenderClick(msg.from, e)}
-                                  />
-                                )}
-                                <div className="message-content">
-                                  {!isMine && (
-                                    <SenderNameButton
-                                      name={getNodeName(msg.from)}
-                                      title={t('channels.sender_click_title', { name: getNodeName(msg.from) })}
-                                      onActivate={e => handleSenderClick(msg.from, e)}
-                                    />
-                                  )}
-                                  {msg.replyId && !isReaction && (
-                                    <div className="replied-message">
-                                      <div className="reply-arrow"><UiIcon name="reply" size={14} /></div>
-                                      <div className="reply-content">
-                                        {repliedMessage ? (
-                                          <>
-                                            <div className="reply-from">{getNodeShortName(repliedMessage.from)}</div>
-                                            <div className="reply-text">{repliedMessage.text || t('channels.empty_message')}</div>
-                                          </>
-                                        ) : (
-                                          <div className="reply-text" style={{ fontStyle: 'italic', opacity: 0.6 }}>
-                                            {t('channels.message_unavailable')}
-                                          </div>
-                                        )}
-                                      </div>
-                                    </div>
-                                  )}
-                                  <div className={`message-bubble ${isMine ? 'mine' : 'theirs'}${msg.spoofSuspected ? ' spoofed' : ''}`}>
-                                    {msg.spoofSuspected && (
-                                      <div
-                                        className="message-spoof-warning"
-                                        title={t('channels.spoof_warning_title', 'This message claims to be from your node but arrived over RF — someone may be impersonating your node.')}
-                                      >
-                                        <UiIcon name="alert" size={15} /> {t('channels.spoof_warning', 'Possible impersonation of your node')}
-                                      </div>
-                                    )}
-                                    <div className="message-text-row">
-                                      <div className="message-text" style={{ whiteSpace: 'pre-line' }}>
-                                        {renderMessageWithLinks(msg.text, mentionRenderOptions)}
-                                      </div>
-                                      <div className="message-meta">
-                                        <span className="message-time">
-                                          {formatMessageTime(currentDate, timeFormat, dateFormat)}
-                                          <HopCountDisplay
-                                            hopStart={msg.hopStart}
-                                            hopLimit={msg.hopLimit}
-                                            rxSnr={msg.rxSnr}
-                                            rxRssi={msg.rxRssi}
-                                            relayNode={msg.relayNode}
-                                            viaMqtt={msg.viaMqtt}
-                                            viaStoreForward={msg.viaStoreForward}
-                                            xeddsaSigned={msg.xeddsaSigned}
-                                            onClick={() => handleRelayClick(msg, isMine ? 'sent' : 'received')}
-                                          />
-                                        </span>
-                                      </div>
-                                    </div>
-                                    <LinkPreview text={msg.text} />
-                                    {translatedMessages[msg.id] && (
-                                      <TranslatedMessage
-                                        state={translatedMessages[msg.id]}
-                                        onDismiss={() => dismissTranslation(msg.id)}
-                                        onRetry={translationSettings.canTranslate ? () => translateMessage(msg.id, msg.text) : undefined}
-                                        onChangeTargetLang={translationSettings.canTranslate ? (newLang) => translateMessage(msg.id, msg.text, newLang) : undefined}
-                                      />
-                                    )}
-                                    {reactions.length > 0 && (
-                                      <div className="message-reactions">
-                                        {reactions.map(reaction => {
-                                          // #4243: show WHO reacted inline. The short
-                                          // name was already resolved here for the
-                                          // tooltip, but a hover-only affordance is
-                                          // unusable on touch and invisible at a glance.
-                                          const reactorName = getNodeShortName(reaction.from);
-                                          // Reaction chips stay clickable even when txDisabled: they are
-                                          // also the read affordance for "who reacted" (hover tooltip +
-                                          // inline name), and disabling them would hide that read-only
-                                          // info. A re-tap while TX is off surfaces the 409 via the
-                                          // handleSendTapback failure-branch toast (App.tsx) instead of
-                                          // being pre-emptively blocked here (epic #4294 Phase 2, §3.2).
-                                          return (
-                                            <span
-                                              key={reaction.id}
-                                              className={`reaction ${isMyMessage(reaction) ? 'mine' : 'theirs'}`}
-                                              title={t('channels.reaction_tooltip', { name: reactorName })}
-                                              onClick={() => handleSendTapback(reaction.text, msg)}
-                                            >
-                                              {reaction.text}
-                                              {reactorName && (
-                                                <span className="reaction__author">{reactorName}</span>
-                                              )}
-                                            </span>
-                                          );
-                                        })}
-                                      </div>
-                                    )}
-                                  </div>
-                                  {/* Rendered AFTER the bubble (issue #4311): on touch/no-hover
-                                      displays .message-actions sits in normal flow, so keeping it
-                                      between .sender-name and .message-bubble pushed the long name
-                                      away from its own bubble. On hover displays it stays an
-                                      absolutely-positioned overlay (unaffected by DOM order). */}
-                                  {hasPermission(`channel_${selectedChannel}` as ResourceType, 'write') && (
-                                    <div className="message-actions">
-                                      {/* Hide reply/resend for Channel Database channels (read-only) - device channels are 0-7 */}
-                                      {selectedChannel >= 0 && selectedChannel < CHANNEL_DB_OFFSET && (
-                                        isMine ? (
-                                          <button
-                                            className="resend-button"
-                                            onClick={() => handleResendMessage(msg)}
-                                            title={t('channels.resend_button_title')}
-                                            aria-label={t('channels.resend_button_title')}
-                                          >
-                                            <UiIcon name="refresh" size={15} />
-                                          </button>
-                                        ) : (
-                                          <button
-                                            className="reply-button"
-                                            onClick={() => {
-                                              setReplyingTo(msg);
-                                              channelMessageInputRef.current?.focus();
-                                            }}
-                                            title={t('channels.reply_button_title')}
-                                            aria-label={t('channels.reply_button_title')}
-                                          >
-                                            <UiIcon name="reply" size={15} />
-                                          </button>
-                                        )
-                                      )}
-                                      {/* Hide emoji reactions for Channel Database channels (read-only) */}
-                                      {selectedChannel >= 0 && selectedChannel < CHANNEL_DB_OFFSET && (
-                                        <button
-                                          className="emoji-picker-button"
-                                          onClick={() => setEmojiPickerMessage(msg)}
-                                          disabled={txDisabled}
-                                          title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : t('channels.emoji_button_title')}
-                                          aria-label={t('channels.emoji_button_title')}
-                                        >
-                                          <UiIcon name="reaction" size={15} />
-                                        </button>
-                                      )}
-                                      {translationSettings.canTranslate && msg.text && (
-                                        <button
-                                          className="translate-button"
-                                          onClick={() => translateMessage(msg.id, msg.text)}
-                                          title={t('messages.translate', 'Translate')}
-                                          aria-label={t('messages.translate', 'Translate')}
-                                        >
-                                          <UiIcon name="translate" size={15} />
-                                        </button>
-                                      )}
-                                      <button
-                                        className="delete-button"
-                                        onClick={() => handleDeleteMessage(msg)}
-                                        title={t('channels.delete_button_title')}
-                                        aria-label={t('channels.delete_button_title')}
-                                      >
-                                        <UiIcon name="delete" size={15} />
-                                      </button>
-                                    </div>
-                                  )}
-                                </div>
-                                {isMine && (
-                                  <div className="message-status">
-                                    <MessageStatusIndicator message={msg} onShowDetails={() => setDetailsState({ message: msg, direction: 'sent' })} />
-                                  </div>
-                                )}
-                              </div>
-                            </React.Fragment>
-                          );
-                        })
+                            return (
+                              <ChannelMessageRow
+                                key={msg.id}
+                                msg={msg}
+                                isMine={isMyMessage(msg)}
+                                dateSeparator={dateSeparator}
+                                showUnreadDivider={unreadAnchorId === msg.id}
+                                reactions={tapbacksFor(responseIndex, msg)}
+                                repliedMessage={repliedMessageFor(responseIndex, msg)}
+                                senderStatus={statusByNodeId.get(msg.from)}
+                                currentNodeId={currentNodeId}
+                                canWrite={canWrite}
+                                isDeviceChannel={isDeviceChannel}
+                                txDisabled={txDisabled}
+                                txDisabledTooltip={txDisabledTooltip}
+                                canTranslate={translationSettings.canTranslate}
+                                translation={translation}
+                                timeFormat={timeFormat}
+                                dateFormat={dateFormat}
+                                today={today}
+                                meshProtocol={meshProtocol}
+                                mentionOptions={mentionRenderOptions}
+                                names={rowNames}
+                                actions={rowActions}
+                              />
+                            );
+                          });
+                        })()
                       ) : (
                         <p className="no-messages">{t('channels.no_messages_yet')}</p>
                       );
@@ -1441,93 +1246,35 @@ export default function ChannelsTab({
                       {/* Hide message input for Channel Database channels (read-only) - device channels are 0-7 */}
                       {hasPermission(`channel_${selectedChannel}` as ResourceType, 'write') && selectedChannel >= 0 && selectedChannel < CHANNEL_DB_OFFSET && (
                         <div className="message-input-container">
-                          <div className="input-with-counter" style={{ position: 'relative' }}>
-                            <MentionAutocomplete
-                              id="channel-mention-list"
-                              candidates={mentions.suggestions}
-                              activeIndex={mentions.activeIndex}
-                              onHover={mentions.setActiveIndex}
-                              onSelect={mentions.select}
-                            />
-                            <textarea
-                              ref={channelMessageInputRef}
-                              value={newMessage}
-                              onChange={e => {
-                                setNewMessage(e.target.value);
-                                mentions.handleChange(e.target.value, e.target.selectionStart);
-                              }}
-                              onSelect={e => mentions.syncFromCaret(
-                                e.currentTarget.value,
-                                e.currentTarget.selectionStart
-                              )}
-                              onBlur={mentions.close}
-                              role="combobox"
-                              aria-expanded={mentions.isOpen}
-                              aria-controls={mentions.isOpen ? 'channel-mention-list' : undefined}
-                              aria-activedescendant={mentions.activeDescendantId('channel-mention-list')}
-                              aria-autocomplete="list"
-                              onFocus={scrollInputIntoView}
-                              placeholder={
-                                /* #5265: the composer is one row on mobile, so
-                                   the input is ~270px and the full "Send
-                                   message to X..." wraps to a second line
-                                   inside a single-line box — the text renders
-                                   half-clipped. The short form fits, and the
-                                   channel is already named in the selector
-                                   directly above. */
-                                isMobileViewport
-                                  ? t('channels.send_placeholder_short', { name: getChannelName(selectedChannel) })
-                                  : t('channels.send_placeholder', { name: getChannelName(selectedChannel) })
-                              }
-                              className="message-input"
-                              rows={1}
-                              disabled={txDisabled}
-                              title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : undefined}
-                              onKeyDown={e => {
-                                // The open suggestion list claims Enter/Tab/arrows
-                                // first, or picking a node would send instead.
-                                if (mentions.handleKeyDown(e)) return;
-                                if (
-                                  txDisabled ||
-                                  !(
-                                    e.key === 'Enter' &&
-                                    !e.shiftKey &&
-                                    !e.ctrlKey &&
-                                    !e.metaKey &&
-                                    !e.altKey &&
-                                    !e.nativeEvent.isComposing
-                                  )
-                                ) {
-                                  return;
-                                }
-                                e.preventDefault();
-                                void handleSendMessage(selectedChannel);
-                              }}
-                            />
-                            <div className={byteCountDisplay.className}>
-                              {byteCountDisplay.text}
-                            </div>
-                          </div>
-                          <MessageEmojiButton
+                          <MessageComposeInput
+                            listId="channel-mention-list"
                             textareaRef={channelMessageInputRef}
-                            value={newMessage}
-                            onChange={setNewMessage}
+                            mentionCandidates={mentionCandidates}
+                            homoglyphEnabled={homoglyphEnabled}
+                            placeholder={
+                              /* #5265: the composer is one row on mobile, so
+                                 the input is ~270px and the full "Send
+                                 message to X..." wraps to a second line
+                                 inside a single-line box — the text renders
+                                 half-clipped. The short form fits, and the
+                                 channel is already named in the selector
+                                 directly above. */
+                              isMobileViewport
+                                ? t('channels.send_placeholder_short', { name: getChannelName(selectedChannel) })
+                                : t('channels.send_placeholder', { name: getChannelName(selectedChannel) })
+                            }
+                            disabled={txDisabled}
+                            disabledTitle={txDisabledTooltip ?? t('tx_disabled.control_tooltip')}
+                            onFocus={scrollInputIntoView}
+                            onSend={() => { void handleSendMessage(selectedChannel); }}
+                            /* #5265: on mobile these live in the action row under
+                               the header instead, so the composer is one row.
+                               Rendered in exactly one place either way — two
+                               copies would mean two elements sharing an
+                               aria-label, which is worse than the layout it
+                               would fix. */
+                            actions={!isMobileViewport && channelSendActionButtons}
                           />
-                          {/* #5265: on mobile these live in the action row under
-                              the header instead, so the composer is one row.
-                              Rendered in exactly one place either way — two
-                              copies would mean two elements sharing an
-                              aria-label, which is worse than the layout it
-                              would fix. */}
-                          {!isMobileViewport && channelSendActionButtons}
-                          <button
-                            onClick={() => handleSendMessage(selectedChannel)}
-                            disabled={!newMessage.trim() || txDisabled}
-                            className="send-btn"
-                            title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : undefined}
-                          >
-                            <UiIcon name="send" size={16} />
-                          </button>
                         </div>
                       )}
                     </div>
@@ -1819,6 +1566,47 @@ export default function ChannelsTab({
                   </div>
                 )}
               </div>
+              {hasPermission(`channel_${CHANNEL_DB_OFFSET + virtualChannelInfoModal.id}` as ResourceType, 'write') && (
+                <div
+                  style={{
+                    marginTop: '1.5rem',
+                    paddingTop: '1rem',
+                    borderTop: '1px solid var(--color-surface-active)',
+                  }}
+                >
+                  <button
+                    onClick={() => {
+                      const channelNum = CHANNEL_DB_OFFSET + virtualChannelInfoModal.id;
+                      setVirtualChannelInfoModal(null);
+                      void handlePurgeChannelMessages(channelNum);
+                    }}
+                    style={{
+                      width: '100%',
+                      padding: '0.75rem',
+                      backgroundColor: 'var(--color-danger)',
+                      color: 'var(--color-bg)',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: 'pointer',
+                      fontWeight: 'bold',
+                      fontSize: '0.95rem',
+                    }}
+                    title={t('channels.purge_messages_title')}
+                  >
+                    {t('channels.purge_all_messages')}
+                  </button>
+                  <p
+                    style={{
+                      marginTop: '0.5rem',
+                      fontSize: '0.85rem',
+                      color: 'var(--color-text-subtle)',
+                      textAlign: 'center',
+                    }}
+                  >
+                    {t('channels.cannot_undo')}
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1845,10 +1633,10 @@ export default function ChannelsTab({
         <TranslateModal
           isOpen={translateModalOpen}
           onClose={() => setTranslateModalOpen(false)}
-          initialText={newMessage}
+          initialText={composeDraftStore.get()}
           defaultTargetLanguage={translationSettings.defaultOutgoingLanguage}
           defaultSourceLanguage={translationSettings.defaultLanguage}
-          onApply={(translatedText) => setNewMessage(translatedText)}
+          onApply={(translatedText) => composeDraftStore.set(translatedText)}
         />
       )}
     </div>

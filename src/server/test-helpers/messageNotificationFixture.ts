@@ -24,6 +24,14 @@ export interface FixturePrefs {
   mutedDMs: Array<{ nodeUuid: string; muteUntil: number | null }>;
   messageTitleTemplate: string | null;
   messageBodyTemplate: string | null;
+  messageTextMaxPush: number | null;
+  messageTextMaxApprise: number | null;
+  /** Event toggles read by `broadcastToPreferenceUsers`; absent = off. */
+  notifyOnNewNode?: boolean;
+  notifyOnWaypoint?: boolean;
+  notifyOnMention?: boolean;
+  notifyOnAutoTrace?: boolean;
+  notifyOnServerEvents?: boolean;
 }
 
 export function fixturePrefs(over: Partial<FixturePrefs> = {}): FixturePrefs {
@@ -42,6 +50,8 @@ export function fixturePrefs(over: Partial<FixturePrefs> = {}): FixturePrefs {
     mutedDMs: [],
     messageTitleTemplate: null,
     messageBodyTemplate: null,
+    messageTextMaxPush: null,
+    messageTextMaxApprise: null,
     ...over,
   };
 }
@@ -51,9 +61,19 @@ export interface FixtureState {
   prefs: Map<string, FixturePrefs>;
   /** Users who lack messages:read. */
   deniedUsers: Set<number>;
+  /** `${userId}|${sourceId}` pairs that lack messages:read on that one source (#5729). */
+  deniedPairs?: Set<string>;
   subscriptions: Array<{ id: number; userId: number | null; sourceId: string; endpoint: string; p256dhKey: string; authKey: string }>;
   appriseUsers: number[];
-  users: Array<{ id: number; isActive: boolean }>;
+  users: Array<{ id: number; isActive: boolean; isAdmin?: boolean }>;
+  /**
+   * The user's mesh-wide row (#5729). Absent: a user with push rows gets the
+   * list migration 235 would have written (the sources of their rows), so a
+   * test written against per-source subscriptions keeps its meaning.
+   */
+  mesh?: Map<number, { prefs?: FixturePrefs; saved: boolean; pushSourceIds: string[] | null }>;
+  /** Id of the active anonymous account; null = none. Default 999. */
+  anonymousUserId?: number | null;
 }
 
 export function emptyState(): FixtureState {
@@ -72,8 +92,20 @@ export function buildDatabaseMock(state: FixtureState) {
     notifications: {
       getUserPreferences: async (userId: number, sourceId?: string) =>
         state.prefs.get(`${userId}|${sourceId ?? ''}`) ?? null,
-      getUserPreferenceRows: async () => [],
+      // Every saved row of the user, as the targeted alert path reads them.
+      getUserPreferenceRows: async (userId: number) =>
+        [...state.prefs.entries()]
+          .filter(([key]) => key.startsWith(`${userId}|`))
+          .map(([key, prefs]) => ({ sourceId: key.slice(key.indexOf('|') + 1), prefs })),
       getUsersWithServiceEnabled: async () => state.appriseUsers,
+      getMeshPreferences: async (userId: number) => {
+        const stored = state.mesh?.get(userId);
+        if (stored) return { prefs: stored.prefs ?? fixturePrefs(), saved: stored.saved, pushSourceIds: stored.pushSourceIds };
+        const subscribed = [...new Set(state.subscriptions
+          .filter((s) => s.userId === userId && s.sourceId !== '__mesh__')
+          .map((s) => s.sourceId))];
+        return subscribed.length > 0 ? { prefs: fixturePrefs(), saved: false, pushSourceIds: subscribed } : null;
+      },
     },
     settings: {
       getSetting: async () => null,
@@ -82,7 +114,13 @@ export function buildDatabaseMock(state: FixtureState) {
     },
     auth: { getAllUsers: async () => state.users },
     getSettingAsync: async () => null,
-    checkPermissionAsync: async (userId: number) => !state.deniedUsers.has(userId),
+    checkPermissionAsync: async (userId: number, _resource?: string, _action?: string, sourceId?: string) =>
+      !state.deniedUsers.has(userId) && !state.deniedPairs?.has(`${userId}|${sourceId ?? ''}`),
+    findUserByIdAsync: async (id: number) => state.users.find((u) => u.id === id) ?? null,
+    findUserByUsernameAsync: async (name: string) => {
+      const anonId = state.anonymousUserId === undefined ? 999 : state.anonymousUserId;
+      return name === 'anonymous' && anonId !== null ? { id: anonId, isActive: true } : null;
+    },
     waitForReady: async () => undefined,
   };
 }

@@ -24,6 +24,11 @@ jobs:
 
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # MeshRadar: skip the review when the repo has no CLAUDE_CODE_OAUTH_TOKEN
+    # secret instead of failing the check. Secrets can't be read in a job-level
+    # `if`, so expose a has-token flag through env and gate the step on it.
+    env:
+      HAS_CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
     permissions:
       contents: read
       pull-requests: write  # Changed from read to write to allow posting comments
@@ -32,6 +37,10 @@ jobs:
       id-token: write
     
     steps:
+      - name: Note skipped review
+        if: env.HAS_CLAUDE_TOKEN != 'true'
+        run: echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set for this repository, so the Claude review is skipped."
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
@@ -39,6 +48,7 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
+        if: env.HAS_CLAUDE_TOKEN == 'true'
         uses: anthropics/claude-code-action@beta
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

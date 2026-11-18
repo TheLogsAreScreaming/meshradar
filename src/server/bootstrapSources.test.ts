@@ -37,6 +37,8 @@ import { getPrimaryMeshtasticManager } from './sourceManagerTypes.js';
 import { bootstrapSources, type BootstrapDeps, type BootstrapDb } from './bootstrapSources.js';
 import type { Source } from '../db/repositories/sources.js';
 import type { ISourceManager } from './sourceManagerRegistry.js';
+import { logger } from '../utils/logger.js';
+import { parseMeshCoreDefaultEnv } from './config/meshcoreEnv.js';
 
 // ---------------------------------------------------------------------------
 // Module mocks — applied before any import resolution by Vitest's hoisting.
@@ -380,6 +382,118 @@ describe('bootstrapSources — startup pin-test matrix (WP1)', () => {
   // Scenario 3: DB-sources-only — 2 tcp rows exist, env is set
   // Asserts env is IGNORED for source creation when rows already exist.
   // -------------------------------------------------------------------------
+  describe('Scenario 2c — first-boot Virtual Node env vars (#5874)', () => {
+    const vnEnv = {
+      meshtasticNodeIp: '1.2.3.4',
+      meshtasticNodeIpProvided: true,
+      meshtasticTcpPort: 4403,
+      virtualNodeEnabled: true,
+      virtualNodePort: 4499,
+    };
+
+    it('adds a virtualNode block with admin commands off to the new Default source', async () => {
+      const db = makeDbStub([]);
+      await bootstrapSources(makeDeps({ db, registry, makeMeshtastic: meshFactory.factory, env: vnEnv }));
+      const createdArg = (db.sources.createSource as any).mock.calls[0][0];
+      expect(createdArg.config.virtualNode).toEqual({ enabled: true, port: 4499, allowAdminCommands: false });
+      const [, factoryCfg] = meshFactory.factory.mock.calls[0] as any;
+      expect(factoryCfg.virtualNode).toEqual({ enabled: true, port: 4499, allowAdminCommands: false });
+    });
+
+    it('defaults the port to 4404 when only ENABLE_VIRTUAL_NODE is set', async () => {
+      const db = makeDbStub([]);
+      await bootstrapSources(makeDeps({
+        db, registry, makeMeshtastic: meshFactory.factory,
+        env: { ...vnEnv, virtualNodePort: undefined },
+      }));
+      const createdArg = (db.sources.createSource as any).mock.calls[0][0];
+      expect(createdArg.config.virtualNode.port).toBe(4404);
+    });
+
+    it('adds no virtualNode block when ENABLE_VIRTUAL_NODE is off', async () => {
+      const db = makeDbStub([]);
+      await bootstrapSources(makeDeps({
+        db, registry, makeMeshtastic: meshFactory.factory,
+        env: { ...vnEnv, virtualNodeEnabled: false },
+      }));
+      const createdArg = (db.sources.createSource as any).mock.calls[0][0];
+      expect(createdArg.config.virtualNode).toBeUndefined();
+    });
+
+    it('creates nothing when MESHTASTIC_NODE_IP is unset, even with ENABLE_VIRTUAL_NODE on', async () => {
+      const db = makeDbStub([]);
+      await bootstrapSources(makeDeps({
+        db, registry, makeMeshtastic: meshFactory.factory,
+        env: { ...vnEnv, meshtasticNodeIp: '192.168.1.100', meshtasticNodeIpProvided: false },
+      }));
+      expect(db.sources.createSource).not.toHaveBeenCalled();
+    });
+
+    it('a later boot with different env leaves the existing source config alone', async () => {
+      const row = makeTcpSource('existing-1', '1.2.3.4', 4403, {
+        virtualNode: { enabled: true, port: 4404, allowAdminCommands: false },
+      });
+      const db = makeDbStub([row]);
+      await bootstrapSources(makeDeps({
+        db, registry, makeMeshtastic: meshFactory.factory,
+        env: { ...vnEnv, virtualNodePort: 5555 },
+      }));
+      expect(db.sources.createSource).not.toHaveBeenCalled();
+      const [, factoryCfg] = meshFactory.factory.mock.calls[0] as any;
+      expect(factoryCfg.virtualNode.port).toBe(4404);
+    });
+  });
+
+  describe('Scenario 2d — MeshCore default source from MESHCORE_* (#5874)', () => {
+    const noMt = { meshtasticNodeIp: '192.168.1.100', meshtasticNodeIpProvided: false, meshtasticTcpPort: 4403 };
+    const mcEnv = (env: Record<string, string>) => parseMeshCoreDefaultEnv(env as NodeJS.ProcessEnv);
+
+    it('empty table + MeshCore only: creates and starts one MeshCore source, no Meshtastic row', async () => {
+      const db = makeDbStub([]);
+      await bootstrapSources(makeDeps({
+        db, registry, makeMeshtastic: meshFactory.factory,
+        env: { ...noMt, meshcoreDefault: mcEnv({ MESHCORE_TCP_HOST: '192.0.2.10', MESHCORE_ENABLE_VIRTUAL_NODE: 'true' }) },
+      }));
+      expect(db.sources.createSource).toHaveBeenCalledTimes(1);
+      const created = (db.sources.createSource as any).mock.calls[0][0];
+      expect(created).toMatchObject({ name: 'Default MeshCore', type: 'meshcore', enabled: true });
+      expect(created.config.virtualNode).toMatchObject({ enabled: true, port: 5000, allowAdminCommands: false });
+      expect(ensureMeshCoreManagerStarted).toHaveBeenCalledTimes(1);
+      expect(meshFactory.factory).not.toHaveBeenCalled();
+    });
+
+    it('empty table + both: Meshtastic Default then MeshCore', async () => {
+      const db = makeDbStub([]);
+      await bootstrapSources(makeDeps({
+        db, registry, makeMeshtastic: meshFactory.factory,
+        env: {
+          meshtasticNodeIp: '192.0.2.1', meshtasticNodeIpProvided: true, meshtasticTcpPort: 4403,
+          meshcoreDefault: mcEnv({ MESHCORE_SERIAL_PORT: '/dev/ttyUSB0' }),
+        },
+      }));
+      const types = (db.sources.createSource as any).mock.calls.map((c: any[]) => c[0].type);
+      expect(types).toEqual(['meshtastic_tcp', 'meshcore']);
+    });
+
+    it('existing install + new MESHCORE_* vars: no new source', async () => {
+      const db = makeDbStub([makeTcpSource('existing-1', '1.2.3.4')]);
+      await bootstrapSources(makeDeps({
+        db, registry, makeMeshtastic: meshFactory.factory,
+        env: { ...noMt, meshcoreDefault: mcEnv({ MESHCORE_TCP_HOST: '192.0.2.10' }) },
+      }));
+      expect(db.sources.createSource).not.toHaveBeenCalled();
+    });
+
+    it('a later boot with changed env leaves the MeshCore source alone', async () => {
+      const db = makeDbStub([makeMeshCoreSource('mc-1')]);
+      await bootstrapSources(makeDeps({
+        db, registry, makeMeshtastic: meshFactory.factory,
+        env: { ...noMt, meshcoreDefault: mcEnv({ MESHCORE_SERIAL_PORT: '/dev/ttyACM0' }) },
+      }));
+      expect(db.sources.createSource).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Scenario 3 — DB-sources-only: 2 tcp rows, env set → env ignored', () => {
     it('(A) does NOT create a new source row (sourceCount > 0)', async () => {
       const row1 = makeTcpSource('src-1', '10.0.0.1');
@@ -474,6 +588,38 @@ describe('bootstrapSources — startup pin-test matrix (WP1)', () => {
       const [, factoryCfg] = meshFactory.factory.mock.calls[0] as any;
       // passiveMode should be absent or falsy — NOT forced to true or any default.
       expect(factoryCfg.passiveMode).toBeFalsy();
+    });
+  });
+
+  describe('Scenario 3c — two enabled tcp sources on one node warn at boot (#5974)', () => {
+    const slotWarnings = (spy: ReturnType<typeof vi.spyOn>) =>
+      spy.mock.calls.filter((c) => String(c[0]).includes('one TCP client at a time'));
+
+    it('warns once, naming both sources, when host:port differs only in case and port type', async () => {
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined as any);
+      const a = makeTcpSource('a', '192.168.1.192', 4403);
+      const b = makeTcpSource('b', ' 192.168.1.192 ', '4403' as any);
+      const db = makeDbStub([a, b]);
+      await bootstrapSources(makeDeps({ db, registry, makeMeshtastic: meshFactory.factory }));
+      const hits = slotWarnings(warn);
+      expect(hits).toHaveLength(1);
+      expect(String(hits[0][0])).toContain('192.168.1.192:4403');
+      expect(String(hits[0][0])).toContain('"TCP-a"');
+      expect(String(hits[0][0])).toContain('"TCP-b"');
+      // Diagnostic only: both still start.
+      expect(meshFactory.factory).toHaveBeenCalledTimes(2);
+      warn.mockRestore();
+    });
+
+    it('does not warn for distinct endpoints or when the twin is disabled', async () => {
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined as any);
+      const a = makeTcpSource('a', '10.0.0.1');
+      const b = makeTcpSource('b', '10.0.0.2');
+      const c = { ...makeTcpSource('c', '10.0.0.1'), enabled: false };
+      const db = makeDbStub([a, b, c]);
+      await bootstrapSources(makeDeps({ db, registry, makeMeshtastic: meshFactory.factory }));
+      expect(slotWarnings(warn)).toHaveLength(0);
+      warn.mockRestore();
     });
   });
 
@@ -978,5 +1124,154 @@ describe('identity/staleness pins (§2.5 documentation)', () => {
         protoSpy.mockRestore();
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #5245 — configurable default Meshtastic source
+// ---------------------------------------------------------------------------
+describe('bootstrapSources — default Meshtastic source setting (#5245)', () => {
+  let registry: SourceManagerRegistry;
+  let meshFactory: ReturnType<typeof makeMeshMockFactory>;
+
+  beforeEach(() => {
+    registry = new SourceManagerRegistry();
+    meshFactory = makeMeshMockFactory();
+    vi.clearAllMocks();
+  });
+
+  function dbWithDefault(rows: SourceRow[], value: string | null) {
+    const db = makeDbStub(rows);
+    (db.settings.getSetting as any).mockImplementation(async (key: string) =>
+      key === 'defaultMeshtasticSourceId' ? value : null,
+    );
+    return db;
+  }
+
+  async function boot(db: BootstrapDb) {
+    await bootstrapSources(makeDeps({ db, registry, makeMeshtastic: meshFactory.factory }));
+  }
+
+  it('makes the chosen TCP source primary even when it starts last', async () => {
+    const db = dbWithDefault(
+      [makeTcpSource('a', '10.0.0.1'), makeTcpSource('b', '10.0.0.2'), makeTcpSource('c', '10.0.0.3')],
+      'c',
+    );
+    await boot(db);
+    expect(registry.getPrimaryMeshtasticSourceId()).toBe('c');
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('c');
+    // The automatic designation is still the first started, for when c goes away.
+    expect(registry.getAutomaticPrimaryMeshtasticSourceId()).toBe('a');
+  });
+
+  it('unset keeps the first-started rule', async () => {
+    const db = dbWithDefault([makeTcpSource('a', '10.0.0.1'), makeTcpSource('b', '10.0.0.2')], null);
+    await boot(db);
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+  });
+
+  it('blank keeps the first-started rule', async () => {
+    const db = dbWithDefault([makeTcpSource('a', '10.0.0.1'), makeTcpSource('b', '10.0.0.2')], '');
+    await boot(db);
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+  });
+
+  it('a disabled choice falls back to the first-started rule', async () => {
+    const db = dbWithDefault(
+      [makeTcpSource('a', '10.0.0.1'), { ...makeTcpSource('b', '10.0.0.2'), enabled: false }],
+      'b',
+    );
+    await boot(db);
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+  });
+
+  it('a missing choice falls back to the first-started rule', async () => {
+    const db = dbWithDefault([makeTcpSource('a', '10.0.0.1'), makeTcpSource('b', '10.0.0.2')], 'gone');
+    await boot(db);
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+  });
+
+  it('an autoConnect:false choice falls back to the first-started rule', async () => {
+    const db = dbWithDefault(
+      [makeTcpSource('a', '10.0.0.1'), makeTcpSource('b', '10.0.0.2', 4403, { autoConnect: false })],
+      'b',
+    );
+    await boot(db);
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+  });
+
+  it('a non-TCP choice is ignored', async () => {
+    (buildMqttManagerForSource as any).mockImplementation((id: string) => makeMqttManagerStub(id));
+    const db = dbWithDefault([makeBrokerSource('broker'), makeTcpSource('a', '10.0.0.1')], 'broker');
+    await boot(db);
+    expect(registry.getPrimaryMeshtasticSourceId()).toBe('a');
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+  });
+});
+
+describe('SourceManagerRegistry — default Meshtastic source at runtime (#5245)', () => {
+  function tcp(id: string): ISourceManager {
+    return {
+      sourceId: id,
+      sourceType: 'meshtastic_tcp',
+      start: vi.fn().mockResolvedValue(undefined),
+      stop: vi.fn().mockResolvedValue(undefined),
+      getStatus: vi.fn(() => ({ sourceId: id, sourceName: id, sourceType: 'meshtastic_tcp' as const, connected: false })),
+      getLocalNodeInfo: vi.fn().mockReturnValue(null),
+      startDistanceDeleteScheduler: vi.fn().mockResolvedValue(undefined),
+      stopDistanceDeleteScheduler: vi.fn(),
+    };
+  }
+
+  async function twoSources() {
+    const registry = new SourceManagerRegistry();
+    await registry.addManager(tcp('a'));
+    registry.setPrimaryMeshtasticSource('a');
+    await registry.addManager(tcp('b'));
+    return registry;
+  }
+
+  it('a save switches the primary; clearing goes back to automatic', async () => {
+    const registry = await twoSources();
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+    registry.setPreferredMeshtasticSource('b');
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('b');
+    registry.setPreferredMeshtasticSource('');
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+    registry.setPreferredMeshtasticSource('b');
+    registry.setPreferredMeshtasticSource(null);
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+  });
+
+  it('the chosen source going away falls back to automatic, and coming back restores it', async () => {
+    const registry = await twoSources();
+    registry.setPreferredMeshtasticSource('b');
+    const captured = getPrimaryMeshtasticManager(registry);
+    expect(captured?.sourceId).toBe('b');
+
+    await registry.removeManager('b'); // disabled or deleted
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
+    // A caller that captured the manager before the change keeps it.
+    expect(captured?.sourceId).toBe('b');
+
+    await registry.addManager(tcp('b')); // re-enabled
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('b');
+  });
+
+  it('a removed automatic primary falls back to insertion order, and the choice still wins', async () => {
+    const registry = await twoSources();
+    await registry.addManager(tcp('c'));
+    await registry.removeManager('a');
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('b');
+    registry.setPreferredMeshtasticSource('c');
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('c');
+  });
+
+  it('a chosen id that is not a meshtastic_tcp manager is ignored', async () => {
+    const registry = await twoSources();
+    await registry.addManager({ ...tcp('mq'), sourceType: 'mqtt_broker' } as ISourceManager);
+    registry.setPreferredMeshtasticSource('mq');
+    expect(registry.getPrimaryMeshtasticSourceId()).toBe('a');
+    expect(getPrimaryMeshtasticManager(registry)?.sourceId).toBe('a');
   });
 });

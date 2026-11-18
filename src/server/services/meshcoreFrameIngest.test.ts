@@ -3,17 +3,19 @@
  * decrypt, the secret-derived channel index / fingerprint, and ADVERT → node.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ChannelCrypto } from '@michaelhart/meshcore-decoder';
+import { ChannelCrypto, Ed25519SignatureVerifier } from '@michaelhart/meshcore-decoder';
 import { ALL_SOURCES } from '../../db/repositories/base.js';
 
 const upsertNode = vi.fn().mockResolvedValue(undefined);
 const getAllChannels = vi.fn();
 const getEnabledVirtual = vi.fn();
+const getSettingAsBoolean = vi.fn().mockResolvedValue(false);
 vi.mock('../../services/database.js', () => ({
   default: {
     meshcore: { upsertNode: (...a: unknown[]) => upsertNode(...a) },
     channels: { getAllChannels: (...a: unknown[]) => getAllChannels(...a) },
     channelDatabase: { getEnabledAsync: (...a: unknown[]) => getEnabledVirtual(...a) },
+    settings: { getSettingAsBoolean: (...a: unknown[]) => getSettingAsBoolean(...a) },
   },
 }));
 
@@ -22,11 +24,14 @@ import {
   advertLastHeardMs,
   channelKeyFingerprint,
   keyedChannelIndex,
+  keyedFilingFor,
+  MESHCORE_UNRESOLVED_KEY_FINGERPRINT,
   isKeyedChannelIndex,
   MESHCORE_KEYED_CHANNEL_BASE,
   findChannelKeysByHash,
   decryptGroupTextFrame,
   frameChannelMessageId,
+  frameRoomPostId,
   ingestAdvertFrame,
   openGroupFrame,
 } from './meshcoreFrameIngest.js';
@@ -153,14 +158,38 @@ describe('frameChannelMessageId', () => {
   });
 });
 
+describe('frameRoomPostId', () => {
+  it('is stable per (source, room, author, time, text) so a re-pushed post dedupes', () => {
+    const a = frameRoomPostId('s1', 'roomkey', 'aabbccdd', 100, 'hello room');
+    // Same post pushed again on the next login → same id → insertIgnore drops it.
+    expect(a).toBe(frameRoomPostId('s1', 'roomkey', 'aabbccdd', 100, 'hello room'));
+    expect(a).toMatch(/^room_s1_[0-9a-f]{24}$/);
+  });
+
+  it('separates posts that differ in any keyed field', () => {
+    const a = frameRoomPostId('s1', 'roomkey', 'aabbccdd', 100, 'hello room');
+    expect(frameRoomPostId('s2', 'roomkey', 'aabbccdd', 100, 'hello room')).not.toBe(a); // other source
+    expect(frameRoomPostId('s1', 'other', 'aabbccdd', 100, 'hello room')).not.toBe(a);   // other room
+    expect(frameRoomPostId('s1', 'roomkey', 'ee\u0000ff', 100, 'hello room')).not.toBe(a); // other author
+    expect(frameRoomPostId('s1', 'roomkey', 'aabbccdd', 101, 'hello room')).not.toBe(a);  // other second
+    expect(frameRoomPostId('s1', 'roomkey', 'aabbccdd', 100, 'hello world')).not.toBe(a); // other text
+  });
+
+  it('still yields a stable id when the author is unknown (empty prefix, #5774)', () => {
+    const a = frameRoomPostId('s1', 'roomkey', '', 100, 'anon post');
+    expect(a).toBe(frameRoomPostId('s1', 'roomkey', '', 100, 'anon post'));
+    expect(a).toMatch(/^room_s1_[0-9a-f]{24}$/);
+  });
+});
+
 describe('ingestAdvertFrame', () => {
   it('upserts the advert fields with undefined-preserves semantics', async () => {
-    const advert = await ingestAdvertFrame(
+    const ingested = await ingestAdvertFrame(
       buildAdvertFrame({ publicKey: NODE_KEY, advType: 2 }),
       'src-rep',
       { lastHeardMs: 1234 },
     );
-    expect(advert?.publicKey.toLowerCase()).toBe(NODE_KEY);
+    expect(ingested?.advert.publicKey.toLowerCase()).toBe(NODE_KEY);
     expect(upsertNode).toHaveBeenCalledTimes(1);
     const [node, sourceId] = upsertNode.mock.calls[0];
     expect(sourceId).toBe('src-rep');
@@ -199,10 +228,95 @@ describe('ingestAdvertFrame', () => {
     expect(node.lastAdvertHadPosition).toBe(false);
   });
 
+  describe('insert and signature report (#6306)', () => {
+    it('reports inserted from the repository result; a missing result reads as not inserted', async () => {
+      upsertNode.mockResolvedValueOnce({ inserted: true });
+      expect((await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1 }))?.inserted).toBe(true);
+      upsertNode.mockResolvedValueOnce({ inserted: false });
+      expect((await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1 }))?.inserted).toBe(false);
+      expect((await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1 }))?.inserted).toBe(false);
+    });
+
+    it('reports signatureVerified only for a checked, passing signature', async () => {
+      // Not checked (no verifySignature) and checked-and-failed (dummy signature) both read false.
+      expect((await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1 }))?.signatureVerified).toBe(false);
+      expect((await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, verifySignature: 'always' }))?.signatureVerified).toBe(false);
+      const spy = vi.spyOn(Ed25519SignatureVerifier, 'verifyAdvertisementSignature').mockResolvedValue(true);
+      expect((await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, verifySignature: 'always' }))?.signatureVerified).toBe(true);
+      spy.mockRestore();
+    });
+  });
+
+  describe('heardHops → pathLen (#6220)', () => {
+    it('writes a heard hop count, 0 included', async () => {
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, heardHops: 3 });
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, heardHops: 0 });
+      expect(upsertNode.mock.calls[0][0].pathLen).toBe(3);
+      expect(upsertNode.mock.calls[1][0].pathLen).toBe(0);
+    });
+
+    it('never sends pathLen when unknown, since null would clear the stored route', async () => {
+      for (const heardHops of [undefined, null, -1, 1.5]) {
+        upsertNode.mockClear();
+        await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, heardHops });
+        expect(upsertNode.mock.calls[0][0]).not.toHaveProperty('pathLen');
+      }
+    });
+  });
+
   it('skips a named key and ignores non-advert frames', async () => {
     expect(await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, skipPublicKey: NODE_KEY.toUpperCase() })).toBeNull();
     expect(await ingestAdvertFrame(buildGrpTxtFrame(1, 'A: b', SECRET_A), 's', { lastHeardMs: 1 })).toBeNull();
     expect(upsertNode).not.toHaveBeenCalled();
+  });
+
+  describe('advertSignatureVerified marker (#5909)', () => {
+    it('is left untouched (undefined) for callers that do not record it', async () => {
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1 });
+      expect(upsertNode.mock.calls[0][0].advertSignatureVerified).toBeUndefined();
+      expect(getSettingAsBoolean).not.toHaveBeenCalled();
+    });
+
+    it('is written null (unchecked) WITHOUT a signature check while the toggle is off', async () => {
+      getSettingAsBoolean.mockResolvedValueOnce(false);
+      const spy = vi.spyOn(Ed25519SignatureVerifier, 'verifyAdvertisementSignature');
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, verifySignature: 'toggle' });
+      expect(upsertNode.mock.calls[0][0].advertSignatureVerified).toBeNull();
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('records the check result while the toggle is on', async () => {
+      getSettingAsBoolean.mockResolvedValue(true);
+      // The test frame carries a dummy signature, so the real check fails.
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, verifySignature: 'toggle' });
+      expect(upsertNode.mock.calls[0][0].advertSignatureVerified).toBe(false);
+
+      const spy = vi.spyOn(Ed25519SignatureVerifier, 'verifyAdvertisementSignature').mockResolvedValue(true);
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, verifySignature: 'toggle' });
+      expect(upsertNode.mock.calls[1][0].advertSignatureVerified).toBe(true);
+      spy.mockRestore();
+      getSettingAsBoolean.mockReset().mockResolvedValue(false);
+    });
+
+    it('treats a throwing settings read as off (null, unchecked)', async () => {
+      getSettingAsBoolean.mockRejectedValueOnce(new Error('db down'));
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, verifySignature: 'toggle' });
+      expect(upsertNode.mock.calls[0][0].advertSignatureVerified).toBeNull();
+    });
+
+    it("'always' (Repeater) verifies without reading the toggle: forged -> false, valid -> true", async () => {
+      getSettingAsBoolean.mockClear();
+      // The test frame carries a dummy signature, so the real check fails.
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, verifySignature: 'always' });
+      expect(upsertNode.mock.calls.at(-1)![0].advertSignatureVerified).toBe(false);
+
+      const spy = vi.spyOn(Ed25519SignatureVerifier, 'verifyAdvertisementSignature').mockResolvedValue(true);
+      await ingestAdvertFrame(buildAdvertFrame({ publicKey: NODE_KEY }), 's', { lastHeardMs: 1, verifySignature: 'always' });
+      expect(upsertNode.mock.calls.at(-1)![0].advertSignatureVerified).toBe(true);
+      spy.mockRestore();
+      expect(getSettingAsBoolean).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -251,5 +365,33 @@ describe('openGroupFrame (#5567)', () => {
   it('opens nothing for any other payload type', () => {
     const group = groupOf(buildGrpTxtFrame(1, 'A: b', SECRET_A));
     expect(openGroupFrame(0x02, group, SECRET_A)).toBeNull();
+  });
+});
+
+describe('keyedFilingFor (#6308)', () => {
+  it('returns the secret-derived index, fingerprint and the key provenance', () => {
+    const key = { sourceId: 'src-1', channelIdx: 4, channelDbId: null, name: 'x', secretHex: SECRET_A };
+    expect(keyedFilingFor(key)).toEqual({
+      channelIdx: keyedChannelIndex(SECRET_A),
+      keyFingerprint: channelKeyFingerprint(SECRET_A),
+      keySourceId: 'src-1',
+      keyChannelIdx: 4,
+    });
+  });
+
+  it('leaves provenance null for a virtual channel key', () => {
+    const f = keyedFilingFor({ sourceId: null, channelIdx: null, channelDbId: 9, name: 'v', secretHex: SECRET_B });
+    expect(f.keySourceId).toBeNull();
+    expect(f.keyChannelIdx).toBeNull();
+  });
+
+  it('fingerprint prefix equals the on-air channel hash', () => {
+    expect(channelKeyFingerprint(SECRET_A).slice(0, 2).toLowerCase())
+      .toBe(ChannelCrypto.calculateChannelHash(SECRET_A).toLowerCase());
+  });
+
+  it('the unresolved sentinel is not hex and fits varchar(32)', () => {
+    expect(MESHCORE_UNRESOLVED_KEY_FINGERPRINT).not.toMatch(/^[0-9a-f]+$/);
+    expect(MESHCORE_UNRESOLVED_KEY_FINGERPRINT.length).toBeLessThanOrEqual(32);
   });
 });

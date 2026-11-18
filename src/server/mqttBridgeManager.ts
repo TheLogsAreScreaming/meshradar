@@ -25,6 +25,7 @@
 
 import { EventEmitter } from 'events';
 import { MqttBrokerClient, MqttReconnectCoordinator, type MqttClientCapabilities } from './transports/mqttBrokerClient.js';
+import { attachBrokerLinkNotifier, type BrokerLinkNotifier } from './services/brokerLinkNotifier.js';
 import {
   MqttPacketFilter,
   type MqttFilterConfig,
@@ -48,10 +49,12 @@ import {
   type PoolPublishResult,
   type PublisherStatus,
 } from './mqttBridgePublisherPool.js';
-import { allowsUplink, resolveOkToMqttForEnvelope } from './utils/okToMqtt.js';
+import { allowsUplink, isOwnMapReport, resolveOkToMqttForEnvelope } from './utils/okToMqtt.js';
 import { automationPacketTracker } from './utils/automationPacketTracker.js';
 import { DistanceDeleteScheduler } from './services/distanceDeleteScheduler.js';
 import { mqttGeoSweepService, type GeoSweepStats } from './services/mqttGeoSweepService.js';
+import { deriveRootTopicFromSubscriptions } from './services/mqttNative/mqttNativePacket.js';
+import type { MqttNativeReadiness } from './services/mqttNative/mqttNativeSendService.js';
 
 /**
  * Direction the bridge is permitted to operate in against the upstream
@@ -83,6 +86,8 @@ export type MqttBridgeMode = 'bidirectional' | 'publish_only' | 'subscribe_only'
  * - `single`: legacy behavior — one upstream connection with
  *   `mm-bridge-<sourceId>-<random>` Client ID handles every uplink.
  *   Useful for upstream brokers with tight per-username connection caps.
+ *   `upstream.clientId` (#5893) replaces that ID, verbatim, for brokers that
+ *   accept only `!<8-hex>`.
  */
 export type MqttBridgeForwardingMode = 'per_gateway' | 'single';
 
@@ -100,6 +105,15 @@ export interface MqttBridgeSourceConfig {
     url: string;
     username?: string;
     password?: string;
+    /**
+     * #5893: optional Client ID for `single` forwarding mode, stored as
+     * lowercase `!<8-hex>` (see {@link normalizeBridgeClientId}). Used verbatim
+     * on CONNECT, with no random suffix, so a strict community broker that
+     * accepts only `!<8-hex>` sees one connection from MeshRadar. Unset =
+     * the default `mm-bridge-<sourceId>-<random>`. Ignored in `per_gateway`
+     * mode, whose subscriber already takes the parent broker's gateway id.
+     */
+    clientId?: string;
   };
   subscriptions: string[];
   /** See {@link MqttBridgeMode}. Defaults to `'bidirectional'` when unset. */
@@ -152,6 +166,21 @@ export interface MqttBridgeSourceConfig {
    * add a per-packet override (declined in meshtastic/firmware#11994).
    */
   dropAutomationUplinks?: boolean;
+  /**
+   * #5708: packets this bridge republishes into its parent broker are never
+   * RAISED by the broker's hop-limit policy; the clamp still applies. For an
+   * upstream (e.g. mqtt.meshtastic.org, which zero-hops everything) whose
+   * traffic you want to watch but not re-flood locally. Absent ⇒ raise as before.
+   */
+  skipRaise?: boolean;
+  /**
+   * #5013: uplink packets that ANOTHER bridge on the same parent broker
+   * brought down from its upstream. Off (absent) by default: a bridge then
+   * uplinks only traffic that really originated locally, so two bridges to
+   * two upstreams do not relay each other's feeds. Turn on only to relay one
+   * upstream into another on purpose.
+   */
+  relayOtherBridges?: boolean;
 }
 
 /**
@@ -173,6 +202,43 @@ export const BRIDGE_MAX_AUTH_FAILURES = 5;
 export const BRIDGE_AUTH_STOPPED_MESSAGE =
   `Broker rejected the login ${BRIDGE_MAX_AUTH_FAILURES} times in a row, so this bridge stopped ` +
   'reconnecting. Fix the username or password and save the source, or reconnect it.';
+
+/**
+ * #5893: evictions inside {@link BRIDGE_EVICTION_WINDOW_MS} before one of a
+ * bridge's upstream clients stops reconnecting. Counted per client, like the
+ * auth stop. Kept in memory: a source save or a restart starts a fresh count.
+ */
+export const BRIDGE_MAX_EVICTIONS = 5;
+export const BRIDGE_EVICTION_WINDOW_MS = 10 * 60_000;
+
+/**
+ * What the bridge status says once the subscriber was evicted
+ * {@link BRIDGE_MAX_EVICTIONS} times. Fixed text, for the same reason as
+ * {@link BRIDGE_AUTH_STOPPED_MESSAGE}: the status is readable without a login.
+ */
+export const BRIDGE_EVICTION_STOPPED_MESSAGE =
+  `The upstream broker closed this bridge's connection ${BRIDGE_MAX_EVICTIONS} times in ` +
+  `${BRIDGE_EVICTION_WINDOW_MS / 60_000} minutes, so it stopped reconnecting. Another client is ` +
+  'probably using the same Client ID or login (another bridge source, another MeshRadar, the ' +
+  'gateway node itself, or a per-username connection cap). Fix that, then save the source or ' +
+  'reconnect it.';
+
+/** #5893: accepted `upstream.clientId` shapes, before normalisation. */
+const BRIDGE_CLIENT_ID_RE = /^!?[0-9a-fA-F]{8}$/;
+
+/**
+ * #5893: normalise a configured single-mode Client ID to lowercase
+ * `!<8-hex>`. Returns `undefined` for an absent or blank value and `null` for
+ * one that is not 8 hex digits (with or without the leading `!`).
+ */
+export function normalizeBridgeClientId(value: unknown): string | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed === '') return undefined;
+  if (!BRIDGE_CLIENT_ID_RE.test(trimmed)) return null;
+  return '!' + trimmed.replace(/^!/, '').toLowerCase();
+}
 
 /** Literal prefix replacement rule applied to a Meshtastic MQTT topic. */
 export interface TopicRewriteRule {
@@ -238,6 +304,30 @@ export interface MqttBridgeStatus extends SourceStatus {
    * them and `dropAutomationUplinks` is on (#5414).
    */
   uplinkAutomationDrops: number;
+  /** #5013: uplinks skipped because another bridge brought the packet in. */
+  uplinkBridgeRelayDrops: number;
+  /**
+   * #5893: uplink packets dropped because the connection that would carry
+   * them was down (including one stopped after evictions). Dropped, never
+   * queued and never replayed.
+   */
+  uplinkDisconnectedDrops: number;
+  /**
+   * #5893: true once the SUBSCRIBER client gave up after
+   * {@link BRIDGE_MAX_EVICTIONS} evictions in {@link BRIDGE_EVICTION_WINDOW_MS}.
+   * A config save or a manual connect clears it.
+   */
+  evictionStopped: boolean;
+  /** `!<8-hex>` ids of per-gateway publishers that stopped the same way. */
+  evictionStoppedGateways: string[];
+  evictionStoppedGatewayCount: number;
+  /**
+   * #5893: non-null when another running bridge shares this bridge's parent
+   * broker and upstream URL in `per_gateway` mode, so the two open
+   * connections under the same Client IDs and evict each other. A warning
+   * only; nothing is blocked.
+   */
+  sharedUpstreamWarning: string | null;
   /**
    * True once the SUBSCRIBER client gave up after
    * {@link BRIDGE_MAX_AUTH_FAILURES} rejected logins in a row. Intake is
@@ -309,6 +399,8 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
   private readonly sourceName: string;
   private readonly config: MqttBridgeSourceConfig;
   private client: MqttBrokerClient | null = null;
+  /** Debounced upstream-link alerts (#6307). Disposed silently on stop / client swap. */
+  private brokerLink: BrokerLinkNotifier | null = null;
   private parentBroker: MqttBrokerManager | null = null;
   private parentListener: ((p: MqttBrokerLocalPacket) => void) | null = null;
   private registryAddedListener: ((m: ISourceManager) => void) | null = null;
@@ -321,6 +413,11 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
   private uplinkOut = 0;
   private uplinkOkToMqttDrops = 0;
   private uplinkAutomationDrops = 0;
+  private uplinkBridgeRelayDrops = 0;
+  /** #5893: uplinks dropped while the subscriber connection was down. */
+  private uplinkDisconnectedDrops = 0;
+  /** #5893: true once this disconnected episode's drop was logged. */
+  private disconnectedDropLogged = false;
   private lastError: string | null = null;
   private readonly downlinkEchoes: EchoEntry[] = [];
   private readonly uplinkEchoes: EchoEntry[] = [];
@@ -357,6 +454,12 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
   private subscriberAuthStopped = false;
   /** Uplink packets dropped on the stopped subscriber client. */
   private subscriberAuthStoppedDrops = 0;
+  /**
+   * #5893: true once the subscriber was evicted {@link BRIDGE_MAX_EVICTIONS}
+   * times in the window and gave up. In memory, like the auth stop: a save
+   * builds a new manager and a restart starts a fresh count.
+   */
+  private subscriberEvictionStopped = false;
 
   constructor(sourceId: string, sourceName: string, config: MqttBridgeSourceConfig) {
     super();
@@ -427,18 +530,15 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
       const localInfo = this.parentBroker.getLocalNodeInfo();
       this.brokerGatewayNum = localInfo.nodeNum >>> 0;
       subscriberClientId = formatGatewayClientId(this.brokerGatewayNum);
-      this.publisherPool = new MqttBridgePublisherPool({
-        url: this.config.upstream.url,
-        username: this.config.upstream.username,
-        password: this.config.upstream.password,
-        poolLabel: this.sourceId,
-        reconnectCoordinator: this.reconnectCoordinator,
-        maxAuthFailures: BRIDGE_MAX_AUTH_FAILURES,
-      });
+      this.publisherPool = this.buildPublisherPool(this.reconnectCoordinator);
+    } else if (forwardingMode === 'single') {
+      subscriberClientId = this.configuredSingleClientId();
     }
 
     this.subscriberClientId = subscriberClientId;
     this.subscriberAuthStopped = false;
+    this.subscriberEvictionStopped = false;
+    this.warnIfSharedUpstream();
     await this.connectSubscriber();
     if (mode === 'publish_only') {
       logger.info(
@@ -471,9 +571,18 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
       // A rejected login does not fix itself; without this a wrong password
       // costs the broker a CONNECT every ~60 s for ever.
       maxAuthFailures: BRIDGE_MAX_AUTH_FAILURES,
+      // #5893: nor does a Client ID or login another client also holds.
+      maxEvictions: BRIDGE_MAX_EVICTIONS,
+      evictionWindowMs: BRIDGE_EVICTION_WINDOW_MS,
     });
     this.client = client;
     if (this.reconnectCoordinator) client.setCoordinator(this.reconnectCoordinator);
+    // Attach BEFORE the auth / eviction listeners below so a stop alerts first.
+    this.brokerLink?.dispose();
+    this.brokerLink = attachBrokerLinkNotifier(client, {
+      sourceId: this.sourceId,
+      sourceName: this.sourceName,
+    });
     client.on('error', (err) => {
       this.lastError = err.message;
     });
@@ -493,10 +602,15 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     });
     client.on('message', (msg) => this.handleDownlink(msg.topic, msg.payload, msg.retained));
     client.on('auth-stopped', () => this.onSubscriberAuthStopped(client));
+    client.on('eviction-stopped', () => this.onSubscriberEvictionStopped(client));
+    // #5893: a new connected episode; the next disconnected drop logs again.
+    client.on('connect', () => {
+      if (this.client === client) this.disconnectedDropLogged = false;
+    });
 
     await client.connect();
-    // stop() or an auth stop may have run while the login was in flight.
-    if (this.client !== client || this.subscriberAuthStopped) return;
+    // stop() or a stop may have run while the login was in flight.
+    if (this.client !== client || this.subscriberAuthStopped || this.subscriberEvictionStopped) return;
     if (mode !== 'publish_only' && this.config.subscriptions.length > 0) {
       await client.subscribe(this.config.subscriptions);
     }
@@ -528,9 +642,133 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     });
   }
 
+  private buildPublisherPool(coordinator: MqttReconnectCoordinator): MqttBridgePublisherPool {
+    return new MqttBridgePublisherPool({
+      url: this.config.upstream.url,
+      username: this.config.upstream.username,
+      password: this.config.upstream.password,
+      poolLabel: this.sourceId,
+      reconnectCoordinator: coordinator,
+      maxAuthFailures: BRIDGE_MAX_AUTH_FAILURES,
+      maxEvictions: BRIDGE_MAX_EVICTIONS,
+      evictionWindowMs: BRIDGE_EVICTION_WINDOW_MS,
+    });
+  }
+
   /**
-   * Manual reconnect: give every client that stopped after rejected logins a
-   * fresh start, and leave the rest alone. A healthy or still-retrying client
+   * #5893: the parent broker registered after `start()` had already built the
+   * subscriber without it. In `per_gateway` mode that left the subscriber on
+   * the `mm-bridge-…` fallback ID and no publisher pool until a restart. Build
+   * the pool now and re-log the subscriber in under the broker's gateway ID.
+   *
+   * Does nothing when `start()` has not reached the subscriber yet (it reads
+   * `parentBroker` itself), in `single` mode, or when the pool exists.
+   */
+  private async adoptLateParentBroker(): Promise<void> {
+    const old = this.client;
+    const coordinator = this.reconnectCoordinator;
+    if (!old || !coordinator || !this.parentBroker) return;
+    if (this.getForwardingMode() !== 'per_gateway' || this.publisherPool) return;
+
+    this.brokerGatewayNum = this.parentBroker.getLocalNodeInfo().nodeNum >>> 0;
+    this.subscriberClientId = formatGatewayClientId(this.brokerGatewayNum);
+    this.publisherPool = this.buildPublisherPool(coordinator);
+    logger.info(
+      `MQTT bridge ${this.sourceId}: parent broker attached late; reconnecting upstream as ${this.subscriberClientId}`,
+    );
+    // Internal re-login under the gateway ID, not an outage: stay silent.
+    this.brokerLink?.dispose();
+    this.brokerLink = null;
+    old.removeAllListeners();
+    old.on('error', () => {});
+    await old.disconnect().catch(() => {});
+    // stop() ran meanwhile: it closed the pool and cleared the client.
+    if (this.client !== old) return;
+    this.subscriberAuthStopped = false;
+    this.subscriberEvictionStopped = false;
+    try {
+      await this.connectSubscriber();
+    } catch (err) {
+      logger.warn(
+        `MQTT bridge ${this.sourceId}: subscribe failed after late parent attach: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * #5893: the configured single-mode Client ID, normalised, or undefined for
+   * the default `mm-bridge-…`. The route stores it normalised; this guards a
+   * hand-edited row.
+   */
+  private configuredSingleClientId(): string | undefined {
+    const configured = normalizeBridgeClientId(this.config.upstream.clientId);
+    if (configured === null) {
+      logger.warn(
+        `MQTT bridge ${this.sourceId}: ignoring invalid upstream.clientId (expected !xxxxxxxx); using the default`,
+      );
+      return undefined;
+    }
+    return configured;
+  }
+
+  /**
+   * #5893: the broker evicted the subscriber too many times. Same handling as
+   * an auth stop: record why and close the socket. `this.client` stays set so
+   * the pool path in `handleUplink` still runs.
+   */
+  private onSubscriberEvictionStopped(client: MqttBrokerClient): void {
+    if (this.client !== client) return;
+    this.subscriberEvictionStopped = true;
+    this.lastError = BRIDGE_EVICTION_STOPPED_MESSAGE;
+    logger.warn(
+      `MQTT bridge ${this.sourceId}: broker evicted the subscriber ${BRIDGE_MAX_EVICTIONS} times in ` +
+        `${BRIDGE_EVICTION_WINDOW_MS / 60_000} minutes; stopped reconnecting until the source is saved or reconnected`,
+    );
+    void client.disconnect().catch((err) => {
+      logger.debug(`MQTT bridge ${this.sourceId}: error closing evicted client:`, err);
+    });
+  }
+
+  /**
+   * #5893: log once when another running bridge shares this one's parent
+   * broker and upstream URL in `per_gateway` mode. Both then connect under
+   * the same `!<hex>` Client IDs and the broker evicts one for the other.
+   */
+  private warnIfSharedUpstream(): void {
+    const warning = this.computeSharedUpstreamWarning();
+    if (warning) logger.warn(`MQTT bridge ${this.sourceId}: ${warning}`);
+  }
+
+  /** The key two bridges must share to collide on Client IDs, or null. */
+  getSharedUpstreamKey(): string | null {
+    if (this.getForwardingMode() !== 'per_gateway' || !this.config.brokerSourceId) return null;
+    const url = this.config.upstream.url?.trim().toLowerCase();
+    if (!url) return null;
+    return `${this.config.brokerSourceId}|${url}`;
+  }
+
+  private computeSharedUpstreamWarning(): string | null {
+    const key = this.getSharedUpstreamKey();
+    if (!key) return null;
+    let others = 0;
+    for (const m of sourceManagerRegistry.getAllManagers()) {
+      if (m === this || m.sourceType !== 'mqtt_bridge') continue;
+      const other = m as Partial<MqttBridgeManager>;
+      if (typeof other.getSharedUpstreamKey === 'function' && other.getSharedUpstreamKey() === key) {
+        others++;
+      }
+    }
+    if (others === 0) return null;
+    return (
+      `${others} other bridge source(s) use the same parent broker and upstream URL in ` +
+      'per_gateway mode. They connect with the same Client IDs and the upstream broker will evict ' +
+      'one for the other. Keep one bridge per broker and upstream, or switch one to single mode.'
+    );
+  }
+
+  /**
+   * Manual reconnect: give every client that stopped (after rejected logins
+   * or, #5893, repeated evictions) a fresh start, and leave the rest alone. A healthy or still-retrying client
    * is never touched, so a repeated click cannot churn a working session or
    * add login attempts.
    *
@@ -540,10 +778,11 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
   async reconnectAuthStopped(): Promise<{ subscriber: boolean; gateways: number }> {
     const gateways = this.publisherPool?.restartAuthStopped() ?? 0;
     let subscriber = false;
-    if (this.subscriberAuthStopped && this.client) {
+    if ((this.subscriberAuthStopped || this.subscriberEvictionStopped) && this.client) {
       const old = this.client;
       subscriber = true;
       this.subscriberAuthStopped = false;
+      this.subscriberEvictionStopped = false;
       this.subscriberAuthStoppedDrops = 0;
       this.lastError = null;
       old.removeAllListeners();
@@ -565,9 +804,17 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     return { subscriber, gateways };
   }
 
-  /** True when the subscriber or any gateway publisher stopped after rejected logins. */
+  /**
+   * True when the subscriber or any gateway publisher stopped, after rejected
+   * logins or (#5893) repeated evictions.
+   */
   hasAuthStop(): boolean {
-    return this.subscriberAuthStopped || (this.publisherPool?.getAuthStoppedGateways().length ?? 0) > 0;
+    return (
+      this.subscriberAuthStopped ||
+      this.subscriberEvictionStopped ||
+      (this.publisherPool?.getAuthStoppedGateways().length ?? 0) > 0 ||
+      (this.publisherPool?.getEvictionStoppedGateways().length ?? 0) > 0
+    );
   }
 
   /** Resolves the configured mode, defaulting to `'bidirectional'`. */
@@ -582,6 +829,9 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
       await this.publisherPool.close();
       this.publisherPool = null;
     }
+    // Silent: stopping or saving is never an outage.
+    this.brokerLink?.dispose();
+    this.brokerLink = null;
     if (this.client) {
       await this.client.disconnect();
       this.client = null;
@@ -593,6 +843,7 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     this.brokerGatewayNum = null;
     // Stopped by hand is not "stopped by the broker"; start() begins clean.
     this.subscriberAuthStopped = false;
+    this.subscriberEvictionStopped = false;
   }
 
   getStatus(): MqttBridgeStatus {
@@ -609,7 +860,12 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     // login, so it never carries the broker's own words, host, or credentials.
     // Stopped gateways are reported by count and id below; the sidebar words
     // that itself, so `permissionMessage` only speaks for the subscriber.
-    const stoppedMessage = this.subscriberAuthStopped ? BRIDGE_AUTH_STOPPED_MESSAGE : null;
+    const stoppedMessage = this.subscriberAuthStopped
+      ? BRIDGE_AUTH_STOPPED_MESSAGE
+      : this.subscriberEvictionStopped
+        ? BRIDGE_EVICTION_STOPPED_MESSAGE
+        : null;
+    const evictionStoppedGateways = this.publisherPool?.getEvictionStoppedGateways() ?? [];
     return {
       sourceId: this.sourceId,
       sourceName: this.sourceName,
@@ -628,9 +884,10 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
       authStoppedGatewayCount: stoppedGateways.length,
       uplinkAuthStoppedDrops:
         this.subscriberAuthStoppedDrops + (this.publisherPool?.getAuthStoppedDrops() ?? 0),
-      lastError: this.subscriberAuthStopped
-        ? BRIDGE_AUTH_STOPPED_MESSAGE
-        : this.lastError ?? this.client?.getLastError() ?? null,
+      evictionStopped: this.subscriberEvictionStopped,
+      evictionStoppedGateways,
+      evictionStoppedGatewayCount: evictionStoppedGateways.length,
+      lastError: stoppedMessage ?? this.lastError ?? this.client?.getLastError() ?? null,
       capabilities,
       permissionMessage: stoppedMessage ?? buildPermissionMessage(capabilities, requestedSubs),
       mode,
@@ -638,6 +895,10 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
       publishers: this.publisherPool?.getStatus() ?? {},
       uplinkOkToMqttDrops: this.uplinkOkToMqttDrops,
       uplinkAutomationDrops: this.uplinkAutomationDrops,
+      uplinkBridgeRelayDrops: this.uplinkBridgeRelayDrops,
+      uplinkDisconnectedDrops:
+        this.uplinkDisconnectedDrops + (this.publisherPool?.getEvictionStoppedDrops() ?? 0),
+      sharedUpstreamWarning: this.computeSharedUpstreamWarning(),
       lastGeoSweep: this.lastGeoSweep,
     };
   }
@@ -725,6 +986,27 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
   }
 
   /**
+   * Whether MQTT-native send (#4305) may publish through this bridge right
+   * now. `subscribe_only` is read-only and always refuses; a stopped or
+   * disconnected upstream client refuses too, because `publish()` would drop
+   * the packet silently after a login stop and a user would see "sent".
+   */
+  getNativePublishReadiness(): MqttNativeReadiness {
+    if (this.getMode() === 'subscribe_only') {
+      return { ok: false, code: 'READ_ONLY', reason: 'This MQTT bridge is subscribe-only, so it never publishes.' };
+    }
+    if (this.subscriberAuthStopped || this.subscriberEvictionStopped || !this.client || !this.client.isConnected()) {
+      return { ok: false, code: 'NOT_CONNECTED', reason: 'This MQTT bridge is not connected to its upstream broker.' };
+    }
+    return { ok: true };
+  }
+
+  /** Root topic MQTT-native send uses when none is configured (#4305). */
+  getNativeRootTopicHint(): string | null {
+    return deriveRootTopicFromSubscriptions(this.config.subscriptions);
+  }
+
+  /**
    * Publish a raw payload to the upstream broker through this bridge's
    * client connection. Used by the client-proxy mqttLink path so a
    * meshtastic_tcp source can route its device's MQTT traffic through a
@@ -741,10 +1023,55 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
       this.noteSubscriberDrop();
       return;
     }
+    if (this.subscriberEvictionStopped) {
+      // #5893: the same for a stop after evictions.
+      this.noteDisconnectedDrop();
+      return;
+    }
     if (!this.client || !this.client.isConnected()) {
       throw new Error(`MQTT bridge ${this.sourceId} not connected to upstream`);
     }
+    // The client-proxy path lands here without passing handleUplink, so it
+    // needs its own automation check (#5414). Without it, a TCP node whose
+    // MQTT proxy is linked to this bridge uplinked every auto-ack tapback and
+    // other automation send even with `dropAutomationUplinks` on.
+    if (this.config.dropAutomationUplinks && this.isAutomationEnvelope(payload)) {
+      this.uplinkAutomationDrops++;
+      return;
+    }
     await this.client.publish(topic, payload, retained);
+  }
+
+  /**
+   * True when `payload` is a ServiceEnvelope whose packet MeshRadar's own
+   * automation sent. Anything that does not decode (a JSON topic, a map
+   * report) is not ours to drop.
+   */
+  private isAutomationEnvelope(payload: Uint8Array): boolean {
+    const envelope = meshtasticProtobufService.decodeServiceEnvelope(payload, { quiet: true });
+    const packet = envelope?.packet;
+    if (!packet || packet.id === undefined || packet.id === null) return false;
+    if (packet.from === undefined || packet.from === null) return false;
+    // Coerce like handleUplink: some decode paths hand back a Long.
+    return automationPacketTracker.isAutomationPacket(Number(packet.from) >>> 0, Number(packet.id) >>> 0);
+  }
+
+  /**
+   * #5893: count an uplink packet dropped because the subscriber connection is
+   * down. Logs once per disconnected episode, not per packet; the next
+   * successful connect re-arms the log line.
+   */
+  private noteDisconnectedDrop(): void {
+    this.uplinkDisconnectedDrops++;
+    if (this.disconnectedDropLogged) return;
+    this.disconnectedDropLogged = true;
+    const why = this.subscriberEvictionStopped
+      ? 'it stopped reconnecting after repeated evictions'
+      : 'it is not connected';
+    logger.info(
+      `MQTT bridge ${this.sourceId}: dropping uplink packets because ${why}; ` +
+        'they are counted in the source status and not replayed',
+    );
   }
 
   /** Count an uplink packet dropped on the stopped subscriber; log the first. */
@@ -778,6 +1105,9 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
         logger.info(
           `MQTT bridge ${this.sourceId} attached to deferred parent broker ${m.sourceId}`,
         );
+        void this.adoptLateParentBroker().catch((err) => {
+          logger.warn(`MQTT bridge ${this.sourceId}: late parent attach failed:`, err);
+        });
       }
     };
     sourceManagerRegistry.on('manager-started', this.registryAddedListener);
@@ -835,10 +1165,11 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     const packetId =
       typeof envelope.packet?.id === 'number' ? envelope.packet.id >>> 0 : null;
 
-    // If we just sent this upstream, ignore the echo coming back down.
-    if (packetId !== null && this.matchesEcho(this.uplinkEchoes, topic, packetId)) {
-      return;
-    }
+    // A copy of a packet we just sent upstream. It still counts as received on
+    // this source (#5858: the user's own messages never showed up here), but
+    // it must not go back to devices or the local broker, which already have it.
+    const isOwnUplinkEcho =
+      packetId !== null && this.matchesEcho(this.uplinkEchoes, topic, packetId);
 
     if (!this.downlinkFilter.preFilter(topic, envelope)) return;
 
@@ -897,6 +1228,8 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
         logger.warn(`MQTT bridge ${this.sourceId} ingest failed: ${msg}`);
       });
 
+    if (isOwnUplinkEcho) return;
+
     // Emit local-packet so consumers (e.g. a meshtastic_tcp source using
     // this bridge as its `mqttLink` client-proxy target — issue #3134) can
     // relay the upstream packet to their device. Shape matches
@@ -921,11 +1254,26 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
       // original topic. Echo recorded under the post-rewrite topic so the
       // uplink direction sees the same topic the parent broker emits.
       const publishTopic = applyTopicRewrite(topic, this.config.downlinkTopicRewrite);
+      // #5013: a copy of a packet this bridge already handed to the broker in
+      // the last minute is not handed over again.
+      if (packetId !== null && this.matchesEcho(this.downlinkEchoes, publishTopic, packetId)) return;
+      // #5708: tell the broker not to raise this packet on its way to a radio.
+      if (this.config.skipRaise && fromNum !== null && packetId !== null) {
+        this.parentBroker.markSkipRaise(fromNum, packetId);
+      }
+      // #5013: tell the other bridges on this broker where it came from.
+      if (fromNum !== null && packetId !== null) {
+        this.parentBroker.markBridgeOrigin(this.sourceId, fromNum, packetId);
+      }
+      // Record the echo BEFORE publishing. Aedes emits `publish` (and so the
+      // broker's `local-packet`, and so our own handleUplink) synchronously
+      // inside publish(); recording in .then() let this bridge re-uplink its
+      // own downlink once. The mqttLink path records first for the same reason.
+      this.recordEcho(this.downlinkEchoes, publishTopic, packetId);
       this.parentBroker
         .publish(publishTopic, payload, retained)
         .then(() => {
           this.downlinkRepublished++;
-          this.recordEcho(this.downlinkEchoes, publishTopic, packetId);
         })
         .catch((err) => {
           this.lastError = `local republish failed: ${err.message}`;
@@ -939,6 +1287,19 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     const packetId = p.envelope.packet?.id !== undefined ? (p.envelope.packet.id >>> 0) : null;
     if (packetId !== null && this.matchesEcho(this.downlinkEchoes, p.topic, packetId)) {
       return;
+    }
+
+    // #5013: a packet another bridge brought down from its upstream is not
+    // local traffic. Uplinking it would relay upstream A into upstream B (and,
+    // per gateway, under a foreign gateway's client id). Opt-in only.
+    if (!this.config.relayOtherBridges && this.parentBroker) {
+      const rawFrom = p.envelope.packet?.from;
+      const from = rawFrom === undefined || rawFrom === null ? null : Number(rawFrom) >>> 0;
+      const origin = this.parentBroker.bridgeOriginOf(from, packetId);
+      if (origin !== null && origin !== this.sourceId) {
+        this.uplinkBridgeRelayDrops++;
+        return;
+      }
     }
 
     if (!this.uplinkFilter.preFilter(p.topic, p.envelope)) return;
@@ -963,7 +1324,9 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     // Honor the originator's `ok_to_mqtt` preference unless the operator
     // has explicitly opted out for this bridge. See evaluateOkToMqtt for
     // the policy details — bridge-level gate, not part of the filter chain.
-    if (!this.config.ignoreOkToMqtt) {
+    // A node's own map report never carries the bit (firmware sends it outside
+    // MQTT::onSend; Map Reporting is its opt-in), so it is not gated here.
+    if (!this.config.ignoreOkToMqtt && !isOwnMapReport(p.envelope)) {
       const allow = await this.evaluateOkToMqtt(p.envelope);
       if (!allow) {
         this.uplinkOkToMqttDrops++;
@@ -985,6 +1348,10 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
     // under the post-rewrite topic so the downlink direction can suppress
     // the upstream broker's re-emission of this same packet.
     const publishTopic = applyTopicRewrite(p.topic, this.config.uplinkTopicRewrite);
+    // #5013: never send the same packet upstream twice in a minute. With
+    // relayOtherBridges on and two bridges whose upstreams share traffic,
+    // each copy coming back down would otherwise be sent up again, forever.
+    if (packetId !== null && this.matchesEcho(this.uplinkEchoes, publishTopic, packetId)) return;
     // Per-gateway dispatch: when the pool is active and the envelope's
     // gateway_id parses to a nodeNum different from the broker's own
     // gateway nodeId, publish through the pool entry whose clientId is
@@ -1019,7 +1386,12 @@ export class MqttBridgeManager extends EventEmitter implements ISourceManager {
         this.noteSubscriberDrop();
         return;
       }
-      if (!this.client.isConnected()) return;
+      if (!this.client.isConnected()) {
+        // #5893: used to return silently, so a flapping connection made
+        // uplink look broken with no trace in the logs or the status.
+        this.noteDisconnectedDrop();
+        return;
+      }
       this.client
         .publish(publishTopic, p.payload, p.retained)
         .then(onSuccess)

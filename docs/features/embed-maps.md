@@ -16,6 +16,8 @@ Embed Maps let you share a live, read-only view of your mesh network on any webs
 
 You can create multiple profiles to serve different audiences — for example, one public-facing profile showing all channels and another restricted to a single channel for a community group.
 
+Embeds always count as signed-out viewers. When [public-instance mode](./public-instance-mode) is on, embed maps show coarsened positions, spread markers that share a coarse cell so they do not stack, show ages as "within the last hour" when times are rounded, and hide the data it hides.
+
 ## Creating an Embed Profile
 
 1. Navigate to **Settings** > **Embed Maps**
@@ -37,6 +39,12 @@ When creating a new profile, MeshMonitor automatically computes the map center f
 ### Channels
 
 Select which Meshtastic channels to include. Only nodes on the selected channels appear on the embedded map. Channel 0 (Primary) is selected by default. With no channel selected, nodes on every device channel (0-7) appear. Nodes last heard on a Channel Database (server-decrypted) channel never appear on an embed.
+
+The channel list applies to Meshtastic nodes only. MeshCore contacts have no channel, so a MeshCore node with a position shows whatever channels you pick. The form says so under the channel list when the profile's source is a MeshCore source, or when it shows all sources and you have one.
+
+### Source
+
+Pick one source, or **All sources**. A Meshtastic source shows its Meshtastic nodes. A MeshCore source (a device or a MeshCore MQTT source) shows its MeshCore nodes. **All sources** shows nodes from every source of both kinds. See [MeshCore Nodes](#meshcore-nodes).
 
 ### Map Defaults
 
@@ -139,13 +147,26 @@ When **Show Popups** is enabled, clicking a node marker opens a detailed popup s
 
 The popup uses a dark theme matching MeshMonitor's Catppuccin styling.
 
+### MeshCore Nodes
+
+An embed shows MeshCore nodes when the profile's source is a MeshCore source, or when it shows all sources. A MeshCore node appears when:
+
+- MeshMonitor has heard it in the last 7 days, the same window as Meshtastic nodes;
+- it has a position (an advert position, or a location override);
+- its location override, if it has one, is not marked private. A node with a private override is left out, as a Meshtastic node is;
+- for a MeshCore MQTT source, the profile has **Show MQTT Nodes** on.
+
+The channel filter does not apply to MeshCore nodes (see [Channels](#channels)). A node that two MeshCore sources both hear appears once, at the position from the source that heard it last.
+
+A MeshCore node's popup shows its role (Companion, Repeater, Room Server or Sensor) and its ID, `mc:` plus the first 16 hex digits of its public key. It has no hardware model, hop count or channel. Repeaters and room servers use the tower icon.
+
 ### Neighbor Info Lines
 
-When **Show Neighbor Info** is enabled, dashed orange lines connect nodes that report each other as neighbors. Both nodes must pass the profile's channel and MQTT filters to appear.
+When **Show Neighbor Info** is enabled, dashed orange lines connect nodes that report each other as neighbors. Both nodes must pass the profile's channel and MQTT filters to appear. MeshCore neighbor links follow the same toggle: a dashed line joins two MeshCore nodes when one reports the other as a neighbor (heard in the last 7 days). A line shows once per pair, and only when both nodes are on the embed.
 
 ### Traceroute Paths
 
-When **Show Paths** is enabled, traceroute path segments between nodes are drawn with the canonical SNR color scale — green (excellent), yellow (good), orange (fair), red (poor), and dashed gray for unknown SNR. MeshMonitor decomposes multi-hop traceroutes into individual point-to-point segments and deduplicates them, keeping the most recent instance. Only traceroutes from the last 24 hours are displayed.
+When **Show Paths** is enabled, traceroute path segments between nodes are drawn with the canonical SNR color scale — green (excellent), yellow (good), orange (fair), red (poor), and dashed gray for unknown SNR. MeshMonitor decomposes multi-hop traceroutes into individual point-to-point segments and deduplicates them, keeping the most recent instance. Only traceroutes from the last 24 hours are displayed. MeshCore trace paths follow the same toggle. MeshMonitor draws each hop of a MeshCore trace from the last 24 hours as a segment, with the same SNR colors, once both hop ends are nodes the embed shows. Hops that did not resolve to a known node are not drawn.
 
 ### Hop Count Legend
 
@@ -183,6 +204,7 @@ The viewer of an embed is anonymous, so the profile alone decides what is sent:
 - **Private position overrides.** A node whose position override is marked private is left out of the embed: no marker, no neighbor line, no traceroute segment. There is no profile setting that turns this on.
 - **Hidden nodes.** A node with "Hide from Map" set is left out of markers, neighbor lines and traceroute segments.
 - **Other sources.** A profile tied to a source shows that source only.
+- **MeshCore private location overrides.** A MeshCore node whose location override is marked private is left out, the same rule as Meshtastic. It is also never the end of a neighbor line or a trace segment.
 - **Other channels.** A node appears only when it was last heard on one of the profile's channels, and its reported position arrived on one of them. A traceroute heard on another channel is not drawn.
 - **Neighbor lines and traceroute paths** are served only when the profile turns them on.
 

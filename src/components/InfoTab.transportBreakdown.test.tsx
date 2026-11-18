@@ -599,3 +599,49 @@ describe('InfoTab node address', () => {
     expect(addressLine()).toBeNull();
   });
 });
+
+describe('InfoTab BLE address line (#6157)', () => {
+  it('renders the BLE address when the local node advertises one', () => {
+    render(
+      <InfoTab
+        {...baseProps}
+        nodes={[]}
+        deviceInfo={{ deviceMetadata: { bleAddress: 'AA:BB:CC:DD:EE:FF' } }}
+      />,
+    );
+    expect(screen.getByText('info.ble_address')).toBeTruthy();
+    expect(screen.getByText('AA:BB:CC:DD:EE:FF')).toBeTruthy();
+  });
+
+  it('hides the BLE address line when the field is an empty string', () => {
+    render(
+      <InfoTab {...baseProps} nodes={[]} deviceInfo={{ deviceMetadata: { bleAddress: '' } }} />,
+    );
+    expect(screen.queryByText('info.ble_address')).toBeNull();
+  });
+
+  it('hides the BLE address line when the field is absent', () => {
+    render(<InfoTab {...baseProps} nodes={[]} deviceInfo={{ deviceMetadata: {} }} />);
+    expect(screen.queryByText('info.ble_address')).toBeNull();
+  });
+});
+
+describe('InfoTab bootloader version line (#6321)', () => {
+  it('renders the unpacked bootloader version when non-zero', () => {
+    render(
+      <InfoTab {...baseProps} nodes={[]} deviceInfo={{ deviceMetadata: { bootloaderVersion: 0x000a03 } }} />,
+    );
+    expect(screen.getByText('info.bootloader_version')).toBeTruthy();
+    expect(screen.getByText('0.10.3')).toBeTruthy();
+  });
+
+  it('hides the bootloader version line when the field is 0', () => {
+    render(<InfoTab {...baseProps} nodes={[]} deviceInfo={{ deviceMetadata: { bootloaderVersion: 0 } }} />);
+    expect(screen.queryByText('info.bootloader_version')).toBeNull();
+  });
+
+  it('hides the bootloader version line when the field is absent', () => {
+    render(<InfoTab {...baseProps} nodes={[]} deviceInfo={{ deviceMetadata: {} }} />);
+    expect(screen.queryByText('info.bootloader_version')).toBeNull();
+  });
+});

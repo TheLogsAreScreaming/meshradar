@@ -60,7 +60,7 @@ describe('auto responder pattern field on a wide row', () => {
   });
 
   it('the Response field uses the class, not an inline flex', () => {
-    const tsx = read('AutoResponderSection.tsx');
+    const tsx = read('auto-responder/TriggerEditor.tsx');
     expect(tsx).toContain('className={`${layout.growField} ${layout.responseField}`}>');
     expect(tsx).not.toContain("style={{ flex: '2' }}");
     // The script select must not force the Response field past its share.
@@ -94,12 +94,34 @@ describe('geofence number-input hints wrap under the input on a phone', () => {
 describe('trigger placeholder locales', () => {
   const localeDir = join(here, '../../public/locales');
 
-  it('non-English locales drop the stale long placeholder and fall back to English', () => {
+  // #5465 dropped the stale translations: a long list of examples
+  // ("Przykład: pogoda, pogoda {location}, p {location}") or an empty string,
+  // which overflowed the field or blanked it. A locale may still translate the
+  // current short English text (Weblate adds it back, e.g. pl "np. weather
+  // {location}"); it just must not be the old list shape or empty.
+  it('non-English locales carry no stale long placeholder (absent falls back to English)', () => {
     for (const file of readdirSync(localeDir).filter((f) => f.endsWith('.json') && f !== 'en.json')) {
       const d = JSON.parse(readFileSync(join(localeDir, file), 'utf8')) as Record<string, unknown>;
-      expect(d, file).not.toHaveProperty(['auto_responder.trigger_placeholder']);
+      const value = d['auto_responder.trigger_placeholder'];
+      // Absent or "" (Weblate's untranslated marker) both fall back to English.
+      if (value === undefined || value === '') continue;
+      expect(typeof value, file).toBe('string');
+      const str = value as string;
+      expect(str.trim(), file).not.toBe('');
+      // #5465 guarded against the stale LIST shape — several comma-separated
+      // examples, e.g. "Przykład: pogoda, pogoda {location}, p {location}" —
+      // which overflowed the field or blanked it. A normal single-example
+      // translation may legitimately carry one comma (Spanish "p. ej., tiempo
+      // {location}"), so reject only the list shape: two or more commas, a
+      // repeated {location} token, or an implausibly long value.
+      const commaCount = (str.match(/,/g) ?? []).length;
+      const tokenCount = (str.match(/\{location\}/g) ?? []).length;
+      expect(commaCount, `${file}: ${str}`).toBeLessThanOrEqual(1);
+      expect(tokenCount, `${file}: ${str}`).toBeLessThanOrEqual(1);
+      expect(str.length, `${file}: ${str}`).toBeLessThanOrEqual(80);
     }
     const i18n = read('../config/i18n.ts');
     expect(i18n).toMatch(/fallbackLng:\s*'en'/);
+    expect(i18n).toMatch(/returnEmptyString:\s*false/);
   });
 });

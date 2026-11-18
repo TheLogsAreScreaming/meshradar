@@ -10,6 +10,7 @@
  * `node.*` (hydrated subject node incl. calculated `ageMinutes`/`roleName`), and
  * `telemetry.*` (latest reading per metric for the subject node).
  */
+import type { HopEmojiOverrides } from '../../../utils/hopEmoji.js';
 import { type TriggerContext, resolveTriggerPath, subjectKeyOf, meshCoreSubjectKey, ageMinutesSince } from './triggerContext.js';
 import type { VariableResolver, VarContext } from './variableResolver.js';
 import { interpolate, extractPaths, type InterpolationValue } from './interpolate.js';
@@ -67,6 +68,13 @@ export interface NodeDataProvider {
    */
   getChannelName?(sourceId: string | null, channelIndex: number): Promise<string | null>;
   /**
+   * Text and sender name of a stored MeshCore message, for the target of a
+   * reaction (#5763). Optional; absent or null = the target fields stay unset.
+   */
+  getMeshCoreMessage?(sourceId: string | null, messageId: string): Promise<{ text: string; fromName: string | null } | null>;
+  /** True when `name` is the local node name of any MeshCore source (#5763 self guard). */
+  isOwnMeshCoreName?(name: string): Promise<boolean>;
+  /**
    * Current position of a waypoint, for a geofence anchored to one rather than
    * to a drawn region (#4722). Resolved on every geofence check so moving the
    * waypoint moves the fence with no edit to the automation.
@@ -102,6 +110,12 @@ export interface NodeDataProvider {
    */
   getSourceProtocol?(sourceId: string | null): Promise<string | null>;
   /**
+   * Announced display name of a Reticulum destination (LXMF hash), for the
+   * `fromName`/`senderLabel` message tokens (#6143). Optional; absent or null →
+   * the builder falls back to the raw hash.
+   */
+  getReticulumDisplayName?(sourceId: string | null, hash: string): Promise<string | null>;
+  /**
    * Exact configured type of a source (`meshtastic_tcp` | `mqtt_broker` |
    * `mqtt_bridge` | `meshcore`), where `getSourceProtocol` only exposes the
    * coarse protocol family. Used to tell "arrived through an MQTT source" from
@@ -109,6 +123,11 @@ export interface NodeDataProvider {
    * Optional; absent → treated as not-MQTT, i.e. today's behaviour.
    */
   getSourceType?(sourceId: string | null): Promise<string | null>;
+  /**
+   * The source's chosen 0-hop and MQTT glyphs (#5890). Optional; absent →
+   * the built-in glyphs.
+   */
+  getHopEmojiOverrides?(sourceId: string | null): Promise<HopEmojiOverrides>;
   /**
    * Own/local node number for a Meshtastic source — used to drop self-originated
    * events (messages/telemetry/node updates our own node produced) so automations
@@ -176,6 +195,24 @@ export interface NodeDataProvider {
     publicKey: string,
     sinceMs: number,
   ): Promise<Array<{ timestamp: number; value: number }>>;
+  /**
+   * The source's airtime-cutoff verdict (the same one the legacy timers use).
+   * Only Meshtastic sources measure Channel Utilization; MeshCore, Reticulum,
+   * MQTT and unknown sources resolve null, and the executor treats null or a
+   * throw as "not gated" (fail open). Optional; absent → never gated.
+   */
+  getAirtimeGate?(sourceId: string): Promise<AirtimeGateVerdict | null>;
+}
+
+/** Airtime-cutoff verdict for one source (see {@link NodeDataProvider.getAirtimeGate}). */
+export interface AirtimeGateVerdict {
+  gated: boolean;
+  /** Effective Channel Utilization percent, or null when unknown. */
+  channelUtilization: number | null;
+  /** Cutoff percent; 0 = feature off. */
+  threshold: number;
+  /** 'local' or 'neighbors'. */
+  measuredFrom?: string;
 }
 
 export interface EngineEvalContext {
@@ -198,6 +235,25 @@ export interface EngineEvalContext {
    * disabled itself). The engine's `haltReason` hook reads it after each action.
    */
   halt?: { reason: string };
+  /**
+   * Actions in this run that had nothing to do (#5723: a scheduled-trace step
+   * whose paths were all "not due", or capped with the cap already reported
+   * this hour). When every action that ran was idle, the
+   * engine writes no run-log row, so a one-minute tick does not fill the log.
+   */
+  idleActions?: number;
+  /**
+   * True for a user's "Run now" (manual) run. Manual runs bypass the airtime
+   * cutoff (the user asked for this send) and say so in the run log.
+   */
+  manual?: boolean;
+  /** True in the simulator (Test panel). An airtime skip then keeps the rendered text. */
+  dryRun?: boolean;
+  /**
+   * Sources whose airtime cutoff a manual run ignored, with the figures, so the
+   * run log can say so. Filled by the executor; read by the engine.
+   */
+  airtimeBypassed?: Array<{ sourceId: string; channelUtilization: number | null; threshold: number }>;
   /** internal memo for the hydrated subject node (do not set directly). */
   __nodeP?: Promise<NodeFacts | null>;
 }

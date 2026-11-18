@@ -13,7 +13,9 @@
  * Behavior is driven by the connected firmware (server-side dispatch in
  * MeshCoreManager.sendLocalCliCommand):
  *   - Repeater / Room Server → device's native text CLI.
- *   - Companion → small synthetic CLI (ver, stats, clock, advert.zerohop, advert, help).
+ *   - Companion fw 1.18.0+ → the firmware's own text CLI (#5866), plus the
+ *     shim's stats / clock / advert / help.
+ *   - Older Companion → small synthetic CLI (ver, stats, clock, advert.zerohop, advert, help).
  *
  * The command catalog adapts to the device type so users see buttons for
  * commands that actually work on their hardware.
@@ -24,6 +26,7 @@ import { useTranslation } from 'react-i18next';
 import type { MeshCoreActions } from './hooks/useMeshCore';
 import { CliConsoleBody, type ActionCommand, type CliConsoleBodyHandle } from './CliConsoleBody';
 import { MeshCoreAclManager } from './MeshCoreAclManager';
+import { companionHasNativeCli } from '../../utils/meshcoreCompanionCli';
 import './MeshCoreRemoteConsole.css';
 
 /** Verbs that the synthetic Companion CLI implements. Keep in sync with
@@ -38,6 +41,21 @@ const COMPANION_ACTION_CATALOG: ActionCommand[] = [
   { key: 'help',   labelKey: 'meshcore.localConsole.action.help',   defaultLabel: 'Help',    command: 'help' },
 ];
 
+/** Companion fw 1.18.0+ (#5868): the shim's verbs plus reads from the
+ *  firmware CLI and a danger Reboot. WiFi verbs exist only on WiFi builds,
+ *  so they are typed, not buttons. */
+const COMPANION_NATIVE_ACTION_CATALOG: ActionCommand[] = [
+  { key: 'ver',    labelKey: 'meshcore.localConsole.action.ver',    defaultLabel: 'Version', command: 'ver' },
+  { key: 'stats',  labelKey: 'meshcore.localConsole.action.stats',  defaultLabel: 'Stats',   command: 'stats' },
+  { key: 'clock',  labelKey: 'meshcore.localConsole.action.clock',  defaultLabel: 'Clock',   command: 'clock' },
+  { key: 'radio',  labelKey: 'meshcore.localConsole.action.radio',  defaultLabel: 'Radio',   command: 'get radio' },
+  { key: 'tx',     labelKey: 'meshcore.localConsole.action.tx',     defaultLabel: 'TX power', command: 'get tx' },
+  { key: 'tz',     labelKey: 'meshcore.localConsole.action.tz',     defaultLabel: 'Time zone', command: 'get tz.offset' },
+  { key: 'advert', labelKey: 'meshcore.localConsole.action.advert_zerohop', defaultLabel: 'Zero-hop advert', command: 'advert.zerohop' },
+  { key: 'help',   labelKey: 'meshcore.localConsole.action.help',   defaultLabel: 'Help',    command: 'help' },
+  { key: 'reboot', labelKey: 'meshcore.remoteConsole.action.reboot', defaultLabel: 'Reboot', command: 'reboot', danger: true },
+];
+
 /** Repeater / Room Server firmware: the native serial CLI handles a
  *  much larger command set. We surface the same safe verbs as the
  *  remote-Repeater console for consistency, plus a danger Reboot. */
@@ -45,6 +63,7 @@ const REPEATER_ACTION_CATALOG: ActionCommand[] = [
   { key: 'ver',       labelKey: 'meshcore.remoteConsole.action.ver',       defaultLabel: 'Version',  command: 'ver' },
   { key: 'stats',     labelKey: 'meshcore.remoteConsole.action.stats',     defaultLabel: 'Stats',    command: 'stats' },
   { key: 'neighbors', labelKey: 'meshcore.remoteConsole.action.neighbors', defaultLabel: 'Neighbors', command: 'neighbors' },
+  { key: 'discover_neighbors', labelKey: 'meshcore.remoteConsole.action.discover_neighbors', defaultLabel: 'Discover neighbors', command: 'discover.neighbors' },
   { key: 'clock',     labelKey: 'meshcore.remoteConsole.action.clock',     defaultLabel: 'Clock',    command: 'clock' },
   { key: 'advert',    labelKey: 'meshcore.localConsole.action.advert_zerohop', defaultLabel: 'Zero-hop advert', command: 'advert.zerohop' },
   { key: 'reboot',    labelKey: 'meshcore.remoteConsole.action.reboot',    defaultLabel: 'Reboot',   command: 'reboot', danger: true },
@@ -60,6 +79,9 @@ interface MeshCoreLocalConsoleProps {
   /** MeshCore device type from status.deviceType (0=Unknown, 1=Companion,
    *  2=Repeater, 3=RoomServer). Drives the command catalog. */
   deviceType?: number;
+  /** DeviceInfo protocol byte (`fw ver`); 14+ means the Companion has its
+   *  own text CLI (fw 1.18.0, #5866). Unknown until the poller reads it. */
+  firmwareVer?: number;
   /** Whether the source is currently connected. Disables the console
    *  when false — sending to a disconnected source would just timeout. */
   connected: boolean;
@@ -75,12 +97,14 @@ export const MeshCoreLocalConsole: React.FC<MeshCoreLocalConsoleProps> = ({
   deviceName,
   sourceId,
   deviceType,
+  firmwareVer,
   connected,
   actions,
   receiveOnly = false,
 }) => {
   const { t } = useTranslation();
 
+  const nativeCompanionCli = deviceType === 1 && companionHasNativeCli(firmwareVer);
   const targetName = deviceName || t('meshcore.localConsole.default_target', 'this device');
 
   // Repeater (2) and RoomServer (3) share the same catalog. Companion (1)
@@ -88,18 +112,22 @@ export const MeshCoreLocalConsole: React.FC<MeshCoreLocalConsoleProps> = ({
   // the user can still type free-form commands.
   //
   // The console itself stays enabled while receive-only (local serial CLI is
-  // explicitly allowed — interview decision 2); only the synthetic `advert`
-  // verb transmits, so it alone is disabled (with a tooltip) via
-  // ActionCommand.disabled rather than being filtered out of the catalog —
+  // explicitly allowed — interview decision 2); the `advert` and
+  // `discover.neighbors` verbs transmit, so they are disabled (with a tooltip)
+  // via ActionCommand.disabled rather than being filtered out of the catalog —
   // a vanished button teaches the user nothing (#4547 Phase 2 §3.5).
+  // `discover.neighbors` is simple_repeater-only firmware, so it is dropped
+  // for Room Servers (deviceType 3) even though they share the catalog (#3351).
   const actionCatalog = useMemo<ActionCommand[]>(() => {
-    const base =
+    let base =
       deviceType === 2 || deviceType === 3 ? REPEATER_ACTION_CATALOG :
+      nativeCompanionCli ? COMPANION_NATIVE_ACTION_CATALOG :
       deviceType === 1 ? COMPANION_ACTION_CATALOG :
       [];
+    if (deviceType !== 2) base = base.filter(a => a.key !== 'discover_neighbors');
     if (!receiveOnly) return base;
-    return base.map(action => action.key === 'advert' ? { ...action, disabled: true } : action);
-  }, [deviceType, receiveOnly]);
+    return base.map(action => (action.key === 'advert' || action.key === 'discover_neighbors') ? { ...action, disabled: true } : action);
+  }, [deviceType, nativeCompanionCli, receiveOnly]);
 
   const runCommand = useCallback(
     (text: string, opts?: { confirm?: boolean }) => actions.sendLocalCliCommand(text, opts),
@@ -113,7 +141,9 @@ export const MeshCoreLocalConsole: React.FC<MeshCoreLocalConsoleProps> = ({
   const showAcl = connected && (deviceType === 2 || deviceType === 3);
   const bodyRef = useRef<CliConsoleBodyHandle | null>(null);
 
-  const basePlaceholder = deviceType === 1
+  const basePlaceholder = nativeCompanionCli
+    ? t('meshcore.localConsole.companion_native_placeholder', 'Type a CLI command (ver, stats, get radio, set tx, get wifi.status, set tz.offset, help…)')
+    : deviceType === 1
     ? t('meshcore.localConsole.companion_placeholder', 'Type a command (ver, stats, clock, advert.zerohop, advert, help)')
     : t('meshcore.localConsole.repeater_placeholder', 'Type a CLI command (ver, stats, neighbors, advert…)');
   const enabledPlaceholder = receiveOnly
@@ -124,7 +154,7 @@ export const MeshCoreLocalConsole: React.FC<MeshCoreLocalConsoleProps> = ({
     : basePlaceholder;
 
   return (
-    <section className="meshcore-remote-console" aria-label={t('meshcore.localConsole.title', 'Device console')}>
+    <section id="meshcore-local-console" className="meshcore-remote-console" aria-label={t('meshcore.localConsole.title', 'Device console')}>
       <header className="mrc-header">
         <h3 className="mrc-title">{t('meshcore.localConsole.title', 'Device console')}</h3>
         <div className="mrc-status">
@@ -144,6 +174,7 @@ export const MeshCoreLocalConsole: React.FC<MeshCoreLocalConsoleProps> = ({
         ref={bodyRef}
         targetId={sourceId}
         targetName={targetName}
+        history={{ sourceId, target: 'local' }}
         runCommand={runCommand}
         actionCatalog={connected ? actionCatalog : []}
         disabled={!connected}

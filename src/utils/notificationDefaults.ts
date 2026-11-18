@@ -31,6 +31,10 @@ export interface NotificationPreferenceDefaults {
   lowBatteryVoltageThreshold: number;
   notifyOnServerEvents: boolean;
   notifyOnWaypoint: boolean;
+  /** MeshCore `@[Name]` mentions of the source's own node. Opt-in. */
+  notifyOnMention: boolean;
+  /** Automatic MeshCore traces / path discoveries (M3). Opt-in. */
+  notifyOnAutoTrace: boolean;
   waypointRadiusKm: number;
   waypointCenterLat: number | null;
   waypointCenterLon: number | null;
@@ -43,6 +47,9 @@ export interface NotificationPreferenceDefaults {
   mutedDMs: Array<{ nodeUuid: string; muteUntil: number | null }>;
   messageTitleTemplate: string | null;
   messageBodyTemplate: string | null;
+  /** Message text length (#6278): Web Push / desktop and Apprise. null = 100. */
+  messageTextMaxPush: number | null;
+  messageTextMaxApprise: number | null;
 }
 
 /**
@@ -71,6 +78,8 @@ export function defaultNotificationPreferences(): NotificationPreferenceDefaults
     lowBatteryVoltageThreshold: 3300,
     notifyOnServerEvents: false,
     notifyOnWaypoint: false,
+    notifyOnMention: false,
+    notifyOnAutoTrace: false,
     waypointRadiusKm: 10,
     waypointCenterLat: null,
     waypointCenterLon: null,
@@ -87,5 +96,17 @@ export function defaultNotificationPreferences(): NotificationPreferenceDefaults
     // null = the built-in message-notification template (#5593).
     messageTitleTemplate: null,
     messageBodyTemplate: null,
+    messageTextMaxPush: null,
+    messageTextMaxApprise: null,
   };
 }
+
+/**
+ * `sourceId` of a user's mesh-wide notification row (#5729).
+ *
+ * In `user_notification_preferences` it marks the mesh-wide DEFAULT: the
+ * settings for every source the user can read that has no row of its own (a
+ * per-source row is an override). In `push_subscriptions` it marks the one
+ * subscription a browser holds for the whole mesh. Never a real source id.
+ */
+export const MESH_PREFERENCES_SOURCE_ID = '__mesh__';

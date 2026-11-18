@@ -14,15 +14,19 @@ type SupportedModules = Partial<Record<ExcludedModuleKey, boolean>> & {
   /** Firmware carries the TAK module config (2.8.0+). Absent on an older server. */
   takConfig?: boolean;
   rangeTest?: boolean;
+  /** AES-CCM channels, firmware 2.8.1+ (#5248). Absent on an older server. */
+  aeadChannels?: boolean;
 };
 import { useQueryClient } from '@tanstack/react-query';
 import { UiIcon } from './icons';
 import { useTranslation } from 'react-i18next';
 import apiService from '../services/api';
+import { mqttRootErrorMessage } from './MQTT/mqttRootApiError';
 import { normalizeMeshtasticKey } from '../utils/meshtasticKeyFormat';
 import { policyToSend, toKnownPolicy } from '../utils/packetSignaturePolicy';
 import { useToast } from './ToastContainer';
 import { useSource } from '../contexts/SourceContext';
+import { sourcePollQueryKey } from '../hooks/pollQueryKey';
 import type { DeviceInfo, Channel } from '../types/device';
 import { logger } from '../utils/logger';
 import NodeIdentitySection from './configuration/NodeIdentitySection';
@@ -30,6 +34,7 @@ import DeviceConfigSection from './configuration/DeviceConfigSection';
 import LoRaConfigSection from './configuration/LoRaConfigSection';
 import PositionConfigSection from './configuration/PositionConfigSection';
 import MQTTConfigSection from './configuration/MQTTConfigSection';
+import { buildAdminMqttSavePayload } from './admin-commands/mqttSavePayload';
 import NeighborInfoSection from './configuration/NeighborInfoSection';
 import NetworkConfigSection from './configuration/NetworkConfigSection';
 import PowerConfigSection from './configuration/PowerConfigSection';
@@ -44,9 +49,11 @@ import RemoteHardwareConfigSection from './configuration/RemoteHardwareConfigSec
 import DetectionSensorConfigSection from './configuration/DetectionSensorConfigSection';
 import PaxcounterConfigSection from './configuration/PaxcounterConfigSection';
 import StatusMessageConfigSection from './configuration/StatusMessageConfigSection';
+import StatusMessageReapplyOption from './configuration/StatusMessageReapplyOption';
 import TAKConfigSection from './configuration/TAKConfigSection';
 import { normalizeTakConfig } from '../utils/takConfig';
-import { floorKeepingZero, NODE_INFO_BROADCAST_FLOOR_SECS, POSITION_BROADCAST_FLOOR_SECS } from '../utils/broadcastIntervalFloor';
+import { statusMessageSaveErrorText } from '../utils/statusMessage';
+import { floorKeepingZero, neighborInfoIntervalToSend, NODE_INFO_BROADCAST_FLOOR_SECS, POSITION_BROADCAST_FLOOR_SECS } from '../utils/broadcastIntervalFloor';
 import TrafficManagementConfigSection from './configuration/TrafficManagementConfigSection';
 import MeshBeaconConfigSection from './configuration/MeshBeaconConfigSection';
 import { unpackMeshBeaconFlags, pskToBase64, buildMeshBeaconConfigPayload, MESH_BEACON_MIN_INTERVAL_SECS, type BroadcastTarget } from './admin-commands/useAdminCommandsState';
@@ -63,17 +70,28 @@ import GpioPinSummary from './configuration/GpioPinSummary';
 import BackupManagementSection from './configuration/BackupManagementSection';
 import { ImportConfigModal } from './configuration/ImportConfigModal';
 import { ExportConfigModal } from './configuration/ExportConfigModal';
+import { ConfirmDialog } from './shared/automation/ConfirmDialog';
+import { ConfigSection } from './shared/config/ConfigSection';
+import { TypedConfirmDialog } from './common/TypedConfirmDialog';
+import { DangerZone, DangerZoneActions, DangerZoneButton } from './shared/config/DangerZone';
+import { buildAdminCommandsPath } from '../utils/adminDeepLink';
 import { ROLE_MAP, REGION_MAP, resolveModemPresetValue, UNKNOWN_MODEM_PRESET } from './configuration/constants';
 import SectionNav from './SectionNav';
+import sectionNavLayout from './SectionNav.module.css';
 import { configurationNavItems } from './search/configSections';
 import styles from './ConfigurationTab.module.css';
+import { rebootExpectation, type ConfigSaveSection } from '../utils/configRebootRules';
 
 interface ConfigurationTabProps {
   baseUrl?: string; // Optional, not used in component but passed from App.tsx
   nodes?: DeviceInfo[]; // Pass nodes from App to avoid separate API call
   channels?: Channel[]; // Pass channels from App
   onRebootDevice?: () => Promise<boolean>;
-  onConfigChangeTriggeringReboot?: () => void;
+  /**
+   * Called after a save the node reboots to apply (#5823). `possible` means
+   * the node restarts only if certain fields changed.
+   */
+  onConfigChangeTriggeringReboot?: (expectation: 'always' | 'possible') => void;
   onChannelsUpdated?: () => void; // Callback when channels are updated
   refreshTrigger?: number; // Increment this to trigger config refresh
 }
@@ -93,6 +111,10 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
   // Settings page. A viewer who cannot open that page keeps it here: its
   // routes check `configuration`, the grant this page already needs.
   const canViewSourceSettings = hasPermission('settings', 'read', { anySource: true });
+  // Every save on this page, and reboot / purge, needs configuration:write on
+  // this source (#5830). Read-only viewers see the values with the controls
+  // disabled; the routes refuse the write regardless.
+  const canWrite = hasPermission('configuration', 'write', { sourceId });
   const queryClient = useQueryClient();
 
   // Device Config State
@@ -142,6 +164,9 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
   const [txEnabled, setTxEnabled] = useState<boolean>(true);
   const [overrideDutyCycle, setOverrideDutyCycle] = useState<boolean>(false);
   const [paFanDisabled, setPaFanDisabled] = useState<boolean>(false);
+  // #6181: LoRaConfig.transparent_mode, shown read-only. MeshRadar never
+  // writes it; the server keeps the device's own value on every LoRa save.
+  const [transparentMode, setTransparentMode] = useState<boolean>(false);
 
   // Position Config State
   const [positionBroadcastSecs, setPositionBroadcastSecs] = useState(900);
@@ -176,7 +201,11 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
   const [mqttProxyClientAttached, setMqttProxyClientAttached] = useState(false);
   const [mqttMapReportingEnabled, setMqttMapReportingEnabled] = useState(false);
   const [mqttMapPublishIntervalSecs, setMqttMapPublishIntervalSecs] = useState(0);
-  const [mqttMapPositionPrecision, setMqttMapPositionPrecision] = useState(14);
+  // 0 = firmware default (14 bits); a node that reports 0 must load as 0.
+  const [mqttMapPositionPrecision, setMqttMapPositionPrecision] = useState(0);
+  // MapReportSettings.should_report_location (fw 2.6.8+): the node's consent
+  // to put its position in map reports. Save must send it back as loaded.
+  const [mqttMapShouldReportLocation, setMqttMapShouldReportLocation] = useState(false);
 
   // NeighborInfo Config State
   const [neighborInfoEnabled, setNeighborInfoEnabled] = useState(false);
@@ -233,7 +262,9 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
   const [healthMeasurementEnabled, setHealthMeasurementEnabled] = useState(false);
   const [healthUpdateInterval, setHealthUpdateInterval] = useState(900);
   const [healthScreenEnabled, setHealthScreenEnabled] = useState(false);
-  const [telemetryConfigVersion, setTelemetryConfigVersion] = useState(0);
+  // Bumped whenever config is (re)loaded from the node, so each section can
+  // move its SaveBar baseline to the loaded values (#5797).
+  const [configVersion, setConfigVersion] = useState(0);
 
   // External Notification Config State
   const [extNotifEnabled, setExtNotifEnabled] = useState(false);
@@ -388,6 +419,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
   const [statusMessage, setStatusMessage] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isReloading, setIsReloading] = useState(false);
+  // Which danger-zone action is waiting on its confirm dialog (#5830).
+  const [confirmAction, setConfirmAction] = useState<'reboot' | 'purge' | null>(null);
   const [configChanges, setConfigChanges] = useState<{ field: string; oldValue: string; newValue: string }[]>([]);
   const [showChanges, setShowChanges] = useState(false);
 
@@ -523,6 +556,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
           if (config.deviceConfig.lora.paFanDisabled !== undefined) {
             setPaFanDisabled(config.deviceConfig.lora.paFanDisabled);
           }
+          setTransparentMode(config.deviceConfig.lora.transparentMode === true);
         }
 
         // Populate position config
@@ -574,7 +608,9 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
           setMqttProxyToClientEnabled(config.moduleConfig.mqtt.proxyToClientEnabled || false);
           setMqttMapReportingEnabled(config.moduleConfig.mqtt.mapReportingEnabled || false);
           setMqttMapPublishIntervalSecs(config.moduleConfig.mqtt.mapReportSettings?.publishIntervalSecs || 0);
-          setMqttMapPositionPrecision(config.moduleConfig.mqtt.mapReportSettings?.positionPrecision ?? 14);
+          // A stored 0 is "firmware default" and stays 0; it used to load as 14.
+          setMqttMapPositionPrecision(config.moduleConfig.mqtt.mapReportSettings?.positionPrecision ?? 0);
+          setMqttMapShouldReportLocation(config.moduleConfig.mqtt.mapReportSettings?.shouldReportLocation === true);
         }
 
         // Populate NeighborInfo config
@@ -645,7 +681,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
           setHealthUpdateInterval(config.moduleConfig.telemetry.healthUpdateInterval ?? 900);
           setHealthScreenEnabled(config.moduleConfig.telemetry.healthScreenEnabled || false);
           // Increment version to signal config load to TelemetryConfigSection
-          setTelemetryConfigVersion(v => v + 1);
+          setConfigVersion(v => v + 1);
         }
 
         // Populate External Notification config
@@ -924,7 +960,15 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
     void loadPositionFromNodes();
   }, [nodes]); // Run when nodes first populate
 
-  const handleSaveDeviceConfig = async () => {
+  // After a successful save, tell the parent to expect the reboot the firmware
+  // starts on its own about 7 s later. This sends nothing to the node.
+  // configRebootRules.ts says which saves reboot (#5823).
+  const expectRebootAfterSave = (section: ConfigSaveSection) => {
+    const expectation = rebootExpectation(section, localFirmwareVersion);
+    if (expectation !== 'never') onConfigChangeTriggeringReboot?.(expectation);
+  };
+
+  const handleSaveDeviceConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -935,7 +979,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         setNodeInfoBroadcastSecs(validNodeInfoBroadcastSecs);
         showToast(t('config.node_info_adjusted'), 'warning');
         setIsSaving(false);
-        return;
+        return false;
       }
 
       await apiService.setDeviceConfig({
@@ -952,36 +996,40 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.device_config_saved'));
       showToast(t('config.device_config_saved_toast'), 'success');
-      // Device config changes don't require reboot
+      expectRebootAfterSave('device');
+      return true;
     } catch (error) {
       logger.error('Error saving device config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.device_config_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.device_config_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveNodeOwner = async () => {
+  const handleSaveNodeOwner = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
       await apiService.setNodeOwner(longName, shortName, isUnmessagable, isLicensed, sourceId);
       setStatusMessage(t('config.node_names_saved'));
       showToast(t('config.node_names_saved_toast'), 'success');
-      // Node owner changes don't require reboot
+      expectRebootAfterSave('owner');
+      return true;
     } catch (error) {
       logger.error('Error saving node owner:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.node_names_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.node_names_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveLoRaConfig = async () => {
+  const handleSaveLoRaConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -991,7 +1039,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         setHopLimit(validHopLimit);
         showToast(t('config.hop_limit_adjusted'), 'warning');
         setIsSaving(false);
-        return;
+        return false;
       }
 
       // An unrecognised preset must never be written back as a guess (#5547).
@@ -1002,7 +1050,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       if (presetUnknown && usePreset) {
         showToast(t('config.lora_unknown_preset', { name: unknownModemPresetName ?? '?' }), 'error');
         setIsSaving(false);
-        return;
+        return false;
       }
 
       await apiService.setLoRaConfig({
@@ -1030,18 +1078,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       // Refresh TX status promptly so the global banner + gated controls reflect
       // the new txEnabled value without waiting for the 30s poll (#4294).
       void queryClient.invalidateQueries({ queryKey: ['txStatus'] });
-      onConfigChangeTriggeringReboot?.();
+      expectRebootAfterSave('lora');
+      return true;
     } catch (error) {
       logger.error('Error saving LoRa config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.lora_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.lora_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSavePositionConfig = async () => {
+  const handleSavePositionConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1052,7 +1102,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         setPositionBroadcastSecs(validPositionBroadcastSecs);
         showToast(t('config.position_interval_adjusted'), 'warning');
         setIsSaving(false);
-        return;
+        return false;
       }
 
       // Validate lat/long ranges if fixed position is enabled
@@ -1060,12 +1110,12 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         if (fixedLatitude < -90 || fixedLatitude > 90) {
           showToast(t('config.latitude_range_error'), 'error');
           setIsSaving(false);
-          return;
+          return false;
         }
         if (fixedLongitude < -180 || fixedLongitude > 180) {
           showToast(t('config.longitude_range_error'), 'error');
           setIsSaving(false);
-          return;
+          return false;
         }
       }
 
@@ -1087,22 +1137,26 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.position_saved'));
       showToast(t('config.position_saved_toast'), 'success');
-      // Position config changes don't require reboot
+      expectRebootAfterSave('position');
+      return true;
     } catch (error) {
       logger.error('Error saving position config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.position_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.position_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveMQTTConfig = async () => {
+  const handleSaveMQTTConfig = async (extra?: { brokerPresetId?: number }): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
-      await apiService.setMQTTConfig({
+      // Firmware replaces the whole MQTT struct, so every field goes out,
+      // map report settings included even while map reporting is off.
+      await apiService.setMQTTConfig({ ...buildAdminMqttSavePayload({
         enabled: mqttEnabled,
         address: mqttAddress,
         username: mqttUsername,
@@ -1113,30 +1167,32 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         tlsEnabled: mqttTlsEnabled,
         proxyToClientEnabled: mqttProxyToClientEnabled,
         mapReportingEnabled: mqttMapReportingEnabled,
-        mapReportSettings: mqttMapReportingEnabled ? {
-          publishIntervalSecs: mqttMapPublishIntervalSecs,
-          positionPrecision: mqttMapPositionPrecision
-        } : undefined
-      }, sourceId);
+        mapPublishIntervalSecs: mqttMapPublishIntervalSecs,
+        mapPositionPrecision: mqttMapPositionPrecision,
+        mapShouldReportLocation: mqttMapShouldReportLocation,
+      }), ...(extra?.brokerPresetId !== undefined ? { brokerPresetId: extra.brokerPresetId } : {}) }, sourceId);
       setStatusMessage(t('config.mqtt_saved'));
       showToast(t('config.mqtt_saved_toast'), 'success');
-      // MQTT config changes don't require reboot
+      expectRebootAfterSave('mqtt');
+      return true;
     } catch (error) {
       logger.error('Error saving MQTT config:', error);
-      const errorMsg = error instanceof Error ? error.message : t('config.mqtt_failed');
+      const errorMsg = mqttRootErrorMessage(error, t)
+        ?? (error instanceof Error ? error.message : t('config.mqtt_failed'));
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.mqtt_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveNeighborInfoConfig = async () => {
+  const handleSaveNeighborInfoConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
       // Enforce minimum interval
-      const validInterval = Math.max(14400, neighborInfoInterval);
+      const validInterval = neighborInfoIntervalToSend(neighborInfoInterval);
       if (validInterval !== neighborInfoInterval) {
         setNeighborInfoInterval(validInterval);
         showToast(t('config.neighbor_interval_adjusted'), 'warning');
@@ -1149,18 +1205,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.neighbor_saved'));
       showToast(t('config.neighbor_saved_toast'), 'success');
-      // NeighborInfo config changes don't require reboot
+      expectRebootAfterSave('neighborinfo');
+      return true;
     } catch (error) {
       logger.error('Error saving NeighborInfo config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.neighbor_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.neighbor_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveNetworkConfig = async () => {
+  const handleSaveNetworkConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1187,18 +1245,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       setFullNetworkConfig(updatedConfig);
       setStatusMessage(t('config.network_saved'));
       showToast(t('config.network_saved_toast'), 'success');
-      onConfigChangeTriggeringReboot?.();
+      expectRebootAfterSave('network');
+      return true;
     } catch (error) {
       logger.error('Error saving Network config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.network_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.network_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSavePowerConfig = async () => {
+  const handleSavePowerConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1214,18 +1274,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.power_saved'));
       showToast(t('config.power_saved_toast'), 'success');
-      // Power config changes don't require reboot
+      expectRebootAfterSave('power');
+      return true;
     } catch (error) {
       logger.error('Error saving Power config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.power_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.power_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveDisplayConfig = async () => {
+  const handleSaveDisplayConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1242,18 +1304,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.display_saved'));
       showToast(t('config.display_saved_toast'), 'success');
-      // Display config changes don't require reboot
+      expectRebootAfterSave('display');
+      return true;
     } catch (error) {
       logger.error('Error saving Display config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.display_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.display_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveTelemetryConfig = async () => {
+  const handleSaveTelemetryConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1275,18 +1339,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.telemetry_saved'));
       showToast(t('config.telemetry_saved_toast'), 'success');
-      // Telemetry config changes don't require reboot
+      expectRebootAfterSave('telemetry');
+      return true;
     } catch (error) {
       logger.error('Error saving Telemetry config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.telemetry_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.telemetry_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveExternalNotificationConfig = async () => {
+  const handleSaveExternalNotificationConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1309,17 +1375,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.extnotif_saved'));
       showToast(t('config.extnotif_saved_toast'), 'success');
+      expectRebootAfterSave('extnotif');
+      return true;
     } catch (error) {
       logger.error('Error saving External Notification config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.extnotif_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.extnotif_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveStoreForwardConfig = async () => {
+  const handleSaveStoreForwardConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1333,17 +1402,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.storeforward_saved'));
       showToast(t('config.storeforward_saved_toast'), 'success');
+      expectRebootAfterSave('storeforward');
+      return true;
     } catch (error) {
       logger.error('Error saving Store & Forward config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.storeforward_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.storeforward_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveRangeTestConfig = async () => {
+  const handleSaveRangeTestConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1354,17 +1426,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.rangetest_saved'));
       showToast(t('config.rangetest_saved_toast'), 'success');
+      expectRebootAfterSave('rangetest');
+      return true;
     } catch (error) {
       logger.error('Error saving Range Test config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.rangetest_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.rangetest_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveCannedMessageConfig = async () => {
+  const handleSaveCannedMessageConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1383,17 +1458,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.cannedmsg_saved'));
       showToast(t('config.cannedmsg_saved_toast'), 'success');
+      expectRebootAfterSave('cannedmsg');
+      return true;
     } catch (error) {
       logger.error('Error saving Canned Message config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.cannedmsg_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.cannedmsg_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveAudioConfig = async () => {
+  const handleSaveAudioConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1408,17 +1486,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.audio_saved'));
       showToast(t('config.audio_saved_toast'), 'success');
+      expectRebootAfterSave('audio');
+      return true;
     } catch (error) {
       logger.error('Error saving Audio config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.audio_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.audio_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveRemoteHardwareConfig = async () => {
+  const handleSaveRemoteHardwareConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1428,17 +1509,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.remotehardware_saved'));
       showToast(t('config.remotehardware_saved_toast'), 'success');
+      expectRebootAfterSave('remotehardware');
+      return true;
     } catch (error) {
       logger.error('Error saving Remote Hardware config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.remotehardware_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.remotehardware_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveDetectionSensorConfig = async () => {
+  const handleSaveDetectionSensorConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1454,17 +1538,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.detectionsensor_saved'));
       showToast(t('config.detectionsensor_saved_toast'), 'success');
+      expectRebootAfterSave('detectionsensor');
+      return true;
     } catch (error) {
       logger.error('Error saving Detection Sensor config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.detectionsensor_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.detectionsensor_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSavePaxcounterConfig = async () => {
+  const handleSavePaxcounterConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1476,17 +1563,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.paxcounter_saved'));
       showToast(t('config.paxcounter_saved_toast'), 'success');
+      expectRebootAfterSave('paxcounter');
+      return true;
     } catch (error) {
       logger.error('Error saving Paxcounter config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.paxcounter_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.paxcounter_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveStatusMessageConfig = async () => {
+  const handleSaveStatusMessageConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1495,34 +1585,44 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.statusmessage_saved', 'Status Message config saved'));
       showToast(t('config.statusmessage_saved_toast', 'Status Message config saved successfully'), 'success');
+      expectRebootAfterSave('statusmessage');
+      return true;
     } catch (error) {
       logger.error('Error saving Status Message config:', error);
-      const errorMsg = error instanceof Error ? error.message : t('config.statusmessage_failed', 'Failed to save Status Message config');
+      // A save the node did not confirm (#5745) gets its own text.
+      const known = statusMessageSaveErrorText((error as { code?: string } | null)?.code);
+      const errorMsg = known
+        ? t(known.key, known.fallback)
+        : error instanceof Error ? error.message : t('config.statusmessage_failed', 'Failed to save Status Message config');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.statusmessage_failed', 'Failed to save Status Message config')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveTAKConfig = async () => {
+  const handleSaveTAKConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
       await apiService.setModuleConfig('tak', { team: takTeam, role: takRole }, sourceId);
       setStatusMessage(t('config.tak_saved'));
       showToast(t('config.tak_saved_toast'), 'success');
+      expectRebootAfterSave('tak');
+      return true;
     } catch (error) {
       logger.error('Error saving TAK config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.tak_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.tak_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveTrafficManagementConfig = async () => {
+  const handleSaveTrafficManagementConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1535,17 +1635,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.trafficmanagement_saved', 'Traffic Management config saved'));
       showToast(t('config.trafficmanagement_saved_toast', 'Traffic Management config saved successfully'), 'success');
+      expectRebootAfterSave('trafficmanagement');
+      return true;
     } catch (error) {
       logger.error('Error saving Traffic Management config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.trafficmanagement_failed', 'Failed to save Traffic Management config');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.trafficmanagement_failed', 'Failed to save Traffic Management config')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveMeshBeaconConfig = async () => {
+  const handleSaveMeshBeaconConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1567,17 +1670,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       await apiService.setModuleConfig('meshbeacon', config, sourceId);
       setStatusMessage(t('config.meshbeacon_saved', 'MeshBeacon config saved'));
       showToast(t('config.meshbeacon_saved_toast', 'MeshBeacon config saved successfully'), 'success');
+      expectRebootAfterSave('meshbeacon');
+      return true;
     } catch (error) {
       logger.error('Error saving MeshBeacon config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.meshbeacon_failed', 'Failed to save MeshBeacon config');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.meshbeacon_failed', 'Failed to save MeshBeacon config')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveSerialConfig = async () => {
+  const handleSaveSerialConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1593,17 +1699,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.serial_saved'));
       showToast(t('config.serial_saved_toast'), 'success');
+      expectRebootAfterSave('serial');
+      return true;
     } catch (error) {
       logger.error('Error saving Serial config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.serial_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.serial_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveAmbientLightingConfig = async () => {
+  const handleSaveAmbientLightingConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1616,17 +1725,20 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }, sourceId);
       setStatusMessage(t('config.ambientlighting_saved'));
       showToast(t('config.ambientlighting_saved_toast'), 'success');
+      expectRebootAfterSave('ambientlighting');
+      return true;
     } catch (error) {
       logger.error('Error saving Ambient Lighting config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.ambientlighting_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.ambientlighting_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handleSaveSecurityConfig = async () => {
+  const handleSaveSecurityConfig = async (): Promise<boolean> => {
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1663,24 +1775,23 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       }
       setStatusMessage(t('config.security_saved'));
       showToast(t('config.security_saved_toast'), 'success');
-      // Security config changes may require reboot for some settings
+      expectRebootAfterSave('security');
+      return true;
     } catch (error) {
       logger.error('Error saving Security config:', error);
       const errorMsg = error instanceof Error ? error.message : t('config.security_failed');
       setStatusMessage(`Error: ${errorMsg}`);
       showToast(`${t('config.security_failed')}: ${errorMsg}`, 'error');
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
+  // Reboot and purge each confirm in an in-app dialog (#5830); the handlers
+  // below run only from that dialog's Confirm.
   const handleRebootDevice = async () => {
-    const confirmed = window.confirm(t('config.reboot_confirm'));
-
-    if (!confirmed) {
-      return;
-    }
-
+    setConfirmAction(null);
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1713,12 +1824,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
   };
 
   const handlePurgeNodeDb = async () => {
-    const confirmed = window.confirm(t('config.purge_confirm'));
-
-    if (!confirmed) {
-      return;
-    }
-
+    setConfirmAction(null);
     setIsSaving(true);
     setStatusMessage('');
     try {
@@ -1755,6 +1861,13 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
       // Wait a moment for device to respond
       await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // The reload re-saves every channel slot the node sends, but the
+      // channel list on this page comes from the poll cache, which refetches
+      // only every 30 s while the WebSocket is up (and no channel event is
+      // pushed). Refetch it now, or a renamed or newly enabled slot keeps its
+      // stale name until the next poll (#5919).
+      void queryClient.invalidateQueries({ queryKey: sourcePollQueryKey(sourceId) });
 
       // Fetch updated config
       const config = await apiService.getCurrentConfig(sourceId);
@@ -1848,6 +1961,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         if (lora.configOkToMqtt !== undefined) setConfigOkToMqtt(lora.configOkToMqtt);
         if (lora.overrideDutyCycle !== undefined) setOverrideDutyCycle(lora.overrideDutyCycle);
         if (lora.paFanDisabled !== undefined) setPaFanDisabled(lora.paFanDisabled);
+        setTransparentMode(lora.transparentMode === true);
       }
 
       // Update Position Config
@@ -1886,9 +2000,11 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       // Update MQTT Config
       if (config.moduleConfig?.mqtt) {
         const mqtt = config.moduleConfig.mqtt;
-        if (mqtt.enabled !== undefined && mqtt.enabled !== mqttEnabled) {
-          changes.push({ field: 'MQTT: Enabled', oldValue: formatValue(mqttEnabled), newValue: formatValue(mqtt.enabled) });
-          setMqttEnabled(mqtt.enabled);
+        // proto3 elides `false`, so an absent `enabled` means off (#6439, #5028 class).
+        const newMqttEnabled = mqtt.enabled === true;
+        if (newMqttEnabled !== mqttEnabled) {
+          changes.push({ field: 'MQTT: Enabled', oldValue: formatValue(mqttEnabled), newValue: formatValue(newMqttEnabled) });
+          setMqttEnabled(newMqttEnabled);
         }
         if (mqtt.address !== undefined && mqtt.address !== mqttAddress) {
           changes.push({ field: 'MQTT: Address', oldValue: formatValue(mqttAddress), newValue: formatValue(mqtt.address) });
@@ -1900,17 +2016,31 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
           changes.push({ field: 'MQTT: Encryption Enabled', oldValue: formatValue(mqttEncryptionEnabled), newValue: formatValue(newMqttEncryptionEnabled) });
           setMqttEncryptionEnabled(newMqttEncryptionEnabled);
         }
-        if (mqtt.tlsEnabled !== undefined && mqtt.tlsEnabled !== mqttTlsEnabled) {
-          changes.push({ field: 'MQTT: TLS Enabled', oldValue: formatValue(mqttTlsEnabled), newValue: formatValue(mqtt.tlsEnabled) });
-          setMqttTlsEnabled(mqtt.tlsEnabled);
+        const newMqttTlsEnabled = mqtt.tlsEnabled === true;
+        if (newMqttTlsEnabled !== mqttTlsEnabled) {
+          changes.push({ field: 'MQTT: TLS Enabled', oldValue: formatValue(mqttTlsEnabled), newValue: formatValue(newMqttTlsEnabled) });
+          setMqttTlsEnabled(newMqttTlsEnabled);
         }
         // Update remaining MQTT fields
         if (mqtt.username !== undefined) setMqttUsername(mqtt.username);
         if (mqtt.password !== undefined) setMqttPassword(mqtt.password);
-        if (mqtt.jsonEnabled !== undefined) setMqttJsonEnabled(mqtt.jsonEnabled);
+        setMqttJsonEnabled(mqtt.jsonEnabled === true);
         if (mqtt.root !== undefined) setMqttRoot(mqtt.root);
-        if (mqtt.proxyToClientEnabled !== undefined) setMqttProxyToClientEnabled(mqtt.proxyToClientEnabled);
-        if (mqtt.mapReportingEnabled !== undefined) setMqttMapReportingEnabled(mqtt.mapReportingEnabled);
+        setMqttProxyToClientEnabled(mqtt.proxyToClientEnabled === true);
+        // Map reporting: read like the initial load. proto3 elides `false`, so
+        // an absent flag is off; skipping it on `undefined` left a box ticked
+        // after it was turned off on the radio. Report Location was never
+        // re-read at all.
+        const newMapReportingEnabled = mqtt.mapReportingEnabled === true;
+        if (newMapReportingEnabled !== mqttMapReportingEnabled) {
+          changes.push({ field: 'MQTT: Map Reporting', oldValue: formatValue(mqttMapReportingEnabled), newValue: formatValue(newMapReportingEnabled) });
+          setMqttMapReportingEnabled(newMapReportingEnabled);
+        }
+        const newMapShouldReportLocation = mqtt.mapReportSettings?.shouldReportLocation === true;
+        if (newMapShouldReportLocation !== mqttMapShouldReportLocation) {
+          changes.push({ field: 'MQTT: Map Report Location', oldValue: formatValue(mqttMapShouldReportLocation), newValue: formatValue(newMapShouldReportLocation) });
+          setMqttMapShouldReportLocation(newMapShouldReportLocation);
+        }
         if (mqtt.mapReportSettings?.publishIntervalSecs !== undefined) setMqttMapPublishIntervalSecs(mqtt.mapReportSettings.publishIntervalSecs);
         if (mqtt.mapReportSettings?.positionPrecision !== undefined) setMqttMapPositionPrecision(mqtt.mapReportSettings.positionPrecision);
       }
@@ -2016,8 +2146,6 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         if (tel.healthMeasurementEnabled !== undefined) setHealthMeasurementEnabled(tel.healthMeasurementEnabled);
         if (tel.healthUpdateInterval !== undefined) setHealthUpdateInterval(tel.healthUpdateInterval);
         if (tel.healthScreenEnabled !== undefined) setHealthScreenEnabled(tel.healthScreenEnabled);
-        // Increment version to signal config update to TelemetryConfigSection
-        setTelemetryConfigVersion(v => v + 1);
       }
 
       // Update Node Identity
@@ -2028,6 +2156,11 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         if (config.localNodeInfo.isLicensed !== undefined) setIsLicensed(config.localNodeInfo.isLicensed);
         if (config.localNodeInfo.firmwareVersion !== undefined) setLocalFirmwareVersion(config.localNodeInfo.firmwareVersion ?? null);
       }
+
+      // The reloaded values are what the node holds now: re-baseline the
+      // sections this reload refreshed. Batched with the setters above, so the
+      // first render with the new values already compares against them.
+      setConfigVersion(v => v + 1);
 
       setConfigChanges(changes);
       if (changes.length > 0) {
@@ -2059,10 +2192,9 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
     <div className="tab-content">
       {/* Picker + form share one flex row on a landscape phone (#5069): the
           picker becomes a left rail so the form keeps the full usable height. */}
-      <div className={styles.configShell}>
+      <div className={sectionNavLayout.shell}>
       {!isLoading && (
       <SectionNav
-        className={styles.configNav}
         searchable
         searchPlaceholder={t('config_search.filter_configuration', 'Search configuration...')}
         searchLabel={t('config_search.filter_configuration', 'Search configuration...')}
@@ -2072,7 +2204,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       )}
 
       {/* Two-column layout: main content on left, GPIO summary on right */}
-      <div className={styles.configBody} style={{ display: 'flex', gap: '1.5rem', alignItems: 'flex-start' }}>
+      <div className={sectionNavLayout.body} style={{ display: 'flex', gap: '1.5rem', alignItems: 'flex-start' }}>
         {/* Main content column */}
         <div style={{ flex: 1, minWidth: 0 }}>
 
@@ -2082,72 +2214,69 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         </div>
       ) : (
       <>
-      <div id="config-danger" className="settings-section danger-zone" style={{ marginBottom: '2rem' }}>
-        <h2 style={{ color: '#ff4444', marginTop: 0 }}><UiIcon name="alert" /> {t('config.warning_title')}</h2>
-        <p style={{ fontSize: '1.1rem', fontWeight: 'bold' }}>
-          {t('config.warning_text')}
-        </p>
-        <p>
-          {t('config.warning_description')}
-        </p>
-        <div className={styles.dangerActions} style={{ marginTop: '1.5rem', display: 'flex', gap: '1rem' }}>
+      {/* Reload, import and export (#5830). Nothing here restarts or erases
+          the node, so it stays at the top; reboot and purge moved to the
+          danger zone at the end of the page. */}
+      <div className={styles.topSection}>
+      <ConfigSection
+        id="config-import-export"
+        title={t('config.import_export_title')}
+        description={t('config.import_export_description')}
+        headerActions={
           <button
-            onClick={handleRebootDevice}
-            disabled={isSaving}
-            style={{
-              backgroundColor: '#ff6b6b',
-              color: '#fff',
-              padding: '0.75rem 1.5rem',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isSaving ? 'not-allowed' : 'pointer',
-              fontSize: '1rem',
-              fontWeight: 'bold',
-              opacity: isSaving ? 0.6 : 1
-            }}
-          >
-            <UiIcon name="refresh" /> {t('config.reboot_device')}
-          </button>
-          <button
-            onClick={handlePurgeNodeDb}
-            disabled={isSaving}
-            style={{
-              backgroundColor: '#d32f2f',
-              color: '#fff',
-              padding: '0.75rem 1.5rem',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isSaving ? 'not-allowed' : 'pointer',
-              fontSize: '1rem',
-              fontWeight: 'bold',
-              opacity: isSaving ? 0.6 : 1
-            }}
-          >
-            <UiIcon name="delete" /> {t('config.purge_node_db')}
-          </button>
-          <button
+            type="button"
+            className={styles.reloadButton}
             onClick={handleReloadConfig}
             disabled={isReloading}
-            style={{
-              backgroundColor: 'var(--color-info)',
-              color: 'var(--color-bg)',
-              padding: '0.75rem 1.5rem',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: isReloading ? 'not-allowed' : 'pointer',
-              fontSize: '1rem',
-              fontWeight: 'bold',
-              opacity: isReloading ? 0.6 : 1
-            }}
           >
             {isReloading ? (
               <>
-                <span style={{ display: 'inline-block', animation: 'spin 1s linear infinite' }}><UiIcon name="refresh" /></span>
+                <span className={styles.spin}><UiIcon name="refresh" /></span>
                 {' '}{t('config.reloading')}
               </>
             ) : (
               <><UiIcon name="refresh" /> {t('config.reload_config')}</>
             )}
+          </button>
+        }
+        notice={
+          <p className={styles.pageWarning} role="note">
+            <UiIcon name="alert" /> <span>{t('config.warning_text')}</span>
+          </p>
+        }
+      >
+        <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
+          <button
+            onClick={() => setIsImportModalOpen(true)}
+            disabled={!canWrite}
+            style={{
+              backgroundColor: 'var(--color-accent)',
+              color: '#fff',
+              padding: '0.75rem 1.5rem',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: canWrite ? 'pointer' : 'not-allowed',
+              opacity: canWrite ? 1 : 0.6,
+              fontSize: '1rem',
+              fontWeight: 'bold'
+            }}
+          >
+            <UiIcon name="import" /> {t('config.import_config')}
+          </button>
+          <button
+            onClick={() => setIsExportModalOpen(true)}
+            style={{
+              backgroundColor: 'var(--color-success)',
+              color: '#fff',
+              padding: '0.75rem 1.5rem',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '1rem',
+              fontWeight: 'bold'
+            }}
+          >
+            <UiIcon name="upload" /> {t('config.export_config')}
           </button>
         </div>
         {/* Config Changes Display */}
@@ -2200,47 +2329,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
             )}
           </div>
         )}
-      </div>
-
-      {/* Import/Export Configuration Section */}
-      <div id="config-import-export" className="settings-section" style={{ marginBottom: '2rem' }}>
-        <h3>{t('config.import_export_title')}</h3>
-        <p style={{ color: 'var(--color-text-subtle)', marginBottom: '1rem' }}>
-          {t('config.import_export_description')}
-        </p>
-        <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem' }}>
-          <button
-            onClick={() => setIsImportModalOpen(true)}
-            style={{
-              backgroundColor: 'var(--color-accent)',
-              color: '#fff',
-              padding: '0.75rem 1.5rem',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: 'pointer',
-              fontSize: '1rem',
-              fontWeight: 'bold'
-            }}
-          >
-            <UiIcon name="import" /> {t('config.import_config')}
-          </button>
-          <button
-            onClick={() => setIsExportModalOpen(true)}
-            style={{
-              backgroundColor: 'var(--color-success)',
-              color: '#fff',
-              padding: '0.75rem 1.5rem',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: 'pointer',
-              fontSize: '1rem',
-              fontWeight: 'bold'
-            }}
-          >
-            <UiIcon name="upload" /> {t('config.export_config')}
-          </button>
-        </div>
-
+      </ConfigSection>
       </div>
 
       {statusMessage && (
@@ -2262,6 +2351,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
       <div className={`settings-content ${styles.sectionStack}`}>
         <div id="config-node-identity">
           <NodeIdentitySection
+            canWrite={canWrite}
+            configVersion={configVersion}
             longName={longName}
             shortName={shortName}
             isUnmessagable={isUnmessagable}
@@ -2277,6 +2368,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
         <div id="config-device">
           <DeviceConfigSection
+            canWrite={canWrite}
+            configVersion={configVersion}
             role={role}
             setRole={setRole}
             nodeInfoBroadcastSecs={nodeInfoBroadcastSecs}
@@ -2304,6 +2397,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
         <div id="config-lora">
           <LoRaConfigSection
+            canWrite={canWrite}
+            configVersion={configVersion}
             usePreset={usePreset}
             setUsePreset={setUsePreset}
             modemPreset={modemPreset}
@@ -2342,6 +2437,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
             setOverrideDutyCycle={setOverrideDutyCycle}
             paFanDisabled={paFanDisabled}
             setPaFanDisabled={setPaFanDisabled}
+            transparentMode={transparentMode}
             isSaving={isSaving}
             onSave={handleSaveLoRaConfig}
           />
@@ -2349,6 +2445,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
         <div id="config-position">
           <PositionConfigSection
+            canWrite={canWrite}
+            configVersion={configVersion}
             positionBroadcastSecs={positionBroadcastSecs}
             setPositionBroadcastSecs={setPositionBroadcastSecs}
             positionSmartEnabled={positionSmartEnabled}
@@ -2384,6 +2482,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
         <div id="config-power">
           <PowerConfigSection
+            canWrite={canWrite}
+            configVersion={configVersion}
             isPowerSaving={isPowerSaving}
             setIsPowerSaving={setIsPowerSaving}
             onBatteryShutdownAfterSecs={onBatteryShutdownAfterSecs}
@@ -2407,6 +2507,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
         <div id="config-display">
           <DisplayConfigSection
+            canWrite={canWrite}
+            configVersion={configVersion}
             screenOnSecs={screenOnSecs}
             setScreenOnSecs={setScreenOnSecs}
             autoScreenCarouselSecs={autoScreenCarouselSecs}
@@ -2433,7 +2535,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-telemetry">
           <ModuleAvailabilityGate available={supportedModules?.telemetry} moduleName="Telemetry">
             <TelemetryConfigSection
-              configVersion={telemetryConfigVersion}
+              canWrite={canWrite}
+              configVersion={configVersion}
               deviceUpdateInterval={deviceUpdateInterval}
               setDeviceUpdateInterval={setDeviceUpdateInterval}
               deviceTelemetryEnabled={deviceTelemetryEnabled}
@@ -2471,6 +2574,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-mqtt">
           <ModuleAvailabilityGate available={supportedModules?.mqtt} moduleName="MQTT">
             <MQTTConfigSection
+              configVersion={configVersion}
+              loraRegion={region}
               mqttEnabled={mqttEnabled}
               setMqttEnabled={setMqttEnabled}
               mqttAddress={mqttAddress}
@@ -2495,6 +2600,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
               setMapPublishIntervalSecs={setMqttMapPublishIntervalSecs}
               mapPositionPrecision={mqttMapPositionPrecision}
               setMapPositionPrecision={setMqttMapPositionPrecision}
+              mapShouldReportLocation={mqttMapShouldReportLocation}
+              setMapShouldReportLocation={setMqttMapShouldReportLocation}
               isBridged={isBridged}
               proxyClientAttached={mqttProxyClientAttached}
               isSaving={isSaving}
@@ -2506,6 +2613,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-neighbor">
           <ModuleAvailabilityGate available={supportedModules?.neighborinfo} moduleName="Neighbor Info">
             <NeighborInfoSection
+              canWrite={canWrite}
+              configVersion={configVersion}
               neighborInfoEnabled={neighborInfoEnabled}
               setNeighborInfoEnabled={setNeighborInfoEnabled}
               neighborInfoInterval={neighborInfoInterval}
@@ -2521,6 +2630,8 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-network">
           <ModuleAvailabilityGate available={supportedModules?.network} moduleName="Network">
             <NetworkConfigSection
+              canWrite={canWrite}
+              configVersion={configVersion}
               wifiEnabled={wifiEnabled}
               setWifiEnabled={setWifiEnabled}
               wifiSsid={wifiSsid}
@@ -2553,6 +2664,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-extnotif">
           <ModuleAvailabilityGate available={supportedModules?.extnotif} moduleName="External Notification">
             <ExternalNotificationConfigSection
+              canWrite={canWrite}
               enabled={extNotifEnabled}
               setEnabled={setExtNotifEnabled}
               outputMs={extNotifOutputMs}
@@ -2592,6 +2704,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-storeforward">
           <ModuleAvailabilityGate available={supportedModules?.storeforward} moduleName="Store & Forward">
             <StoreForwardConfigSection
+              canWrite={canWrite}
               enabled={storeForwardEnabled}
               setEnabled={setStoreForwardEnabled}
               heartbeat={storeForwardHeartbeat}
@@ -2613,6 +2726,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-rangetest">
           <ModuleAvailabilityGate available={supportedModules?.rangetest} moduleName="Range Test">
           <RangeTestConfigSection
+            canWrite={canWrite}
             enabled={rangeTestEnabled}
             setEnabled={setRangeTestEnabled}
             sender={rangeTestSender}
@@ -2633,6 +2747,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-cannedmsg">
           <ModuleAvailabilityGate available={supportedModules?.cannedmsg} moduleName="Canned Messages">
             <CannedMessageConfigSection
+              canWrite={canWrite}
               enabled={cannedMsgEnabled}
               setEnabled={setCannedMsgEnabled}
               rotary1Enabled={cannedMsgRotary1Enabled}
@@ -2664,6 +2779,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-audio">
           <ModuleAvailabilityGate available={supportedModules?.audio} moduleName="Audio">
             <AudioConfigSection
+              canWrite={canWrite}
               codec2Enabled={audioCodec2Enabled}
               setCodec2Enabled={setAudioCodec2Enabled}
               pttPin={audioPttPin}
@@ -2687,6 +2803,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-remotehardware">
           <ModuleAvailabilityGate available={supportedModules?.remotehardware} moduleName="Remote Hardware">
             <RemoteHardwareConfigSection
+              canWrite={canWrite}
               enabled={remoteHardwareEnabled}
               setEnabled={setRemoteHardwareEnabled}
               allowUndefinedPinAccess={remoteHardwareAllowUndefinedPinAccess}
@@ -2700,6 +2817,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-detectionsensor">
           <ModuleAvailabilityGate available={supportedModules?.detectionsensor} moduleName="Detection Sensor">
             <DetectionSensorConfigSection
+              canWrite={canWrite}
               enabled={detectionSensorEnabled}
               setEnabled={setDetectionSensorEnabled}
               minimumBroadcastSecs={detectionSensorMinimumBroadcastSecs}
@@ -2725,6 +2843,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-paxcounter">
           <ModuleAvailabilityGate available={supportedModules?.paxcounter} moduleName="Paxcounter">
             <PaxcounterConfigSection
+              canWrite={canWrite}
               enabled={paxcounterEnabled}
               setEnabled={setPaxcounterEnabled}
               paxcounterUpdateInterval={paxcounterUpdateInterval}
@@ -2741,16 +2860,19 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
         <div id="config-statusmessage">
           <StatusMessageConfigSection
+            canWrite={canWrite}
             nodeStatus={statusMessageNodeStatus}
             setNodeStatus={setStatusMessageNodeStatus}
             isDisabled={!supportedModules?.statusmessage}
             isSaving={isSaving}
             onSave={handleSaveStatusMessageConfig}
           />
+          <StatusMessageReapplyOption isDisabled={!supportedModules?.statusmessage} />
         </div>
 
         <div id="config-trafficmanagement">
           <TrafficManagementConfigSection
+            canWrite={canWrite}
             positionMinIntervalSecs={trafficManagementPositionMinIntervalSecs}
             setPositionMinIntervalSecs={setTrafficManagementPositionMinIntervalSecs}
             nodeinfoDirectResponseMaxHops={trafficManagementNodeinfoDirectResponseMaxHops}
@@ -2769,6 +2891,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
         <div id="config-meshbeacon">
           <MeshBeaconConfigSection
+            canWrite={canWrite}
             listenEnabled={meshBeaconListenEnabled}
             setListenEnabled={setMeshBeaconListenEnabled}
             broadcastEnabled={meshBeaconBroadcastEnabled}
@@ -2802,6 +2925,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-tak">
           <ModuleAvailabilityGate available={supportedModules?.tak} moduleName="TAK">
             <TAKConfigSection
+              canWrite={canWrite}
               team={takTeam}
               setTeam={setTakTeam}
               role={takRole}
@@ -2816,6 +2940,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-serial">
           <ModuleAvailabilityGate available={supportedModules?.serial} moduleName="Serial">
             <SerialConfigSection
+              canWrite={canWrite}
               enabled={serialEnabled}
               setEnabled={setSerialEnabled}
               echo={serialEcho}
@@ -2841,6 +2966,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         <div id="config-ambientlighting">
           <ModuleAvailabilityGate available={supportedModules?.ambientlighting} moduleName="Ambient Lighting">
             <AmbientLightingConfigSection
+              canWrite={canWrite}
               ledState={ambientLedState}
               setLedState={setAmbientLedState}
               current={ambientCurrent}
@@ -2859,6 +2985,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
 
         <div id="config-security">
           <SecurityConfigSection
+            canWrite={canWrite}
             publicKey={securityPublicKey}
             privateKey={securityPrivateKey}
             setPrivateKey={setSecurityPrivateKey}
@@ -2892,7 +3019,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
               />
             )
           ) : (
-            <PkiDmDecryptionSection canWrite={hasPermission('configuration', 'write')} />
+            <PkiDmDecryptionSection canWrite={canWrite} />
           )}
         </div>
 
@@ -2900,6 +3027,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
           <ChannelsConfigSection
             channels={channels}
             onChannelsUpdated={onChannelsUpdated}
+            aeadSupported={supportedModules?.aeadChannels === true}
           />
         </div>
 
@@ -2907,7 +3035,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
             device's configuration and restore to it, so the list and schedule
             stay on Device Configuration (#5683 follow-up decision). */}
         <div id="config-backup">
-          <BackupManagementSection />
+          <BackupManagementSection protocol="meshtastic" canWrite={canWrite} />
         </div>
       </div>{/* End settings-content */}
       </>
@@ -2917,6 +3045,42 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
           purpose: see the comment on this return. It keeps every guard it had
           on Settings; only the page changed. */}
       {showFirmware && <FirmwareUpdateSection baseUrl={baseUrl} />}
+
+      {/* Danger zone, last on the page as on MeshCore (#5830). Each action
+          confirms in an in-app dialog; purge needs a typed word. Shutdown and
+          factory reset stay on Admin Commands, linked below. */}
+      {!isLoading && (
+        <DangerZone
+          id="config-danger"
+          canWrite={canWrite}
+          description={t('config.danger_zone_description', 'These actions restart the node or erase data. They cannot be undone.')}
+          footer={isAdmin && sourceId ? (
+            <MovedSettingNote
+              testId="danger-admin-commands-link"
+              text={t('config.danger_zone_admin_note', 'Shutdown, DFU mode and factory reset are on Admin Commands.')}
+              linkLabel={t('config.danger_zone_admin_link', 'Open Admin Commands')}
+              to={buildAdminCommandsPath(sourceId)}
+            />
+          ) : undefined}
+        >
+          <DangerZoneActions>
+            <DangerZoneButton
+              onClick={() => setConfirmAction('reboot')}
+              disabled={isSaving || !canWrite}
+              data-testid="config-reboot-button"
+            >
+              <UiIcon name="refresh" /> {t('config.reboot_device')}
+            </DangerZoneButton>
+            <DangerZoneButton
+              onClick={() => setConfirmAction('purge')}
+              disabled={isSaving || !canWrite}
+              data-testid="config-purge-button"
+            >
+              <UiIcon name="delete" /> {t('config.purge_node_db')}
+            </DangerZoneButton>
+          </DangerZoneActions>
+        </DangerZone>
+      )}
 
         </div>{/* End main content column */}
 
@@ -2980,6 +3144,29 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ baseUrl = '', nodes
         )}
       </div>{/* End two-column layout */}
       </div>{/* End landscape rail shell */}
+
+      {confirmAction === 'reboot' && (
+        <ConfirmDialog
+          title={t('config.reboot_dialog_title', 'Reboot the device?')}
+          message={t('config.reboot_dialog_message', 'The device restarts and is offline for about 30 to 60 seconds.')}
+          confirmLabel={t('config.reboot_device')}
+          cancelLabel={t('common.cancel')}
+          onConfirm={() => { void handleRebootDevice(); }}
+          onCancel={() => setConfirmAction(null)}
+        />
+      )}
+      <TypedConfirmDialog
+        isOpen={confirmAction === 'purge'}
+        title={t('config.purge_dialog_title', 'Purge the node database?')}
+        confirmWord="PURGE"
+        confirmLabel={t('config.purge_node_db')}
+        danger
+        busy={isSaving}
+        onConfirm={() => { void handlePurgeNodeDb(); }}
+        onCancel={() => setConfirmAction(null)}
+      >
+        <p>{t('config.purge_dialog_body', 'This deletes every stored node from the device and from MeshRadar\'s database for this source. It cannot be undone. The device rebuilds its list as it hears nodes on the mesh.')}</p>
+      </TypedConfirmDialog>
 
       {/* Import/Export Modals */}
       {!isLoading && (

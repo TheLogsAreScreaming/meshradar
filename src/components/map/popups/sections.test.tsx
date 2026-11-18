@@ -15,6 +15,7 @@ import {
   type NodeActionSpec,
 } from './sections';
 import { toNodeCardModel, type NodeCardModel } from './nodeCardModel';
+import { GatewayNameContext, buildGatewayNameIndex } from './gatewayLabel';
 import type { DbTraceroute } from '../../../services/database';
 import { orientTracerouteRow } from '../../../utils/tracerouteOrientation';
 
@@ -326,6 +327,61 @@ describe('SourcesList', () => {
   it('disables rows when no onSourceSelect is given', () => {
     render(<SourcesList sources={sources} />);
     expect(screen.getByText('Tower Alpha').closest('button')).toBeDisabled();
+  });
+
+  // #6175: gateway chips nested under their owning MQTT source.
+  it('renders gateway chips nested under the matching source', () => {
+    render(
+      <SourcesList
+        sources={sources}
+        gateways={[
+          { sourceId: 'a', gatewayId: '!gw000001', gatewayNodeNum: 1, receptionCount: 3, lastHeard: 200 },
+          { sourceId: 'a', gatewayId: '!gw000002', gatewayNodeNum: 2, receptionCount: 1, lastHeard: 100 },
+        ]}
+      />,
+    );
+    expect(screen.getByText('via 2 gateways')).toBeInTheDocument();
+    expect(screen.getByText('!gw000001')).toBeInTheDocument();
+    expect(screen.getByText('!gw000002')).toBeInTheDocument();
+  });
+
+  it('shows gateway chips only under the source that owns them', () => {
+    const { container } = render(
+      <SourcesList
+        sources={sources}
+        gateways={[{ sourceId: 'b', gatewayId: '!gwcore01', gatewayNodeNum: 9, receptionCount: 1, lastHeard: 50 }]}
+      />,
+    );
+    // One "via N gateway" label total — source 'a' has no gateways.
+    expect(container.querySelectorAll('.node-popup-gateways')).toHaveLength(1);
+    expect(screen.getByText('via 1 gateway')).toBeInTheDocument();
+    expect(screen.getByText('!gwcore01')).toBeInTheDocument();
+  });
+
+  // #6386: a known gateway shows its short name; the tooltip keeps the hex id.
+  it('labels a known gateway chip with its short name and keeps the id in the tooltip', () => {
+    const index = buildGatewayNameIndex([
+      { nodeNum: 1, longName: 'Hilltop Gateway', shortName: 'HILL' },
+    ]);
+    render(
+      <GatewayNameContext.Provider value={index}>
+        <SourcesList
+          sources={sources}
+          gateways={[
+            { sourceId: 'a', gatewayId: '!00000001', gatewayNodeNum: 1, receptionCount: 3, lastHeard: 200 },
+            { sourceId: 'a', gatewayId: '!00000002', gatewayNodeNum: 2, receptionCount: 1, lastHeard: 100 },
+          ]}
+        />
+      </GatewayNameContext.Provider>,
+    );
+    expect(screen.getByText('HILL')).toHaveAttribute('title', 'Hilltop Gateway (!00000001)');
+    // Unknown gateway falls back to the raw id.
+    expect(screen.getByText('!00000002')).toHaveAttribute('title', '!00000002');
+  });
+
+  it('renders no gateway chips when none are supplied', () => {
+    const { container } = render(<SourcesList sources={sources} />);
+    expect(container.querySelectorAll('.node-popup-gateways')).toHaveLength(0);
   });
 });
 

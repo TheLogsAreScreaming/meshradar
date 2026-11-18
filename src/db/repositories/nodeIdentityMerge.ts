@@ -258,6 +258,12 @@ export const NOT_REKEYED: readonly { table: string; reason: string }[] = [
     reason: 'Global (no sourceId) and keyed on the node number. Self-heals on the next key-repair pass.',
   },
   {
+    table: 'pki_exchange_state',
+    reason:
+      'Reliable PKI exchange outcome (#5691). Rebuilt by the next encrypted exchange with the ' +
+      'merged node; the hourly priming timer of the absorbed number is not carried over.',
+  },
+  {
     table: 'geofence_cooldowns',
     reason: 'Global (no sourceId). A stale cooldown expires on its own.',
   },
@@ -310,8 +316,8 @@ export const MERGE_COLLISION_POLICY = {
   nodes:
     "The predecessor's `nodes` row is deleted and snapshotted whole. The survivor keeps all its own " +
     'fields except `createdAt`, which takes the earlier of the two so the node\'s first-seen date ' +
-    'survives, and except `notes` / `isFavorite` / `favoriteLocked`, which are carried over only ' +
-    'when the survivor has none — operator-entered data must not vanish silently.',
+    'survives, and except `notes` / `isFavorite` / `favoriteLocked` and a locked `channel`, which are ' +
+    'carried over only when the survivor has none — operator-entered data must not vanish silently.',
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -767,6 +773,12 @@ export class NodeIdentityMergeRepository extends BaseRepository {
     if (this.truthy(fromRow.isFavorite) && !this.truthy(toRow.isFavorite)) {
       patch.isFavorite = fromRow.isFavorite;
       if (this.truthy(fromRow.favoriteLocked)) patch.favoriteLocked = fromRow.favoriteLocked;
+    }
+
+    // #5923: an admin-locked channel is operator-entered too.
+    if (this.truthy(fromRow.channelLocked) && !this.truthy(toRow.channelLocked)) {
+      patch.channel = fromRow.channel ?? null;
+      patch.channelLocked = fromRow.channelLocked;
     }
 
     return patch;

@@ -45,6 +45,12 @@ import {
   type AdminOperationStatus,
   type AdminOperationResult,
 } from '../services/adminOperationService.js';
+import {
+  adminVerifyJobService,
+  resolveVerifyTarget,
+  VerifyJobLimitError,
+  type VerifyTarget,
+} from '../services/adminVerifyJobService.js';
 import { isValidMeshtasticKey } from '../utils/meshtasticKeys.js';
 import {
   buildSecurityConfigWrite,
@@ -53,7 +59,10 @@ import {
   type RawSecurityConfig,
 } from '../utils/securityConfigWrite.js';
 import { channelPskToStoredBase64 } from '../utils/channelPsk.js';
+import { formatAdminMqttConfig } from '../utils/adminMqttConfig.js';
 import { extendRequestTimeout } from '../middleware/requestTimeout.js';
+import { fillDeviceMqttFromPreset } from '../services/mqttBrokerPresetFill.js';
+import { checkMqttRootSave, failInvalidMqttRoot } from '../utils/mqttRootGuard.js';
 
 // Admin operations round-trip to the radio and can legitimately run past the
 // 30s default socket timeout; extend it per-route so the caller gets the
@@ -427,26 +436,12 @@ router.post('/load-config', extendRequestTimeout(LOAD_CONFIG_TIMEOUT_MS), requir
             break;
           case 'mqtt':
             if (finalConfig.moduleConfig?.mqtt) {
-              config = {
-                enabled: finalConfig.moduleConfig.mqtt.enabled || false,
-                address: finalConfig.moduleConfig.mqtt.address || '',
-                username: finalConfig.moduleConfig.mqtt.username || '',
-                password: finalConfig.moduleConfig.mqtt.password || '',
-                encryptionEnabled: finalConfig.moduleConfig.mqtt.encryptionEnabled !== false,
-                jsonEnabled: finalConfig.moduleConfig.mqtt.jsonEnabled || false,
-                root: finalConfig.moduleConfig.mqtt.root || ''
-              };
+              config = formatAdminMqttConfig(finalConfig.moduleConfig.mqtt);
             } else {
-              // MQTT config might not exist if it's not configured, return empty config
-              config = {
-                enabled: false,
-                address: '',
-                username: '',
-                password: '',
-                encryptionEnabled: true,
-                jsonEnabled: false,
-                root: ''
-              };
+              // No MQTT config cached for the local node yet. Answer with the
+              // firmware's factory values, where encryption is on
+              // (default_mqtt_encryption_enabled), not the proto3 zero values.
+              config = { ...formatAdminMqttConfig({}), encryptionEnabled: true };
             }
             break;
           case 'security':
@@ -600,15 +595,7 @@ router.post('/load-config', extendRequestTimeout(LOAD_CONFIG_TIMEOUT_MS), requir
             }
             break;
           case 'mqtt':
-            config = {
-              enabled: remoteConfig.enabled || false,
-              address: remoteConfig.address || '',
-              username: remoteConfig.username || '',
-              password: remoteConfig.password || '',
-              encryptionEnabled: remoteConfig.encryptionEnabled !== false,
-              jsonEnabled: remoteConfig.jsonEnabled || false,
-              root: remoteConfig.root || ''
-            };
+            config = formatAdminMqttConfig(remoteConfig);
             break;
           case 'security':
             // Convert admin keys from Uint8Array to base64 strings for UI
@@ -1017,7 +1004,11 @@ router.post('/get-device-metadata', extendRequestTimeout(GET_DEVICE_METADATA_TIM
             canShutdown: localNodeInfo.canShutdown ?? null,
             hasRemoteHardware: false,
             deviceStateVersion: 0,
-            positionFlags: 0
+            positionFlags: 0,
+            // #6157: DeviceMetadata.ble_address — the BLE MAC the node
+            // advertises. Only present when non-empty (firmware-develop only
+            // today); omitted otherwise so the UI shows nothing.
+            ...(localNodeInfo.bleAddress ? { bleAddress: localNodeInfo.bleAddress } : {})
           }
         });
       } else {
@@ -1057,7 +1048,12 @@ router.post('/get-device-metadata', extendRequestTimeout(GET_DEVICE_METADATA_TIM
             // field 14): whether XEdDSA packet signature verification is
             // compiled in. Distinguishes "this node cannot sign" from "this
             // node did not sign this packet" (#3923).
-            hasXeddsa: metadata.hasXeddsa || false
+            hasXeddsa: metadata.hasXeddsa || false,
+            // #6157: DeviceMetadata.ble_address — only when the remote node
+            // reports a non-empty address (firmware-develop only today).
+            ...(typeof metadata.bleAddress === 'string' && metadata.bleAddress
+              ? { bleAddress: metadata.bleAddress }
+              : {})
           }
         });
       } else {
@@ -1479,10 +1475,14 @@ router.post('/import-config', requireAdmin(), requireMeshtasticDeviceSource('bod
           // #4294's export fix; older exported URLs may still carry the old
           // forced `true`), and finally true (fail-open).
           let remoteTxEnabled: boolean | undefined;
+          // #6181: transparent_mode is never taken from the URL; keep what the
+          // remote node reports (live, else cached, else false).
+          let remoteTransparentMode: boolean | undefined;
           try {
             const liveRemoteLora = await aicManager.requestRemoteConfig(destinationNodeNum, 5, false); // LORA_CONFIG = 5
             if (liveRemoteLora) {
               remoteTxEnabled = liveRemoteLora.txEnabled !== false;
+              remoteTransparentMode = liveRemoteLora.transparentMode === true;
             }
           } catch (error) {
             logger.warn(`⚠️ Could not fetch live remote LoRa config for txEnabled preserve on node ${destinationNodeNum}; falling back to cached/URL value:`, error);
@@ -1498,9 +1498,14 @@ router.post('/import-config', requireAdmin(), requireMeshtasticDeviceSource('bod
               ? cachedRemoteLora.txEnabled !== false
               : (decoded.loraConfig.txEnabled ?? true);
           }
+          if (remoteTransparentMode === undefined) {
+            remoteTransparentMode =
+              aicManager.getRemoteNodeConfig(destinationNodeNum)?.deviceConfig?.lora?.transparentMode === true;
+          }
           const loraConfigToImport = {
             ...decoded.loraConfig,
             txEnabled: remoteTxEnabled,
+            transparentMode: remoteTransparentMode,
           };
           const adminMessage = protobufService.createSetLoRaConfigMessage(loraConfigToImport, sessionPasskey);
           await aicManager.sendAdminCommand(adminMessage, destinationNodeNum);
@@ -2083,12 +2088,21 @@ router.post('/commands', requireAdmin(), requireMeshtasticDeviceSource('body'), 
         }
         buildAdminMessage = (passkey) => protobufService.createSetDeviceConfigMessage(params.config, passkey);
         break;
-      case 'setLoRaConfig':
+      case 'setLoRaConfig': {
         if (!params.config) {
           return res.status(400).json({ error: 'config is required for setLoRaConfig' });
         }
-        buildAdminMessage = (passkey) => protobufService.createSetLoRaConfigMessage(params.config, passkey);
+        // #6181: set_config replaces the whole LoRaConfig, so transparent_mode
+        // must ride along or the save turns it off. MeshRadar never chooses
+        // it: send what the node last reported (local: live config; remote:
+        // the cached /load-config snapshot, else false as before).
+        const reportedTransparentMode = isLocalNode
+          ? acManager.isTransparentMode()
+          : acManager.getRemoteNodeConfig(destinationNodeNum)?.deviceConfig?.lora?.transparentMode === true;
+        const loraConfig = { ...params.config, transparentMode: reportedTransparentMode };
+        buildAdminMessage = (passkey) => protobufService.createSetLoRaConfigMessage(loraConfig, passkey);
         break;
+      }
       case 'setPositionConfig': {
         if (!params.config) {
           return res.status(400).json({ error: 'config is required for setPositionConfig' });
@@ -2135,6 +2149,19 @@ router.post('/commands', requireAdmin(), requireMeshtasticDeviceSource('body'), 
       case 'setMQTTConfig':
         if (!params.config) {
           return res.status(400).json({ error: 'config is required for setMQTTConfig' });
+        }
+        {
+          // A saved broker preset's login, for a caller who was not shown it (#5794).
+          const presetErr = await fillDeviceMqttFromPreset(params.config);
+          if (presetErr) return fail(res, presetErr.status, presetErr.code, presetErr.message);
+          // Refuse a bad root, but only when it changes (#6338). The previous
+          // root comes from this source's cache of the target node; an
+          // unknown one counts as a change.
+          const prevMqtt = isLocalNode
+            ? acManager.getActualModuleConfig?.()?.mqtt
+            : acManager.getRemoteNodeConfig?.(destinationNodeNum)?.moduleConfig?.mqtt;
+          const rootErr = checkMqttRootSave(params.config.root, prevMqtt?.root);
+          if (rootErr) return failInvalidMqttRoot(res, rootErr, 'root');
         }
         buildAdminMessage = (passkey) => protobufService.createSetMQTTConfigMessage(params.config, passkey);
         break;
@@ -2453,7 +2480,22 @@ router.post('/commands', requireAdmin(), requireMeshtasticDeviceSource('body'), 
         if (params.favoriteNodeNum === undefined) {
           return res.status(400).json({ error: 'favoriteNodeNum is required for setFavoriteNode' });
         }
-        buildAdminMessage = (passkey) => protobufService.createSetFavoriteNodeMessage(params.favoriteNodeNum, passkey);
+        {
+          const favoriteNodeNum = Number(params.favoriteNodeNum);
+          // #6153: send add_contact first, as FavoritesService does for every
+          // other favorite path. set_favorite_node only flags an existing NodeDB
+          // entry, so without this it does nothing on a radio that doesn't hold
+          // the node yet. A failed add_contact still lets set_favorite_node go.
+          preSend = async (passkey) => {
+            try {
+              const contactMsg = await acManager.buildFavoritedContactMessage(favoriteNodeNum, passkey ?? new Uint8Array());
+              if (contactMsg) await acManager.sendAdminCommand(contactMsg, destinationNodeNum);
+            } catch (error) {
+              logger.warn(`⚠️ add_contact for ${favoriteNodeNum} failed; sending set_favorite_node anyway:`, error);
+            }
+          };
+          buildAdminMessage = (passkey) => protobufService.createSetFavoriteNodeMessage(favoriteNodeNum, passkey);
+        }
         break;
       case 'removeFavoriteNode':
         // Use favoriteNodeNum to avoid collision with destination nodeNum
@@ -2514,6 +2556,54 @@ router.post('/commands', requireAdmin(), requireMeshtasticDeviceSource('body'), 
         return ok(res, result);
       }
       return res.json({ success: true, ...result });
+    }
+
+    // Verified save (#4487): send once, then read the section back until it
+    // proves the change landed. Opt-in; runs as a background job.
+    if (params.verify === true) {
+      // Decode the packet the job will send, so the comparison sees exactly
+      // what goes on the wire (server-side defaults included). Security's
+      // builder depends on its preSend read, so it is refused before building.
+      let target: VerifyTarget | null = null;
+      if (!oneShot && command !== 'setSecurityConfig') {
+        try {
+          target = resolveVerifyTarget(protobufService.decodeAdminMessage(buildAdminMessage()));
+        } catch (error) {
+          logger.debug(`Could not decode '${command}' for verification: ${(error as Error)?.message}`);
+        }
+      }
+      if (!target) {
+        return fail(res, 400, 'VERIFY_UNSUPPORTED', `'${command}' cannot be verified by reading the config back`);
+      }
+      const cached = acManager.getRemoteNodeConfig(destinationNodeNum);
+      const baseline = (target.kind === 'module' ? cached?.moduleConfig : cached?.deviceConfig)?.[target.section];
+      if (!baseline) {
+        return fail(res, 409, 'VERIFY_NEEDS_BASELINE', 'Load this config from the node first, so the save can be compared against it');
+      }
+      try {
+        const job = adminVerifyJobService.start(
+          {
+            sourceId: acManager.sourceId,
+            destinationNodeNum,
+            command,
+            userId: req.session?.userId ?? null,
+            target,
+            baseline: structuredClone(baseline),
+          },
+          {
+            send: async () => {
+              await execute();
+            },
+            readBack: () => acManager.requestRemoteConfig(destinationNodeNum, target.adminType, target.kind === 'module'),
+            isFatal: (error) =>
+              isTxDisabledError(error) ? { code: 'TX_DISABLED', message: 'Transmit is disabled on this source' } : null,
+          },
+        );
+        return res.status(202).json({ success: true, verifyJobId: job.id, status: job.status });
+      } catch (error) {
+        if (error instanceof VerifyJobLimitError) return fail(res, 429, error.code, error.message);
+        throw error;
+      }
     }
 
     // Remote node: accept now, finish on the mesh's schedule (#4482). Holding
@@ -2626,6 +2716,20 @@ router.get('/operations/:id', requireAdmin(), async (req, res) => {
     result: operation.result,
     error: operation.error,
   });
+});
+
+/**
+ * Verified-save jobs (#4487). Every admin sees every job: they act on shared
+ * radios, and anyone may need to cancel one that is still sending.
+ */
+router.get('/verify-jobs', requireAdmin(), (_req, res) => {
+  return ok(res, adminVerifyJobService.list());
+});
+
+router.post('/verify-jobs/:id/cancel', requireAdmin(), (req, res) => {
+  const job = adminVerifyJobService.cancel(req.params.id);
+  if (!job) return fail(res, 404, 'VERIFY_JOB_NOT_FOUND', 'Unknown or expired verify job');
+  return ok(res, job);
 });
 
 

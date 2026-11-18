@@ -94,6 +94,7 @@ export const BACKUP_TABLES: string[] = [
   'automation_variables',
   'automation_variable_values',
   'automation_home_anchors',
+  'automation_fire_state',
   'custom_themes',
   'user_map_preferences',
   'embed_profiles',
@@ -120,6 +121,8 @@ export const BACKUP_TABLES: string[] = [
   'meshcore_nodes',
   'meshcore_messages',
   'meshcore_neighbor_info',
+  // #6274: per-repeater first-seen ledger for the confirmed new-neighbour alert.
+  'meshcore_neighbor_watch',
   'meshcore_position_history',
   'meshcore_heard_repeaters',
   'reticulum_destinations',
@@ -127,10 +130,16 @@ export const BACKUP_TABLES: string[] = [
   'reticulum_paths',
 
   // ── Secrets ──────────────────────────────────────────────────────────────
-  // All three are described in BACKUP_SECRET_TABLES.
+  // All of these are described in BACKUP_SECRET_TABLES.
   'api_tokens',
+  // #5841: WebAuthn passkeys. FK to users (cascade).
+  'user_passkeys',
   'source_pki_keys',
+  // #4305: MQTT-native send identity (sealed X25519 private key).
+  'mqtt_native_identities',
   'meshcore_observer_credentials',
+  // Values user scripts receive as environment variables (API keys).
+  'script_secrets',
 
   // ── History, logs and derived data ───────────────────────────────────────
   // The large group. Everything here can be lost without breaking the install,
@@ -157,6 +166,28 @@ export const BACKUP_TABLES: string[] = [
   // have; leaving them out would start every cooldown from "never fired".
   'auto_key_repair_state',
   'auto_key_repair_log',
+  // #5691 Reliable PKI: per-node exchange outcome and the hourly priming timer.
+  'pki_exchange_state',
+  // #5686: local map markers (user planning data; never transmitted).
+  'map_markers',
+  // #5722: per-hop SNR history from MeshCore traces (reception history).
+  'meshcore_hop_snr',
+  // #6276: attempt log of MeshCore traces sent (answered, timeout, failed).
+  'meshcore_trace_runs',
+  // #6210: daily rollup of nodes heard directly over RF (reception history).
+  'direct_rf_contacts',
+  // #5862: node rename history (names the nodes broadcast).
+  'node_name_history',
+  // #5794: saved MQTT broker presets (admin-curated; holds broker logins).
+  'mqtt_broker_presets',
+  // #5892: MeshCore CLI commands people issued (command/reply text redacted).
+  'meshcore_cli_history',
+  // #5785: remembered MeshCore remote-admin logins. Backed up rather than
+  // excluded: a row is not a credential (the remote's ACL is the authority,
+  // and Log out never touches it), and every read requires the connected
+  // companion's key to equal `selfPublicKey`, so a restore onto another radio
+  // leaves the rows inert. A stale row costs one CLI timeout, then a re-login.
+  'meshcore_admin_sessions',
   'geofence_cooldowns',
   'news_cache',
 ];
@@ -178,6 +209,12 @@ export const BACKUP_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
   // Bookkeeping for device-config backup FILES on this install's disk. Those
   // files are not in a system backup, so the rows would point at nothing.
   backup_history: 'index of device-config backup files on this install, which are not in the backup',
+  // #6195: auto-captured MeshCore Companion device IDENTITY private keys. Unlike
+  // the other SESSION_SECRET-sealed stores, these grant full control of a
+  // physical device's identity, and we never asked the operator to store them
+  // (capture is automatic) — so they are kept OUT of backups entirely rather
+  // than riding along as a sealed-but-present second-stage exploit target.
+  meshcore_source_pki_keys: 'auto-captured MeshCore device identity private keys; a stolen backup must not carry device identities (#6195)',
 };
 
 /**
@@ -190,14 +227,30 @@ export const BACKUP_EXCLUDED_TABLES: Readonly<Record<string, string>> = {
  * (systemRestoreService.findUnreadableSecrets).
  */
 export const BACKUP_SECRET_TABLES: Readonly<Record<string, { protection: string; sessionSecret: boolean }>> = {
-  users: { protection: 'password hashes (bcrypt); MFA secrets as stored', sessionSecret: false },
+  users: {
+    protection: 'password hashes (bcrypt); MFA secrets as stored; MFA backup and passkey recovery codes as bcrypt hashes',
+    sessionSecret: false,
+  },
   api_tokens: { protection: 'bcrypt hash of each token; the token itself is never stored', sessionSecret: false },
+  user_passkeys: {
+    protection: 'public keys only (no private key leaves the authenticator); credential ids tied to user ids are account data',
+    sessionSecret: false,
+  },
   channels: { protection: 'NONE — channel PSKs in the clear', sessionSecret: false },
   channel_database: { protection: 'NONE — channel decryption PSKs in the clear', sessionSecret: false },
   mesh_beacon_offers: { protection: 'NONE — offered channel PSKs in the clear', sessionSecret: false },
+  mqtt_broker_presets: { protection: 'NONE — saved MQTT broker passwords in the clear, as in sources.config', sessionSecret: false },
   source_pki_keys: { protection: 'AES-256-GCM envelope keyed from SESSION_SECRET', sessionSecret: true },
+  mqtt_native_identities: {
+    protection: 'X25519 private key as an AES-256-GCM envelope keyed from SESSION_SECRET (#4305); public key and node number in the clear',
+    sessionSecret: true,
+  },
   meshcore_observer_keys: { protection: 'AES-256-GCM envelope keyed from SESSION_SECRET', sessionSecret: true },
   meshcore_observer_credentials: { protection: 'AES-256-GCM envelope keyed from SESSION_SECRET', sessionSecret: true },
+  script_secrets: {
+    protection: 'AES-256-GCM envelope keyed from SESSION_SECRET; secret names in the clear',
+    sessionSecret: true,
+  },
   meshcore_nodes: {
     protection: 'saved repeater/room passwords as AES-256-GCM envelopes keyed from SESSION_SECRET',
     sessionSecret: true,

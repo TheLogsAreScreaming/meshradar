@@ -173,6 +173,7 @@ vi.mock('./CustomThemeManagement', () => ({ CustomThemeManagement: () => null })
 vi.mock('./CustomTilesetManager', () => ({ CustomTilesetManager: () => null }));
 vi.mock('./LanguageSelector', () => ({ LanguageSelector: () => null }));
 vi.mock('./PositionEstimationSection', () => ({ default: () => null }));
+vi.mock('./MeshWarsSection', () => ({ default: () => null }));
 vi.mock('./TapbackEmojiSettings', () => ({ default: () => null }));
 vi.mock('./settings/EmbedSettings', () => ({ default: () => null }));
 vi.mock('./configuration/DefaultMapCenterPicker', () => ({ DefaultMapCenterPicker: () => null }));
@@ -519,7 +520,44 @@ describe('SettingsTab — Flight matching (ADS-B) section (#5374)', () => {
     expect(feed.disabled).toBe(true);
     expect(screen.getByText(/adsb\.lol: open data under the ODbL/)).toBeTruthy();
     // airplanes.live is not offered in v1.
-    expect(Array.from(feed.options).map((o) => o.value)).toEqual(['adsb.lol', 'adsb.fi']);
+    expect(Array.from(feed.options).map((o) => o.value)).toEqual(['adsb.lol', 'adsb.fi', 'opensky']);
+  });
+
+  // OpenSky (#5877) has no anonymous mode: the option stays disabled until
+  // both credentials are filled in, then saves with them.
+  it('offers OpenSky only once both credentials are set, and saves them', async () => {
+    serverSettings = { adsbMatchEnabled: 'true' };
+    renderSettings();
+    await screen.findByRole('heading', { name: 'Flight matching (ADS-B)' });
+    const feed = document.getElementById('adsbFeed') as HTMLSelectElement;
+    const opensky = () => Array.from(feed.options).find((o) => o.value === 'opensky')!;
+    await waitFor(() => expect(feed.disabled).toBe(false));
+    expect(opensky().disabled).toBe(true);
+    expect(opensky().textContent).toMatch(/needs client ID and secret/);
+
+    const id = document.getElementById('adsbOpenSkyClientId') as HTMLInputElement;
+    const secret = document.getElementById('adsbOpenSkyClientSecret') as HTMLInputElement;
+    fireEvent.change(id, { target: { value: 'my-client' } });
+    expect(opensky().disabled).toBe(true);
+    fireEvent.change(secret, { target: { value: ' s3cret ' } });
+    await waitFor(() => expect(opensky().disabled).toBe(false));
+
+    fireEvent.change(feed, { target: { value: 'opensky' } });
+    expect(screen.getByText(/OpenSky Network: non-commercial and research use only/)).toBeTruthy();
+
+    await saveBarCapture.current!.onSave();
+    const [, options] = csrfFetchMock.mock.calls[csrfFetchMock.mock.calls.length - 1];
+    const body = JSON.parse((options as RequestInit).body as string);
+    expect(body.adsbFeed).toBe('opensky');
+    expect(body.adsb_opensky_client_id).toBe('my-client');
+    expect(body.adsb_opensky_client_secret).toBe('s3cret');
+  });
+
+  it('warns when OpenSky is selected but a credential is missing', async () => {
+    serverSettings = { adsbMatchEnabled: 'true', adsbFeed: 'opensky', adsb_opensky_client_id: 'my-client' };
+    renderSettings();
+    await screen.findByRole('heading', { name: 'Flight matching (ADS-B)' });
+    expect(await screen.findByText(/needs both a client ID and a client secret/)).toBeTruthy();
   });
 
   it('loads stored values and saves edits (enable, feed, key)', async () => {
@@ -542,5 +580,74 @@ describe('SettingsTab — Flight matching (ADS-B) section (#5374)', () => {
     expect(body.adsbMatchEnabled).toBe('true');
     expect(body.adsbFeed).toBe('adsb.lol');
     expect(body.adsb_api_token).toBe('new-key');
+  });
+});
+
+// Tropospheric ducting overlay (#5734): one admin-only global switch, next to
+// elevation and ADS-B, reusing this suite's mocks.
+describe('SettingsTab — Tropospheric ducting overlay section (#5734)', () => {
+  beforeEach(() => {
+    csrfFetchMock.mockClear();
+    csrfFetchMock.mockResolvedValue({ ok: true, json: async () => ({}) });
+    saveBarCapture.current = null;
+    installFetchMock();
+  });
+
+  it('is off by default', async () => {
+    serverSettings = {};
+    renderSettings();
+    await screen.findByRole('heading', { name: 'Tropospheric ducting overlay' });
+    const box = document.getElementById('ductingOverlayEnabled') as HTMLInputElement;
+    expect(box.checked).toBe(false);
+  });
+
+  it('loads a stored value and saves the edit as a strict boolean', async () => {
+    serverSettings = { ductingOverlayEnabled: 'true' };
+    renderSettings();
+    await screen.findByRole('heading', { name: 'Tropospheric ducting overlay' });
+    const box = document.getElementById('ductingOverlayEnabled') as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+
+    fireEvent.click(box);
+    await waitFor(() => expect(box.checked).toBe(false));
+    await saveBarCapture.current!.onSave();
+    const [, options] = csrfFetchMock.mock.calls[csrfFetchMock.mock.calls.length - 1];
+    const body = JSON.parse((options as RequestInit).body as string);
+    expect(body.ductingOverlayEnabled).toBe('false');
+  });
+});
+
+// MQTT root directory refresh (#6337): one admin-only global switch, next to
+// elevation, reusing this suite's mocks.
+describe('SettingsTab — MQTT root directory refresh section (#6337)', () => {
+  beforeEach(() => {
+    csrfFetchMock.mockClear();
+    csrfFetchMock.mockResolvedValue({ ok: true, json: async () => ({}) });
+    saveBarCapture.current = null;
+    installFetchMock();
+  });
+
+  it('is off by default and says what the request reveals', async () => {
+    serverSettings = {};
+    renderSettings();
+    await screen.findByRole('heading', { name: 'MQTT root directory refresh' });
+    const box = document.getElementById('mqttRootDirectoryRefreshEnabled') as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    expect(screen.getByText(/IP address and that someone used the finder/)).toBeTruthy();
+  });
+
+  it('loads a stored value and saves the edit as a strict boolean', async () => {
+    serverSettings = { mqttRootDirectoryRefreshEnabled: 'true' };
+    renderSettings();
+    await screen.findByRole('heading', { name: 'MQTT root directory refresh' });
+    const box = document.getElementById('mqttRootDirectoryRefreshEnabled') as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+
+    fireEvent.click(box);
+    await waitFor(() => expect(box.checked).toBe(false));
+    await saveBarCapture.current!.onSave();
+    const [, options] = csrfFetchMock.mock.calls[csrfFetchMock.mock.calls.length - 1];
+    const body = JSON.parse((options as RequestInit).body as string);
+    expect(body.mqttRootDirectoryRefreshEnabled).toBe('false');
   });
 });

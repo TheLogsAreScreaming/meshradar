@@ -9,9 +9,43 @@ A comprehensive web application for monitoring off-grid mesh networks — Meshta
 
 > MeshRadar is a fork of [MeshMonitor](https://github.com/Yeraze/meshmonitor) by Yeraze, released under the same license. The Docker image is published at `ghcr.io/charlottemeshtastic/meshradar`; links to meshmonitor.org point at the original project's documentation.
 
-![MeshRadar Interface](docs/images/main.png)
+![MeshRadar unified map of every connected source](docs/images/main.png)
 
-![MeshRadar Interface](docs/images/channels.png)
+*The unified map. Every source (Meshtastic radios, MeshCore companions, MQTT bridges and the built-in broker) is listed down the left with its connection state and how many nodes were active in the last two hours. Nodes from all of them share one map.*
+
+## Screenshots
+
+All screenshots are from the original MeshMonitor project's public demo at **[meshmonitor.yeraze.com](https://meshmonitor.yeraze.com/)**, viewed signed out.
+
+### Source view: nodes and map
+
+![Node list and map for a single Meshtastic source](docs/images/source-nodes.png)
+
+Open a source to see its own nodes. The list shows each node's role, SNR and RSSI, power, hop count and last-heard time, and you can filter, sort and export it. On the map, nearby nodes group into numbered clusters until you zoom in. See [Interactive Maps](https://meshmonitor.org/features/maps.html) and [Multi-Source](https://meshmonitor.org/features/multi-source.html).
+
+### Channels
+
+![Channel messages with replies, reactions and hop counts](docs/images/channels.png)
+
+Channel chat supports threaded replies, emoji reactions, and a hop count on every message (for example `4/6 hops`). A toggle shows or hides messages that arrived over MQTT or a bridge.
+
+### Telemetry dashboard
+
+![Per-source telemetry dashboard with node status and hop distribution](docs/images/dashboard.png)
+
+Each source has a drag-and-drop dashboard of widgets. In this shot, **Node Status** shows last-heard, signal and voltage for favorited nodes, and **Hop Distribution** shows how far away the nodes this radio hears are, from direct to 7 hops. See [Telemetry Widgets](https://meshmonitor.org/features/telemetry-widgets.html).
+
+### Unified telemetry
+
+![Telemetry graphs merged across Meshtastic and MeshCore sources](docs/images/telemetry.png)
+
+Favorited telemetry from all sources on one page: RSSI and noise floor from a MeshCore repeater sit beside packet counters from a Meshtastic node. Pick a window from 15 minutes to 7 days, or narrow it to one source.
+
+### Analysis & Reports
+
+![Solar Monitoring Analysis report with battery and solar production chart](docs/images/reports.png)
+
+Reports run across every source. **Solar Monitoring Analysis** (shown here) spots solar-powered nodes from their daily charge and discharge pattern and charts battery level against expected solar production. Other reports include NodeInfo Enrichment, ok_to_mqtt Violations, Mesh Issues, Coverage Report and Traceroute Explorer. See [Analysis & Reports](https://meshmonitor.org/features/analysis-reports.html) and [Solar Monitoring](https://meshmonitor.org/features/solar-monitoring.html).
 
 ## Documentation
 
@@ -65,8 +99,7 @@ helm repo update
 # Minimal custom-values.yaml
 cat > custom-values.yaml << 'EOF'
 env:
-  meshtasticNodeIp: "192.168.1.100"
-  meshtasticUseTls: "false"
+  meshtasticNodeIp: "192.168.1.100"   # optional; omit to add sources in the UI
 EOF
 
 helm install meshmonitor meshmonitor/meshmonitor -f custom-values.yaml
@@ -216,7 +249,7 @@ When proxy authentication is enabled, existing local users are **automatically m
 
 MeshRadar supports multiple deployment methods:
 
-- **🐳 Docker** (Recommended) - Pre-built multi-architecture images with auto-upgrade support
+- **🐳 Docker** (Recommended) - Pre-built multi-architecture images with update notifications
   - [Docker Compose Guide](docs/deployment/DEPLOYMENT_GUIDE.md)
   - Platforms: amd64, arm64, armv7
 
@@ -245,7 +278,7 @@ MeshRadar supports multiple deployment methods:
 - **Multi-Protocol, Multi-Source** - Monitor Meshtastic (TCP/Serial/BLE), MeshCore (USB/TCP), and MQTT brokers from a single deployment, with per-source permissions, schedulers, and Virtual Nodes
 - **Embedded MQTT Broker** - Optional built-in broker with bidirectional bridges to public upstreams and topic/channel/portnum/geo filtering
 - **MQTT Geo Filtering** - With a bounding box configured on an MQTT bridge source, nodes that report a position outside the box are automatically ignored and have all their stored data purged (messages, telemetry, traceroutes, etc.); they reappear automatically the moment they report an in-bounds position. Nodes that never report a position always flow through (no more silent hiding, unlike previous releases). Manually-ignored nodes are never auto-un-ignored. Changing the bounding box retroactively re-applies the rule to already-stored nodes.
-- **Analysis & Reports (4.2)** - Cross-source analytical workspace at `/reports`; first report is Solar Monitoring Analysis with auto-detection of solar-powered nodes, production overlay, healthy-level reference lines, and multi-day battery forecast simulation
+- **Analysis & Reports** - Cross-source workspace at `/reports`: coverage reports, traceroute explorer, mesh issue checks, and solar analysis with battery forecasts
 - **Real-time Mesh Monitoring** - Live node discovery, telemetry, and message tracking across every connected source
 - **Modern UI** - Catppuccin theme with message reactions and threading
 - **Interactive Maps** - Unified node positions and network topology visualization across all sources
@@ -260,7 +293,7 @@ MeshRadar supports multiple deployment methods:
 - **Virtual Node Server** - Remote TCP access for Meshtastic mobile/Python clients, plus a MeshCore Virtual Node to connect the MeshCore app to a managed device over WiFi
 - **REST API** - v1 API with Bearer token authentication for external integrations
 - **Docker Ready** - Pre-built multi-architecture images
-- **One-click Self-Upgrade** - Automatic upgrades from the UI with backup and rollback
+- **Update Notifications** - The UI tells you when a new release is out ([how to update](https://meshmonitor.org/configuration/updating))
 - **System Backup & Restore** - Complete disaster recovery with automated backups
 
 For a complete feature list and technical details, visit **[meshmonitor.org](https://meshmonitor.org/)**.
@@ -313,7 +346,7 @@ This starts both the React dev server (port 5173) and the Express API server (po
 
 **Frontend:**
 - React 19 with TypeScript
-- Vite 7 (build tool)
+- Vite 8 (build tool)
 - CSS3 with Catppuccin theme
 - Translation support crowdsourced by [Weblate](https://hosted.weblate.org/projects/meshmonitor/)
 

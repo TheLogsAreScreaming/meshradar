@@ -1,4 +1,5 @@
 import { Channel } from '../../types/device';
+import type { ResponderSyntax } from '../../utils/responderTrigger';
 
 /**
  * Script metadata from the API
@@ -16,6 +17,11 @@ export type ResponseType = 'text' | 'http' | 'script' | 'traceroute' | 'mailbox'
 export interface AutoResponderTrigger {
   id: string;
   trigger: string | string[]; // Single pattern or array of patterns (e.g., "ask" or ["ask", "ask {message}"])
+  /**
+   * How `trigger` is read (#5924): 'pattern' (placeholder DSL, anchored) or
+   * 'regex' (bare, unanchored, case-insensitive). Missing = 'pattern'.
+   */
+  syntax?: ResponderSyntax;
   responseType: ResponseType;
   response: string; // Either text content, HTTP URL, or script path
   multiline?: boolean; // Enable multiline support for text/http responses
@@ -25,6 +31,8 @@ export interface AutoResponderTrigger {
   channel?: number | 'dm' | 'none';
   scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
   cooldownSeconds?: number; // Per-node cooldown in seconds (0 = disabled, default)
+  /** Per-trigger switch (#6405). Only an explicit `false` turns it off; absent = enabled, so stored triggers keep working. */
+  enabled?: boolean;
 }
 
 export type TimerResponseType = 'script' | 'text';
@@ -37,7 +45,11 @@ export interface TimerTrigger {
   scriptPath?: string; // Path to script in /data/scripts/ (when responseType is 'script')
   response?: string; // Text message with expansion tokens (when responseType is 'text')
   scriptArgs?: string; // Optional CLI arguments for script execution (supports token expansion)
-  channel: number | 'none'; // Channel index (0-7) to send output to, or 'none' for scripts with no mesh output
+  channels?: Array<number | 'none'>; // Channel indexes (0-7) to send output to, or ['none'] for scripts with no mesh output (#6230)
+  /** @deprecated Use channels instead. Kept so old single-channel timers keep working (#6230). */
+  channel?: number | 'none'; // Legacy single channel index (0-7), or 'none' for scripts with no mesh output
+  /** Split a long message into up to 3 marked parts (#6330). Needs a schedule of at least 5 minutes. */
+  multiline?: boolean;
   enabled: boolean; // Whether this timer is active
   lastRun?: number; // Unix timestamp of last execution
   lastResult?: 'success' | 'error'; // Result of last execution
@@ -94,19 +106,11 @@ export interface AutoResponderSectionProps {
   onEnabledChange: (enabled: boolean) => void;
   onTriggersChange: (triggers: AutoResponderTrigger[]) => void;
   onSkipIncompleteNodesChange: (enabled: boolean) => void;
+  /** #6449: also answer messages the sender flagged as automated. Default false (skip them). */
+  respondToAutomation?: boolean;
+  onRespondToAutomationChange?: (enabled: boolean) => void;
+  /** False disables every control (no automation write permission). Default true. */
+  canWrite?: boolean;
+  /** True when the source cannot transmit; shows the paused note. */
+  receiveOnly?: boolean;
 }
-
-export interface TriggerItemProps {
-  trigger: AutoResponderTrigger;
-  isEditing: boolean;
-  localEnabled: boolean;
-  availableScripts: ScriptMetadata[];
-  channels: Channel[];
-  baseUrl: string;
-  onStartEdit: () => void;
-  onCancelEdit: () => void;
-  onSaveEdit: (trigger: string | string[], responseType: ResponseType, response: string, multiline: boolean, verifyResponse: boolean, channels: Array<number | 'dm' | 'none'>, scriptArgs?: string, cooldownSeconds?: number) => void;
-  onRemove: () => void;
-  showToast?: (message: string, type: 'success' | 'error' | 'warning') => void;
-}
-

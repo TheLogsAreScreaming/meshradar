@@ -35,6 +35,43 @@ describe('applyLoadedConfig', () => {
     expect(Object.keys(CONFIG_APPLIERS).sort()).toEqual([...LOAD_CONFIG_TYPES].sort());
   });
 
+  it('mqtt: carries tlsEnabled, so the broker preset and a re-save see the node\'s TLS (#5689)', () => {
+    const setters = makeSetters();
+    applyLoadedConfig('mqtt', { enabled: true, address: 'mqtt.meshtastic.org', tlsEnabled: true }, setters, { nodeNum: 100 });
+    expect(setters.setMQTTConfig).toHaveBeenCalledWith(expect.objectContaining({ address: 'mqtt.meshtastic.org', tlsEnabled: true }));
+    const off = makeSetters();
+    applyLoadedConfig('mqtt', { enabled: true }, off, { nodeNum: 100 });
+    expect(off.setMQTTConfig).toHaveBeenCalledWith(expect.objectContaining({ tlsEnabled: false }));
+  });
+
+  it('mqtt: carries client proxy and map reporting, and stamps the Save gate with the node', () => {
+    const setters = makeSetters();
+    applyLoadedConfig('mqtt', {
+      enabled: true,
+      proxyToClientEnabled: true,
+      mapReportingEnabled: true,
+      mapReportSettings: { publishIntervalSecs: 3600, positionPrecision: 12, shouldReportLocation: true },
+    }, setters, { nodeNum: 200 });
+    expect(setters.setMQTTConfig).toHaveBeenCalledWith(expect.objectContaining({
+      proxyToClientEnabled: true,
+      mapReportingEnabled: true,
+      mapPublishIntervalSecs: 3600,
+      mapPositionPrecision: 12,
+      mapShouldReportLocation: true,
+      loadedForNodeNum: 200,
+    }));
+    const bare = makeSetters();
+    applyLoadedConfig('mqtt', { enabled: false }, bare, { nodeNum: 200 });
+    expect(bare.setMQTTConfig).toHaveBeenCalledWith(expect.objectContaining({
+      proxyToClientEnabled: false,
+      mapReportingEnabled: false,
+      mapPublishIntervalSecs: 0,
+      mapPositionPrecision: 0,
+      mapShouldReportLocation: false,
+      loadedForNodeNum: 200,
+    }));
+  });
+
   it('lists owner and channels as the only sections with their own loader', () => {
     expect(ADMIN_LOAD_SECTIONS.filter(section => !(LOAD_CONFIG_TYPES as readonly string[]).includes(section)))
       .toEqual(['owner', 'channels']);

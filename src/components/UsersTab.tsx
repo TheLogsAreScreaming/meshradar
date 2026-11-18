@@ -7,6 +7,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation, Trans } from 'react-i18next';
 import { UiIcon } from './icons';
+import { PasswordField } from './shared/config/PasswordField';
 import '../styles/users.css';
 import { useAuth } from '../contexts/AuthContext';
 import api from '../services/api';
@@ -14,6 +15,7 @@ import { logger } from '../utils/logger';
 import type { PermissionSet, ResourceType } from '../types/permission';
 import { RESOURCES, SOURCEY_RESOURCES } from '../types/permission';
 import { useToast } from './ToastContainer';
+import AdminPasskeysDialog from './AdminPasskeysDialog';
 import { isAnyMeshCoreSourceType } from '../utils/nodeTypeCategory';
 
 interface Source {
@@ -33,6 +35,10 @@ interface User {
   passwordLocked: boolean;
   createdAt: number;
   lastLoginAt: number | null;
+  /** Passkey-only account (#5841). */
+  passwordLoginDisabled?: boolean;
+  /** How many passkeys the user has (#5841). */
+  passkeyCount?: number;
 }
 
 interface ChannelDatabaseEntry {
@@ -61,8 +67,13 @@ const PERMISSION_KEYS = [
   'dashboard', 'nodes', 'channel_0', 'channel_1', 'channel_2', 'channel_3',
   'channel_4', 'channel_5', 'channel_6', 'channel_7', 'messages', 'settings',
   'configuration', 'info', 'automation', 'connection', 'traceroute', 'audit',
-  'security', 'nodes_private', 'packetmonitor', 'waypoints'
+  'security', 'nodes_private', 'packetmonitor', 'waypoints', 'remote_admin'
 ] as const;
+
+// Real channel slots only (`channel_0`..`channel_7`). A bare
+// `startsWith('channel_')` also matches the global `channel_database`
+// resource, which has no viewOnMap action.
+const isChannelSlot = (resource: string): boolean => /^channel_\d+$/.test(resource);
 
 // PR-C: Global (non-sourcey) resources that surface above the per-source
 // grid. Derived from RESOURCES \ SOURCEY_RESOURCES so new globals (e.g.
@@ -84,6 +95,7 @@ const UsersTab: React.FC = () => {
   const [permissions, setPermissions] = useState<PermissionSet>({});
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showSetPasswordModal, setShowSetPasswordModal] = useState(false);
+  const [showPasskeysDialog, setShowPasskeysDialog] = useState(false);
   const [showDeactivateConfirm, setShowDeactivateConfirm] = useState(false);
   const [userToDeactivate, setUserToDeactivate] = useState<User | null>(null);
   const [showPermanentDeleteConfirm, setShowPermanentDeleteConfirm] = useState(false);
@@ -196,7 +208,7 @@ const UsersTab: React.FC = () => {
       if (user.isAdmin && Object.keys(response.permissions).length === 0) {
         const allPermissions: PermissionSet = {};
         PERMISSION_KEYS.forEach(resource => {
-          if (resource.startsWith('channel_')) {
+          if (isChannelSlot(resource)) {
             allPermissions[resource] = { viewOnMap: true, read: true, write: true };
           } else {
             allPermissions[resource] = { read: true, write: true };
@@ -274,7 +286,7 @@ const UsersTab: React.FC = () => {
         // `nodes` carries viewOnMap alongside channel_* resources (#4559):
         // read makes the node/contact list available, viewOnMap additionally
         // publishes positions on the map — the same split channels already have.
-        if (resource.startsWith('channel_') || resource === 'nodes') {
+        if (isChannelSlot(resource) || resource === 'nodes') {
           validPermissions[resource] = {
             viewOnMap: permissions[resource]?.viewOnMap || false,
             read: permissions[resource]?.read || false,
@@ -375,6 +387,11 @@ const UsersTab: React.FC = () => {
       await api.post(`/api/users/${selectedUser.id}/set-password`, {
         newPassword: passwordForm.newPassword
       });
+
+      // An admin-set password turns password sign-in back on (#5841).
+      const resetId = selectedUser.id;
+      setSelectedUser({ ...selectedUser, passwordLoginDisabled: false });
+      setUsers(prev => prev.map(u => (u.id === resetId ? { ...u, passwordLoginDisabled: false } : u)));
 
       // Reset form and close modal
       setPasswordForm({ newPassword: '', confirmPassword: '' });
@@ -648,11 +665,12 @@ const UsersTab: React.FC = () => {
     security: t('nav.security'),
     nodes_private: t('nodes_private'),
     connection: t('users.can_control_connection'),
-    traceroute: t('users.can_initiate_traceroutes'),
+    traceroute: t('users.traceroute_permission', 'Traceroute'),
     waypoints: 'Waypoints',
     themes: 'Custom Themes',
     sources: 'Sources',
     channel_database: 'Channel Database',
+    remote_admin: t('users.remote_admin_permission', 'Remote Administration'),
   };
 
   const tooltipMap: Record<string, string> = {
@@ -665,7 +683,8 @@ const UsersTab: React.FC = () => {
     info: 'Read: view device info and statistics.',
     automation: 'Read: view automation rules. Write: create/edit automation rules.',
     connection: 'Connect/disconnect the Meshtastic device for this source.',
-    traceroute: 'Initiate traceroute requests to mesh nodes.',
+    // #5898: read and write are separate, like every other resource.
+    traceroute: 'Read: view traceroutes and route data. Write: send traceroutes and NeighborInfo requests over the mesh.',
     audit: 'Read: view the audit log. Write: purge audit log entries.',
     security: 'Read: view security scan results. Write: run scans, manage flagged/dead nodes.',
     packetmonitor: 'Read: view raw Meshtastic packets in the packet monitor.',
@@ -673,6 +692,7 @@ const UsersTab: React.FC = () => {
     themes: 'Read: view custom color themes. Write: create and edit custom themes.',
     sources: 'Read: view per-source status. Write: create, edit, enable/disable, and delete data sources.',
     channel_database: 'Read: list global PSK library entries. Write: create/edit/delete entries used for MQTT decryption.',
+    remote_admin: 'Read: view remote MeshCore admin sessions and status. Write: log in to remote MeshCore nodes and send admin/CLI commands (reboot, configure).',
   };
 
   return (
@@ -707,6 +727,7 @@ const UsersTab: React.FC = () => {
                 </div>
                 <div className="user-item-meta">
                   @{user.username} • {user.authProvider.toUpperCase()}
+                  {(user.passkeyCount ?? 0) > 0 && ` • ${t('passkey_admin.count', { count: user.passkeyCount })}`}
                 </div>
               </div>
               {!user.isActive && <span className="inactive-badge">{t('users.inactive')}</span>}
@@ -770,6 +791,15 @@ const UsersTab: React.FC = () => {
                   </div>
                 </div>
               )}
+              {selectedUser.authProvider === 'local' && (
+                <div className="info-item">
+                  <label>{t('passkey_admin.label')}</label>
+                  <div>
+                    {t('passkey_admin.count', { count: selectedUser.passkeyCount ?? 0 })}
+                    {selectedUser.passwordLoginDisabled && ` • ${t('passkey_admin.password_off_short')}`}
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="user-actions">
@@ -788,6 +818,14 @@ const UsersTab: React.FC = () => {
                   title={selectedUser.passwordLocked ? t('users.password_locked_hint') : ''}
                 >
                   {t('users.set_password')}
+                </button>
+              )}
+              {selectedUser.authProvider === 'local' && (
+                <button
+                  className="button button-secondary"
+                  onClick={() => setShowPasskeysDialog(true)}
+                >
+                  {t('passkey_admin.open')}
                 </button>
               )}
               <button
@@ -955,7 +993,7 @@ const UsersTab: React.FC = () => {
                 if (!SOURCEY_RESOURCES.includes(r as ResourceType)) return false;
                 const scopedSource = sources.find(s => s.id === permissionScope);
                 const isMqttScope = scopedSource?.type === 'mqtt_broker' || scopedSource?.type === 'mqtt_bridge';
-                if (isMqttScope && String(r).startsWith('channel_')) return false;
+                if (isMqttScope && isChannelSlot(String(r))) return false;
                 // Only render channel_N rows for channels actually
                 // configured on the scoped source. MeshCore sources have
                 // no per-slot channels, and Meshtastic sources with fewer
@@ -974,7 +1012,7 @@ const UsersTab: React.FC = () => {
                 // Get label from translated map or format it
                 let label = resource.charAt(0).toUpperCase() + resource.slice(1);
 
-                if (resource.startsWith('channel_')) {
+                if (isChannelSlot(resource)) {
                   const channelNum = resource.split('_')[1];
                   const chName = channelNames.get(Number(channelNum));
                   const baseLabel = channelNum === '0' ? t('users.channel_primary') : t('users.channel_n', { n: channelNum });
@@ -983,7 +1021,7 @@ const UsersTab: React.FC = () => {
                   label = labelMap[resource] || label;
                 }
 
-                const tooltip = resource.startsWith('channel_')
+                const tooltip = isChannelSlot(resource)
                   ? 'View on Map: show nodes heard on this channel. Read: view messages. Write: send messages.'
                   : resource === 'nodes'
                   ? 'View on Map: publish node/contact positions on the map. Read: view the node list.'
@@ -1016,24 +1054,6 @@ const UsersTab: React.FC = () => {
                           />
                           {t('users.read')}
                         </label>
-                      ) : resource === 'traceroute' ? (
-                        // Traceroute is a single action — read is implicit for any
-                        // viewer of the source, only the "initiate" capability
-                        // needs gating.
-                        <label>
-                          <input
-                            type="checkbox"
-                            checked={permissions[resource]?.write || false}
-                            onChange={() => {
-                              const newValue = !permissions[resource]?.write;
-                              setPermissions({
-                                ...permissions,
-                                [resource]: { read: newValue, write: newValue }
-                              });
-                            }}
-                          />
-                          {t('users.can_initiate_traceroutes')}
-                        </label>
                       ) : resource === 'connection' ? (
                         // Connection is split: `read` gates viewing source status
                         // (e.g. MeshCore source pages), `write` gates disconnect/
@@ -1060,7 +1080,7 @@ const UsersTab: React.FC = () => {
                             {t('users.connection_control_device', 'Control device')}
                           </label>
                         </>
-                      ) : resource.startsWith('channel_') ? (
+                      ) : isChannelSlot(resource) ? (
                         // Channel permissions use three checkboxes: viewOnMap, read, write
                         <>
                           <label>
@@ -1264,8 +1284,7 @@ const UsersTab: React.FC = () => {
 
               <div className="form-group">
                 <label>{t('users.password_label')} *</label>
-                <input
-                  type="password"
+                <PasswordField
                   value={createForm.password}
                   onChange={(e) => setCreateForm({ ...createForm, password: e.target.value })}
                   placeholder={t('users.at_least_8_chars')}
@@ -1332,6 +1351,19 @@ const UsersTab: React.FC = () => {
       )}
 
       {/* Set Password Modal */}
+      {showPasskeysDialog && selectedUser && (
+        <AdminPasskeysDialog
+          userId={selectedUser.id}
+          username={selectedUser.username}
+          onClose={() => setShowPasskeysDialog(false)}
+          onChanged={(passkeyCount) => {
+            const changedId = selectedUser.id;
+            setSelectedUser({ ...selectedUser, passkeyCount });
+            setUsers(prev => prev.map(u => (u.id === changedId ? { ...u, passkeyCount } : u)));
+          }}
+        />
+      )}
+
       {showSetPasswordModal && selectedUser && (
         <div className="modal-overlay" onClick={handleCloseSetPasswordModal}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
@@ -1343,9 +1375,8 @@ const UsersTab: React.FC = () => {
             <div className="modal-body">
               <div className="form-group">
                 <label htmlFor="new-password">{t('users.new_password')} *</label>
-                <input
+                <PasswordField
                   id="new-password"
-                  type="password"
                   value={passwordForm.newPassword}
                   onChange={(e) => setPasswordForm({ ...passwordForm, newPassword: e.target.value })}
                   placeholder={t('users.at_least_8_chars')}
@@ -1356,9 +1387,8 @@ const UsersTab: React.FC = () => {
 
               <div className="form-group">
                 <label htmlFor="confirm-password">{t('users.confirm_password')} *</label>
-                <input
+                <PasswordField
                   id="confirm-password"
-                  type="password"
                   value={passwordForm.confirmPassword}
                   onChange={(e) => setPasswordForm({ ...passwordForm, confirmPassword: e.target.value })}
                   placeholder={t('users.reenter_password')}
