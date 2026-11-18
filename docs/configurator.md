@@ -43,9 +43,9 @@ After deploying with the generated configuration:
 
 ### Deployment Modes
 
-- **Development (HTTP)**: Best for local testing and home use. Simple HTTP access without SSL/TLS.
-- **Production with Reverse Proxy**: Recommended for production deployments. Uses HTTPS via a reverse proxy like nginx, Caddy, or Traefik.
-- **Production without Reverse Proxy**: Direct HTTP access in production. Not recommended due to lack of encryption.
+- **Plain HTTP (LAN)** (default): Direct HTTP on your local network, with production settings. Enter the server's IP or hostname so it lands in `ALLOWED_ORIGINS`; otherwise login works only from `http://localhost`. Use a reverse proxy if you open MeshMonitor to the internet.
+- **Reverse Proxy (HTTPS)**: HTTPS through a reverse proxy like nginx, Caddy, or Traefik. Use this for internet access.
+- **Development (contributors)**: For people working on MeshMonitor itself. Sets `NODE_ENV=development`, which raises the default rate limits (for example, 100 failed logins per 15 minutes instead of 5). Don't use it for a real install.
 
 ### Security Options
 
@@ -73,7 +73,7 @@ The services, ports, and volumes are identical between the two. Only how the sec
 For more complex deployments, check out these resources:
 
 - [Kubernetes/Helm Deployment](/configuration/production#kubernetes-with-helm-enterprise-scale)
-- [High Availability Setup](/configuration/production#high-availability)
+- [Uptime and High Availability](/configuration/production#high-availability)
 - [SSO/OIDC Authentication](/configuration/sso)
 - [Custom SSL Certificates](/configuration/reverse-proxy)
 - [Database Optimization](/configuration/production#database-optimization)

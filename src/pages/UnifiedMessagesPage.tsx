@@ -61,6 +61,7 @@ import { messageRowPropsEqual } from '../components/messages/messageRowSupport';
 import type { ReactionChip } from '../components/MeshCore/meshcoreReactionGroups';
 import MessageExportDialog from '../components/MessageExportDialog/MessageExportDialog';
 import type { TranslateFn } from '../types/translate';
+import { usePublicInstanceView } from '../hooks/usePublicInstanceView';
 
 type TFn = TranslateFn;
 
@@ -110,6 +111,8 @@ interface UnifiedMessage {
   /** MeshCore DM / channel entry: wire sender second, for the clock offset (#5973).
    *  Its `timestamp` is then the earliest receipt time. */
   senderTimestamp?: number | null;
+  /** Meshtastic Data.bitfield bit 2 (#6449): sender flagged it as sent by an automation. */
+  isAutomation?: boolean;
 }
 
 interface UnifiedChannel {
@@ -238,6 +241,16 @@ const UnifiedMessageRow = memo(function UnifiedMessageRow({
             </span>
           )}
           <span className="unified-msg-card__sender">{senderLabel(msg)}</span>
+          {msg.isAutomation && (
+            <span
+              className="unified-msg-card__automation"
+              title={t('messages.sent_by_automation', 'Sent by an automation')}
+              aria-label={t('messages.sent_by_automation', 'Sent by an automation')}
+              role="img"
+            >
+              <UiIcon name="bot" size={14} />
+            </span>
+          )}
           <span className="unified-msg-card__time">
             {formatTime(msg.timestamp)}
             {msg.senderTimestamp !== undefined && (
@@ -331,6 +344,7 @@ export default function UnifiedMessagesPage() {
   const navigate = useNavigate();
   const { t } = useTranslation();
   const { authStatus, hasPermission } = useAuth();
+  const publicView = usePublicInstanceView();
   const isAuthenticated = authStatus?.authenticated ?? false;
   // Unified Messages is cross-source: allow whenever the user (including
   // anonymous) has read on messages or any channel on ANY source.
@@ -681,7 +695,7 @@ export default function UnifiedMessagesPage() {
             ))}
           </select>
 
-          {canReadAnyMessages && (
+          {canReadAnyMessages && !publicView.active && (
             <button
               type="button"
               className="unified-header__back"

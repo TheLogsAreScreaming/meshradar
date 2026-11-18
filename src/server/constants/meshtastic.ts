@@ -304,6 +304,8 @@ export const FemLnaMode = {
   ENABLED: 1,
   /** FEM_LNA is not present on the device */
   NOT_PRESENT: 2,
+  /** FEM_LNA is present; the firmware switches it from the measured noise floor (protobufs#1175, firmware#12380) */
+  AUTO: 3,
 } as const;
 
 export type FemLnaModeType = typeof FemLnaMode[keyof typeof FemLnaMode];
@@ -561,6 +563,24 @@ export const MQTT_PKI_CHANNEL_ID = 'PKI';
 export const DATA_BITFIELD_OK_TO_MQTT = 0x01;
 
 /**
+ * `Data.bitfield` bit 2 (meshtastic/protobufs#1134): `is_automation`. The
+ * sender says a bot or script sent the packet, not a person. Self-reported and
+ * advisory. Firmware ORs its own bits in with `|=`, so a client-set bit
+ * survives; older firmware ignores it (#6449).
+ */
+export const DATA_BITFIELD_IS_AUTOMATION = 0x04;
+
+/**
+ * Read the `is_automation` bit from a decoded `Data.bitfield`. Returns null
+ * when the bitfield is absent on the wire (unknown), so callers can store
+ * NULL rather than a false "human" verdict.
+ */
+export function readIsAutomationBit(bitfield: number | null | undefined): boolean | null {
+  if (typeof bitfield !== 'number') return null;
+  return (bitfield & DATA_BITFIELD_IS_AUTOMATION) !== 0;
+}
+
+/**
  * Returns true if `n` is a safe-integer in the 32-bit unsigned `nodeNum` range.
  *
  * Rejects NaN, Infinity, negatives, non-integers (the floating-point values
@@ -576,10 +596,17 @@ export function isValidNodeNum(n: unknown): n is number {
  * Meshtastic default channel encryption key.
  * This is the well-known key used when PSK is set to shorthand value 1 (AQ== in base64).
  */
-export const MESHTASTIC_DEFAULT_KEY = Buffer.from([
+const MESHTASTIC_DEFAULT_KEY_BYTES = [
   0xd4, 0xf1, 0xbb, 0x3a, 0x20, 0x29, 0x07, 0x59,
   0xf0, 0xbc, 0xff, 0xab, 0xcf, 0x4e, 0x69, 0x01
-]);
+];
+// This module is also bundled into the browser (PortNum and other constants),
+// where `Buffer` does not exist. Anything evaluated at module load must not
+// touch it, or the whole app fails to start. The key is only used server-side,
+// where it is always a real Buffer; the browser gets a Uint8Array it never uses.
+export const MESHTASTIC_DEFAULT_KEY: Buffer = (typeof Buffer !== 'undefined'
+  ? Buffer.from(MESHTASTIC_DEFAULT_KEY_BYTES)
+  : Uint8Array.from(MESHTASTIC_DEFAULT_KEY_BYTES)) as Buffer;
 
 /**
  * Expand a Meshtastic shorthand PSK (1 byte) to a full 16-byte key.

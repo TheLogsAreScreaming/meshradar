@@ -24,6 +24,7 @@ import { UiIcon } from '../icons';
 import UnreadDivider from './UnreadDivider';
 import protocolStripe from './ProtocolStripe.module.css';
 import { isOwnMessage, messageRowPropsEqual } from './messageRowSupport';
+import { PortNum } from '../../server/constants/meshtastic.js';
 
 /** Node-name lookups. A new object only when some node's name changes. */
 export interface MessageRowNames {
@@ -107,7 +108,7 @@ function DmMessageRowImpl({
     </div>
   );
 
-  if (msg.portnum === 70) {
+  if (msg.portnum === PortNum.TRACEROUTE_APP) {
     return (
       <>
         {separator}
@@ -129,6 +130,7 @@ function DmMessageRowImpl({
                 viaMqtt={msg.viaMqtt}
                 viaStoreForward={msg.viaStoreForward}
                 xeddsaSigned={msg.xeddsaSigned}
+                isAutomation={msg.isAutomation}
                 onClick={() => actions.relayClick(msg)}
               />
             </span>
@@ -254,6 +256,7 @@ function DmMessageRowImpl({
                     viaMqtt={msg.viaMqtt}
                     viaStoreForward={msg.viaStoreForward}
                     xeddsaSigned={msg.xeddsaSigned}
+                    isAutomation={msg.isAutomation}
                     onClick={() => actions.relayClick(msg)}
                   />
                 </span>

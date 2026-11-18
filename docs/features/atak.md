@@ -114,13 +114,17 @@ Baremetal deployments must initialize the submodule
 (`git submodule update --init --recursive`); the Docker image and LXC
 template include the dictionaries automatically.
 
-## Phase 3 — CoT feed (ATAK/WinTAK network input)
+## Phase 3 — CoT feed (ATAK/WinTAK network input) {#phase-3-cot-feed-atak-wintak-network-input}
 
 MeshMonitor can run a plaintext TCP server that streams CoT `<event>` XML —
 the format ATAK and WinTAK natively consume as a "network input." Point ATAK
 at MeshMonitor's IP and port, and it sees every ATAK contact and every
 positioned mesh node as a map contact, with no REST polling or app plugin
 required.
+
+::: warning Public instances
+The CoT feed sends exact positions and names to anyone who connects. [Public-instance mode](./public-instance-mode) does not redact it. Settings shows a warning when both are on.
+:::
 
 ### What's in the feed
 

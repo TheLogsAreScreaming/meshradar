@@ -31,6 +31,8 @@ import './PacketMonitorPanel.css';
 import { UiIcon } from './icons';
 import PacketHiddenChip from './PacketHiddenChip';
 import { formatAckProofStatus } from '../utils/ackProof';
+import { getUserDisplayName } from '../utils/nodeHelpers';
+import { usePublicInstanceView } from '../hooks/usePublicInstanceView';
 
 interface PacketMonitorPanelProps {
   onClose: () => void;
@@ -63,6 +65,7 @@ const safeJsonParse = <T,>(value: string | null, fallback: T): T => {
 const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNodeClick, standalone }) => {
   const { t } = useTranslation();
   const { hasPermission, authStatus } = useAuth();
+  const publicView = usePublicInstanceView();
   const { timeFormat, dateFormat } = useSettings();
   const { sourceId } = useSource();
   // `packet_log_enabled` is a global (not per-source) setting, gated by
@@ -326,7 +329,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     return {
       nodeNum: node.nodeNum,
       nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}`,
-      longName: node.user?.longName || `Node ${node.nodeNum}`,
+      longName: getUserDisplayName(node.user, node.nodeNum),
       shortName: node.user?.shortName || node.nodeNum.toString(16).padStart(8, '0').slice(-4),
       hopsAway: node.hopsAway,
       role: typeof node.user?.role === 'string' ? parseInt(node.user.role, 10) : node.user?.role,
@@ -490,6 +493,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
             <button className="control-btn" onClick={() => setShowFilters(!showFilters)} title={t('packet_monitor.toggle_filters')} aria-label={t('packet_monitor.toggle_filters')}>
               <Filter size={14} />
             </button>
+            {!publicView.active && (
             <button
               className="control-btn"
               onClick={handleExport}
@@ -499,6 +503,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
             >
               <Download size={14} />
             </button>
+            )}
             {authStatus?.user?.isAdmin && (
               <button className="control-btn" onClick={handleClear} title={t('packet_monitor.clear_all')} aria-label={t('packet_monitor.clear_all')}>
                 <Trash2 size={14} />
@@ -831,6 +836,17 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                                 {' '}<UiIcon name="securityCheck" size={14} />
                               </span>
                             )}
+                            {/* Data.bitfield bit 2: sender flagged it as an automation send (#6449) */}
+                            {packet.is_automation && (
+                              <span
+                                className="automation-badge"
+                                title={t('packet_monitor.is_automation', 'Automation packet: the sender flagged it as sent by a bot or script')}
+                                aria-label={t('packet_monitor.is_automation', 'Automation packet: the sender flagged it as sent by a bot or script')}
+                                role="img"
+                              >
+                                {' '}<UiIcon name="bot" size={14} />
+                              </span>
+                            )}
                           </td>
                           <td className="channel" style={{ width: '110px' }} title={packet.encrypted && packet.channel !== undefined && packet.channel > 7 ? `Encrypted channel (hash: ${packet.channel})` : undefined}>
                             {packet.encrypted && packet.channel !== undefined && packet.channel > 7 ? `?? (ch: ${packet.channel})` : (packet.channel ?? t('common.na'))}
@@ -981,6 +997,11 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                     // when known (pre-2.8 packets have no value either way).
                     ...(selectedPacket.xeddsa_signed != null
                       ? { xeddsa_signed: selectedPacket.xeddsa_signed }
+                      : {}),
+                    // is_automation bit (#6449); shown only when the bitfield
+                    // was present on the wire.
+                    ...(selectedPacket.is_automation != null
+                      ? { is_automation: selectedPacket.is_automation }
                       : {}),
                     payload_preview: selectedPacket.payload_preview,
                   };

@@ -127,6 +127,8 @@ import {
 } from './hooks/connectionCheck';
 import { useConnectionCheckLoop } from './hooks/useConnectionCheckLoop';
 import { useMqttNativeSendStatus } from './hooks/useMqttNativeSendStatus';
+import { getUserDisplayName } from './utils/nodeHelpers';
+import { PortNum } from './server/constants/meshtastic.js';
 
 // Icons and helpers are now imported from utils/
 
@@ -630,6 +632,7 @@ function App() {
     setAutoAckMessageDirect,
     setAutoAckChannels,
     setAutoAckSkipIncompleteNodes,
+    setAutoAckRespondToAutomation,
     setAutoAckIgnoredNodes,
     setAutoAckMatrix,
     setAutoAckCooldownSeconds,
@@ -661,6 +664,7 @@ function App() {
     setAutoResponderEnabled,
     setAutoResponderTriggers,
     setAutoResponderSkipIncompleteNodes,
+    setAutoResponderRespondToAutomation,
     setAutoKeyManagementEnabled,
     setAutoKeyManagementIntervalMinutes,
     setAutoKeyManagementMaxExchanges,
@@ -851,11 +855,11 @@ function App() {
 
     // If currentNodeId isn't available, use localNodeInfo from /api/config
     if (!localNode && deviceInfo?.localNodeInfo) {
-      return deviceInfo.localNodeInfo.longName;
+      return deviceInfo.localNodeInfo.longName || deviceInfo.localNodeInfo.shortName || undefined;
     }
 
     if (localNode && localNode.user) {
-      return localNode.user.longName;
+      return localNode.user.longName || localNode.user.shortName || undefined;
     }
 
     return undefined;
@@ -1079,6 +1083,9 @@ function App() {
           if (settings.autoAckSkipIncompleteNodes !== undefined) {
             setAutoAckSkipIncompleteNodes(settings.autoAckSkipIncompleteNodes === 'true');
           }
+          if (settings.autoAckRespondToAutomation !== undefined) {
+            setAutoAckRespondToAutomation(settings.autoAckRespondToAutomation === 'true');
+          }
 
           if (settings.autoAckIgnoredNodes !== undefined) {
             setAutoAckIgnoredNodes(settings.autoAckIgnoredNodes);
@@ -1204,6 +1211,9 @@ function App() {
 
           if (settings.autoResponderSkipIncompleteNodes !== undefined) {
             setAutoResponderSkipIncompleteNodes(settings.autoResponderSkipIncompleteNodes === 'true');
+          }
+          if (settings.autoResponderRespondToAutomation !== undefined) {
+            setAutoResponderRespondToAutomation(settings.autoResponderRespondToAutomation === 'true');
           }
 
           // Auto key management settings
@@ -2348,7 +2358,7 @@ function App() {
       timestamp: new Date(),
       isLocalMessage: true,
       acknowledged: false,
-      portnum: 1, // Text message
+      portnum: PortNum.TEXT_MESSAGE_APP,
       replyId: replyId,
     };
 
@@ -4105,7 +4115,7 @@ function App() {
           .map(ch => ({ id: ch.id, name: ch.name }))}
         nodes={nodes.map(n => ({
           nodeId: n.user?.id || String(n.nodeNum),
-          longName: n.user?.longName || `!${n.nodeNum.toString(16)}`,
+          longName: getUserDisplayName(n.user, n.nodeNum),
           shortName: n.user?.shortName || '????',
         }))}
         canSearchDms={hasPermission('messages', 'read')}

@@ -254,6 +254,9 @@ import { migration as addNodeMqttConsentMigration, runMigration234Postgres, runM
 import { migration as unifiedNotificationScopeMigration, runMigration235Postgres, runMigration235Mysql } from '../server/migrations/235_unified_notification_scope.js';
 import { migration as createMqttNativeIdentitiesMigration, runMigration236Postgres, runMigration236Mysql } from '../server/migrations/236_create_mqtt_native_identities.js';
 import { migration as meshcoreRoomLoginOkAtMigration, runMigration237Postgres, runMigration237Mysql } from '../server/migrations/237_add_meshcore_room_login_ok_at.js';
+import { migration as meshcoreCompanionDefaultHeartbeatMigration, runMigration238Postgres, runMigration238Mysql } from '../server/migrations/238_meshcore_companion_default_heartbeat.js';
+import { migration as isAutomationFlagMigration, runMigration239Postgres, runMigration239Mysql } from '../server/migrations/239_add_is_automation_flag.js';
+import { migration as scriptSecretsMigration, runMigration240Postgres, runMigration240Mysql } from '../server/migrations/240_add_script_secrets.js';
 import { migration as refileMeshcoreMqttSlotChannelsMigration, runMigration228Postgres, runMigration228Mysql } from '../server/migrations/228_refile_meshcore_mqtt_slot_channels.js';
 import { migration as meshcoreNeighborWatchMigration, runMigration230Postgres, runMigration230Mysql } from '../server/migrations/230_add_meshcore_neighbor_watch.js';
 
@@ -3818,4 +3821,49 @@ registry.register({
   sqlite: (db) => meshcoreRoomLoginOkAtMigration.up(db),
   postgres: (client) => runMigration237Postgres(client),
   mysql: (pool) => runMigration237Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 238: one-time default heartbeat (60 s) for existing MeshCore
+// Companion sources whose stored config has no `heartbeatIntervalSeconds`
+// (#6437). Explicit values and Repeaters are untouched. Local probe, no RF.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 238,
+  name: 'meshcore_companion_default_heartbeat',
+  settingsKey: 'migration_238_meshcore_companion_default_heartbeat',
+  sqlite: (db) => meshcoreCompanionDefaultHeartbeatMigration.up(db),
+  postgres: (client) => runMigration238Postgres(client),
+  mysql: (pool) => runMigration238Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 239: Meshtastic `is_automation` flag (Data.bitfield bit 2, #6449)
+// on `messages.isAutomation` and `packet_log.is_automation`. Nullable; NULL
+// means the bitfield was absent on the wire. Existing rows keep NULL.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 239,
+  name: 'add_is_automation_flag',
+  settingsKey: 'migration_239_add_is_automation_flag',
+  sqlite: (db) => isAutomationFlagMigration.up(db),
+  postgres: (client) => runMigration239Postgres(client),
+  mysql: (pool) => runMigration239Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 240: `script_secrets` — named values (API keys) handed to user
+// scripts as environment variables. Global (no sourceId); values are
+// AES-256-GCM envelopes keyed from SESSION_SECRET.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 240,
+  name: 'add_script_secrets',
+  settingsKey: 'migration_240_add_script_secrets',
+  sqlite: (db) => scriptSecretsMigration.up(db),
+  postgres: (client) => runMigration240Postgres(client),
+  mysql: (pool) => runMigration240Mysql(pool),
 });

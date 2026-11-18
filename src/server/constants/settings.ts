@@ -69,6 +69,9 @@ export const VALID_SETTINGS_KEYS = [
   // have answered the same message. 0 = no cap; default 2; 0-10 enforced on
   // save (settingsRoutes) and clamped on read (autoAckResponseCap.ts).
   'autoAckMaxResponses',
+  // #6449: also answer messages whose sender set the Meshtastic is_automation
+  // bit. Off (absent) by default: Auto-Acknowledge skips automated messages.
+  'autoAckRespondToAutomation',
   // #5890: operator-chosen 0-hop / MQTT tapback glyphs (blank = built-in).
   'hopEmojiZeroHop',
   'hopEmojiMqtt',
@@ -129,6 +132,8 @@ export const VALID_SETTINGS_KEYS = [
   'autoResponderEnabled',
   'autoResponderTriggers',
   'autoResponderSkipIncompleteNodes',
+  // #6449: same opt-in as autoAckRespondToAutomation, for the Auto-Responder.
+  'autoResponderRespondToAutomation',
   'timerTriggers',
   'iconStyle',
   'preferredSortField',
@@ -533,6 +538,10 @@ export const VALID_SETTINGS_KEYS = [
   // MeshCore Required Repeater mode (#6193) — per source. 'any' | 'all';
   // anything but 'all' reads as 'any' (the default).
   'meshcoreRequiredRepeaterMode',
+  // MeshCore Auto Resend (#6240) — per source. 'true' resends own channel and
+  // DM sends until the Required Repeater(s) rule is met, within the manual
+  // Resend limits. Off unless 'true'; inert while the list is empty.
+  'meshcoreAutoResendEnabled',
   // Terrain Link Profile / elevation backend (#4111 Phase 1). Global (not
   // per-source) — elevation is source-agnostic public DEM data.
   // `elevationEnabled` is the public availability flag the Map Analysis page
@@ -626,6 +635,7 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'autoAckMaxAttempts',
   'autoAckHopLimit',
   'autoAckMaxResponses',
+  'autoAckRespondToAutomation',
   'hopEmojiZeroHop',
   'hopEmojiMqtt',
   'autoAckDirectEnabled',
@@ -744,6 +754,7 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   // Auto-responder (the feature the screenshots in #2839 call "Automations")
   'autoResponderEnabled',
   'autoResponderSkipIncompleteNodes',
+  'autoResponderRespondToAutomation',
   'autoResponderTriggers',
   // Auto-time-sync
   'autoTimeSyncEnabled',
@@ -863,6 +874,7 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   // MeshCore Required Repeaters list + mode (#6193) — per source
   'meshcoreRequiredRepeaters',
   'meshcoreRequiredRepeaterMode',
+  'meshcoreAutoResendEnabled',
   // Node Display (#4412 / per-source node display epic). All ten keys in the
   // Settings → Node Display section are per-source as of Phase 1; Phase 2 converts
   // the server reads to getSettingForSource(). `localStatsIntervalMinutes` is
@@ -959,6 +971,12 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   // JSON map keyed by nodeNum, written ONLY by meshtasticManager — see
   // PER_SOURCE_KEYS_NOT_POSTABLE.
   'remoteLocalStatsRetryState',
+  // Server-managed time of the last auto traceroute (epoch ms), written ONLY
+  // by meshtasticManager — see PER_SOURCE_KEYS_NOT_POSTABLE.
+  'autoTracerouteLastSentAt',
+  // Server-managed time of the last remote LocalStats request (epoch ms),
+  // written ONLY by meshtasticManager — see PER_SOURCE_KEYS_NOT_POSTABLE.
+  'remoteLocalStatsLastSentAt',
   // Coverage Report MQTT gateway-reception recording (#5277 P2). Per-source,
   // MQTT sources only, default off. Read via coverageMqttSettings.ts.
   'coverage_mqtt_enabled',
@@ -1190,6 +1208,8 @@ export const PER_SOURCE_KEYS_NOT_POSTABLE = new Set<string>([
   'newNodeAlertLearnUntil',  // newNodeAlertGate.ts (#6306; persisted learning-window end, only a purge re-arms it)
   'newNodeAlertRate',  // newNodeAlertGate.ts (#6306; persisted hourly alert counter, so a restart or save cannot reopen the hour)
   'remoteLocalStatsRetryState',  // meshtasticManager.ts remote-LocalStats scheduler (#6033; persisted per-node miss counter + cooldown, so a restart/save cannot re-arm or clear it)
+  'autoTracerouteLastSentAt',  // meshtasticManager.ts auto-traceroute scheduler (persisted last send, so a restart/save cannot send before last + interval)
+  'remoteLocalStatsLastSentAt',  // meshtasticManager.ts remote-LocalStats scheduler (persisted last send, so a restart/save cannot send before last + interval)
   'aircraftAgeOutLastResult', // aircraftAgeOutService.ts runSweep (#5364/#5365 Phase 2; JSON counts for the settings status line)
   // POST /api/sources/:id/forwarding (forwardingRoutes.ts, #5446) — gated on
   // per-source `automation` write, so the generic `settings` POST must not

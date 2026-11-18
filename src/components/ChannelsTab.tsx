@@ -49,6 +49,8 @@ import {
   useNodeNamesToken,
 } from './messages/messageRowSupport';
 import type { TranslatedMessageState } from './translation/TranslatedMessage';
+import { getUserDisplayName } from '../utils/nodeHelpers';
+import { PortNum } from '../server/constants/meshtastic.js';
 
 /** The latest handlers behind the stable row callbacks (see `rowActions`). */
 interface RowLatest {
@@ -389,7 +391,7 @@ export default function ChannelsTab({
     return {
       nodeNum: node.nodeNum,
       nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}`,
-      longName: node.user?.longName || `Node ${node.nodeNum}`,
+      longName: getUserDisplayName(node.user, node.nodeNum),
       shortName: node.user?.shortName || node.nodeNum.toString(16).padStart(8, '0').slice(-4),
       hopsAway: node.hopsAway,
       role: typeof node.user?.role === 'string' ? parseInt(node.user.role, 10) : node.user?.role,
@@ -1128,7 +1130,7 @@ export default function ChannelsTab({
 
                       // Filter traceroutes from Primary channel (channel 0)
                       if (messageChannel === 0) {
-                        messagesForChannel = messagesForChannel.filter(msg => msg.portnum !== 70);
+                        messagesForChannel = messagesForChannel.filter(msg => msg.portnum !== PortNum.TRACEROUTE_APP);
                       }
 
                       // Sort messages by server-side receipt time (#3187)

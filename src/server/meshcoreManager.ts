@@ -40,6 +40,7 @@ import { scheduleCron, validateCron, type CronJob } from './utils/cronScheduler.
 import { CronOrIntervalScheduler, type ScheduleMode } from './services/cronOrIntervalScheduler.js';
 import { replaceMeshCoreAnnounceTokens } from './utils/meshcoreAnnounceTokens.js';
 import { runScript, type RunScriptResult } from './utils/scriptRunner.js';
+import { scrubScriptSecrets } from './utils/scriptSecretsSnapshot.js';
 import { MeshCoreNativeBackend, MESHCORE_LOGIN_REJECTED, decodeOutPathLen, type BridgeShapedEvent } from './meshcoreNativeBackend.js';
 import {
   MESHCORE_CONTACT_NOT_ON_DEVICE,
@@ -1753,7 +1754,37 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
 
   // Heartbeat / auto-reconnect state (Companion native backend, and the
   // Repeater serial stall probe, #5563).
-  private connectionState: MeshCoreConnectionState = 'disconnected';
+  private _connectionState: MeshCoreConnectionState = 'disconnected';
+  /**
+   * Last `connected` value sent on the `connection:status` data event, so the
+   * automation system events `source-connected` / `source-disconnected` fire
+   * once per transition (#6437), not once per reconnect attempt.
+   */
+  private lastEmittedConnected = false;
+
+  /**
+   * Single choke point for every connection-state change. Edge-triggered:
+   * entering `connected` raises one connected event, leaving it raises one
+   * disconnected event. A reconnect loop (reconnecting -> connecting ->
+   * reconnecting ...) never re-raises, because it stays out of `connected`.
+   */
+  private get connectionState(): MeshCoreConnectionState {
+    return this._connectionState;
+  }
+  private set connectionState(next: MeshCoreConnectionState) {
+    const prev = this._connectionState;
+    this._connectionState = next;
+    const nowConnected = next === 'connected';
+    if (nowConnected === this.lastEmittedConnected) return;
+    this.lastEmittedConnected = nowConnected;
+    dataEventEmitter.emitConnectionStatus(
+      {
+        connected: nowConnected,
+        reason: nowConnected ? 'MeshCore connection established' : `MeshCore connection lost (${prev} -> ${next})`,
+      },
+      this.sourceId,
+    );
+  }
   private heartbeatScheduler: HeartbeatScheduler | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatConsecutiveFailures: number = 0;
@@ -1836,6 +1867,14 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
 
   /** Cached per-source `meshcoreReceiveOnly`. Sync-readable; refreshed on connect and on settings write. */
   private receiveOnly = false;
+
+  /**
+   * Hop-hash width (1-3 bytes) the node stamps on its own floods, or null while
+   * unknown (#6441). Cleared at the start of each connect; set by
+   * {@link applyDefaultPathHashSize}. The Virtual Node reads it to label the
+   * channel messages MeshRadar sends.
+   */
+  private sendPathHashSize: 1 | 2 | 3 | null = null;
 
   // Shared state
   private localNode: MeshCoreNode | null = null;
@@ -2214,6 +2253,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
 
     this.config = config;
     this.pendingConfig = config; // keep staging field in sync with direct connect() calls
+    this.sendPathHashSize = null;
 
     // Ignore / Block lists (#5408) must be cached before the first message
     // arrives: ingest classifies synchronously.
@@ -2368,6 +2408,10 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         dataEventEmitter.emitMeshCoreLocalNodeUpdated(this.localNode, this.sourceId);
       }
       logger.info(`[MeshCore] Connected to ${this.localNode?.name || 'unknown device'}`);
+      // Auto Resend (#6240): pick up own sends from the last hour that still
+      // miss the Required Repeater(s) rule. Fire-and-forget.
+      void this.armAutoResendForRecentSends().catch((err) =>
+        logger.debug(`[MeshCore:${this.sourceId}] Auto Resend sweep failed: ${(err as Error).message}`));
 
       // #6195: capture this Companion's own device private key (encrypted at
       // rest) so the server can decrypt our echoed DMs for #6194 heard-by
@@ -2397,8 +2441,9 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
 
       // Push the configured default path hash size to the companion's persistent
       // NodePrefs (#4945). Best-effort and Companion-only; a reconnect re-asserts
-      // it so the device always matches the MeshRadar setting.
-      void this.applyDefaultPathHashSize();
+      // it so the device always matches the MeshRadar setting. Awaited so the
+      // send width is known before the Virtual Node relays its first message (#6441).
+      await this.applyDefaultPathHashSize();
 
       // Start the Virtual Node server (opt-in) now that the local node identity
       // is known — the server synthesizes SelfInfo from it. Non-fatal on error.
@@ -2717,6 +2762,10 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       clearTimeout(retry.timer);
     }
     this.pendingChannelRetries.clear();
+
+    // Auto Resend timers (#6240). The next connect re-arms them from the
+    // stored messages; the persisted count and cooldown still apply.
+    this.clearAutoResendTimers();
 
     // Auto Ping sessions (#5953): drop them and their timers. Nothing resumes
     // on the next connect, so a reconnect can never fire a burst of pings.
@@ -6884,6 +6933,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           if (autoRetryOnMiss && !isAutoRetry && !reaction) {
             await this.maybeArmChannelRetry(msgId, text, channelIdx!, scopeOverride, senderTimestamp);
           }
+          if (!isAutoRetry && !reaction) void this.maybeArmAutoResend(msgId, sentToPublicKey!);
         } else if (toPublicKey && !reaction) {
           // DM send (#6194): the heard-by signal is additive to and independent
           // of the DM ACK machine. We can't decrypt the echo, so correlateDmEcho
@@ -6892,6 +6942,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           // `existingMessageId ?? msgId` so a resend's echo credits the original
           // row (like the channel path).
           this.registerPendingDmSend(existingMessageId ?? msgId, toPublicKey, senderTimestamp, text);
+          if (!isAutoRetry) void this.maybeArmAutoResend(msgId, toPublicKey);
         }
 
         return {
@@ -7049,6 +7100,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     dataEventEmitter.emitMeshCoreMessage(sentMessage, this.sourceId);
     this.recordMessageEvent(msgId, 'submitted', 'observed');
     this.registerPendingChannelSend(msgId, channelIdx, text, { payloadHex: built.payloadHex, senderName });
+    void this.maybeArmAutoResend(msgId, sentMessage.toPublicKey!);
     logger.debug(`[MeshCore:${this.sourceId}] Raw channel send as override name (${built.wireText.length} chars)`);
     return { ok: true, senderTimestamp: ts, message: sentMessage };
   }
@@ -7411,6 +7463,9 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       return;
     }
     if (!enabled) return;
+    // Auto Resend (#6240) covers this message instead; arming both would send
+    // one more copy than the shared RESEND_MAX allows.
+    if (await this.isAutoResendActive()) return;
 
     const existing = this.pendingChannelRetries.get(messageId);
     if (existing) clearTimeout(existing.timer);
@@ -7719,7 +7774,10 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
    * nothing older than {@link RESEND_MAX_AGE_MS}. The count and cooldown come
    * from persisted `retry` events, so a restart resets neither.
    */
-  async resendChannelMessage(messageId: string): Promise<{ id: string; resendCount: number; lastResendAt: number }> {
+  async resendChannelMessage(
+    messageId: string,
+    opts: { auto?: boolean } = {},
+  ): Promise<{ id: string; resendCount: number; lastResendAt: number }> {
     this.requireTransmit();
     if (!this.connected || this.deviceType === MeshCoreDeviceType.REPEATER) {
       throw new MeshCoreResendError('SOURCE_NOT_CONNECTED', 'Source is not connected to a companion radio');
@@ -7856,7 +7914,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           throw err;
         }
         if (!rawResult.ok) throw new MeshCoreResendError('SEND_FAILED', 'The radio did not accept the resend');
-        return this.finishUserResend(messageId, summary.resendCount, false);
+        return this.finishUserResend(messageId, summary.resendCount, false, opts.auto === true);
       }
 
       // Channel resend goes out on the channel slot; a DM resend (#6194) goes
@@ -7883,15 +7941,20 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         throw new MeshCoreResendError('SEND_FAILED', 'The radio did not accept the resend');
       }
 
-      return this.finishUserResend(messageId, summary.resendCount, isDm);
+      return this.finishUserResend(messageId, summary.resendCount, isDm, opts.auto === true);
     });
   }
 
-  /** Record a successful user resend: ledger, persisted `retry` event, bubble update. */
+  /**
+   * Record a successful resend: ledger, persisted `retry` event, bubble update.
+   * `auto` marks an Auto Resend (#6240); it counts toward the same
+   * {@link RESEND_MAX} as a user resend (see {@link summarizeResends}).
+   */
   private async finishUserResend(
     messageId: string,
     prevCount: number,
     isDm: boolean,
+    auto = false,
   ): Promise<{ id: string; resendCount: number; lastResendAt: number }> {
     const resentAt = Date.now();
     const resendCount = prevCount + 1;
@@ -7905,7 +7968,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         eventType: 'retry',
         provenance: 'observed',
         timestamp: resentAt,
-        detail: JSON.stringify({ attempt: resendCount, userInitiated: true }),
+        detail: JSON.stringify(auto ? { attempt: resendCount, auto: true } : { attempt: resendCount, userInitiated: true }),
       });
     } catch (err) {
       logger.warn(
@@ -7922,9 +7985,169 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       this.sourceId,
     );
     logger.info(
-      `[MeshCore:${this.sourceId}] User resend ${resendCount}/${MeshCoreManager.RESEND_MAX} of ${isDm ? 'direct' : 'channel'} message ${messageId}`,
+      `[MeshCore:${this.sourceId}] ${auto ? 'Auto' : 'User'} resend ${resendCount}/${MeshCoreManager.RESEND_MAX} of ${isDm ? 'direct' : 'channel'} message ${messageId}`,
     );
     return { id: messageId, resendCount, lastResendAt: resentAt };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto Resend until the Required Repeater(s) hear it (#6240)
+  // ---------------------------------------------------------------------------
+  //
+  // Opt-in per source (`meshcoreAutoResendEnabled`), and only while a Required
+  // Repeater(s) list is set. Every own channel or DM send arms a timer; on fire
+  // it goes through resendChannelMessage, so it shares every manual-resend
+  // limit: RESEND_COOLDOWN_MS between copies, RESEND_MAX copies per message
+  // (manual and auto together, persisted, so a restart resets nothing),
+  // RESEND_MAX_AGE_MS, and the refusals for a heard or delivered message.
+
+  /** How long Auto Resend pauses for a target whose rule stayed unmet after RESEND_MAX copies. */
+  static readonly AUTO_RESEND_PAUSE_MS = 60 * 60 * 1000;
+  /** Spacing between messages re-armed by the connect sweep, so a reconnect is not a burst. */
+  static readonly AUTO_RESEND_SWEEP_SPACING_MS = 5_000;
+
+  /** Pending Auto Resend timers by message id. */
+  private readonly autoResendTimers = new Map<string, NodeJS.Timeout>();
+  /**
+   * Targets (`channel-N` or a DM contact key) where Auto Resend is paused until
+   * the given time. In memory, like {@link gateRetrySuppressedUntil}: a restart
+   * forgets it, which costs at most RESEND_MAX more copies before it is set again.
+   */
+  private readonly autoResendPausedUntil = new Map<string, number>();
+
+  /** Auto Resend is on for this source AND a Required Repeater(s) list is set. Read at use, never cached. */
+  private async isAutoResendActive(): Promise<boolean> {
+    try {
+      const on = await databaseService.settings.getSettingForSource(this.sourceId, 'meshcoreAutoResendEnabled');
+      if (on !== 'true') return false;
+      const required = await this.resolveRequiredRepeaters();
+      return required.keys.length > 0;
+    } catch (err) {
+      logger.debug(`[MeshCore:${this.sourceId}] Auto Resend setting read failed: ${(err as Error).message}`);
+      return false;
+    }
+  }
+
+  private armAutoResend(messageId: string, target: string, delayMs: number): void {
+    const existing = this.autoResendTimers.get(messageId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.autoResendTimers.delete(messageId);
+      void this.runAutoResend(messageId, target);
+    }, Math.max(0, delayMs));
+    (timer as { unref?: () => void }).unref?.();
+    this.autoResendTimers.set(messageId, timer);
+  }
+
+  private clearAutoResendTimers(): void {
+    for (const timer of this.autoResendTimers.values()) clearTimeout(timer);
+    this.autoResendTimers.clear();
+  }
+
+  /** Arm Auto Resend for a just-sent message when it is on for this source. */
+  private async maybeArmAutoResend(messageId: string, target: string): Promise<void> {
+    if (!(await this.isAutoResendActive())) return;
+    this.armAutoResend(messageId, target, MeshCoreManager.RESEND_COOLDOWN_MS);
+  }
+
+  /**
+   * One Auto Resend attempt. Re-arms only on a wait (cooldown, a pending #3979
+   * retry, a DM still in its ack cascade); any other refusal or error ends
+   * Auto Resend for the message, so a failing radio cannot loop.
+   */
+  private async runAutoResend(messageId: string, target: string): Promise<void> {
+    if (!this.connected || !this.canTransmit()) return;
+    if (!(await this.isAutoResendActive())) return;
+    const pausedUntil = this.autoResendPausedUntil.get(target) ?? 0;
+    if (Date.now() < pausedUntil) return;
+    // A DM still in its firmware ack-retry cascade (#3977): wait for it.
+    if ([...this.pendingDmRetries.values()].some((r) => r.messageId === messageId)) {
+      this.armAutoResend(messageId, target, MeshCoreManager.RESEND_COOLDOWN_MS);
+      return;
+    }
+    let result: { resendCount: number };
+    try {
+      result = await this.resendChannelMessage(messageId, { auto: true });
+    } catch (err) {
+      if (err instanceof MeshCoreResendError && err.code === 'RESEND_COOLDOWN') {
+        this.armAutoResend(messageId, target, (err.retryAfterSeconds ?? 1) * 1000);
+      } else if (err instanceof MeshCoreResendError && err.code === 'AUTO_RETRY_PENDING') {
+        this.armAutoResend(messageId, target, MeshCoreManager.CHANNEL_RETRY_WINDOW_MS);
+      } else {
+        logger.debug(`[MeshCore:${this.sourceId}] Auto Resend of ${messageId} stopped: ${(err as Error).message}`);
+      }
+      return;
+    }
+    if (result.resendCount < MeshCoreManager.RESEND_MAX) {
+      this.armAutoResend(messageId, target, MeshCoreManager.RESEND_COOLDOWN_MS);
+      return;
+    }
+    // That was the last copy. One echo window later, pause the target if the
+    // rule is still unmet: a wrong Required Repeater(s) list must not cost
+    // RESEND_MAX extra floods on every message.
+    const timer = setTimeout(() => {
+      this.autoResendTimers.delete(messageId);
+      void this.pauseAutoResendIfUnmet(messageId, target);
+    }, MeshCoreManager.CHANNEL_RETRY_WINDOW_MS);
+    (timer as { unref?: () => void }).unref?.();
+    this.autoResendTimers.set(messageId, timer);
+  }
+
+  private async pauseAutoResendIfUnmet(messageId: string, target: string): Promise<void> {
+    try {
+      const required = await this.resolveRequiredRepeaters();
+      if (required.keys.length === 0) return;
+      const heard = await databaseService.meshcore.getHeardRepeatersForMessage(messageId, this.sourceId);
+      const met = requiredRepeatersHeard(
+        heard.map((h) => ({ hash: h.repeaterHash })),
+        required.keys,
+        required.mode,
+        [...this.contacts.values()].map((c) => ({ publicKey: c.publicKey, advType: c.advType ?? null })),
+      );
+      if (met) return;
+      if (!target.startsWith('channel-')) {
+        const delivered = await databaseService.messageEvents.getEventsForMessages(this.sourceId, [messageId], 'delivered');
+        if (delivered.length > 0) return;
+      }
+      const now = Date.now();
+      if ((this.autoResendPausedUntil.get(target) ?? 0) > now) return;
+      this.autoResendPausedUntil.set(target, now + MeshCoreManager.AUTO_RESEND_PAUSE_MS);
+      logger.warn(
+        `[MeshCore:${this.sourceId}] Auto Resend: required repeater rule ('${required.mode}') still unmet after ` +
+        `${MeshCoreManager.RESEND_MAX} resends to ${target.startsWith('channel-') ? target : `contact ${target.slice(0, 12)}`}; ` +
+        `pausing Auto Resend there for 1 hour. Check the Required Repeaters list: a repeater that is out of range, ` +
+        `removed from contacts, or shares a hash prefix keeps the rule unmet. Manual Resend still works.`,
+      );
+    } catch (err) {
+      logger.debug(`[MeshCore:${this.sourceId}] Auto Resend re-check failed: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * On connect, arm Auto Resend for this source's own sends from the last
+   * RESEND_MAX_AGE_MS. Only arms timers, spaced out; resendChannelMessage
+   * still applies the persisted count and cooldown, so a restart never sends
+   * more than RESEND_MAX copies of a message or sends one early.
+   */
+  private async armAutoResendForRecentSends(): Promise<void> {
+    if (!(await this.isAutoResendActive())) return;
+    const selfKey = this.localNode?.publicKey;
+    const now = Date.now();
+    const rows = await databaseService.meshcore.getRecentMessages(500, this.sourceId);
+    let armed = 0;
+    for (const row of rows) {
+      if (now - Number(row.timestamp) > MeshCoreManager.RESEND_MAX_AGE_MS) continue;
+      if (row.fromPublicKey !== 'local' && row.fromPublicKey !== selfKey) continue;
+      if (row.reactionEmoji || !row.toPublicKey || row.senderTimestamp == null) continue;
+      if (this.autoResendTimers.has(row.id)) continue;
+      this.armAutoResend(
+        row.id,
+        row.toPublicKey,
+        MeshCoreManager.RESEND_COOLDOWN_MS + armed * MeshCoreManager.AUTO_RESEND_SWEEP_SPACING_MS,
+      );
+      armed++;
+    }
+    if (armed > 0) logger.debug(`[MeshCore:${this.sourceId}] Auto Resend: re-armed ${armed} recent send(s) after connect`);
   }
 
   /**
@@ -8442,11 +8665,44 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     if (!this.nativeBackend) return;
     const width = size ?? await this.getDefaultPathHashSize();
     try {
-      const resp = await this.sendBridgeCommand('set_path_hash_mode', { size: width });
+      // Local serial command, no RF. Short timeout: a device that never answers
+      // must not hold up connect (this is awaited before the Virtual Node starts).
+      const resp = await this.sendBridgeCommand('set_path_hash_mode', { size: width }, 5000);
       if (!resp.success) throw new Error(resp.error || 'set_path_hash_mode failed');
+      this.sendPathHashSize = width;
     } catch (err) {
       logger.warn(`[MeshCore:${this.sourceId}] Could not apply default path hash size ${width}: ${(err as Error).message}`);
+      // The device kept its own mode: learn it so the Virtual Node can still
+      // label our sends (#6441).
+      this.sendPathHashSize = await this.readDevicePathHashSize();
     }
+  }
+
+  /**
+   * The hop-hash width the device floods with, read from DeviceInfo (#6441).
+   * `path_hash_mode` 0-2 maps to 1-3 bytes. Firmware older than protocol v10
+   * does not report it and only sends 1-byte hashes. Null when unknown.
+   */
+  private async readDevicePathHashSize(): Promise<1 | 2 | 3 | null> {
+    try {
+      const info = await this.deviceQuery();
+      if (!info) return null;
+      const mode = info.pathHashMode;
+      if (mode === 0 || mode === 1 || mode === 2) return (mode + 1) as 1 | 2 | 3;
+      if (mode === undefined && typeof info.firmwareVer === 'number' && info.firmwareVer < 10) return 1;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Hop-hash width (1-3 bytes) the node stamps on its own floods, or null while
+   * unknown (#6441). Used by the Virtual Node to encode MeshRadar's own
+   * channel sends as "0 hops" at this width.
+   */
+  getSendPathHashSize(): 1 | 2 | 3 | null {
+    return this.sendPathHashSize;
   }
 
   /**
@@ -13307,8 +13563,10 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       if (Number.isFinite(ts) && (lastResendAt === null || ts > lastResendAt)) lastResendAt = ts;
       if (!e.detail) continue;
       try {
-        const parsed = JSON.parse(e.detail) as { userInitiated?: unknown };
-        if (parsed && parsed.userInitiated === true) resendCount++;
+        // User resends (#5512) and Auto Resends (#6240) share one count; the
+        // one-shot #3979 retry carries neither flag and is not counted.
+        const parsed = JSON.parse(e.detail) as { userInitiated?: unknown; auto?: unknown };
+        if (parsed && (parsed.userInitiated === true || parsed.auto === true)) resendCount++;
       } catch {
         // Malformed detail — a retry, but not one we can call user-initiated.
       }
@@ -14510,7 +14768,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     const result = await runScript({ scriptPath, scriptArgs: argv, env });
 
     if (!result.success) {
-      logger.warn(`[MeshCore:${this.sourceId}] ${triggerLabel} script error: ${result.error}${result.stderr ? ` | stderr: ${result.stderr.substring(0, 200)}` : ''}`);
+      logger.warn(`[MeshCore:${this.sourceId}] ${triggerLabel} script error: ${scrubScriptSecrets(result.error ?? '')}${result.stderr ? ` | stderr: ${scrubScriptSecrets(result.stderr).substring(0, 200)}` : ''}`);
       return result;
     }
 
@@ -14523,7 +14781,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       try {
         const ok = await dispatch(trimmed, allowSplit);
         if (!ok) {
-          logger.warn(`[MeshCore:${this.sourceId}] ${triggerLabel} script: send failed for "${trimmed.substring(0, 50)}"`);
+          logger.warn(`[MeshCore:${this.sourceId}] ${triggerLabel} script: send failed for "${scrubScriptSecrets(trimmed).substring(0, 50)}"`);
         }
       } catch (err) {
         logger.warn(`[MeshCore:${this.sourceId}] ${triggerLabel} script: send threw: ${(err as Error).message}`);

@@ -1,17 +1,28 @@
-# Auto Responder Scripting Guide
+# Writing Automation Scripts
 
 ## Overview
 
-MeshMonitor's Auto Responder feature supports executing custom scripts in response to mesh messages. This enables advanced automation, dynamic content generation, external API integration, and complex logic beyond simple text responses.
+MeshMonitor can run your own scripts when an automation fires. Use them to call web APIs, build replies on the fly, or run logic a plain text reply can't.
 
-Scripts can be written in **Node.js**, **Python**, or **Shell** and are executed in the MeshMonitor container with full access to message context via environment variables.
+Four features run scripts. They share one script folder (`/data/scripts/`), the same languages, and the same runner:
+
+| Caller | Gets context from | Sends the output |
+|---|---|---|
+| [Auto Responder](/features/automation-messages#auto-responder) | Message [environment variables](#environment-variables) and [arguments](#script-arguments) | Yes, as the reply |
+| [Timer Triggers](/features/automation-triggers#timer-triggers) | [Timer variables and tokens](#timer-trigger-scripts) | Yes, to the chosen channel |
+| [Geofence Triggers](/features/automation-triggers#geofence-triggers) | [Geofence variables and tokens](#geofence-trigger-scripts) | Yes, to the chosen channel or DM |
+| [Automation Engine](/features/automation-engine) **Run a script** action | [`MM_*` variables](#automation-engine-scripts) | No. Store the output and send it with a later action |
+
+Most of this guide uses the Auto Responder as the example. The [last sections](#timer-trigger-scripts) list what the other callers pass.
+
+Write scripts in **Node.js**, **Python**, or **Shell**. They run inside the MeshMonitor container.
 
 ## Supported Languages
 
 | Language | Extensions | Interpreter | Version |
 |----------|-----------|-------------|---------|
-| **Node.js** | `.js`, `.mjs` | `/usr/local/bin/node` | v22.21.1 |
-| **Python** | `.py` | `/usr/bin/python3` | 3.12.12 |
+| **Node.js** | `.js`, `.mjs` | `/usr/local/bin/node` | 24 (from the Docker image) |
+| **Python** | `.py` | `/usr/bin/python3` | 3.14 (Alpine package) |
 | **Shell** | `.sh` | `/bin/sh` | BusyBox ash (Alpine) |
 
 ## Quick Start
@@ -34,7 +45,7 @@ console.log(JSON.stringify(response));
 
 **Option A: Using the UI (Recommended)**
 
-1. Navigate to **Settings → Automation → Auto Responder**
+1. Open the source's **Automation** view and go to **Auto Responder**
 2. Scroll down to **Script Management** section
 3. Click **Import Script**
 4. Select your script file (`.js`, `.mjs`, `.py`, or `.sh`)
@@ -50,13 +61,13 @@ docker cp hello.js meshmonitor:/data/scripts/
 docker exec meshmonitor chmod +x /data/scripts/hello.js
 ```
 
-**Option C: Docker Compose (for scripts requiring environment variables)**
+**Option C: Docker Compose (mount the scripts folder)**
 
 ::: tip Use the Configurator
 The easiest way to set up scripts volume mounting is using the **[Docker Compose Configurator](/configurator)** - just check "Mount Auto Responder Scripts Directory" under Additional Settings!
 :::
 
-For scripts that need environment variables (e.g., API keys) or easier script management:
+To edit scripts on the host instead of copying them into the container:
 
 ```yaml
 services:
@@ -74,23 +85,22 @@ services:
     environment:
       # Timezone configuration (for timezone-aware scripts)
       - TZ=America/New_York
-
-      # Example: API keys for scripts (e.g., Pirate Weather)
-      - PIRATE_WEATHER_API_KEY=your_api_key_here
-
-      # Other MeshMonitor environment variables
-      - MESHTASTIC_NODE_IP=192.168.1.100
-      - MESHTASTIC_TCP_PORT=4403
+      # Needed to store Script Secrets (API keys); see below.
+      # Put SESSION_SECRET=<output of: openssl rand -hex 32> in a .env file.
+      - SESSION_SECRET=${SESSION_SECRET}
 ```
 
 **Benefits:**
 - **Volume Mapping:** `./scripts:/data/scripts` allows editing scripts locally without copying into container
-- **Environment Variables:** Scripts can access all environment variables via `process.env` (Node.js) or `os.environ` (Python)
 - **Timezone:** Set `TZ` for timezone-aware scripts (see [Timezone Support](#timezone-support))
+
+::: warning API keys don't go in the compose file
+Scripts do **not** see every container variable. MeshMonitor strips any variable whose name looks like a secret (`*API_KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `DATABASE_*` and so on), so an uploaded script can't read the server's own keys. A `PIRATE_WEATHER_API_KEY` set in `environment:` never reaches the script. Store it as a [Script Secret](#script-secrets) instead.
+:::
 
 ### 3. Configure Auto Responder
 
-1. Navigate to **Settings → Automation → Auto Responder**
+1. Open the source's **Automation** view and go to **Auto Responder**
 2. Click **Add Trigger** to open a new trigger card
 3. Configure:
    - **Trigger:** `hello {name}`
@@ -274,6 +284,7 @@ When someone sends "admin reboot", the script is called as:
 | `{CHANNEL}` | Channel name | `LongFast` |
 | `{DATE}` | Current date | `1/15/2025` |
 | `{TIME}` | Current time | `2:30:00 PM` |
+| `{LAST_HOP}` | Last relay node (short name → hex byte → `unknown`) | `RLY1` |
 
 > **Note:** These tokens are also supported in HTTP response URLs. When used in URLs, token values are automatically URI-encoded for safety (e.g., spaces become `%20`, slashes become `%2F`). Extracted parameters from regex capture groups take precedence over built-in tokens of the same name.
 
@@ -414,6 +425,31 @@ All scripts receive these environment variables:
 | `PARAM_*` | Extracted parameters | `PARAM_location="miami"` |
 | `MSG_*` | All message fields as individual variables | `MSG_text="weather miami"` |
 | `TZ` | Server timezone (IANA timezone name) | `"America/New_York"` |
+| *your secrets* | Every [Script Secret](#script-secrets), under its own name | `OPENAI_API_KEY="sk-…"` |
+
+### Script Secrets
+
+Store API keys and other values your scripts need in **Settings › Scripts › Script Secrets** (admins only). Each secret reaches every script as an environment variable of the same name:
+
+```python
+import os
+api_key = os.environ.get("PIRATE_WEATHER_API_KEY")
+```
+
+```javascript
+const apiKey = process.env.PIRATE_WEATHER_API_KEY;
+```
+
+How it works:
+
+- **Every script receives every secret.** There is no per-script or per-source scope. Any script uploaded to MeshMonitor can read every stored value, print it, send it over the mesh, or send it to any web server. Only upload scripts you trust.
+- **Users who can edit automations** can point a trigger at an existing script, and so make that script use the secrets, even though they cannot see or change the secrets themselves.
+- **Write only.** After you save a value, no page or API returns it. You can replace or delete it.
+- **Encrypted at rest** with AES-256-GCM, using a key derived from `SESSION_SECRET`. Storing secrets needs `SESSION_SECRET` set in your environment; without it the panel is disabled, since an auto-generated key would change on every restart. If `SESSION_SECRET` changes, each secret shows as **Unreadable**, scripts stop receiving it, and you must enter it again.
+- **Names** are upper-case letters, digits and underscores, up to 64 characters. Names scripts already receive or that control the shell, interpreter or loader are reserved (in any letter case): for example `PATH`, `HOME`, `SHELLOPTS`, `PS4`, `GCONV_PATH`, `OPENSSL_CONF`, `MESSAGE`, `CHANNEL`, `SESSION_SECRET`, and the `MM_` names MeshMonitor sets (`MM_LAT`, `MM_SOURCE_ID`, …), and names starting with `PARAM_`, `MSG_`, `FROM_`, `NODE_`, `MESHCORE_`, `MESHTASTIC_`, `GEOFENCE_`, `TIMER_`, `PYTHON`, `LD_`, `DATABASE_`.
+- A secret never replaces a variable the script would see anyway. At most 50 secrets, each up to 4096 characters.
+- **Logs:** MeshMonitor replaces stored values of 8 or more characters with `***` when it writes script output to its own log, and in the output shown when an admin tests a script. This is **best effort**: it misses a value the script encodes (base64, URL-encoding), splits or changes, and shorter values are not masked. It does not change what a script sends over the mesh.
+- **Backups** include the secrets, still encrypted. A backup restored under a different `SESSION_SECRET` keeps them, but they show as Unreadable until you enter them again. See [System Backup](/features/system-backup#a-backup-is-a-secret).
 
 ### Location Environment Variables
 
@@ -821,7 +857,7 @@ import json
 import sys
 
 # Access Apprise virtual environment
-sys.path.insert(0, '/opt/apprise-venv/lib/python3.12/site-packages')
+sys.path.insert(0, '/opt/apprise-venv/lib/python3.14/site-packages')
 
 try:
     import apprise
@@ -902,6 +938,7 @@ EOF
 import os
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 node_id = os.environ.get('PARAM_nodeid', 'Unknown')
 
@@ -910,7 +947,7 @@ try:
     cursor = conn.cursor()
 
     cursor.execute(
-        "SELECT longName, lastSeen FROM nodes WHERE nodeId = ?",
+        "SELECT longName, lastHeard FROM nodes WHERE nodeId = ?",
         (node_id,)
     )
 
@@ -919,7 +956,7 @@ try:
 
     if result:
         output = {
-            "response": f"{result[0]} last seen {result[1]}"
+            "response": f"{result[0]} last heard {datetime.fromtimestamp(result[1], timezone.utc):%Y-%m-%d %H:%M} UTC" if result[1] else f"{result[0]} not heard yet"
         }
     else:
         output = {"response": f"Node {node_id} not found"}
@@ -1190,13 +1227,162 @@ getWeather().then(result => console.log(JSON.stringify(result)));
 
 Complete example scripts are available in the MeshMonitor repository:
 
-**GitHub:** [examples/auto-responder-scripts/](https://github.com/MeshAddicts/meshmonitor/tree/main/examples/auto-responder-scripts)
+**GitHub:** [examples/auto-responder-scripts/](https://github.com/Yeraze/meshmonitor/tree/main/examples/auto-responder-scripts)
 
 - `hello.js` - Simple Node.js greeting script
 - `weather.py` - Python weather lookup template
 - `PirateWeather.py` - Complete Pirate Weather API integration with Nominatim geocoding
 - `info.sh` - Shell system information script
+- `lorem.js`, `lorem.py`, `lorem.sh` - Return three messages at once, to show the `responses` array
 - `README.md` - Detailed examples and usage
+
+## Timer Trigger Scripts {#timer-trigger-scripts}
+
+A [Timer Trigger](/features/automation-triggers#timer-triggers) runs its script on a cron schedule, with no incoming message. Its output goes to the channel the timer names.
+
+**Environment variables:** `TIMER_NAME`, `TIMER_ID`, `TIMER_SCRIPT`, `MESHTASTIC_IP`, `MESHTASTIC_PORT`, and `MM_LAT` / `MM_LON` when the local node's position is known. The message variables (`MESSAGE`, `FROM_NODE`, `PARAM_*` …) are not set.
+
+Timer triggers support passing command-line arguments to scripts via the **Arguments** field. Arguments support token expansion for dynamic values.
+
+**Example Arguments:**
+- `--ip {IP}` - Pass the node IP address
+- `--count {NODECOUNT}` - Pass the active node count
+- `--verbose --format json` - Pass multiple flags
+
+**Available Tokens:**
+
+| Token | Description | Example |
+|-------|-------------|---------|
+| `{IP}` | Meshtastic node IP | `192.168.1.100` |
+| `{PORT}` | Meshtastic TCP port | `4403` |
+| `{VERSION}` | MeshMonitor version | `v3.4.0` |
+| `{NODECOUNT}` | Active node count | `42` |
+| `{DIRECTCOUNT}` | Direct node count | `15` |
+| `{DURATION}` | Server uptime | `2 days, 5 hours` |
+| `{FEATURES}` | Enabled features | `🗺️ 🤖` |
+
+**Example Configuration:**
+```
+Name: Scheduled Remote Admin
+Schedule: 0 3 * * *
+Script: remote-admin.py
+Arguments: --ip {IP} --dest !abc12345 --reboot
+Channel: 0 (Primary)
+```
+
+This runs a remote admin command every day at 3 AM.
+
+**JSON Output Format** (same as the Auto Responder):
+
+**Single Response:**
+```json
+{
+  "response": "Your message text (max 200 chars)"
+}
+```
+
+**Multiple Responses:**
+```json
+{
+  "responses": [
+    "First message",
+    "Second message",
+    "Third message"
+  ]
+}
+```
+
+**Example scripts:**
+
+**Simple Status Script (status.js)**:
+```javascript
+#!/usr/bin/env node
+
+const now = new Date();
+const response = {
+  response: `Network status check: ${now.toLocaleString()}`
+};
+
+console.log(JSON.stringify(response));
+```
+
+**Weather Script (daily-weather.py)**:
+```python
+#!/usr/bin/env python3
+import json
+import urllib.request
+
+try:
+    url = "https://wttr.in/YourCity?format=3"
+    with urllib.request.urlopen(url, timeout=5) as response:
+        weather = response.read().decode('utf-8').strip()
+    output = {"response": weather}
+except Exception as e:
+    output = {"response": "Weather unavailable"}
+
+print(json.dumps(output))
+```
+
+## Geofence Trigger Scripts {#geofence-trigger-scripts}
+
+A [Geofence Trigger](/features/automation-triggers#geofence-triggers) runs its script when a node crosses the fence.
+
+**Environment variables:** `GEOFENCE_NAME`, `GEOFENCE_ID`, `GEOFENCE_EVENT` (`entry`, `exit` or `while_inside`), `NODE_NUM`, `NODE_ID`, `NODE_LAT`, `NODE_LON`, `DISTANCE_TO_CENTER` (km), `MESHTASTIC_IP`, `MESHTASTIC_PORT`, plus `NODE_LONG_NAME` / `NODE_SHORT_NAME` and `MM_LAT` / `MM_LON` when known.
+
+Geofence triggers support passing command-line arguments to scripts via the **Arguments** field. This is particularly useful with the `remote-admin.py` script for automated node management.
+
+**Example Arguments:**
+- `--reboot` - Reboot node on geofence entry
+- `--set lora.region US` - Change settings on exit
+- `--dest {NODE_ID} --reboot` - Target the triggering node
+- `--ip {IP} --dest {NODE_ID} --factory-reset` - Full reset with token expansion
+
+**Available Tokens:**
+
+| Token | Description | Example |
+|-------|-------------|---------|
+| `{NODE_ID}` | Triggering node ID | `!a1b2c3d4` |
+| `{NODE_NUM}` | Triggering node number | `123456789` |
+| `{LONG_NAME}` | Node's long name | `Alice's Node` |
+| `{SHORT_NAME}` | Node's short name | `ALI` |
+| `{NODE_LAT}` | Node's latitude | `40.7128` |
+| `{NODE_LON}` | Node's longitude | `-74.0060` |
+| `{GEOFENCE_NAME}` | Geofence name | `Base Camp` |
+| `{EVENT}` | Event type | `entry` |
+| `{DISTANCE_TO_CENTER}` | Distance in km | `2.5` |
+| `{IP}` | Meshtastic node IP | `192.168.1.100` |
+| `{PORT}` | Meshtastic TCP port | `4403` |
+| `{VERSION}` | MeshMonitor version | `v3.4.0` |
+| `{NODECOUNT}` | Active node count | `42` |
+
+**Example Configurations:**
+
+| Use Case | Script | Arguments |
+|----------|--------|-----------|
+| Reboot on entry | remote-admin.py | `--reboot` |
+| Change region on exit | remote-admin.py | `--set lora.region US` |
+| Set position | remote-admin.py | `--setlat 40.7128 --setlon -74.0060` |
+| Factory reset | remote-admin.py | `--factory-reset` |
+| Custom with tokens | remote-admin.py | `--dest {NODE_ID} --set device.role CLIENT` |
+
+**Example: Reboot Node on Geofence Entry**
+```
+Name: Reboot on Entry
+Shape: Circle (500m radius)
+Event: Entry
+Response Type: Script
+Script: /data/scripts/remote-admin.py
+Arguments: --reboot
+Channel: Direct Message
+```
+
+## Automation Engine Scripts {#automation-engine-scripts}
+
+The Engine's [Run a script](/features/automation-engine-reference#run-a-script) action runs a script from the same folder.
+
+- **Environment variables:** `MM_TRIGGER_TYPE`, `MM_SOURCE_ID`, `MM_TIMESTAMP`, `MM_NODE_NUM` (when the event has a node), and every trigger field as `MM_<UPPER_SNAKE_NAME>` (objects as JSON). For older scripts it also sets `MESSAGE`, `FROM_NODE`, `PACKET_ID`, `CHANNEL`, `SNR` and `RSSI` when the trigger has them.
+- **Arguments** take Engine templates such as <code v-pre>{{ trigger.from }}</code>, not the `{IP}`-style tokens above.
+- The script's output is **not** sent. Store it with **Store result in**, then send it with a **Send a message** action.
 
 ## API Reference
 
@@ -1243,20 +1429,13 @@ Complete example scripts are available in the MeshMonitor repository:
 
 This endpoint is called automatically by the Auto Responder UI to populate the script dropdown. Scripts with metadata display enhanced information in the UI.
 
-## Version Compatibility
-
-| MeshMonitor Version | Feature |
-|-------------------|---------|
-| v2.18.0+ | Script execution support |
-| v2.17.8 | Text and HTTP responses only |
-
 ## Support
 
 For issues, questions, or feature requests:
-- **GitHub Issues:** https://github.com/MeshAddicts/meshmonitor/issues
-- **Documentation:** https://meshmonitor.org/features/automation#auto-responder
-- **Examples:** https://github.com/MeshAddicts/meshmonitor/tree/main/examples/auto-responder-scripts
+- **GitHub Issues:** https://github.com/Yeraze/meshmonitor/issues
+- **Documentation:** [Auto Responder](/features/automation-messages#auto-responder), [Automation Engine](/features/automation-engine)
+- **Examples:** https://github.com/Yeraze/meshmonitor/tree/main/examples/auto-responder-scripts
 
 ## License
 
-MeshMonitor is licensed under the MIT License. See [LICENSE](https://github.com/MeshAddicts/meshmonitor/blob/main/LICENSE) for details.
+MeshMonitor is licensed under the BSD 3-Clause License. See [LICENSE](https://github.com/Yeraze/meshmonitor/blob/main/LICENSE) for details.

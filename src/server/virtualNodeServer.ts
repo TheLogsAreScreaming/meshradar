@@ -10,6 +10,7 @@ import type { DbMessage } from '../db/types.js';
 import { getEffectiveDbNodePosition } from './utils/nodeEnhancer.js';
 import { MODEM_PRESET_CHANNEL_NAMES } from '../utils/loraFrequency.js';
 import { getMaxNodeAgeHours } from './services/nodeDisplaySettings.js';
+import { PortNum } from './constants/meshtastic.js';
 import { safeJson } from './utils/redactSecrets.js';
 
 const require = createRequire(import.meta.url);
@@ -121,11 +122,9 @@ export class VirtualNodeServer extends EventEmitter {
   private readonly CLIENT_TIMEOUT_MS = 300000; // 5 minutes of inactivity before disconnect
   private readonly CLEANUP_INTERVAL_MS = 60000; // Check for inactive clients every minute
 
-  // Admin portnums to block (security)
-  private readonly BLOCKED_PORTNUMS = [
-    6,   // ADMIN_APP
-    8,   // NODEINFO_APP (can trigger config changes)
-  ];
+  // Admin portnums to block (security). Waypoints and NodeInfo are user
+  // traffic and pass through.
+  private readonly BLOCKED_PORTNUMS: readonly number[] = [PortNum.ADMIN_APP];
 
   // ── Message replay (#6160) ──────────────────────────────────────────────
   // Android freezes the Meshtastic app and MeshRadar drops idle VN clients
@@ -477,7 +476,7 @@ export class VirtualNodeServer extends EventEmitter {
         // the app doesn't hang, and drop them silently. This applies
         // *regardless* of allowAdminCommands — the global guidance from
         // #2602 is "deletion is a MeshRadar-only operation."
-        if (normalizedPortNum === 6) { // ADMIN_APP
+        if (normalizedPortNum === PortNum.ADMIN_APP) {
           const earlyAdminPayload = toRadio.packet.decoded?.payload;
           if (earlyAdminPayload) {
             try {
@@ -524,7 +523,7 @@ export class VirtualNodeServer extends EventEmitter {
         if (!this.allowAdminCommands && normalizedPortNum && this.BLOCKED_PORTNUMS.includes(normalizedPortNum)) {
           // Universal check: block addContact from ALL clients (including localhost)
           // addContact can corrupt the physical node's PKI key store (fixes #1487)
-          if (normalizedPortNum === 6) { // ADMIN_APP
+          if (normalizedPortNum === PortNum.ADMIN_APP) {
             const adminPayloadForContactCheck = toRadio.packet.decoded?.payload;
             if (adminPayloadForContactCheck) {
               try {
@@ -565,7 +564,7 @@ export class VirtualNodeServer extends EventEmitter {
             // Check if this is a favorite/unfavorite command - these should be intercepted
             // and processed locally to update the database (fixes #1000)
             const adminPayload = toRadio.packet.decoded?.payload;
-            if (adminPayload && normalizedPortNum === 6) { // ADMIN_APP
+            if (adminPayload) {
               try {
                 const adminMsg = protobufService.decodeAdminMessage(
                   adminPayload instanceof Uint8Array ? adminPayload : new Uint8Array(adminPayload)
@@ -620,7 +619,7 @@ export class VirtualNodeServer extends EventEmitter {
                 return;
               }
             } else {
-              // Non-admin blocked portnum (like NODEINFO_APP) - block it
+              // Admin packet with no payload - block it
               logger.warn(`Virtual node: Blocked admin command from ${clientId} (portnum ${normalizedPortNum}/${meshtasticProtobufService.getPortNumName(normalizedPortNum)})`);
               logger.warn(`Virtual node: Blocked packet details:`, safeJson({
                 from: toRadio.packet.from,
@@ -670,6 +669,17 @@ export class VirtualNodeServer extends EventEmitter {
               virtualNodeRequestId: toRadio.packet.id // Preserve for ACK matching
             });
             logger.debug(`Virtual node: Stored outgoing message in database with requestId: ${toRadio.packet.id}`);
+
+            // Issue #6436: mirror an outgoing text message to the OTHER connected
+            // clients, the same way a message sent from the web UI is relayed to
+            // every client. Without this, a message typed in one app never shows
+            // up in the other apps sharing this virtual node. The sender is
+            // excluded so its own app does not show the message twice. This is a
+            // local TCP write only: nothing extra goes over the air, and the
+            // receiving apps only display the packet (they do not resend it).
+            if (normalizedPortNum === PortNum.TEXT_MESSAGE_APP) { // (replies and reactions included)
+              await this.broadcastToClients(fromRadioMessage, clientId);
+            }
           }
         } catch (error) {
           logger.error(`Virtual node: Failed to process outgoing message locally:`, error);
@@ -1203,13 +1213,15 @@ export class VirtualNodeServer extends EventEmitter {
   }
 
   /**
-   * Broadcast a message to all connected clients
+   * Broadcast a message to all connected clients, optionally skipping one
+   * (the client the message came from, #6436).
    */
-  public async broadcastToClients(data: Uint8Array): Promise<void> {
+  public async broadcastToClients(data: Uint8Array, excludeClientId?: string): Promise<void> {
     const frame = this.createFrame(data);
     const promises: Promise<void>[] = [];
 
     for (const [clientId, client] of this.clients.entries()) {
+      if (clientId === excludeClientId) continue;
       // Skip clients with destroyed sockets
       if (client.socket.destroyed || !client.socket.writable) {
         logger.debug(`Virtual node: Skipping broadcast to ${clientId} (socket not writable)`);
@@ -1388,11 +1400,11 @@ export class VirtualNodeServer extends EventEmitter {
     }, this.REPLAY_SETTLE_MS);
   }
 
-  /** Stored text messages only (portnum 1, reactions/replies included); skip
+  /** Stored text messages only (TEXT_MESSAGE_APP, reactions/replies included); skip
    *  MeshRadar's own notes and the app's own sends; DMs only when they
    *  involve the local node. */
   private isReplayableMessage(m: DbMessage, localNodeNum: number): boolean {
-    if (Number(m.portnum) !== 1) { // TEXT_MESSAGE_APP (reactions and replies included)
+    if (Number(m.portnum) !== PortNum.TEXT_MESSAGE_APP) { // reactions and replies included
       return false;
     }
     if (!String(m.id).includes('_')) {
@@ -1501,6 +1513,7 @@ export class VirtualNodeServer extends EventEmitter {
           replyId: m.replyId ?? null,
           emoji: m.emoji ?? null,
           pkiEncrypted,
+          isAutomation: m.isAutomation ?? null,
         });
         if (data) {
           await this.sendToClient(clientId, data);

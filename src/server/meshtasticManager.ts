@@ -6,6 +6,7 @@ import meshtasticProtobufService, { formatTakPreview, formatTakV2Preview } from 
 import { takV2Variant } from './takV2Decoder.js';
 import type { RawSecurityConfig } from './utils/securityConfigWrite.js';
 import { formatAdminMqttConfig } from './utils/adminMqttConfig.js';
+import { normalizeTracerouteIntervalMinutes } from './utils/tracerouteInterval.js';
 import protobufService, { convertIpv4ConfigToStrings } from './protobufService.js';
 import { getProtobufRoot, type MeshBeaconPayload } from './protobufLoader.js';
 import { TcpTransport } from './tcpTransport.js';
@@ -122,6 +123,7 @@ import { isPowered, detectPowerTransition } from './utils/poweredState.js';
 import { autoAckIsIp, autoAckIsZeroHop, autoAckCellKey, resolveAutoAckReplyRouting } from './utils/autoAckDecision.js';
 import { hopCountEmoji, HOP_COUNT_EMOJIS, parseHopEmojiOverrides } from '../utils/hopEmoji.js';
 import { buildScriptChildEnv } from './utils/scriptRunner.js';
+import { scrubScriptSecrets } from './utils/scriptSecretsSnapshot.js';
 import { canonicalMessageTime, plausibleRxTime } from './utils/messageTime.js';
 import { canonicalTelemetryType, canonicalTelemetryUnit } from './utils/telemetryKeys.js';
 import { isNodeComplete } from '../utils/nodeHelpers.js';
@@ -134,7 +136,7 @@ import { detectLocalNodeSpoof, SentPacketIdCache, type SpoofDetectionResult } fr
 import { automationPacketTracker, randomPacketId, type SendOrigin } from './utils/automationPacketTracker.js';
 import { resolveBroadcastChannel } from './utils/resolveDestinationChannel.js';
 import { applyHomoglyphOptimization } from '../utils/homoglyph.js';
-import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, resolveRadioPacketTransport, isViaMqtt, MIN_TRACEROUTE_INTERVAL_MS, StoreForwardRequestResponse, getStoreForwardRequestResponseName, isUdpBroadcastEnabled, resolveHopLimit, PacketSignaturePolicy, WANT_CONFIG_NONCE_FULL, WANT_CONFIG_NONCE_ONLY_CONFIG, modemPresetChannelName, MAX_MESSAGE_BYTES } from './constants/meshtastic.js';
+import { PortNum, RoutingError, isPkiError, getRoutingErrorName, CHANNEL_DB_OFFSET, TransportMechanism, resolveRadioPacketTransport, isViaMqtt, MIN_TRACEROUTE_INTERVAL_MS, StoreForwardRequestResponse, getStoreForwardRequestResponseName, isUdpBroadcastEnabled, resolveHopLimit, PacketSignaturePolicy, WANT_CONFIG_NONCE_FULL, WANT_CONFIG_NONCE_ONLY_CONFIG, modemPresetChannelName, MAX_MESSAGE_BYTES, readIsAutomationBit } from './constants/meshtastic.js';
 import { SPLIT_PART_GAP_MS } from '../utils/messageSplitLimits.js';
 import {
   SplitSequenceLock,
@@ -316,7 +318,7 @@ export function parseAutoResponderResponse(
     jsonResp = JSON.parse(rawResp);
   } catch (_) {
     if (jsonExpected) {
-      logger.error(`❌ Auto responder output is not valid JSON: ${rawResp.substring(0, 100)}`);
+      logger.error(`❌ Auto responder output is not valid JSON: ${scrubScriptSecrets(rawResp).substring(0, 100)}`);
       return { json: {}, responses: [] };
     }
     return { json: {}, responses: [rawResp] };
@@ -345,7 +347,7 @@ export function parseAutoResponderResponse(
 
   // Single response format: { "response": "msg" }
   if (typeof obj.response === 'string') {
-    logger.debug(`📥 Auto responder output: ${obj.response.substring(0, 50)}…`);
+    logger.debug(`📥 Auto responder output: ${scrubScriptSecrets(obj.response).substring(0, 50)}…`);
     return { json: obj, responses: [obj.response] };
   }
 
@@ -565,6 +567,7 @@ type TextMessage = {
   decryptedBy?: 'node' | 'server' | null; // Decryption source - 'server' means read-only
   viaStoreForward?: boolean; // Message received via Store & Forward replay
   xeddsaSigned?: boolean; // Broadcast had a cryptographically verified XEdDSA signature (firmware 2.8+)
+  isAutomation?: boolean | null; // Data.bitfield bit 2 (#6449); null = bitfield absent
   ackProofStatus?: number; // #5279 — MeshPacket.AckProofStatus from the settling ack/nak (outbound DMs)
   sourceIp?: string | null; // Per-message ingress attribution (client IP for HTTP injects)
   sourcePath?: 'http_api' | 'tcp_radio' | 'mqtt_bridge' | 'system' | null;
@@ -692,6 +695,20 @@ interface RemoteLocalStatsRetryEntry {
 
 /** Per-source key under which the above map is persisted. */
 const REMOTE_LOCALSTATS_RETRY_STATE_KEY = 'remoteLocalStatsRetryState';
+
+/**
+ * Per-source key holding the epoch-ms time of the last auto traceroute this
+ * source sent. The scheduler reads it on every (re)start, so a settings save,
+ * a reconnect or a process restart never sends sooner than last + interval.
+ */
+const AUTO_TRACEROUTE_LAST_SENT_KEY = 'autoTracerouteLastSentAt';
+
+/**
+ * Per-source key holding the epoch-ms time of the last remote LocalStats
+ * request the scheduler sent. Read on every (re)start, so a settings save, a
+ * reconnect or a process restart never sends sooner than last + interval.
+ */
+const REMOTE_LOCALSTATS_LAST_SENT_KEY = 'remoteLocalStatsLastSentAt';
 
 /**
  * Bounds for `autoAckCooldowns` (#4399). It was previously never evicted at
@@ -1105,6 +1122,10 @@ class MeshtasticManager implements ISourceManager {
 
   private tracerouteIntervalMinutes: number = 0;
   private lastTracerouteSentTime: number = 0;
+  // Bumped on every traceroute scheduler start/stop, so a start that is still
+  // reading the persisted last-send time drops out if a newer start or a stop
+  // ran meanwhile (no double timers, no timer armed after disconnect).
+  private tracerouteSchedulerGeneration: number = 0;
   // Airtime cutoff: pause all transmitting automations when the local node's
   // Channel Utilization exceeds this percent. 0 disables the feature.
   private automationAirtimeCutoffThreshold: number = DEFAULT_AIRTIME_CUTOFF_THRESHOLD;
@@ -1155,6 +1176,7 @@ class MeshtasticManager implements ISourceManager {
   // Throttle the "automations gated" log so a busy mesh doesn't spam.
   private lastAirtimeGateLogTime: number = 0;
   private localStatsInterval: NodeJS.Timeout | null = null;
+  private localStatsFirstRequestTimeout: NodeJS.Timeout | null = null;
   private timeOffsetSamples: number[] = [];
   private timeOffsetInterval: NodeJS.Timeout | null = null;
   // Hourly auto-favorite staleness sweep. Kept on the instance so a reconnect
@@ -1180,6 +1202,9 @@ class MeshtasticManager implements ISourceManager {
   // target per tick (least-recently-polled) to stay gentle on shared airtime.
   private remoteLocalStatsInterval: NodeJS.Timeout | null = null;
   private remoteLocalStatsJitterTimeout: NodeJS.Timeout | null = null;
+  // Bumped on every remote LocalStats scheduler start/stop; see
+  // tracerouteSchedulerGeneration.
+  private remoteLocalStatsSchedulerGeneration: number = 0;
   private remoteLocalStatsIntervalMinutes: number = 0;
   private lastRemoteLocalStatsSentTime: number = 0;
   private remoteLocalStatsLastSentAt: Map<number, number> = new Map();
@@ -1196,9 +1221,13 @@ class MeshtasticManager implements ISourceManager {
   private pendingFavoriteResync: Map<number, boolean> = new Map();
   private remoteAdminScannerInterval: NodeJS.Timeout | null = null;
   private remoteAdminScannerIntervalMinutes: number = 0; // 0 = disabled
+  // Bumped by every start/stop; a start that awaited the DB and finds it
+  // changed drops out, so overlapping starts cannot arm two timers.
+  private remoteAdminScannerGeneration = 0;
   private pendingRemoteAdminScans: Set<number> = new Set(); // Track nodes being scanned
   private timeSyncInterval: NodeJS.Timeout | null = null;
   private timeSyncIntervalMinutes: number = 0; // 0 = disabled
+  private timeSyncSchedulerGeneration = 0; // same role as remoteAdminScannerGeneration
   private pendingTimeSyncs: Set<number> = new Set(); // Track nodes being synced
   private keyRepairInterval: NodeJS.Timeout | null = null;
   private keyRepairEnabled: boolean = false;
@@ -2551,7 +2580,8 @@ class MeshtasticManager implements ISourceManager {
         // time-offset learning, announce, timer, key repair, distance delete,
         // auto-favorite sweep) running.
         const passive = this.passiveMode;
-        setTimeout(() => this.startTracerouteScheduler(), S * 1);
+        setTimeout(() => this.startTracerouteScheduler().catch(e =>
+          logger.error('❌ Error starting traceroute scheduler:', e)), S * 1);
         if (passive) {
           logger.debug('🟢 [passive] Skipping remote admin scanner — outbound queries to device');
         } else {
@@ -2591,7 +2621,8 @@ class MeshtasticManager implements ISourceManager {
         if (passive) {
           logger.debug('🟢 [passive] Skipping remote LocalStats scheduler — outbound queries to mesh');
         } else {
-          setTimeout(() => this.startRemoteLocalStatsScheduler(), S * 10);
+          setTimeout(() => this.startRemoteLocalStatsScheduler().catch(e =>
+            logger.error('❌ Error starting remote LocalStats scheduler:', e)), S * 10);
         }
 
         // Request LoRa config (config type 5) for Configuration tab — deferred
@@ -2883,7 +2914,9 @@ class MeshtasticManager implements ISourceManager {
     destination: number,
     channel: number,
     payloadPreview: string,
-    metadata: Record<string, unknown> = {}
+    metadata: Record<string, unknown> = {},
+    /** Send origin (#6449): an automation send carries the is_automation bit. */
+    origin?: SendOrigin
   ): Promise<void> {
     if (!await packetLogService.isEnabled()) return;
 
@@ -2909,6 +2942,9 @@ class MeshtasticManager implements ISourceManager {
       metadata: JSON.stringify({ ...metadata, direction: 'tx' }),
       direction: 'tx',
       transport_mechanism: TransportMechanism.INTERNAL,  // Outgoing packets are sent via direct connection
+      // Mirrors the wire: only an automation send sets the bit; a manual send
+      // leaves the bitfield absent, which reads as NULL (#6449).
+      is_automation: origin === 'automation' ? true : undefined,
       sourceId: this.sourceId,
     });
   }
@@ -2953,35 +2989,13 @@ class MeshtasticManager implements ISourceManager {
       this.transport = null;
     }
 
-    if (this.tracerouteJitterTimeout) {
-      clearTimeout(this.tracerouteJitterTimeout);
-      this.tracerouteJitterTimeout = null;
-    }
+    this.stopTracerouteScheduler();
 
-    if (this.tracerouteInterval) {
-      clearInterval(this.tracerouteInterval);
-      this.tracerouteInterval = null;
-    }
+    this.stopRemoteLocalStatsScheduler();
 
-    if (this.remoteLocalStatsJitterTimeout) {
-      clearTimeout(this.remoteLocalStatsJitterTimeout);
-      this.remoteLocalStatsJitterTimeout = null;
-    }
+    this.stopRemoteAdminScanner();
 
-    if (this.remoteLocalStatsInterval) {
-      clearInterval(this.remoteLocalStatsInterval);
-      this.remoteLocalStatsInterval = null;
-    }
-
-    if (this.remoteAdminScannerInterval) {
-      clearInterval(this.remoteAdminScannerInterval);
-      this.remoteAdminScannerInterval = null;
-    }
-
-    if (this.timeSyncInterval) {
-      clearInterval(this.timeSyncInterval);
-      this.timeSyncInterval = null;
-    }
+    this.stopTimeSyncScheduler();
 
     if (this.autoFavoriteSweepInterval) {
       clearInterval(this.autoFavoriteSweepInterval);
@@ -3035,8 +3049,10 @@ class MeshtasticManager implements ISourceManager {
     this.externalConfigCaptureCallback = callback;
   }
 
-  private startTracerouteScheduler(): void {
-    // Clear any pending jitter timeout to prevent leaked timers
+  /** Cancel the auto-traceroute timers and any start still reading the DB. */
+  private stopTracerouteScheduler(): void {
+    this.tracerouteSchedulerGeneration++;
+
     if (this.tracerouteJitterTimeout) {
       clearTimeout(this.tracerouteJitterTimeout);
       this.tracerouteJitterTimeout = null;
@@ -3046,6 +3062,38 @@ class MeshtasticManager implements ISourceManager {
       clearInterval(this.tracerouteInterval);
       this.tracerouteInterval = null;
     }
+  }
+
+  /** Persisted time of this source's last auto traceroute (epoch ms), or 0. */
+  private async loadAutoTracerouteLastSentAt(): Promise<number> {
+    try {
+      const raw = await databaseService.settings.getSettingForSource(this.sourceId, AUTO_TRACEROUTE_LAST_SENT_KEY);
+      const at = raw ? Number(raw) : 0;
+      return Number.isFinite(at) && at > 0 ? at : 0;
+    } catch (err) {
+      logger.warn(`🗺️ Auto-traceroute: failed to read last send time for source ${this.sourceId}:`, err);
+      return 0;
+    }
+  }
+
+  private async persistAutoTracerouteLastSentAt(at: number): Promise<void> {
+    try {
+      await databaseService.settings.setSourceSetting(this.sourceId, AUTO_TRACEROUTE_LAST_SENT_KEY, String(at));
+    } catch (err) {
+      logger.warn(`🗺️ Auto-traceroute: failed to persist last send time for source ${this.sourceId}:`, err);
+    }
+  }
+
+  /**
+   * Start (or restart) the auto-traceroute scheduler. A restart (settings
+   * save, reconnect, process restart) is never a trigger: the first run waits
+   * until the persisted last send plus one interval, or the startup jitter,
+   * whichever is later.
+   */
+  private async startTracerouteScheduler(): Promise<void> {
+    // Clear any pending timers to prevent leaks, and invalidate older starts.
+    this.stopTracerouteScheduler();
+    const generation = this.tracerouteSchedulerGeneration;
 
     // If interval is 0, traceroute is disabled
     if (this.tracerouteIntervalMinutes === 0) {
@@ -3060,9 +3108,21 @@ class MeshtasticManager implements ISourceManager {
     // Only the first execution is delayed; subsequent runs use the regular interval.
     const maxJitterMs = Math.min(intervalMs, 5 * 60 * 1000); // Cap at 5 minutes
     const initialJitterMs = Math.random() * maxJitterMs;
-    const jitterSeconds = Math.round(initialJitterMs / 1000);
 
-    logger.debug(`🗺️ Starting traceroute scheduler with ${this.tracerouteIntervalMinutes} minute interval (initial jitter: ${jitterSeconds}s)`);
+    // Never run sooner than last send + interval. The in-memory time covers a
+    // failed DB read; the persisted time covers a process restart.
+    const lastSentAt = Math.max(this.lastTracerouteSentTime, await this.loadAutoTracerouteLastSentAt());
+    if (generation !== this.tracerouteSchedulerGeneration) {
+      return; // a newer start or a stop ran while we read the DB
+    }
+    // Cap at one interval so a last-send time in the future (clock moved
+    // back) cannot stall the scheduler.
+    const untilDueMs = lastSentAt > 0
+      ? Math.min(intervalMs, Math.max(0, lastSentAt + intervalMs - Date.now()))
+      : 0;
+    const initialDelayMs = Math.max(initialJitterMs, untilDueMs);
+
+    logger.debug(`🗺️ Starting traceroute scheduler with ${this.tracerouteIntervalMinutes} minute interval (first run in ${Math.round(initialDelayMs / 1000)}s)`);
 
     // The traceroute execution logic
     const executeTraceroute = async () => {
@@ -3114,7 +3174,10 @@ class MeshtasticManager implements ISourceManager {
             this.pendingAutoTraceroutes.add(targetNode.nodeNum);
             this.pendingTracerouteTimestamps.set(targetNode.nodeNum, Date.now());
 
-            this.lastTracerouteSentTime = Date.now();
+            const sentAt = Date.now();
+            this.lastTracerouteSentTime = sentAt;
+            // Persist so a restart or settings save cannot send early.
+            await this.persistAutoTracerouteLastSentAt(sentAt);
             await this.sendTraceroute(targetNode.nodeNum, channel, { origin: 'automation' });
 
             // Check for timed-out traceroutes (> 5 minutes old)
@@ -3130,7 +3193,7 @@ class MeshtasticManager implements ISourceManager {
       }
     };
 
-    // Delay first execution by jitter, then start regular interval
+    // Delay first execution, then start regular interval
     this.tracerouteJitterTimeout = setTimeout(() => {
       this.tracerouteJitterTimeout = null;
       // Execute first traceroute
@@ -3138,7 +3201,7 @@ class MeshtasticManager implements ISourceManager {
 
       // Start regular interval (no jitter on subsequent runs)
       this.tracerouteInterval = setInterval(executeTraceroute, intervalMs);
-    }, initialJitterMs);
+    }, initialDelayMs);
   }
 
   /** Start this source's per-source auto-delete-by-distance scheduler (#3901).
@@ -3163,9 +3226,19 @@ class MeshtasticManager implements ISourceManager {
     this.distanceDeleteScheduler?.stop();
   }
 
-  setTracerouteInterval(minutes: number): void {
-    if (minutes < 0 || minutes > 60) {
-      throw new Error('Traceroute interval must be between 0 and 60 minutes (0 = disabled)');
+  setTracerouteInterval(requestedMinutes: number): void {
+    // 0 or 3–60; a request for 1 or 2 rises to 3 (the UI minimum).
+    const minutes = normalizeTracerouteIntervalMinutes(requestedMinutes);
+    if (minutes === null) {
+      throw new Error('Traceroute interval must be 0 (disabled) or 3–60 minutes');
+    }
+
+    // Same interval and the scheduler already armed: leave it alone, so a
+    // save that only changes filters or the schedule window does not re-time
+    // the next traceroute.
+    const armed = this.tracerouteJitterTimeout !== null || this.tracerouteInterval !== null;
+    if (minutes === this.tracerouteIntervalMinutes && (armed || minutes === 0)) {
+      return;
     }
     this.tracerouteIntervalMinutes = minutes;
 
@@ -3176,7 +3249,7 @@ class MeshtasticManager implements ISourceManager {
     }
 
     if (this.isConnected) {
-      this.startTracerouteScheduler();
+      this.startTracerouteScheduler().catch(err => logger.error('❌ Error starting traceroute scheduler:', err));
     }
   }
 
@@ -3188,6 +3261,14 @@ class MeshtasticManager implements ISourceManager {
     if (minutes < 0 || minutes > 1440) {
       throw new Error('Remote LocalStats interval must be between 0 and 1440 minutes (0 = disabled)');
     }
+
+    // Same interval and the scheduler already armed: leave it alone, so a
+    // save that only changes filters or the schedule window does not re-time
+    // the next request.
+    const armed = this.remoteLocalStatsJitterTimeout !== null || this.remoteLocalStatsInterval !== null;
+    if (minutes === this.remoteLocalStatsIntervalMinutes && (armed || minutes === 0)) {
+      return;
+    }
     this.remoteLocalStatsIntervalMinutes = minutes;
     logger.debug(
       minutes === 0
@@ -3195,7 +3276,7 @@ class MeshtasticManager implements ISourceManager {
         : `📊 Remote LocalStats interval updated to ${minutes} minutes`
     );
     if (this.isConnected) {
-      this.startRemoteLocalStatsScheduler();
+      this.startRemoteLocalStatsScheduler().catch(err => logger.error('❌ Error starting remote LocalStats scheduler:', err));
     }
   }
 
@@ -3205,16 +3286,14 @@ class MeshtasticManager implements ISourceManager {
    * schedule-window + airtime gating, and a minimum-interval rate limit. Each
    * tick polls ONE target (the least-recently-polled match) to keep airtime use
    * low while still cycling through the whole matched set over time. Issue #3398.
+   * A restart (settings save, reconnect, process restart) is never a trigger:
+   * the first run waits until the persisted last send plus one interval, or
+   * the startup jitter, whichever is later.
    */
-  private startRemoteLocalStatsScheduler(): void {
-    if (this.remoteLocalStatsJitterTimeout) {
-      clearTimeout(this.remoteLocalStatsJitterTimeout);
-      this.remoteLocalStatsJitterTimeout = null;
-    }
-    if (this.remoteLocalStatsInterval) {
-      clearInterval(this.remoteLocalStatsInterval);
-      this.remoteLocalStatsInterval = null;
-    }
+  private async startRemoteLocalStatsScheduler(): Promise<void> {
+    // Clear any pending timers to prevent leaks, and invalidate older starts.
+    this.stopRemoteLocalStatsScheduler();
+    const generation = this.remoteLocalStatsSchedulerGeneration;
 
     if (this.remoteLocalStatsIntervalMinutes === 0) {
       logger.debug('📊 Remote LocalStats automation is disabled');
@@ -3228,7 +3307,20 @@ class MeshtasticManager implements ISourceManager {
 
     const maxJitterMs = Math.min(intervalMs, 5 * 60 * 1000);
     const initialJitterMs = Math.random() * maxJitterMs;
-    logger.debug(`📊 Starting remote LocalStats scheduler with ${this.remoteLocalStatsIntervalMinutes} minute interval (initial jitter: ${Math.round(initialJitterMs / 1000)}s)`);
+
+    // Never run sooner than last send + interval. The in-memory time covers a
+    // failed DB read; the persisted time covers a process restart.
+    const lastSentAt = Math.max(this.lastRemoteLocalStatsSentTime, await this.loadRemoteLocalStatsLastSentAt());
+    if (generation !== this.remoteLocalStatsSchedulerGeneration) {
+      return; // a newer start or a stop ran while we read the DB
+    }
+    // Cap at one interval so a last-send time in the future (clock moved
+    // back) cannot stall the scheduler.
+    const untilDueMs = lastSentAt > 0
+      ? Math.min(intervalMs, Math.max(0, lastSentAt + intervalMs - Date.now()))
+      : 0;
+    const initialDelayMs = Math.max(initialJitterMs, untilDueMs);
+    logger.debug(`📊 Starting remote LocalStats scheduler with ${this.remoteLocalStatsIntervalMinutes} minute interval (first run in ${Math.round(initialDelayMs / 1000)}s)`);
 
     const executeRemoteLocalStats = async () => {
       // TX-disabled radios cannot send remote telemetry requests; skip quietly and
@@ -3305,10 +3397,12 @@ class MeshtasticManager implements ISourceManager {
         const targetName = target.longName || target.nodeId;
         logger.debug(`📊 Remote LocalStats: Requesting local_stats from ${targetName} (${target.nodeId}) on channel ${channel}, hopLimit ${hopLimit}`);
 
-        this.remoteLocalStatsLastSentAt.set(Number(target.nodeNum), Date.now());
-        this.lastRemoteLocalStatsSentTime = Date.now();
         // Record the request so the NEXT tick settles it into success/miss.
         const sentAt = Date.now();
+        this.remoteLocalStatsLastSentAt.set(Number(target.nodeNum), sentAt);
+        this.lastRemoteLocalStatsSentTime = sentAt;
+        // Persist so a restart or settings save cannot send early.
+        await this.persistRemoteLocalStatsLastSentAt(sentAt);
         const entry = retryState.get(Number(target.nodeNum))
           ?? { missCount: 0, cooldownUntil: null, lastRequestAt: null, settledAt: null };
         entry.lastRequestAt = sentAt;
@@ -3324,7 +3418,42 @@ class MeshtasticManager implements ISourceManager {
       this.remoteLocalStatsJitterTimeout = null;
       executeRemoteLocalStats().catch(err => logger.error('Remote LocalStats scheduler error:', err));
       this.remoteLocalStatsInterval = setInterval(executeRemoteLocalStats, intervalMs);
-    }, initialJitterMs);
+    }, initialDelayMs);
+  }
+
+  /** Cancel the remote LocalStats timers and any start still reading the DB. */
+  private stopRemoteLocalStatsScheduler(): void {
+    this.remoteLocalStatsSchedulerGeneration++;
+
+    if (this.remoteLocalStatsJitterTimeout) {
+      clearTimeout(this.remoteLocalStatsJitterTimeout);
+      this.remoteLocalStatsJitterTimeout = null;
+    }
+
+    if (this.remoteLocalStatsInterval) {
+      clearInterval(this.remoteLocalStatsInterval);
+      this.remoteLocalStatsInterval = null;
+    }
+  }
+
+  /** Persisted time of this source's last remote LocalStats request (epoch ms), or 0. */
+  private async loadRemoteLocalStatsLastSentAt(): Promise<number> {
+    try {
+      const raw = await databaseService.settings.getSettingForSource(this.sourceId, REMOTE_LOCALSTATS_LAST_SENT_KEY);
+      const at = raw ? Number(raw) : 0;
+      return Number.isFinite(at) && at > 0 ? at : 0;
+    } catch (err) {
+      logger.warn(`📊 Remote LocalStats: failed to read last send time for source ${this.sourceId}:`, err);
+      return 0;
+    }
+  }
+
+  private async persistRemoteLocalStatsLastSentAt(at: number): Promise<void> {
+    try {
+      await databaseService.settings.setSourceSetting(this.sourceId, REMOTE_LOCALSTATS_LAST_SENT_KEY, String(at));
+    } catch (err) {
+      logger.warn(`📊 Remote LocalStats: failed to persist last send time for source ${this.sourceId}:`, err);
+    }
   }
 
   /**
@@ -3641,8 +3770,29 @@ class MeshtasticManager implements ISourceManager {
    * disabled or no utilization reading is available.
    */
   async isAutomationAirtimeGated(): Promise<boolean> {
+    return (await this.getAirtimeGateVerdict()).gated;
+  }
+
+  /**
+   * The one airtime-cutoff verdict every automation path shares: the legacy
+   * timers (via {@link isAutomationAirtimeGated}) and the Automation Engine
+   * (via its NodeDataProvider). Carries the figures so a skipped Engine
+   * action can say why. Fail-open like {@link shouldGateAutomations}.
+   */
+  async getAirtimeGateVerdict(): Promise<{
+    gated: boolean;
+    channelUtilization: number | null;
+    threshold: number;
+    measuredFrom: AirtimeCutoffSource;
+  }> {
     const { value } = await this.getEffectiveChannelUtilization();
     const gated = shouldGateAutomations(value, this.automationAirtimeCutoffThreshold);
+    const verdict = {
+      gated,
+      channelUtilization: value,
+      threshold: this.automationAirtimeCutoffThreshold,
+      measuredFrom: this.automationAirtimeCutoffSource,
+    };
     if (gated) {
       const now = Date.now();
       if (now - this.lastAirtimeGateLogTime > 60000) {
@@ -3653,7 +3803,7 @@ class MeshtasticManager implements ISourceManager {
         );
       }
     }
-    return gated;
+    return verdict;
   }
 
   /**
@@ -3746,6 +3896,13 @@ class MeshtasticManager implements ISourceManager {
     if (minutes < 0 || minutes > 60) {
       throw new Error('Remote admin scanner interval must be between 0 and 60 minutes (0 = disabled)');
     }
+
+    // Same interval and the scanner already armed: leave it alone. A restart
+    // starts a fresh full interval, so every save would push the next scan
+    // back, and frequent saves would stop it from ever running.
+    if (minutes === this.remoteAdminScannerIntervalMinutes && (this.remoteAdminScannerInterval !== null || minutes === 0)) {
+      return;
+    }
     this.remoteAdminScannerIntervalMinutes = minutes;
 
     if (minutes === 0) {
@@ -3764,14 +3921,15 @@ class MeshtasticManager implements ISourceManager {
    * Periodically checks nodes for remote admin capability
    */
   private async startRemoteAdminScanner(): Promise<void> {
-    if (this.remoteAdminScannerInterval) {
-      clearInterval(this.remoteAdminScannerInterval);
-      this.remoteAdminScannerInterval = null;
-    }
+    this.stopRemoteAdminScanner();
+    const generation = this.remoteAdminScannerGeneration;
 
     // Load setting from database if not already set
     if (this.remoteAdminScannerIntervalMinutes === 0) {
       const savedInterval = await databaseService.settings.getSettingForSource(this.sourceId, 'remoteAdminScannerIntervalMinutes');
+      if (generation !== this.remoteAdminScannerGeneration) {
+        return; // a newer start or a stop ran while we read the DB
+      }
       if (savedInterval) {
         const parsed = parseInt(savedInterval, 10) || 0;
         // 0 keeps the scanner off; anything else is clamped to the UI's 1–60.
@@ -3826,6 +3984,15 @@ class MeshtasticManager implements ISourceManager {
     }, intervalMs);
   }
 
+  /** Cancel the remote admin scanner and any start still reading the DB. */
+  private stopRemoteAdminScanner(): void {
+    this.remoteAdminScannerGeneration++;
+    if (this.remoteAdminScannerInterval) {
+      clearInterval(this.remoteAdminScannerInterval);
+      this.remoteAdminScannerInterval = null;
+    }
+  }
+
   /**
    * Set the auto time sync interval in minutes
    * @param minutes Interval in minutes (15-1440), 0 to disable
@@ -3833,6 +4000,12 @@ class MeshtasticManager implements ISourceManager {
   setTimeSyncInterval(minutes: number): void {
     if (minutes !== 0 && (minutes < 15 || minutes > 1440)) {
       throw new Error('Time sync interval must be 0 (disabled) or between 15 and 1440 minutes');
+    }
+
+    // Same interval and the scheduler already armed: leave it alone, so a
+    // save that only changes the node filter does not push the next sync back.
+    if (minutes === this.timeSyncIntervalMinutes && (this.timeSyncInterval !== null || minutes === 0)) {
+      return;
     }
     this.timeSyncIntervalMinutes = minutes;
 
@@ -3853,20 +4026,24 @@ class MeshtasticManager implements ISourceManager {
    * Start the automatic time sync scheduler
    */
   private async startTimeSyncScheduler(): Promise<void> {
-    if (this.timeSyncInterval) {
-      clearInterval(this.timeSyncInterval);
-      this.timeSyncInterval = null;
-    }
+    this.stopTimeSyncScheduler();
+    const generation = this.timeSyncSchedulerGeneration;
 
     // Per-source reads: when saved via /api/settings/time-sync-nodes?sourceId=,
     // these live at source:<id>:autoTimeSync* and fall back to global keys.
     const enabledStr = await databaseService.settings.getSettingForSource(this.sourceId, 'autoTimeSyncEnabled');
+    if (generation !== this.timeSyncSchedulerGeneration) {
+      return; // a newer start or a stop ran while we read the DB
+    }
     const isEnabled = enabledStr === 'true';
 
     // Load settings from database if not already set
     if (this.timeSyncIntervalMinutes === 0) {
       if (isEnabled) {
         const intervalStr = await databaseService.settings.getSettingForSource(this.sourceId, 'autoTimeSyncIntervalMinutes');
+        if (generation !== this.timeSyncSchedulerGeneration) {
+          return;
+        }
         const parsed = intervalStr ? parseInt(intervalStr, 10) : NaN;
         // NaN keeps the historical default of 15 and 0 still means disabled;
         // anything else is clamped to the UI's 15–1440 range (the setter
@@ -3899,6 +4076,15 @@ class MeshtasticManager implements ISourceManager {
         logger.debug('🕐 Time sync scheduler: Skipping - not connected or no local node info');
       }
     }, intervalMs);
+  }
+
+  /** Cancel the time sync scheduler and any start still reading the DB. */
+  private stopTimeSyncScheduler(): void {
+    this.timeSyncSchedulerGeneration++;
+    if (this.timeSyncInterval) {
+      clearInterval(this.timeSyncInterval);
+      this.timeSyncInterval = null;
+    }
   }
 
   /**
@@ -4158,6 +4344,8 @@ class MeshtasticManager implements ISourceManager {
     autoPurge?: boolean;
     immediatePurge?: boolean;
   }): void {
+    const wasEnabled = this.keyRepairEnabled;
+    const prevIntervalMinutes = this.keyRepairIntervalMinutes;
     if (settings.enabled !== undefined) {
       this.keyRepairEnabled = settings.enabled;
     }
@@ -4182,8 +4370,13 @@ class MeshtasticManager implements ISourceManager {
 
     logger.debug(`🔐 Key repair settings updated: enabled=${this.keyRepairEnabled}, interval=${this.keyRepairIntervalMinutes}min, maxExchanges=${this.keyRepairMaxExchanges}, autoPurge=${this.keyRepairAutoPurge}, immediatePurge=${this.keyRepairImmediatePurge}`);
 
-    // Restart scheduler if connected
-    if (this.isConnected) {
+    // Restart only when the timing changed or the scheduler should run but is
+    // not armed. A restart starts a fresh full interval, so restarting on a
+    // max-exchanges or purge change would push the next repair pass back.
+    const timingChanged = this.keyRepairEnabled !== wasEnabled
+      || this.keyRepairIntervalMinutes !== prevIntervalMinutes;
+    const needsArming = this.keyRepairEnabled && this.keyRepairInterval === null;
+    if (this.isConnected && (timingChanged || needsArming)) {
       this.startKeyRepairScheduler();
     }
   }
@@ -4193,10 +4386,7 @@ class MeshtasticManager implements ISourceManager {
    * Requests LocalStats at the configured interval to track mesh health metrics
    */
   private startLocalStatsScheduler(): void {
-    if (this.localStatsInterval) {
-      clearInterval(this.localStatsInterval);
-      this.localStatsInterval = null;
-    }
+    this.stopLocalStatsScheduler();
 
     // If interval is 0, collection is disabled
     if (this.localStatsIntervalMinutes === 0) {
@@ -4208,7 +4398,8 @@ class MeshtasticManager implements ISourceManager {
     logger.debug(`📊 Starting LocalStats scheduler with ${this.localStatsIntervalMinutes} minute interval`);
 
     // Delay the first request by 30 seconds to let the node settle after connect
-    setTimeout(() => {
+    this.localStatsFirstRequestTimeout = setTimeout(() => {
+      this.localStatsFirstRequestTimeout = null;
       if (this.isConnected && this.localNodeInfo) {
         this.requestLocalStats().catch(error => {
           logger.error('❌ Error requesting initial LocalStats:', error);
@@ -4238,6 +4429,12 @@ class MeshtasticManager implements ISourceManager {
    * Stop LocalStats collection scheduler
    */
   private stopLocalStatsScheduler(): void {
+    // The 30-second first request is a timer too; leaving it armed let every
+    // restart add one more request.
+    if (this.localStatsFirstRequestTimeout) {
+      clearTimeout(this.localStatsFirstRequestTimeout);
+      this.localStatsFirstRequestTimeout = null;
+    }
     if (this.localStatsInterval) {
       clearInterval(this.localStatsInterval);
       this.localStatsInterval = null;
@@ -4300,6 +4497,12 @@ class MeshtasticManager implements ISourceManager {
   setLocalStatsInterval(minutes: number): void {
     if (minutes < 0 || minutes > 60) {
       throw new Error('LocalStats interval must be between 0 and 60 minutes (0 = disabled)');
+    }
+
+    // Same interval and the scheduler already armed: leave it alone, so a
+    // save of an unrelated setting does not restart collection.
+    if (minutes === this.localStatsIntervalMinutes && (this.localStatsInterval !== null || minutes === 0)) {
+      return;
     }
     this.localStatsIntervalMinutes = minutes;
 
@@ -4849,7 +5052,7 @@ class MeshtasticManager implements ISourceManager {
         maxBuffer: 1024 * 1024,
       });
 
-      if (stderr) logger.warn(`📍 Geofence script "${trigger.name}" stderr: ${stderr}`);
+      if (stderr) logger.warn(`📍 Geofence script "${trigger.name}" stderr: ${scrubScriptSecrets(stderr)}`);
 
       // Parse JSON output and send messages (same format as timer scripts)
       if (stdout && stdout.trim()) {
@@ -4898,10 +5101,10 @@ class MeshtasticManager implements ISourceManager {
       await this.updateGeofenceTriggerResult(trigger.id, 'success');
     } catch (error: any) {
       const duration = Date.now() - startTime;
-      const errorMessage = error.message || 'Unknown error';
+      const errorMessage = scrubScriptSecrets(error.message || 'Unknown error');
       logger.error(`📍 Geofence "${trigger.name}" script failed after ${duration}ms: ${errorMessage}`);
-      if (error.stderr) logger.error(`📍 Geofence script stderr: ${error.stderr}`);
-      if (error.stdout) logger.warn(`📍 Geofence script stdout before failure: ${error.stdout.substring(0, 200)}`);
+      if (error.stderr) logger.error(`📍 Geofence script stderr: ${scrubScriptSecrets(String(error.stderr))}`);
+      if (error.stdout) logger.warn(`📍 Geofence script stdout before failure: ${scrubScriptSecrets(String(error.stdout)).substring(0, 200)}`);
       await this.updateGeofenceTriggerResult(trigger.id, 'error', errorMessage);
     }
   }
@@ -5115,7 +5318,7 @@ class MeshtasticManager implements ISourceManager {
       });
 
       if (stderr) {
-        logger.warn(`⏱️ Timer script "${triggerName}" stderr: ${stderr}`);
+        logger.warn(`⏱️ Timer script "${triggerName}" stderr: ${scrubScriptSecrets(stderr)}`);
       }
 
       const duration = Date.now() - startTime;
@@ -5123,14 +5326,14 @@ class MeshtasticManager implements ISourceManager {
 
       // Parse JSON output and send messages to channel
       if (stdout && stdout.trim()) {
-        logger.debug(`⏱️ Timer script stdout: ${stdout.substring(0, 200)}${stdout.length > 200 ? '...' : ''}`);
+        logger.debug(`⏱️ Timer script stdout: ${scrubScriptSecrets(stdout).substring(0, 200)}${stdout.length > 200 ? '...' : ''}`);
 
         // Try to parse as JSON (same format as Auto-Responder scripts)
         let scriptOutput;
         try {
           scriptOutput = JSON.parse(stdout.trim());
         } catch (parseError) {
-          logger.debug(`⏱️ Timer script output is not JSON, ignoring: ${stdout.substring(0, 100)}`);
+          logger.debug(`⏱️ Timer script output is not JSON, ignoring: ${scrubScriptSecrets(stdout).substring(0, 100)}`);
           await this.updateTimerTriggerResult(triggerId, 'success');
           return;
         }
@@ -5149,7 +5352,7 @@ class MeshtasticManager implements ISourceManager {
         } else if (scriptOutput.response && typeof scriptOutput.response === 'string') {
           // Single response format: { "response": "msg" }
           scriptResponses = [scriptOutput.response];
-          logger.debug(`⏱️ Timer script response: ${scriptOutput.response.substring(0, 50)}...`);
+          logger.debug(`⏱️ Timer script response: ${scrubScriptSecrets(scriptOutput.response).substring(0, 50)}...`);
         } else {
           logger.debug(`⏱️ Timer script output has no 'response' or 'responses' field, ignoring`);
           await this.updateTimerTriggerResult(triggerId, 'success');
@@ -5195,10 +5398,10 @@ class MeshtasticManager implements ISourceManager {
 
     } catch (error: any) {
       const duration = Date.now() - startTime;
-      const errorMessage = error.message || 'Unknown error';
+      const errorMessage = scrubScriptSecrets(error.message || 'Unknown error');
       logger.error(`⏱️ Timer "${triggerName}" failed after ${duration}ms: ${errorMessage}`);
-      if (error.stderr) logger.error(`⏱️ Timer script stderr: ${error.stderr}`);
-      if (error.stdout) logger.warn(`⏱️ Timer script stdout before failure: ${error.stdout.substring(0, 200)}`);
+      if (error.stderr) logger.error(`⏱️ Timer script stderr: ${scrubScriptSecrets(String(error.stderr))}`);
+      if (error.stdout) logger.warn(`⏱️ Timer script stdout before failure: ${scrubScriptSecrets(String(error.stdout)).substring(0, 200)}`);
       await this.updateTimerTriggerResult(triggerId, 'error', errorMessage);
     }
   }
@@ -7313,6 +7516,8 @@ class MeshtasticManager implements ISourceManager {
           // Firmware 2.8 XEdDSA signature-verified flag (#3923); undefined
           // (pre-2.8 firmware) stays NULL = unknown.
           xeddsa_signed: meshPacket.xeddsaSigned ?? undefined,
+          // Data.bitfield bit 2 (#6449); absent bitfield stays NULL.
+          is_automation: readIsAutomationBit(meshPacket.decoded?.bitfield),
           // 'tx' ONLY for genuine local transmissions (internal, fresh, no RX
           // metadata). A spoofed packet claiming our node number is a reception.
           direction: spoof.isGenuineLocalTx ? 'tx' : 'rx',
@@ -8025,6 +8230,9 @@ class MeshtasticManager implements ISourceManager {
           // cryptographically verified this broadcast's signature. Read the same
           // way the Packet Monitor path does (see metadata.xeddsa_signed above).
           xeddsaSigned: meshPacket.xeddsaSigned === true ? true : undefined,
+          // is_automation (Data.bitfield bit 2, #6449): NULL when the bitfield
+          // is absent on the wire, so "unknown" never reads as "human".
+          isAutomation: readIsAutomationBit(meshPacket.decoded?.bitfield),
           // Inbound radio path — message arrived from a meshtastic node over TCP.
           // MQTT-bridged inbound packets are flagged via viaMqtt above; we still
           // attribute the row's ingress to 'tcp_radio' because it arrived via
@@ -10478,6 +10686,7 @@ class MeshtasticManager implements ISourceManager {
         destination: options.destination,
         channel: options.channel,
         hopLimit,
+        isAutomation: options.origin === 'automation',
       });
       if (data.length === 0) return 0;
 
@@ -10504,6 +10713,7 @@ class MeshtasticManager implements ISourceManager {
         channel,
         `Waypoint id=${waypoint.id} ${waypoint.name ?? ''}`.trim(),
         { destination, packetId, waypointId: waypoint.id, expire: waypoint.expire },
+        options.origin,
       );
 
       logger.debug(`📍 Waypoint broadcast id=${waypoint.id} (${waypoint.name ?? ''}) packetId=${packetId}`);
@@ -11690,7 +11900,7 @@ class MeshtasticManager implements ISourceManager {
       const hopLimit = clampHopLimitOverride(options?.hopLimitOverride, this.getConfiguredHopLimit());
       const zeroHop = hopLimit === 0;
 
-      const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji, pkiEncrypted, hopLimit);
+      const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji, pkiEncrypted, hopLimit, options?.origin === 'automation');
 
       // Remember our own packet id so that if this message is overheard
       // rebroadcast, echoed by MQTT, or replayed by store-and-forward, it isn't
@@ -11720,7 +11930,8 @@ class MeshtasticManager implements ISourceManager {
         destination || 0xffffffff,
         channel,
         `"${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`,
-        { messageId, replyId, emoji }
+        { messageId, replyId, emoji },
+        options?.origin
       );
 
       // Save sent message to database for UI display
@@ -11781,6 +11992,8 @@ class MeshtasticManager implements ISourceManager {
           sourcePath: attribution?.sourcePath ?? 'system',
           // #5101: every outbound Meshtastic message write stamps INTERNAL.
           transportMechanism: TransportMechanism.INTERNAL,
+          // Mirrors the wire (#6449): only an automation send sets the bit.
+          isAutomation: options?.origin === 'automation' ? true : undefined,
         };
 
         await databaseService.messages.insertMessage(message, this.sourceId);
@@ -11830,6 +12043,7 @@ class MeshtasticManager implements ISourceManager {
             replyId: replyId || null,
             emoji: emoji || null,
             pkiEncrypted: !!destination && pkiEncrypted,
+            isAutomation: options?.origin === 'automation',
           });
           if (fromRadioData) {
             await virtualNodeServer.broadcastToClients(fromRadioData);
@@ -11867,7 +12081,7 @@ class MeshtasticManager implements ISourceManager {
       // Traceroutes normally let the firmware pick the packet id. An automated
       // one needs a known id so the MQTT bridge can recognise it (#5414).
       const automationId = options?.origin === 'automation' ? randomPacketId() : undefined;
-      const tracerouteData = meshtasticProtobufService.createTracerouteMessage(destination, channel, hopLimit, automationId);
+      const tracerouteData = meshtasticProtobufService.createTracerouteMessage(destination, channel, hopLimit, automationId, options?.origin === 'automation');
       if (automationId !== undefined) this.recordAutomationPacket(automationId, options?.origin);
 
       logger.debug(`🔍 Traceroute packet created: ${tracerouteData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, hopLimit=${hopLimit}`);
@@ -11894,7 +12108,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `Traceroute request to !${destination.toString(16).padStart(8, '0')}`,
-        { destination }
+        { destination },
+        options?.origin
       );
     } catch (error) {
       logger.error('Error sending traceroute:', error);
@@ -11924,7 +12139,8 @@ class MeshtasticManager implements ISourceManager {
       const { data: positionRequestData, packetId, requestId } = meshtasticProtobufService.createPositionRequestMessage(
         destination,
         channel,
-        this.getConfiguredHopLimit()
+        this.getConfiguredHopLimit(),
+        options?.origin === 'automation'
       );
 
       logger.debug(`📍 Position exchange packet created: ${positionRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, packetId=${packetId}, requestId=${requestId}`);
@@ -11951,7 +12167,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `Position exchange with !${destination.toString(16).padStart(8, '0')}`,
-        { destination, packetId, requestId }
+        { destination, packetId, requestId },
+        options?.origin
       );
 
       return { packetId, requestId };
@@ -12002,7 +12219,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         localUserInfo,
-        this.getConfiguredHopLimit()
+        this.getConfiguredHopLimit(),
+        options?.origin === 'automation'
       );
 
       logger.debug(`📇 NodeInfo exchange packet created: ${nodeInfoRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, packetId=${packetId}, requestId=${requestId}, userInfo=${localUserInfo ? localUserInfo.longName : 'none'}`);
@@ -12029,7 +12247,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `NodeInfo exchange with !${destination.toString(16).padStart(8, '0')}`,
-        { destination, packetId, requestId }
+        { destination, packetId, requestId },
+        options?.origin
       );
 
       return { packetId, requestId };
@@ -12067,7 +12286,8 @@ class MeshtasticManager implements ISourceManager {
       const { data: neighborInfoRequestData, packetId, requestId } = meshtasticProtobufService.createNeighborInfoRequestMessage(
         destination,
         channel,
-        this.getConfiguredHopLimit()
+        this.getConfiguredHopLimit(),
+        options?.origin === 'automation'
       );
 
       logger.debug(`🏠 NeighborInfo request packet created: ${neighborInfoRequestData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, packetId=${packetId}, requestId=${requestId}`);
@@ -12099,7 +12319,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `NeighborInfo request to !${destination.toString(16).padStart(8, '0')}`,
-        { destination, packetId, requestId }
+        { destination, packetId, requestId },
+        options?.origin
       );
 
       return { packetId, requestId };
@@ -12313,7 +12534,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         telemetryType,
-        this.getConfiguredHopLimit()
+        this.getConfiguredHopLimit(),
+        options?.origin === 'automation'
       );
       recordOwnTelemetryRequest(packetId); // loop guard: its reply must not fire trigger.telemetry
 
@@ -12349,7 +12571,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         `Telemetry request (${typeLabel}) to !${destination.toString(16).padStart(8, '0')}`,
-        { destination, telemetryType: typeLabel, packetId, requestId }
+        { destination, telemetryType: typeLabel, packetId, requestId },
+        options?.origin
       );
 
       // Track this outstanding request so the firmware NeighborInfo-hijack
@@ -12498,7 +12721,8 @@ class MeshtasticManager implements ISourceManager {
         destination,
         channel,
         'localStats',
-        hopLimit
+        hopLimit,
+        options?.origin === 'automation'
       );
     recordOwnTelemetryRequest(packetId); // loop guard: its reply must not fire trigger.telemetry
 
@@ -12675,6 +12899,15 @@ class MeshtasticManager implements ISourceManager {
       // Skip if auto-acknowledge is disabled
       if (autoAckEnabled !== 'true') {
         if (afterWait) logger.debug(`⏭️ Dropping delayed auto-acknowledge for packet ${packetId} on ${sourceId}: Auto-Acknowledge was turned off`);
+        return;
+      }
+
+      // #6449: the sender flagged this as sent by an automation (Data.bitfield
+      // bit 2). Skip it unless the operator opted in, so two bots cannot
+      // acknowledge each other forever. Absent/unknown flag counts as human.
+      if (message?.isAutomation === true
+        && await settings.getSettingForSource(sourceId, 'autoAckRespondToAutomation') !== 'true') {
+        logger.debug(`⏭️ Skipping auto-acknowledge for packet ${packetId}: sender flagged it as automated`);
         return;
       }
 
@@ -13685,6 +13918,14 @@ class MeshtasticManager implements ISourceManager {
         return;
       }
 
+      // #6449: skip messages the sender flagged as automated (Data.bitfield
+      // bit 2) unless the operator opted in — a bot-to-bot loop guard.
+      if (message.isAutomation === true
+        && await settings.getSettingForSource(sourceId, 'autoResponderRespondToAutomation') !== 'true') {
+        logger.debug(`⏭️ Skipping auto-responder for packet ${packetId}: sender flagged it as automated`);
+        return;
+      }
+
       // TX-disabled radios cannot send the auto-responder reply; skip quietly (#4294).
       if (!this.canTransmit()) {
         logger.debug('⏭️ Skipping auto-responder - TX disabled on this source');
@@ -13956,7 +14197,7 @@ class MeshtasticManager implements ISourceManager {
               });
 
               if (stderr) {
-                logger.warn(`🔧 Auto-responder script for "${triggerPattern}" stderr: ${stderr}`);
+                logger.warn(`🔧 Auto-responder script for "${triggerPattern}" stderr: ${scrubScriptSecrets(stderr)}`);
               }
 
               // Support both single response and multiple responses
@@ -14033,10 +14274,10 @@ class MeshtasticManager implements ISourceManager {
               } else if (error.code === 'ENOENT') {
                 logger.error(`🔧 Auto-responder script for "${triggerPattern}" not found: ${scriptPath}`);
               } else {
-                logger.error(`🔧 Auto-responder script for "${triggerPattern}" failed after ${scriptDuration}ms: ${error.message}`);
+                logger.error(`🔧 Auto-responder script for "${triggerPattern}" failed after ${scriptDuration}ms: ${scrubScriptSecrets(String(error.message))}`);
               }
-              if (error.stderr) logger.error(`🔧 Script stderr: ${error.stderr}`);
-              if (error.stdout) logger.warn(`🔧 Script stdout before failure: ${error.stdout.substring(0, 200)}`);
+              if (error.stderr) logger.error(`🔧 Script stderr: ${scrubScriptSecrets(String(error.stderr))}`);
+              if (error.stdout) logger.warn(`🔧 Script stdout before failure: ${scrubScriptSecrets(String(error.stdout)).substring(0, 200)}`);
               return;
             }
 
@@ -15873,6 +16114,15 @@ class MeshtasticManager implements ISourceManager {
   }
 
   /**
+   * The add_contact packet that precedes set_favorite_node (#6153), or null
+   * when it must not be sent. Shared with the Admin Commands route so every
+   * favorite path builds it the same way.
+   */
+  async buildFavoritedContactMessage(nodeNum: number, sessionPasskey: Uint8Array): Promise<Uint8Array | null> {
+    return this.favoritesService.buildFavoritedContactMessage(nodeNum, sessionPasskey);
+  }
+
+  /**
    * Send admin message to remove a node from favorites on the device
    */
   async sendRemoveFavoriteNode(nodeNum: number, destinationNodeNum?: number): Promise<void> {
@@ -16240,6 +16490,17 @@ class MeshtasticManager implements ISourceManager {
     timeoutMs: number = 30000
   ): Promise<{ packetId: number; acked: boolean; errorReason: number | null; timedOut: boolean }> {
     return this.adminTransactionService.sendAdminCommandAwaitAck(adminMessagePayload, destinationNodeNum, timeoutMs);
+  }
+
+  /**
+   * Send an admin command to our own node and report a refusal (routing error
+   * code), or null when the node stayed silent, which means it accepted.
+   */
+  async sendLocalAdminAwaitRejection(
+    adminMessagePayload: Uint8Array,
+    timeoutMs: number = 5000
+  ): Promise<{ rejected: number | null }> {
+    return this.adminTransactionService.sendLocalAdminAwaitRejection(adminMessagePayload, timeoutMs);
   }
 
   /**
@@ -16730,6 +16991,7 @@ class MeshtasticManager implements ISourceManager {
       emoji: msg.emoji ?? undefined,
       viaMqtt: Boolean(msg.viaMqtt),
       xeddsaSigned: msg.xeddsaSigned ? true : undefined,
+      isAutomation: msg.isAutomation ? true : undefined,
       ackProofStatus: normalizeAckProofStatus(msg.ackProofStatus),
       rxSnr: msg.rxSnr ?? undefined,
       rxRssi: msg.rxRssi ?? undefined,
@@ -16932,37 +17194,15 @@ class MeshtasticManager implements ISourceManager {
 
     // 'stopSchedulers' action (below, through the cron-job clear)
     // Clear any active intervals and pending jitter timeouts
-    if (this.tracerouteJitterTimeout) {
-      clearTimeout(this.tracerouteJitterTimeout);
-      this.tracerouteJitterTimeout = null;
-    }
+    this.stopTracerouteScheduler();
 
-    if (this.tracerouteInterval) {
-      clearInterval(this.tracerouteInterval);
-      this.tracerouteInterval = null;
-    }
-
-    if (this.remoteLocalStatsJitterTimeout) {
-      clearTimeout(this.remoteLocalStatsJitterTimeout);
-      this.remoteLocalStatsJitterTimeout = null;
-    }
-
-    if (this.remoteLocalStatsInterval) {
-      clearInterval(this.remoteLocalStatsInterval);
-      this.remoteLocalStatsInterval = null;
-    }
+    this.stopRemoteLocalStatsScheduler();
 
     this.distanceDeleteScheduler?.stop();
 
-    if (this.remoteAdminScannerInterval) {
-      clearInterval(this.remoteAdminScannerInterval);
-      this.remoteAdminScannerInterval = null;
-    }
+    this.stopRemoteAdminScanner();
 
-    if (this.timeSyncInterval) {
-      clearInterval(this.timeSyncInterval);
-      this.timeSyncInterval = null;
-    }
+    this.stopTimeSyncScheduler();
 
     if (this.autoFavoriteSweepInterval) {
       clearInterval(this.autoFavoriteSweepInterval);

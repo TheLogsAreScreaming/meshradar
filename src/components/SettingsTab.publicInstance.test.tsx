@@ -312,6 +312,14 @@ describe('SettingsTab — Public-instance mode section (#5156)', () => {
     }
   });
 
+  it('lays the toggles out inline with the shared checkbox-row class', async () => {
+    renderSettings();
+    await waitFor(() => expect(el('publicInstanceModeEnabled')).not.toBeNull());
+    for (const id of ['publicInstanceModeEnabled', ...SUBS]) {
+      expect(el(id).closest('label')?.className).toMatch(/checkboxRow/);
+    }
+  });
+
   it('enables the sub-toggles when the master is on', async () => {
     serverSettings = { publicInstanceModeEnabled: '1' };
     renderSettings();
@@ -343,5 +351,22 @@ describe('SettingsTab — Public-instance mode section (#5156)', () => {
     expect(body.publicInstanceHidePublicKeys).toBe('0');
     expect(body.publicInstanceRoundTimestamps).toBe('1');
     expect(body.publicInstanceHideMessageText).toBe('1');
+  });
+
+  it('warns that the CoT feed is not redacted only when both it and the mode are on', async () => {
+    const warning = () => document.querySelector('[data-testid="public-instance-cot-warning"]');
+    for (const [settings, expected] of [
+      [{ publicInstanceModeEnabled: '1', cotFeedEnabled: '1' }, true],
+      [{ publicInstanceModeEnabled: '1', cotFeedEnabled: '0' }, false],
+      [{ publicInstanceModeEnabled: '0', cotFeedEnabled: '1' }, false],
+    ] as const) {
+      serverSettings = { ...settings };
+      const { unmount } = renderSettings();
+      await waitFor(() => expect(el('publicInstanceModeEnabled')).not.toBeNull());
+      await waitFor(() => expect(el('publicInstanceModeEnabled').checked).toBe(settings.publicInstanceModeEnabled === '1'));
+      await new Promise(r => setTimeout(r, 50));
+      expect(warning() !== null).toBe(expected);
+      unmount();
+    }
   });
 });

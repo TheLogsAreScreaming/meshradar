@@ -42,7 +42,7 @@ import { isDeviceDbWarningMitigatable } from '../utils/deviceDbWarning';
 import { calculateDistance, formatDistance, getDistanceToNode } from '../utils/distance';
 import { mentionCandidatesFromNodes } from '../utils/mentionCandidates';
 import { getMessageContentMatchNodeIds } from '../utils/messageContentFilter';
-import { isNodeComplete, isInfrastructureNode, hasValidPosition, parseNodeId, formatSenderLabel } from '../utils/nodeHelpers';
+import { isNodeComplete, isInfrastructureNode, hasValidPosition, parseNodeId, formatSenderLabel, getUserDisplayName } from '../utils/nodeHelpers';
 import { getEffectiveHops } from '../utils/nodeHops';
 import { scrollInputIntoView } from '../utils/scrollInputIntoView';
 import { useMapContext } from '../contexts/MapContext';
@@ -83,6 +83,10 @@ import {
   useNodeNamesToken,
 } from './messages/messageRowSupport';
 import type { TranslatedMessageState } from './translation/TranslatedMessage';
+import { PublicInstanceNotice } from './PublicInstanceNotice';
+import { HiddenMessageText } from './messages/HiddenMessageText';
+import { isPublicHiddenText } from '../utils/publicInstanceMode';
+import { PortNum } from '../server/constants/meshtastic.js';
 
 /** The latest handlers behind the stable row callbacks (see `rowActions`). */
 interface RowLatest {
@@ -630,7 +634,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
     return {
       nodeNum: node.nodeNum,
       nodeId: node.user?.id || `!${node.nodeNum.toString(16).padStart(8, '0')}`,
-      longName: node.user?.longName || `Node ${node.nodeNum}`,
+      longName: getUserDisplayName(node.user, node.nodeNum),
       shortName: node.user?.shortName || node.nodeNum.toString(16).padStart(8, '0').slice(-4),
       hopsAway: node.hopsAway,
       role: typeof node.user?.role === 'string' ? parseInt(node.user.role, 10) : node.user?.role,
@@ -788,7 +792,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
           (msg.from === nodeId || msg.to === nodeId) &&
           msg.to !== '!ffffffff' &&
           msg.channel === -1 &&
-          msg.portnum === 1
+          msg.portnum === PortNum.TEXT_MESSAGE_APP
       );
     },
     [messages]
@@ -1131,7 +1135,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
     if (heardDiff !== 0) return heardDiff;
 
     // 3. Deterministic alphabetical fallback
-    return (a.user?.longName || `Node ${a.nodeNum}`).localeCompare(b.user?.longName || `Node ${b.nodeNum}`);
+    return getUserDisplayName(a.user, a.nodeNum).localeCompare(getUserDisplayName(b.user, b.nodeNum));
   };
 
   // Sort and filter nodes based on dmFilter
@@ -1227,7 +1231,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
       );
     })
     .map(node => {
-      const displayName = node.user?.longName || `Node ${node.nodeNum}`;
+      const displayName = getUserDisplayName(node.user, node.nodeNum);
       const shortName = node.user?.shortName || '-';
       const snr = node.snr != null ? ` ${node.snr.toFixed(1)}dB` : '';
       const battery =
@@ -1312,6 +1316,8 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
     <div className="nodes-split-view messages-split-view">
       {/* Left Sidebar - Node List */}
       <div className={`nodes-sidebar messages-sidebar ${isMessagesNodeListCollapsed ? 'collapsed' : ''}`}>
+        {/* Own full-width row: inside the header it squeezed the buttons into a column. */}
+        {!isMessagesNodeListCollapsed && <PublicInstanceNotice />}
         <div className="sidebar-header">
           <button
             className="collapse-nodes-btn"
@@ -1391,7 +1397,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                         <div className="node-name">
                           {node.isFavorite && <span className="favorite-indicator"><UiIcon name="favorite" size={15} /></span>}
                           <div className="node-name-text">
-                            <div className="node-longname">{node.user?.longName || t('messages.node_fallback', { nodeNum: node.nodeNum })}</div>
+                            <div className="node-longname">{node.user?.longName || node.user?.shortName || t('messages.node_fallback', { nodeNum: node.nodeNum })}</div>
                           </div>
                         </div>
                         <div className="node-actions">
@@ -1472,7 +1478,9 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                               minWidth: 0,
                             }}
                           >
-                            {node.lastMessageText || t('messages.no_messages_preview')}
+                            {isPublicHiddenText(node.lastMessageText)
+                              ? <HiddenMessageText />
+                              : node.lastMessageText || t('messages.no_messages_preview')}
                           </div>
 
                           <div
@@ -2789,7 +2797,7 @@ const MessagesTab: React.FC<MessagesTabProps> = ({
                                 {t('messages.shared_key_with')}
                                 {sharedNodeNums.map((nodeNum, idx) => {
                                   const sharedNode = nodes.find(n => n.nodeNum === nodeNum);
-                                  const displayName = sharedNode?.user?.longName || t('messages.node_fallback', { nodeNum });
+                                  const displayName = sharedNode?.user?.longName || sharedNode?.user?.shortName || t('messages.node_fallback', { nodeNum });
                                   const shortName = sharedNode?.user?.shortName || '?';
                                   return (
                                     <span key={nodeNum}>

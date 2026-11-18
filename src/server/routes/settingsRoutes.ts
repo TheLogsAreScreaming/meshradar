@@ -82,6 +82,7 @@ import {
   isValidAutoAckMaxResponses,
 } from '../autoAckResponseCap.js';
 import { clampIntervalSetting, GEOFENCE_WHILE_INSIDE_MINUTES } from '../utils/schedulerInterval.js';
+import { normalizeTracerouteIntervalMinutes } from '../utils/tracerouteInterval.js';
 import { GEOFENCE_RADIUS_KM_MAX } from '../../utils/geofenceLimits.js';
 import { keepServerRunState, parseStoredTriggers } from '../utils/timerRunState.js';
 import { findSplitTimerTooFrequent, findTimerTooManyChannels } from '../utils/timerSplitGuard.js';
@@ -1858,16 +1859,30 @@ router.delete('/', requirePermission('settings', 'write'), async (req: Request, 
 const perSourceSettings = (action: 'read' | 'write') =>
   requireSourcePermission('settings', action, { whenOmitted: 'primary' });
 
-router.post('/traceroute-interval', perSourceSettings('write'), (req, res) => {
+router.post('/traceroute-interval', perSourceSettings('write'), async (req, res) => {
   try {
     const { intervalMinutes } = req.body;
-    if (typeof intervalMinutes !== 'number' || intervalMinutes < 0 || intervalMinutes > 60) {
-      return fail(res, 400, 'INVALID_INTERVAL', 'Invalid interval. Must be between 0 and 60 minutes (0 = disabled).');
+    // 0 (off) or 3–60, the same set the Automation tab offers and the
+    // scheduler accepts at startup (applyManagerSettings).
+    const normalized = typeof intervalMinutes === 'number'
+      ? normalizeTracerouteIntervalMinutes(intervalMinutes)
+      : null;
+    if (normalized === null || normalized !== intervalMinutes) {
+      return fail(res, 400, 'INVALID_INTERVAL', 'Invalid interval. Must be 0 (disabled) or 3–60 minutes.');
+    }
+
+    // Save it for this source, the key applyManagerSettings reads at startup,
+    // so the value survives a restart (same row POST /api/settings writes).
+    const target = getSourceTarget(req);
+    if (target.sourceId) {
+      await databaseService.settings.setSourceSetting(target.sourceId, 'tracerouteIntervalMinutes', String(intervalMinutes));
+    } else {
+      await databaseService.settings.setSetting('tracerouteIntervalMinutes', String(intervalMinutes));
     }
 
     // Apply only to THIS source's own radio. A non-Meshtastic source has none;
     // re-arming the primary's scheduler would change its airtime (#5375).
-    getSourceTarget(req).manager?.setTracerouteInterval(intervalMinutes);
+    target.manager?.setTracerouteInterval(intervalMinutes);
     res.json({ success: true, intervalMinutes });
   } catch (error) {
     logger.error('Error setting traceroute interval:', error);
@@ -1875,14 +1890,22 @@ router.post('/traceroute-interval', perSourceSettings('write'), (req, res) => {
   }
 });
 
-router.post('/remote-localstats-interval', perSourceSettings('write'), (req, res) => {
+router.post('/remote-localstats-interval', perSourceSettings('write'), async (req, res) => {
   try {
     const { intervalMinutes } = req.body;
-    if (typeof intervalMinutes !== 'number' || intervalMinutes < 0 || intervalMinutes > 1440) {
-      return fail(res, 400, 'INVALID_INTERVAL', 'Invalid interval. Must be between 0 and 1440 minutes (0 = disabled).');
+    if (!Number.isInteger(intervalMinutes) || intervalMinutes < 0 || intervalMinutes > 1440) {
+      return fail(res, 400, 'INVALID_INTERVAL', 'Invalid interval. Must be a whole number between 0 and 1440 minutes (0 = disabled).');
+    }
+    // Save it for this source, the key applyManagerSettings reads at startup,
+    // so the value survives a restart (same row POST /api/settings writes).
+    const target = getSourceTarget(req);
+    if (target.sourceId) {
+      await databaseService.settings.setSourceSetting(target.sourceId, 'remoteLocalStatsIntervalMinutes', String(intervalMinutes));
+    } else {
+      await databaseService.settings.setSetting('remoteLocalStatsIntervalMinutes', String(intervalMinutes));
     }
     // Own radio only; never the primary's scheduler (#5375).
-    getSourceTarget(req).manager?.setRemoteLocalStatsInterval(intervalMinutes);
+    target.manager?.setRemoteLocalStatsInterval(intervalMinutes);
     res.json({ success: true, intervalMinutes });
   } catch (error) {
     logger.error('Error setting remote LocalStats interval:', error);
@@ -2345,24 +2368,17 @@ router.post('/time-sync-nodes', perSourceSettings('write'), async (req, res) => 
       intervalMinutes: intervalMinutes !== undefined ? Number(intervalMinutes) : undefined,
     }, sourceId);
 
-    // Update the meshtastic manager interval if connected
-    const timeSyncSourceId = sourceId;
+    // Read back the saved values (per-source with global fallback), so a
+    // request that sends only one of enabled / intervalMinutes uses the
+    // stored value for the other. A missing `enabled` used to read as false
+    // and turned Time Sync off on an interval-only save.
+    const updatedSettings = await databaseService.getTimeSyncFilterSettingsAsync(sourceId);
+
     // Own radio only; a non-Meshtastic source never re-arms the primary's
     // time-sync scheduler (#5375).
-    if (!timeSyncManager) {
-      // Settings are saved above; there is no local radio to apply them to.
-    } else if (intervalMinutes !== undefined) {
-      timeSyncManager.setTimeSyncInterval(enabled ? Number(intervalMinutes) : 0);
-    } else if (enabled !== undefined) {
-      // If only enabled/disabled changed, use existing interval (per-source with global fallback)
-      const intervalStr = await databaseService.settings.getSettingForSource(timeSyncSourceId ?? null, 'autoTimeSyncIntervalMinutes');
-      const parsed = intervalStr ? parseInt(intervalStr, 10) : NaN;
-      const currentInterval = isNaN(parsed) ? 15 : parsed;
-      timeSyncManager.setTimeSyncInterval(enabled ? currentInterval : 0);
+    if (timeSyncManager && (enabled !== undefined || intervalMinutes !== undefined)) {
+      timeSyncManager.setTimeSyncInterval(updatedSettings.enabled ? updatedSettings.intervalMinutes : 0);
     }
-
-    // Get the updated settings to return
-    const updatedSettings = await databaseService.getTimeSyncFilterSettingsAsync(sourceId);
 
     res.json({
       success: true,

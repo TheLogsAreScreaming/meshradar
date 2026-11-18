@@ -2367,7 +2367,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-link-previews') && <div id="settings-link-previews" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.linkPreviewsEnabled}
@@ -2384,7 +2384,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-privacy') && <div id="settings-privacy" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.noIndexEnabled}
@@ -2471,7 +2471,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-public-instance') && <div id="settings-public-instance" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="publicInstanceModeEnabled"
                 type="checkbox"
@@ -2486,7 +2486,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             {t('settings.public_instance_description', 'Limits what signed-out visitors and embed maps can see. Signed-in users are not affected. Positions are always shown only to about 1.5 km. Raw packet data and file exports are blocked for signed-out visitors.')}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="publicInstanceHideLongNames"
                 type="checkbox"
@@ -2499,7 +2499,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             </label>
           </div>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="publicInstanceHidePublicKeys"
                 type="checkbox"
@@ -2512,7 +2512,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             </label>
           </div>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="publicInstanceRoundTimestamps"
                 type="checkbox"
@@ -2525,7 +2525,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             </label>
           </div>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="publicInstanceHideMessageText"
                 type="checkbox"
@@ -2537,11 +2537,17 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               <span>{t('settings.public_instance_hide_message_text', 'Hide message text')}</span>
             </label>
           </div>
+          {draft.publicInstanceModeEnabled && draft.cotFeedEnabled && (
+            <p className={settingsStyles.txWarning} data-testid="public-instance-cot-warning">
+              <UiIcon name="alert" />
+              {t('settings.public_instance_cot_warning')}
+            </p>
+          )}
         </div>}
 
         {show('settings-meshcore-messaging') && <div id="settings-meshcore-messaging" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.meshcoreChannelRetryEnabled}
@@ -2572,7 +2578,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             />
           </div>
           <div className="setting-item">
-            <label htmlFor="meshcoreCrossSourceHopResolution" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label htmlFor="meshcoreCrossSourceHopResolution" className={settingsStyles.checkboxRow}>
               <input
                 id="meshcoreCrossSourceHopResolution"
                 type="checkbox"
@@ -2593,7 +2599,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         {show('settings-map') && <div id="settings-map" className="settings-section">
           <h3>{t('settings.map')}</h3>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.discardInvalidPositions}
@@ -3157,7 +3163,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-packet-monitor') && <div id="settings-packet-monitor" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.packetLogEnabled}
@@ -3193,7 +3199,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-solar') && <div id="settings-solar" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.solarMonitoringEnabled}
@@ -3446,7 +3452,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="elevationEnabled"
                 type="checkbox"
@@ -3513,7 +3519,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="mqttRootDirectoryRefreshEnabled"
                 type="checkbox"
@@ -3538,7 +3544,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="ductingOverlayEnabled"
                 type="checkbox"
@@ -3563,7 +3569,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="adsbMatchEnabled"
                 type="checkbox"
@@ -3695,7 +3701,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="cotFeedEnabled"
                 type="checkbox"
@@ -3741,7 +3747,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="virtualNodeReplayEnabled"
                 type="checkbox"
