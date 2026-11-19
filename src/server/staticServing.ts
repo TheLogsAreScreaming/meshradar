@@ -25,9 +25,65 @@ import { robotsTxtHandler } from './middleware/robotsTag.js';
 import { createEmbedCspMiddleware } from './middleware/embedMiddleware.js';
 import { rewriteHtml } from './utils/htmlRewriter.js';
 import { generateAnalyticsScript, AnalyticsProvider } from './utils/analyticsScriptGenerator.js';
+import { CSP_NONCE_PLACEHOLDER } from './middleware/dynamicCsp.js';
+
+/**
+ * Send a cached HTML page, substituting the per-request CSP nonce for the
+ * `__CSP_NONCE__` placeholder baked into the cached markup. The nonce is set on
+ * `res.locals.cspNonce` by `dynamicCspMiddleware` (for the main SPA) and, for
+ * the embed page, by `createEmbedCspMiddleware`. If no nonce is present the
+ * placeholder is stripped, which is correct in development (where `script-src`
+ * carries `'unsafe-inline'` and no nonce is enforced).
+ */
+function sendHtmlWithNonce(res: express.Response, html: string): void {
+  const nonce = (res.locals.cspNonce as string | undefined) ?? '';
+  res.type('html').send(html.split(CSP_NONCE_PLACEHOLDER).join(nonce));
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/** Vite content-hashes everything under `assets/`, so a name never changes meaning. */
+export const IMMUTABLE_ASSET_CACHE_CONTROL = 'public, max-age=31536000, immutable';
+/** Cache, but revalidate (ETag / Last-Modified) on every use. */
+export const REVALIDATE_CACHE_CONTROL = 'no-cache';
+
+/**
+ * Files that keep a fixed name across builds, so a browser must check for a new
+ * copy each time: the HTML shell, the service worker and its loader, the PWA
+ * manifest, and the translation files (`locales/*.json`, not hashed).
+ */
+function mustRevalidate(relPath: string): boolean {
+  const name = path.basename(relPath);
+  return (
+    name === 'sw.js' ||
+    name === 'registerSW.js' ||
+    name.endsWith('.webmanifest') ||
+    name.endsWith('.html') ||
+    relPath.split(path.sep)[0] === 'locales'
+  );
+}
+
+/**
+ * Picks the Cache-Control for a file under the build output. `express.static`
+ * defaults to `max-age=0`; anything not matched here keeps that default.
+ */
+export function cacheControlForBuildFile(buildPath: string, filePath: string): string | null {
+  const rel = path.relative(buildPath, filePath);
+  if (rel.split(path.sep)[0] === 'assets') return IMMUTABLE_ASSET_CACHE_CONTROL;
+  if (mustRevalidate(rel)) return REVALIDATE_CACHE_CONTROL;
+  return null;
+}
+
+function staticOptions(buildPath: string) {
+  return {
+    index: false,
+    setHeaders: (res: express.Response, filePath: string) => {
+      const value = cacheControlForBuildFile(buildPath, filePath);
+      if (value) res.setHeader('Cache-Control', value);
+    },
+  };
+}
 
 export interface StaticServingDeps {
   /** Override the build output directory (primarily for tests). Defaults to `<repo>/dist`. */
@@ -51,7 +107,11 @@ async function getAnalyticsScript(): Promise<string> {
     if (provider === 'none') return '';
     const configStr = await databaseService.settings.getSetting('analyticsConfig') || '{}';
     const config = JSON.parse(configStr);
-    return generateAnalyticsScript(provider, config);
+    // Stamp each emitted inline <script> with the nonce placeholder; the real
+    // per-request nonce is substituted at serve time (sendHtmlWithNonce). The
+    // HTML is cached once, so a placeholder — not a live nonce — must be baked
+    // in here (MISC-09 / #6085).
+    return generateAnalyticsScript(provider, config, CSP_NONCE_PLACEHOLDER);
   } catch {
     return '';
   }
@@ -75,6 +135,7 @@ export function configureStaticServing(app: express.Express, deps: StaticServing
         .replace('"/sw.js"', `"${BASE_URL}/sw.js"`)
         .replace("scope: '/'", `scope: '${BASE_URL}/'`)
         .replace('scope: "/"', `scope: "${BASE_URL}/"`);
+      res.setHeader('Cache-Control', REVALIDATE_CACHE_CONTROL);
       res.type('application/javascript').send(content);
     });
 
@@ -85,14 +146,17 @@ export function configureStaticServing(app: express.Express, deps: StaticServing
       // Update manifest paths
       manifest.scope = `${BASE_URL}/`;
       manifest.start_url = `${BASE_URL}/`;
+      res.setHeader('Cache-Control', REVALIDATE_CACHE_CONTROL);
       res.type('application/manifest+json').json(manifest);
     });
 
-    // Serve assets folder specifically
-    app.use(`${BASE_URL}/assets`, express.static(path.join(buildPath, 'assets')));
+    // Serve assets folder specifically (hashed names: cached for a year)
+    app.use(`${BASE_URL}/assets`, express.static(path.join(buildPath, 'assets'), {
+      setHeaders: (res) => res.setHeader('Cache-Control', IMMUTABLE_ASSET_CACHE_CONTROL),
+    }));
 
     // Create static middleware once and reuse it
-    const staticMiddleware = express.static(buildPath, { index: false });
+    const staticMiddleware = express.static(buildPath, staticOptions(buildPath));
 
     // Serve other static files (like favicon, logo, etc.) - but exclude /api
     app.use(BASE_URL, (req, res, next) => {
@@ -118,7 +182,8 @@ export function configureStaticServing(app: express.Express, deps: StaticServing
         cachedRewrittenEmbedHtml = rewriteHtml(cachedEmbedHtml, BASE_URL, embedAnalyticsScript);
       }
       res.setHeader('Content-Type', 'text/html');
-      res.send(cachedRewrittenEmbedHtml);
+      res.setHeader('Cache-Control', REVALIDATE_CACHE_CONTROL);
+      sendHtmlWithNonce(res, cachedRewrittenEmbedHtml);
     });
 
     // Catch all handler for SPA routing - but exclude /api
@@ -130,7 +195,8 @@ export function configureStaticServing(app: express.Express, deps: StaticServing
         const analyticsScript = await getAnalyticsScript();
         cachedRewrittenHtml = rewriteHtml(cachedHtml, BASE_URL, analyticsScript);
       }
-      res.type('html').send(cachedRewrittenHtml);
+      res.setHeader('Cache-Control', REVALIDATE_CACHE_CONTROL);
+      sendHtmlWithNonce(res, cachedRewrittenHtml);
     });
     // Use a route pattern that Express 5 can handle
     app.use(async (req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -153,7 +219,8 @@ export function configureStaticServing(app: express.Express, deps: StaticServing
         const analyticsScript = await getAnalyticsScript();
         cachedRewrittenHtml = rewriteHtml(cachedHtml, BASE_URL, analyticsScript);
       }
-      res.type('html').send(cachedRewrittenHtml);
+      res.setHeader('Cache-Control', REVALIDATE_CACHE_CONTROL);
+      sendHtmlWithNonce(res, cachedRewrittenHtml);
     });
   } else {
     // Normal static file serving for root deployment.
@@ -164,7 +231,7 @@ export function configureStaticServing(app: express.Express, deps: StaticServing
     // for `/` would be served by static middleware with the raw index.html,
     // bypassing analytics injection entirely — which is the bug that caused
     // GA4 tags to silently not appear on root deployments.
-    app.use(express.static(buildPath, { index: false }));
+    app.use(express.static(buildPath, staticOptions(buildPath)));
 
     // Serve robots.txt (before SPA fallback) — dynamic body gated on noIndexEnabled (#4202)
     app.get('/robots.txt', robotsTxtHandler);
@@ -181,7 +248,8 @@ export function configureStaticServing(app: express.Express, deps: StaticServing
         cachedRewrittenEmbedHtml = rewriteHtml(cachedEmbedHtml, BASE_URL, embedAnalyticsScript);
       }
       res.setHeader('Content-Type', 'text/html');
-      res.send(cachedRewrittenEmbedHtml);
+      res.setHeader('Cache-Control', REVALIDATE_CACHE_CONTROL);
+      sendHtmlWithNonce(res, cachedRewrittenEmbedHtml);
     });
 
     // Catch all handler for SPA routing - skip API routes
@@ -197,7 +265,8 @@ export function configureStaticServing(app: express.Express, deps: StaticServing
         const analyticsScript = await getAnalyticsScript();
         cachedRewrittenHtml = rewriteHtml(cachedHtml, BASE_URL, analyticsScript);
       }
-      res.type('html').send(cachedRewrittenHtml);
+      res.setHeader('Cache-Control', REVALIDATE_CACHE_CONTROL);
+      sendHtmlWithNonce(res, cachedRewrittenHtml);
     });
   }
 }

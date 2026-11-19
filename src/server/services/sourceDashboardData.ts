@@ -19,6 +19,7 @@
  * middleware is applied per-dataset by `buildSourceDashboard`.
  */
 import databaseService from '../../services/database.js';
+import { applyMeshCorePositionOverridesForViewer } from '../utils/meshcorePositionOverride.js';
 import { hasPermission } from '../auth/authMiddleware.js';
 import { logger } from '../../utils/logger.js';
 import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
@@ -33,22 +34,85 @@ import {
 import { modemPresetChannelName, TransportMechanism } from '../constants/meshtastic.js';
 import { transformChannel } from '../utils/channelView.js';
 import { getMaxNodeAgeHours } from './nodeDisplaySettings.js';
+import { DASHBOARD_OMITTED_NODE_FIELDS } from '../../utils/dashboardNodeFields.js';
+import { unifiedNodeKey } from '../../utils/nodeIdentity.js';
+import {
+  NODE_DISPLAY_NUMERIC_DEFAULTS,
+  MAX_INFRA_NODE_AGE_HOURS_DEFAULT,
+  parseNodeDisplayNumber,
+  parseMaxInfraNodeAgeHours,
+} from '../../constants/nodeDisplayDefaults.js';
 import { effectiveIsMobile } from '../../utils/assetTracking.js';
 import { loadSignFlipContext, applySignFlipCorrection, getDisplayDbNodePosition, applySignFlipToTraceroute } from './signFlipCorrection.js';
+import mqttPacketLogService from './mqttPacketLogService.js';
+import type { MqttNodeGatewayRow } from '../../db/repositories/mqttPacketLog.js';
 import type { ResourceType } from '../../types/permission.js';
+import type { LiveNodeFilter } from '../../db/repositories/nodes.js';
+import type { DbNode } from '../../db/types.js';
 import type { User } from '../../types/auth.js';
 
 type SourceRow = { id: string; name: string; type: string };
 // The request user (null when anonymous), as attached by optionalAuth/requirePermission.
 type ReqUser = User | null;
 
-/** Nodes for a source, channel-filtered and position-masked (mirrors GET /:id/nodes). */
-export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promise<unknown[]> {
+/**
+ * Omitted fields that buildSourceNodes still reads while it filters and masks
+ * (position-channel masking, the position override, the private-override
+ * strip). They are read from the database and dropped at the end.
+ */
+const DASHBOARD_PROCESSING_FIELDS = new Set([
+  'positionChannel',
+  'latitudeOverride', 'longitudeOverride', 'altitudeOverride',
+  'positionOverrideEnabled', 'positionOverrideIsPrivate',
+  'aircraftFixedLatitude', 'aircraftFixedLongitude',
+]);
+const DASHBOARD_OMITTED_SET = new Set(DASHBOARD_OMITTED_NODE_FIELDS);
+const DASHBOARD_UNSELECTED_COLUMNS = DASHBOARD_OMITTED_NODE_FIELDS.filter(
+  (k) => !DASHBOARD_PROCESSING_FIELDS.has(k),
+);
+
+/** Copy of `node` without the DASHBOARD_OMITTED_NODE_FIELDS keys. */
+function omitDashboardFields(node: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k in node) {
+    if (!DASHBOARD_OMITTED_SET.has(k)) out[k] = node[k];
+  }
+  return out;
+}
+
+/**
+ * Nodes for a source, channel-filtered and position-masked (mirrors GET /:id/nodes).
+ *
+ * `slim` (the dashboard bundles) leaves out DASHBOARD_OMITTED_NODE_FIELDS.
+ * Filtering and masking run on the same rows either way.
+ */
+export async function buildSourceNodes(
+  source: SourceRow,
+  user: ReqUser,
+  opts?: { slim?: boolean },
+): Promise<unknown[]> {
+  return (await buildSourceNodesCounted(source, user, opts)).nodes;
+}
+
+/**
+ * buildSourceNodes, plus the row count before a `liveOnly` read.
+ *
+ * `liveOnly` (the dashboard age cut, Meshtastic sources only) reads just the
+ * rows of nodes with a live row in its sources, instead of every row, and
+ * returns `uncutCount`: how many rows the channel filter passes over the whole
+ * source, i.e. `nodes.length` without `liveOnly`.
+ */
+async function buildSourceNodesCounted(
+  source: SourceRow,
+  user: ReqUser,
+  opts?: { slim?: boolean; liveOnly?: LiveNodeFilter },
+): Promise<{ nodes: unknown[]; uncutCount?: number }> {
+  const slim = opts?.slim === true;
   // MeshCore sources don't share the meshtastic node table — pull contacts
   // (and localNode) directly from the per-source MeshCoreManager and map
   // them into the dashboard's flat node shape. These return early and never
-  // reach the position-override logic below: MeshCore contacts have no
-  // override columns (that's a Meshtastic-node feature, #3551).
+  // reach the Meshtastic position-override logic below; MeshCore contacts get
+  // their own override (#5842) through applyMeshCorePositionOverridesForViewer.
   // isAnyMeshCoreSourceType, not === 'meshcore' (#5094): this outer gate was
   // the reason the isAnyMeshCoreManager narrow below never ran for an ingest
   // source. The comment there described behaviour this line prevented.
@@ -60,7 +124,7 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
     // (#4559). Admins bypass, as everywhere else in this file.
     const canViewOnMap = user ? await hasPermission(user, 'nodes', 'viewOnMap', source.id) : false;
     if (!canViewOnMap) {
-      return [];
+      return { nodes: [] };
     }
 
     const _raw = sourceManagerRegistry.getManager(source.id);
@@ -72,7 +136,8 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
     // #5363: display-only sign-flip correction against this source's reference.
     const mcSignFlipCtx = mcManager ? await loadSignFlipContext(source.id) : null;
     if (mcManager) {
-      for (const n of await mcManager.getAllNodes()) {
+      // #5842: an enabled location override wins over the advert position.
+      for (const n of await applyMeshCorePositionOverridesForViewer(await mcManager.getAllNodes(), user, source.id)) {
         if (n.latitude == null || n.longitude == null) continue;
         if (n.latitude === 0 && n.longitude === 0) continue;
         const lastHeard = typeof n.lastHeard === 'number'
@@ -102,23 +167,33 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
           latitude: n.latitude,
           longitude: n.longitude,
           position: { latitude: n.latitude, longitude: n.longitude },
+          ...(n.positionIsOverride ? { positionIsOverride: true } : {}),
           lastHeard,
           hopsAway: 0,
           role: 0,
           advType: typeof n.advType === 'number' ? n.advType : 0,
           // #5578: lets the map hide a node whose latest advert had no
-          // position (`false`), unless the fix is a live telemetry one.
-          lastAdvertHadPosition: n.lastAdvertHadPosition ?? null,
+          // position (`false`), unless the fix is a live telemetry one. An
+          // override (#5842) is a known location, so it never hides.
+          lastAdvertHadPosition: n.positionIsOverride ? null : n.lastAdvertHadPosition ?? null,
           positionSource: n.positionSource ?? null,
         }, mcSignFlipCtx));
       }
     }
-    return mcNodes;
+    return { nodes: mcNodes };
   }
 
   // Nodes are stored per-source (composite PK (nodeNum, sourceId) since
   // migration 029). Filter strictly by this source.
-  const nodes = await databaseService.nodes.getAllNodes(source.id);
+  const liveOnly = opts?.liveOnly;
+  const [nodes, channelCounts] = await Promise.all([
+    databaseService.nodes.getAllNodes(source.id, {
+      ...(slim ? { omitColumns: DASHBOARD_UNSELECTED_COLUMNS } : {}),
+      ...(liveOnly ? { liveAcross: liveOnly } : {}),
+    }),
+    liveOnly ? databaseService.nodes.countNodesByChannel(source.id) : Promise.resolve(null),
+  ]);
+  let synthesizedLocal: DbNode | null = null;
 
   // The local node for this source may not be in DB yet (brand new device).
   const manager = sourceManagerRegistry.getManager(source.id);
@@ -135,7 +210,7 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
       if (localNode) {
         nodes.push(localNode);
       } else {
-        nodes.push({
+        synthesizedLocal = {
           nodeNum: localNodeInfo.nodeNum,
           nodeId: localNodeInfo.nodeId,
           longName: localNodeInfo.longName,
@@ -143,13 +218,21 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
           hwModel: localNodeInfo.hwModel ?? 0,
           lastHeard: Math.floor(Date.now() / 1000),
           sourceId: source.id,
-        } as any);
+        } as unknown as DbNode;
+        nodes.push(synthesizedLocal);
       }
     }
   }
 
   // Filter by channel viewOnMap permissions and mask private position channels.
   const filtered = await filterNodesByChannelPermission(nodes, user, source.id);
+  // Same filter over one stand-in row per channel: it reads only `channel`.
+  let uncutCount: number | undefined;
+  if (channelCounts) {
+    const passing = await filterNodesByChannelPermission(channelCounts, user, source.id);
+    uncutCount = passing.reduce((sum, g) => sum + g.count, 0)
+      + (synthesizedLocal !== null && filtered.includes(synthesizedLocal) ? 1 : 0);
+  }
   const masked = await maskNodeLocationByChannel(filtered, user, source.id);
 
   // Apply per-node position override to the flat lat/lng the dashboard map
@@ -198,12 +281,14 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
   // overlay in enhanceNodeForClient. Computed only: the raw `mobile` column is
   // passed through untouched.
   const assets = await databaseService.getAssetNodesMapAsync();
-  return withOverride.map((node) => {
+  const out = withOverride.map((node) => {
     const n = applySignFlipCorrection(node, signFlipCtx) as typeof node & { nodeNum?: unknown; mobile?: unknown };
     const entry = assets.get(Number(n.nodeNum));
     const asset = entry ? { retentionDays: entry.retentionDays } : undefined;
-    return { ...n, asset, isMobile: effectiveIsMobile(n.mobile, asset) };
+    const base = slim ? omitDashboardFields(n as Record<string, unknown>) : n;
+    return { ...base, asset, isMobile: effectiveIsMobile(n.mobile, asset) };
   });
+  return { nodes: out, uncutCount };
 }
 
 /** Channels for a source, per-channel read-gated, PSK projected (mirrors GET /:id/channels). */
@@ -387,7 +472,31 @@ export interface SourceDashboardPayload {
   traceroutes: unknown[];
   neighborInfo: unknown[];
   channels: unknown[];
+  /** Node rows before the age window cut; set only when it ran (applyDashboardAgeWindow). */
+  nodeCount?: number;
+  /**
+   * Per-`(node, gateway)` membership for the "colour nodes by gateway" view
+   * (#6175). Present only for MQTT sources (`mqtt_broker`/`mqtt_bridge`) when
+   * the viewer holds `nodes:read` AND `packetmonitor:read` on this source and
+   * the packet-log capture is enabled; `[]`/absent otherwise. Rows are limited
+   * to nodes already in this payload's `nodes`, so a node the viewer's node
+   * filters hide never surfaces here. Read-only over already-ingested rows —
+   * no mesh traffic.
+   */
+  gatewayMembership?: MqttNodeGatewayRow[];
 }
+
+/** MQTT source types that carry a gateway-membership view (#6175). */
+function isMqttSourceType(type: string): boolean {
+  return type === 'mqtt_broker' || type === 'mqtt_bridge';
+}
+
+/**
+ * Lookback for the gateway-membership read (#6175). Scoped to the source's own
+ * node age window when known, else a conservative default that comfortably
+ * covers the packet log's own 24 h default retention.
+ */
+const DEFAULT_GATEWAY_MEMBERSHIP_HOURS = 48;
 
 /**
  * Aggregate the four dashboard datasets for a source in one shot, applying the
@@ -403,18 +512,245 @@ export interface SourceDashboardPayload {
 export async function buildSourceDashboard(
   source: SourceRow,
   user: ReqUser,
-  opts?: { maxNodeAgeHours?: number },
+  opts?: { maxNodeAgeHours?: number; nodePrefilter?: LiveNodeFilter },
 ): Promise<SourceDashboardPayload> {
   const isAdmin = user?.isAdmin === true;
   const canReadNodes = isAdmin || (user ? await hasPermission(user, 'nodes', 'read', source.id) : false);
   const canReadTraceroutes = isAdmin || (user ? await hasPermission(user, 'traceroute', 'read', source.id) : false);
 
-  const [nodes, traceroutes, neighborInfo, channels] = await Promise.all([
-    canReadNodes ? buildSourceNodes(source, user) : Promise.resolve([]),
+  const [nodeResult, traceroutes, neighborInfo, channels] = await Promise.all([
+    canReadNodes
+      ? buildSourceNodesCounted(source, user, { slim: true, liveOnly: opts?.nodePrefilter })
+      : Promise.resolve({ nodes: [] as unknown[], uncutCount: undefined }),
     canReadTraceroutes ? buildSourceTraceroutes(source, user) : Promise.resolve([]),
     canReadNodes ? buildSourceNeighborInfo(source, user, opts?.maxNodeAgeHours) : Promise.resolve([]),
     buildSourceChannels(source, user),
   ]);
 
-  return { sourceId: source.id, nodes, traceroutes, neighborInfo, channels };
+  const payload: SourceDashboardPayload = {
+    sourceId: source.id, nodes: nodeResult.nodes, traceroutes, neighborInfo, channels,
+  };
+  // Only a prefiltered read knows the uncut count; applyDashboardAgeWindow
+  // fills it in from nodes.length otherwise.
+  if (nodeResult.uncutCount !== undefined) payload.nodeCount = nodeResult.uncutCount;
+
+  // Gateway membership (#6175): MQTT sources only. The rows come from the
+  // MQTT packet log, so they need `packetmonitor:read` on this source on top
+  // of the `nodes:read` the node list needs (4.17.3 review M2), and they are
+  // cut to the nodes this payload already shows: the node list applies the
+  // per-node visibility rules, the packet-log read does not. The service itself returns []
+  // when packet-log capture is off, so a disabled install degrades to no
+  // gateways and the map behaves exactly as before.
+  //
+  // This is an ADDITIVE, optional dataset: a failure fetching it must never
+  // sink the whole bundle. Any throw (service/method unavailable, read error)
+  // degrades to an empty membership and the other datasets still return 200 —
+  // the same graceful posture as capture being disabled.
+  const canReadPackets = canReadNodes && isMqttSourceType(source.type)
+    && (isAdmin || (user ? await hasPermission(user, 'packetmonitor', 'read', source.id) : false));
+  if (canReadPackets) {
+    const visibleNodeNums = new Set<number>();
+    for (const row of nodeResult.nodes as Array<{ nodeNum?: unknown }>) {
+      const num = Number(row?.nodeNum);
+      if (Number.isFinite(num)) visibleNodeNums.add(num);
+    }
+    const hours = opts?.maxNodeAgeHours && opts.maxNodeAgeHours > 0
+      ? opts.maxNodeAgeHours
+      : DEFAULT_GATEWAY_MEMBERSHIP_HOURS;
+    const since = Date.now() - hours * 60 * 60 * 1000;
+    try {
+      const rows = await mqttPacketLogService.getNodeGatewayMembership({
+        sourceIds: [source.id],
+        since,
+      });
+      payload.gatewayMembership = rows.filter((r) => visibleNodeNums.has(Number(r.fromNode)));
+    } catch (error) {
+      logger.warn(`Gateway membership read failed for source ${source.id}; returning empty (#6175):`, error);
+      payload.gatewayMembership = [];
+    }
+  }
+
+  return payload;
+}
+
+/**
+ * Node age windows the dashboard map filters on, in hours (<= 0 = no limit).
+ * See resolveDashboardAgeWindow.
+ */
+export interface DashboardAgeWindow {
+  nodeHours: number;
+  infraHours: number;
+}
+
+/**
+ * Extra seconds the server keeps past the window. The client compares
+ * `lastHeard` against its own clock some time after this response was built,
+ * so a node near the edge must reach it and let the client decide.
+ */
+export const DASHBOARD_AGE_GRACE_SEC = 3600;
+
+/**
+ * The widest window the Dashboard map can apply, across EVERY source.
+ *
+ * The map's cutoff is `useMaxNodeAgeHoursAcross` / `useMaxInfraNodeAgeHoursAcross`
+ * over the sources it lists, each read from GET /api/settings?sourceId (the
+ * per-source row, else the global row, else the default). This takes every
+ * configured source and includes the default, so it is never narrower than
+ * what the client computes, including while the client's settings queries are
+ * still loading (it then uses the default). A 0 ("no limit") on any source
+ * turns the cutoff off. The map slider can only narrow the window, never widen
+ * it (MapAgeFilterControl), so the setting is the upper bound.
+ */
+export async function resolveDashboardAgeWindow(): Promise<DashboardAgeWindow> {
+  const sources = await databaseService.sources.getAllSources();
+  const ids = sources.map((s) => s.id);
+  const settings = databaseService.settings;
+  const [nodeGlobal, infraGlobal, nodeBySource, infraBySource] = await Promise.all([
+    settings.getSetting('maxNodeAgeHours'),
+    settings.getSetting('maxInfraNodeAgeHours'),
+    settings.getSettingForSources(ids, 'maxNodeAgeHours'),
+    settings.getSettingForSources(ids, 'maxInfraNodeAgeHours'),
+  ]);
+  const nodeValues: number[] = [NODE_DISPLAY_NUMERIC_DEFAULTS.maxNodeAgeHours];
+  const infraValues: number[] = [MAX_INFRA_NODE_AGE_HOURS_DEFAULT];
+  for (const id of ids) {
+    nodeValues.push(parseNodeDisplayNumber('maxNodeAgeHours', nodeBySource.get(id) ?? nodeGlobal));
+    infraValues.push(parseMaxInfraNodeAgeHours(infraBySource.get(id) ?? infraGlobal));
+  }
+  const widest = (values: number[]) => (values.some((v) => v <= 0) ? 0 : Math.max(...values));
+  return { nodeHours: widest(nodeValues), infraHours: widest(infraValues) };
+}
+
+/** nodeNums of every source's local node: the map's polar grid centres on them even when stale. */
+export function localNodeNums(): Set<number> {
+  const out = new Set<number>();
+  for (const m of sourceManagerRegistry.getAllManagers()) {
+    const num = Number(m.getLocalNodeInfo()?.nodeNum);
+    if (Number.isFinite(num) && num > 0) out.add(num);
+  }
+  return out;
+}
+
+type AgeRow = {
+  nodeNum?: unknown;
+  isMeshCore?: unknown;
+  advType?: unknown;
+  lastHeard?: unknown;
+  isFavorite?: unknown;
+  aircraftAgedOutAt?: unknown;
+};
+
+/**
+ * Whether one node row could pass the Dashboard map's age gate
+ * (DashboardMap `passesAgeGate`). It errs towards keeping: the client still
+ * applies its own gate, so a kept row costs bytes, a dropped one hides a node.
+ */
+function rowPassesAgeWindow(
+  row: AgeRow,
+  nodeCutoff: number,
+  infraCutoff: number,
+  keepNodeNums: Set<number>,
+): boolean {
+  if (row.isFavorite) return true;
+  // Aged-out aircraft skip the age gate (isAgedOutAircraft); any row with the
+  // mark is kept, ignored or not, as a superset.
+  if (row.aircraftAgedOutAt != null) return true;
+  if (!row.isMeshCore && keepNodeNums.has(Number(row.nodeNum))) return true;
+  if (row.lastHeard == null) return false;
+  const lastHeard = Number(row.lastHeard);
+  if (!Number.isFinite(lastHeard)) return true;
+  // MeshCore repeaters and room servers (advType 2/3) use the infra window
+  // (isMeshCoreInfrastructureAdvType in components/MeshCore/meshcoreRole.ts).
+  const isInfra = row.isMeshCore === true && (row.advType === 2 || row.advType === 3);
+  return lastHeard >= (isInfra ? infraCutoff : nodeCutoff);
+}
+
+/**
+ * Drop node rows the Dashboard map would hide by age.
+ *
+ * Works on the unified node key (`unifiedNodeKey`, the key the client merge
+ * buckets on): if ANY row of a node passes, every row of that node is kept
+ * across all `bundles`. The merged node takes `lastHeard` as the max over
+ * rows, `isFavorite` as an OR, and its position from whichever row has one, so
+ * dropping an old row of a live node could move or hide its marker.
+ *
+ * Sets `nodeCount` on each bundle to its row count before the cut, so the
+ * sidebar's per-source node total does not shrink; a bundle built with
+ * `nodePrefilter` already carries it. Mutates `bundles`.
+ */
+export function applyDashboardAgeWindow(
+  bundles: SourceDashboardPayload[],
+  window: DashboardAgeWindow,
+  keepNodeNums: Set<number>,
+  nowSec: number = Date.now() / 1000,
+): void {
+  // "No limit" on both windows: nothing to cut.
+  if (window.nodeHours <= 0 && window.infraHours <= 0) {
+    for (const b of bundles) b.nodeCount ??= b.nodes.length;
+    return;
+  }
+  const nodeCutoff = window.nodeHours <= 0 ? -Infinity : nowSec - window.nodeHours * 3600 - DASHBOARD_AGE_GRACE_SEC;
+  const infraCutoff = window.infraHours <= 0 ? -Infinity : nowSec - window.infraHours * 3600 - DASHBOARD_AGE_GRACE_SEC;
+
+  const liveKeys = new Set<string>();
+  for (const b of bundles) {
+    for (const row of b.nodes as AgeRow[]) {
+      const key = unifiedNodeKey(row as Parameters<typeof unifiedNodeKey>[0]);
+      if (key !== null && !liveKeys.has(key) && rowPassesAgeWindow(row, nodeCutoff, infraCutoff, keepNodeNums)) {
+        liveKeys.add(key);
+      }
+    }
+  }
+  for (const b of bundles) {
+    b.nodeCount ??= b.nodes.length;
+    b.nodes = b.nodes.filter((row) => {
+      const key = unifiedNodeKey(row as Parameters<typeof unifiedNodeKey>[0]);
+      // No identity: the unified merge drops it; a single-source view still
+      // draws it, so keep it.
+      return key === null || liveKeys.has(key);
+    });
+  }
+}
+
+/**
+ * Above this many live nodes, buildSourceDashboard reads by subquery instead
+ * of a bound list, well under every backend's bind-parameter limit.
+ */
+export const DASHBOARD_LIVE_NODE_LIST_MAX = 5000;
+
+/**
+ * The SQL side of applyDashboardAgeWindow, for buildSourceDashboard's
+ * `nodePrefilter`: read only the Meshtastic rows of nodes that have a row
+ * in `sourceIds` the cut could keep, instead of every row.
+ *
+ * It must select a SUPERSET of what applyDashboardAgeWindow keeps (that pass
+ * still runs on the result and makes the output exact):
+ * - keyed on nodeNum, which is the unified key of every Meshtastic DB row
+ *   (`mt:<nodeNum>`), and taken over all `sourceIds` regardless of what the
+ *   caller may see there;
+ * - the cutoff is floored and taken now, before the in-memory pass takes its
+ *   own (later, so larger) cutoff;
+ * - Meshtastic rows are never MeshCore infra, so only the node window
+ *   applies. MeshCore rows are not read from this table and are left alone.
+ *
+ * Undefined when the node window is off (every Meshtastic row passes). The
+ * live nodeNums are looked up once here, so the per-source reads bind them
+ * as a list (up to DASHBOARD_LIVE_NODE_LIST_MAX; past that each read runs
+ * the subquery itself).
+ */
+export async function dashboardNodePrefilter(
+  sourceIds: string[],
+  window: DashboardAgeWindow,
+  keepNodeNums: Set<number>,
+  nowSec: number = Date.now() / 1000,
+): Promise<LiveNodeFilter | undefined> {
+  if (window.nodeHours <= 0 || sourceIds.length === 0) return undefined;
+  const filter: LiveNodeFilter = {
+    sourceIds,
+    minLastHeard: Math.floor(nowSec - window.nodeHours * 3600 - DASHBOARD_AGE_GRACE_SEC),
+    keepNodeNums: [...keepNodeNums],
+  };
+  const nodeNums = await databaseService.nodes.getLiveNodeNums(filter);
+  if (nodeNums.length <= DASHBOARD_LIVE_NODE_LIST_MAX) filter.nodeNums = nodeNums;
+  return filter;
 }

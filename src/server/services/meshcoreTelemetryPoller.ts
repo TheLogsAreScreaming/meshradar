@@ -26,7 +26,8 @@ import type { DbMeshCoreNode } from '../../db/repositories/meshcore.js';
 import type { MeshCoreManager, MeshCoreDeviceInfo } from '../meshcoreManager.js';
 import type { SourceManagerRegistry } from '../sourceManagerRegistry.js';
 import { isMeshCoreManager } from '../sourceManagerTypes.js';
-import { detectMeshCoreReboot, detectMeshCorePowerChange } from './meshcoreDeviceHealth.js';
+import { detectMeshCoreReboot, detectMeshCorePowerChange, detectClockOffset, type ClockOffsetTelemetry } from './meshcoreDeviceHealth.js';
+import { nodeNumFromPubkey } from '../../utils/meshcoreNodeNum.js';
 
 /**
  * Minimal slice of DatabaseService the poller depends on. Lets us unit-test
@@ -42,9 +43,11 @@ export interface PollerDatabase {
       telemetryType: string,
       sourceId?: string,
     ) => Promise<{ value: number } | null>;
+    // Optional: the clock-offset history for trigger.clockOutOfSync (#6273).
+    getTelemetryByNode?: ClockOffsetTelemetry['getTelemetryByNode'];
   };
   meshcore: {
-    upsertNode: (node: Partial<DbMeshCoreNode> & { publicKey: string }, sourceId: string) => Promise<void>;
+    upsertNode: (node: Partial<DbMeshCoreNode> & { publicKey: string }, sourceId: string) => Promise<unknown>;
     markHeard: (sourceId: string, publicKey: string, heardAtMs: number) => Promise<void>;
   };
 }
@@ -520,6 +523,21 @@ export class MeshCoreTelemetryPoller {
       );
     }
 
+    // #6273: the attached device's own clock reading feeds trigger.clockOutOfSync.
+    // The drift row is already in `rows` (the batch below stores it, as before);
+    // this reads the prior samples first, so it must run before the insert.
+    if (snapshot.rtcDriftSecs !== undefined) {
+      await detectClockOffset(
+        this.database.telemetry,
+        nodeId,
+        snapshot.rtcDriftSecs,
+        'device',
+        Math.floor(now / 1000) - snapshot.rtcDriftSecs,
+        manager.sourceId,
+        now,
+      );
+    }
+
     try {
       await this.database.telemetry.insertTelemetryBatch(rows, manager.sourceId);
       logger.debug(
@@ -547,17 +565,4 @@ export function getMeshCoreTelemetryPoller(): MeshCoreTelemetryPoller | null {
   return _poller;
 }
 
-/**
- * Stable 31-bit numeric derived from the low 4 bytes of a hex pubkey.
- * The `telemetry.nodeNum` column is `NOT NULL` everywhere, but MeshCore has
- * no genuine equivalent — queries against MeshCore telemetry always go
- * through `nodeId` (the pubkey). We synthesise a non-negative integer so
- * inserts succeed without lying about Meshtastic provenance.
- */
-export function nodeNumFromPubkey(publicKey: string): number {
-  if (!publicKey) return 0;
-  const tail = publicKey.replace(/^0x/, '').slice(-8);
-  const n = parseInt(tail, 16);
-  if (!Number.isFinite(n)) return 0;
-  return n & 0x7fffffff;
-}
+export { nodeNumFromPubkey };

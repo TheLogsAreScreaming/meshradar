@@ -94,6 +94,8 @@ const USER_1_ROW_ON_A = {
   lowBatteryVoltageThreshold: 3300,
   notifyOnServerEvents: true,
   notifyOnWaypoint: false,
+  notifyOnMention: false,
+  notifyOnAutoTrace: false,
   waypointRadiusKm: 10,
   waypointCenterLat: null,
   waypointCenterLon: null,
@@ -106,6 +108,8 @@ const USER_1_ROW_ON_A = {
   mutedDMs: [],
   messageTitleTemplate: null,
   messageBodyTemplate: null,
+  messageTextMaxPush: null,
+  messageTextMaxApprise: null,
 };
 
 type MessageEvent = { kind: 'message'; text: string; channelId: number; isDirectMessage: boolean; viaMqtt?: boolean };
@@ -234,6 +238,12 @@ describe('notification volume with a row on source A only', () => {
         });
       }
     }
+    // #5729: those are pre-4.18 per-source rows. Run migration 235 over them,
+    // as an upgrade would, so the matrix below is the post-upgrade behaviour:
+    // one mesh-wide row per browser, with each user's subscribed sources kept
+    // as their Web Push source list. Nothing in the matrix may move.
+    const { migration } = await import('../migrations/235_unified_notification_scope.js');
+    migration.up(h.sqlite);
   });
 
   beforeEach(async () => {

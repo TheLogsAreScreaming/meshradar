@@ -15,8 +15,8 @@
  * MapAnalysis-only; `PerSourceWaypoints` has no such dependency and is the
  * cross-surface piece Dashboard consumes directly.
  */
-import { useMemo } from 'react';
-import { Marker, Popup } from 'react-leaflet';
+import { Fragment, useMemo } from 'react';
+import { Circle, Marker, Popup, Rectangle } from 'react-leaflet';
 import L from 'leaflet';
 import {
   useDashboardSources,
@@ -25,8 +25,43 @@ import { useMapAnalysisCtx } from '../../MapAnalysis/MapAnalysisContext';
 import { useWaypoints } from '../../../hooks/useWaypoints';
 import type { Waypoint } from '../../../types/waypoint';
 import { UiIcon } from '../../icons';
+import styles from './WaypointsLayer.module.css';
+import { geofenceSummary } from './waypointGeofenceSummary';
 
 const FALLBACK_EMOJI = '\u{1F4CD}';
+
+/**
+ * The firmware geofence a waypoint carries (#5922), drawn under its pin.
+ * Dashed and non-interactive, so it reads apart from automation geofences
+ * and never steals a click from a node marker. Exported for tests.
+ */
+export function WaypointGeofenceRegion({ wp }: { wp: Waypoint }) {
+  const box = wp.boundingBox;
+  const drawBox = box && box.west < box.east && box.south < box.north;
+  return (
+    <>
+      {wp.geofenceRadiusM != null && wp.geofenceRadiusM > 0 && (
+        <Circle
+          center={[wp.latitude, wp.longitude]}
+          radius={wp.geofenceRadiusM}
+          interactive={false}
+          // A top-level prop: react-leaflet applies pathOptions through
+          // setStyle, which never adds a class.
+          className={styles.geofence}
+          pathOptions={{ weight: 2, dashArray: '6 6', fillOpacity: 0.08 }}
+        />
+      )}
+      {drawBox && (
+        <Rectangle
+          bounds={[[box.south, box.west], [box.north, box.east]]}
+          interactive={false}
+          className={styles.geofence}
+          pathOptions={{ weight: 2, dashArray: '6 6', fillOpacity: 0.08 }}
+        />
+      )}
+    </>
+  );
+}
 const EMOJI_VS = '️'; // emoji-presentation variation selector
 
 /** Force emoji (color) presentation for codepoints that default to text glyphs
@@ -99,6 +134,15 @@ export interface WaypointPopupActions {
   onEdit?: (wp: Waypoint) => void;
   /** Caller invokes delete flow with the chosen waypoint. */
   onDelete?: (wp: Waypoint) => void;
+  /**
+   * True when the waypoint is locked to a node other than this source's own
+   * (#5685). Edit and Delete then draw disabled with the reason, instead of
+   * live buttons the server would refuse. Omitted: buttons stay live and the
+   * caller's handlers decide.
+   */
+  lockedToOther?: (wp: Waypoint) => boolean;
+  /** Tooltip for the disabled buttons. */
+  lockedTitle?: string;
 }
 
 export function PerSourceWaypoints({
@@ -116,13 +160,15 @@ export function PerSourceWaypoints({
     <>
       {waypoints.map((wp: Waypoint) => {
         const icon = emojiDivIcon(wp.iconEmoji, Boolean(wp.lockedTo));
+        const locked = actions?.lockedToOther?.(wp) ?? false;
         const ownerLabel =
           wp.ownerNodeNum != null
             ? `!${Number(wp.ownerNodeNum).toString(16).padStart(8, '0')}`
             : 'unknown';
         return (
+          <Fragment key={`${wp.sourceId}:${wp.waypointId}`}>
+          <WaypointGeofenceRegion wp={wp} />
           <Marker
-            key={`${wp.sourceId}:${wp.waypointId}`}
             position={[wp.latitude, wp.longitude]}
             icon={icon}
           >
@@ -150,6 +196,13 @@ export function PerSourceWaypoints({
                     <div className="node-popup-item" style={{ gridColumn: '1 / -1' }}>
                       <span className="node-popup-icon"><UiIcon name="text" size={15} /></span>
                       <span className="node-popup-value">{wp.description}</span>
+                    </div>
+                  )}
+
+                  {geofenceSummary(wp) && (
+                    <div className="node-popup-item" style={{ gridColumn: '1 / -1' }}>
+                      <span className="node-popup-icon"><UiIcon name="location" size={15} /></span>
+                      <span className="node-popup-value">{geofenceSummary(wp)}</span>
                     </div>
                   )}
 
@@ -187,6 +240,8 @@ export function PerSourceWaypoints({
                       {actions.canEdit && (
                         <button
                           type="button"
+                          disabled={locked}
+                          title={locked ? actions.lockedTitle : undefined}
                           onClick={() => actions.onEdit?.(wp)}
                         >
                           <UiIcon name="edit" size={14} /> Edit
@@ -196,6 +251,8 @@ export function PerSourceWaypoints({
                         <button
                           type="button"
                           className="danger"
+                          disabled={locked}
+                          title={locked ? actions.lockedTitle : undefined}
                           onClick={() => actions.onDelete?.(wp)}
                         >
                           <UiIcon name="delete" size={14} /> Delete
@@ -207,13 +264,21 @@ export function PerSourceWaypoints({
               </div>
             </Popup>
           </Marker>
+          </Fragment>
         );
       })}
     </>
   );
 }
 
-export default function WaypointsLayer() {
+/**
+ * Map Analysis: waypoints for the sources in the analysis filter. `actionsFor`
+ * gives the popup actions for one source, or undefined for a read-only popup
+ * (#5685: write permission and the ability to send differ per source).
+ */
+export default function WaypointsLayer({ actionsFor }: {
+  actionsFor?: (source: SourceInfo) => WaypointPopupActions | undefined;
+} = {}) {
   const { config } = useMapAnalysisCtx();
   const { data: sources = [] } = useDashboardSources();
   const sourceList = sources as SourceInfo[];
@@ -226,7 +291,7 @@ export default function WaypointsLayer() {
   return (
     <>
       {visibleSources.map((s) => (
-        <PerSourceWaypoints key={s.id} source={s} />
+        <PerSourceWaypoints key={s.id} source={s} actions={actionsFor?.(s)} />
       ))}
     </>
   );

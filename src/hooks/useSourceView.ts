@@ -32,6 +32,7 @@ import { DeviceInfo } from '../types/device';
 import { SortField, SortDirection, NodeFilters } from '../types/ui';
 import { useSettings } from '../contexts/SettingsContext';
 import { useMapContext } from '../contexts/MapContext';
+import { useMapViewSelector } from '../contexts/mapViewStore';
 import { useData } from '../contexts/DataContext';
 import { useMessaging } from '../contexts/MessagingContext';
 import { useUI } from '../contexts/UIContext';
@@ -39,6 +40,7 @@ import { useSource } from '../contexts/SourceContext';
 import { useToast } from '../components/ToastContainer';
 import { useNodes, useTelemetryNodes, setNodeFieldInCache } from './useServerData';
 import { useTraceroutePaths, type ThemeColors } from './useTraceroutePaths';
+import { TRACEROUTE_LOW_ZOOM } from '../utils/tracerouteSegments';
 import { isNodeComplete, getEffectivePosition } from '../utils/nodeHelpers';
 import { effectiveMapMaxAgeHours } from '../utils/mapAge';
 import { resolveNodeListAgeHours } from '../utils/nodeQuickAgeFilter';
@@ -48,6 +50,7 @@ import { logger } from '../utils/logger';
 import { favoritePendingKey, pendingFavoriteRequests } from '../utils/pendingToggles';
 import { isTxDisabledBody } from '../utils/txDisabled';
 import { isAgedOutAircraft } from '../components/map/agedOutAircraft';
+import { passesNodeFilters, toMeshtasticFilterSubject } from '../utils/nodeAdvancedFilter';
 
 export interface UseSourceViewParams {
   /** The deployment base path — App passes `appBasename` (#3962 5.4 PR8
@@ -177,9 +180,14 @@ export function useSourceView(params: UseSourceViewParams) {
     traceroutes,
     selectedNodeId,
     setSelectedNodeId,
-    mapZoom,
     mapMaxAgeHours,
   } = useMapContext();
+  // useTraceroutePaths only cares which side of its low-zoom threshold the map
+  // is on. Subscribing to that boolean (not the raw zoom, which isn't on
+  // MapContext any more) means App re-renders when it flips, not on every
+  // zoom step or pan.
+  const belowTracerouteLowZoom = useMapViewSelector(s => s.zoom < TRACEROUTE_LOW_ZOOM);
+  const mapZoom = belowTracerouteLowZoom ? TRACEROUTE_LOW_ZOOM - 1 : TRACEROUTE_LOW_ZOOM;
   // mqtt_bridge/mqtt_broker sources have no RF path — every node on them
   // arrived over MQTT, so the RF/UDP/MQTT toggles (and their saved
   // preferences) have no meaning and can only blank the map. Skip them
@@ -401,122 +409,10 @@ export function useSourceView(params: UseSourceViewParams) {
     // Messages tab will apply its own messagesNodeFilter
     const textFiltered = activeTab === 'nodes' ? filterNodes(ageFiltered, nodesNodeFilter) : ageFiltered;
 
-    // Apply advanced filters
-    const passesAdvancedFilters = (node: DeviceInfo, allowAgedOut: boolean): boolean => {
-      const nodeId = node.user?.id;
-      const isShowMode = nodeFilters.filterMode === 'show';
-
-      // MQTT filter
-      if (nodeFilters.showMqtt) {
-        const matches = node.viaMqtt;
-        if (isShowMode && !matches) return false; // Show mode: exclude non-matches
-        if (!isShowMode && matches) return false; // Hide mode: exclude matches
-      }
-
-      // Telemetry filter
-      if (nodeFilters.showTelemetry) {
-        const matches = nodeId && nodesWithTelemetry.has(nodeId);
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      // Environment metrics filter
-      if (nodeFilters.showEnvironment) {
-        const matches = nodeId && nodesWithWeatherTelemetry.has(nodeId);
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      // Power source filter
-      const batteryLevel = node.deviceMetrics?.batteryLevel;
-      if (nodeFilters.powerSource !== 'both' && batteryLevel !== undefined) {
-        const isPowered = batteryLevel === 101;
-        if (nodeFilters.powerSource === 'powered' && !isPowered) {
-          return false;
-        }
-        if (nodeFilters.powerSource === 'battery' && isPowered) {
-          return false;
-        }
-      }
-
-      // Position filter
-      if (nodeFilters.showPosition) {
-        const hasPosition = node.position && node.position.latitude != null && node.position.longitude != null;
-        const matches = hasPosition;
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      // Hops filter (always applies regardless of mode)
-      if (node.hopsAway != null) {
-        if (node.hopsAway < nodeFilters.minHops || node.hopsAway > nodeFilters.maxHops) {
-          return false;
-        }
-      }
-
-      // PKI filter
-      if (nodeFilters.showPKI) {
-        const matches = nodeId && nodesWithPKC.has(nodeId);
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      // Remote Admin filter
-      if (nodeFilters.showRemoteAdmin) {
-        const matches = !!node.hasRemoteAdmin;
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      /**
-       * Unknown nodes filter
-       * Identifies nodes that lack both longName and shortName, which are typically
-       * displayed as "Node 12345678" in the UI. These nodes have only been detected
-       * but haven't provided identifying information yet.
-       */
-      if (nodeFilters.showUnknown) {
-        const hasLongName = node.user?.longName && node.user.longName.trim() !== '';
-        const hasShortName = node.user?.shortName && node.user.shortName.trim() !== '';
-        const isUnknown = !hasLongName && !hasShortName;
-        const matches = isUnknown;
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      // Ignored nodes filter - hide ignored nodes by default
-      // When showIgnored is false (default): hide ignored nodes
-      // When showIgnored is true: show ignored nodes
-      // #5364/#5365 Phase 2: `allowAgedOut` lets an aged-out aircraft through
-      // for the map-only "Show aged-out" list; manual/geo ignores never pass.
-      if (!nodeFilters.showIgnored && node.isIgnored && !(allowAgedOut && isAgedOutAircraft(node))) {
-        return false;
-      }
-
-      // Favorite locked filter
-      if (nodeFilters.showFavoriteLocked) {
-        const matches = !!node.favoriteLocked;
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      // Device role filter
-      if (nodeFilters.deviceRoles.length > 0) {
-        const role = typeof node.user?.role === 'number' ? node.user.role : parseInt(node.user?.role || '0');
-        const matches = nodeFilters.deviceRoles.includes(role);
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      // Channel filter
-      if (nodeFilters.channels.length > 0) {
-        const nodeChannel = node.channel ?? -1;
-        const matches = nodeFilters.channels.includes(nodeChannel);
-        if (isShowMode && !matches) return false;
-        if (!isShowMode && matches) return false;
-      }
-
-      return true;
-    };
+    // Apply advanced filters (shared predicate, #6259)
+    const filterSets = { nodesWithTelemetry, nodesWithWeather: nodesWithWeatherTelemetry, nodesWithPKC };
+    const passesAdvancedFilters = (node: DeviceInfo, allowAgedOut: boolean): boolean =>
+      passesNodeFilters(toMeshtasticFilterSubject(node, filterSets), nodeFilters, { allowAgedOut });
     const advancedFiltered = textFiltered.filter(node => passesAdvancedFilters(node, false));
 
     // Aged-out aircraft skip the age window (they are older than it by

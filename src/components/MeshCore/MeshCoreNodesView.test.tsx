@@ -86,6 +86,8 @@ function listedNames(): string[] {
 // are all within 3 hours, so they survive it. The per-source age filter
 // suite overrides this per-test where it needs a different cutoff.
 beforeEach(() => {
+  // The toolbar sort and filters persist (#6259); keep tests independent.
+  localStorage.clear();
   mockUseNodeDisplaySettings.mockReset().mockReturnValue({ maxNodeAgeHours: 24, maxInfraNodeAgeHours: 720 });
   meshCoreMapProps.mockClear();
 });
@@ -100,18 +102,56 @@ describe('MeshCoreNodesView — sort controls', () => {
   it('sorts alphabetically (case-insensitive) when "Name" is selected', () => {
     render(<MeshCoreNodesView nodes={nodes} contacts={contacts} />);
     const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
-    fireEvent.change(dropdown, { target: { value: 'name' } });
+    fireEvent.change(dropdown, { target: { value: 'longName' } });
     // Direction defaults to desc — toggle to asc for natural alphabetical.
-    fireEvent.click(screen.getByTitle('Descending'));
+    fireEvent.click(screen.getByTitle('nodes.descending'));
     expect(listedNames()).toEqual(['alpha', 'Bravo', 'Charlie']);
   });
 
   it('reverses order when the direction button is clicked', () => {
     render(<MeshCoreNodesView nodes={nodes} contacts={contacts} />);
     const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
-    fireEvent.change(dropdown, { target: { value: 'name' } });
+    fireEvent.change(dropdown, { target: { value: 'longName' } });
     // After selecting name, direction is still 'desc' from default — Z..A.
     expect(listedNames()).toEqual(['Charlie', 'Bravo', 'alpha']);
+  });
+
+  it('sorts by public key (lowercase hex) when "Public key" is selected (#6185)', () => {
+    render(<MeshCoreNodesView nodes={nodes} contacts={contacts} />);
+    const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
+    fireEvent.change(dropdown, { target: { value: 'id' } });
+    // Direction defaults to desc — toggle to asc for natural hex order.
+    fireEvent.click(screen.getByTitle('nodes.descending'));
+    // PK_A(aaa…)=Charlie < PK_B(bbb…)=alpha < PK_C(ccc…)=Bravo
+    expect(listedNames()).toEqual(['Charlie', 'alpha', 'Bravo']);
+  });
+
+  it('compares public keys case-insensitively (#6185)', () => {
+    // 'B' (ASCII 66) sorts BEFORE 'a' (ASCII 97) by raw byte order, but AFTER
+    // it once both are lowercased — so a lowercase compare puts NodeA first.
+    const mixed: MeshCoreNode[] = [
+      { publicKey: 'B'.repeat(64), name: 'NodeB', advType: 1, lastHeard: NOW - 1 * HOUR_MS },
+      { publicKey: 'a'.repeat(64), name: 'NodeA', advType: 1, lastHeard: NOW - 2 * HOUR_MS },
+    ];
+    render(<MeshCoreNodesView nodes={mixed} contacts={contacts} />);
+    const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
+    fireEvent.change(dropdown, { target: { value: 'id' } });
+    fireEvent.click(screen.getByTitle('nodes.descending'));
+    expect(listedNames()).toEqual(['NodeA', 'NodeB']);
+  });
+
+  it('pins favorites to the top under public-key sort (#6185)', () => {
+    const withFavorite: MeshCoreNode[] = [
+      { publicKey: PK_A, name: 'Charlie', advType: 1, lastHeard: NOW - 3 * HOUR_MS },
+      { publicKey: PK_B, name: 'alpha', advType: 1, lastHeard: NOW - 1 * HOUR_MS },
+      { publicKey: PK_C, name: 'Bravo', advType: 1, lastHeard: NOW - 2 * HOUR_MS, isFavorite: true },
+    ];
+    render(<MeshCoreNodesView nodes={withFavorite} contacts={contacts} />);
+    const dropdown = screen.getByTitle('Sort by') as HTMLSelectElement;
+    fireEvent.change(dropdown, { target: { value: 'id' } });
+    fireEvent.click(screen.getByTitle('nodes.descending'));
+    // Favorite PK_C (Bravo) pins to the top; the rest follow in hex order.
+    expect(listedNames()).toEqual(['Bravo', 'Charlie', 'alpha']);
   });
 });
 
@@ -222,6 +262,27 @@ describe('MeshCoreNodesView — Discover menu (#3351)', () => {
     expect(onDiscoverNodes).toHaveBeenCalledWith('repeaters');
     await waitFor(() => expect(showToast).toHaveBeenCalledWith('Discovery failed', 'error'));
   });
+
+  it('puts the title and actions on one header row, filter and sort on a second (#5936)', () => {
+    const { container } = render(
+      <MeshCoreNodesView
+        nodes={nodes}
+        contacts={contacts}
+        onImportContact={vi.fn()}
+        onDiscoverNodes={vi.fn()}
+        canDiscover
+      />,
+    );
+    const header = container.querySelector('.meshcore-list-pane-header')!;
+    const rows = Array.from(header.children);
+    expect(rows).toHaveLength(2);
+    const [top, bottom] = rows;
+    expect(top.contains(screen.getByText('Nodes'))).toBe(true);
+    expect(top.contains(screen.getByText('Import'))).toBe(true);
+    expect(top.contains(screen.getByText('Discover'))).toBe(true);
+    expect(bottom.contains(screen.getByTestId('node-age-window'))).toBe(true);
+    expect(bottom.contains(screen.getByLabelText('Sort by'))).toBe(true);
+  });
 });
 
 function setViewportWidth(width: number) {
@@ -265,9 +326,25 @@ describe('MeshCoreNodesView — list collapse toggle (mobile map access)', () =>
     expect(document.querySelector('.meshcore-list-pane.collapsed')).not.toBeNull();
   });
 
+  it('on mobile, opens on the map, with a Node list button back to the list (#5968)', () => {
+    setViewportWidth(500);
+    render(<MeshCoreNodesView nodes={nodes} contacts={contacts} />);
+    expect(document.querySelector('.meshcore-two-pane.mobile-show-content')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Node list/ }));
+    expect(document.querySelector('.meshcore-two-pane.mobile-show-list')).not.toBeNull();
+    expect(screen.queryByRole('button', { name: /Node list/ })).toBeNull();
+  });
+
+  it('on desktop, opens with the list and map side by side, as before', () => {
+    render(<MeshCoreNodesView nodes={nodes} contacts={contacts} />);
+    expect(document.querySelector('.meshcore-two-pane.mobile-show-list')).not.toBeNull();
+    expect(screen.queryByRole('button', { name: /Node list/ })).toBeNull();
+  });
+
   it('on mobile, the toggle reveals the map instead of collapsing to a thin bar', () => {
     setViewportWidth(500);
     render(<MeshCoreNodesView nodes={nodes} contacts={contacts} />);
+    fireEvent.click(screen.getByRole('button', { name: /Node list/ }));
     expect(document.querySelector('.meshcore-two-pane.mobile-show-list')).not.toBeNull();
     fireEvent.click(screen.getByTitle('Collapse node list'));
     // Reveals the map pane via the existing mobile pane-swap mechanism...
@@ -542,5 +619,99 @@ describe('MeshCoreNodesView — Nodes tab quick age filter (#5387)', () => {
 
     act(() => setNodeQuickAgeHours(24));
     expect(listedNames()).toEqual(['Recent']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hide incomplete + marker dimming (#6258)
+// ---------------------------------------------------------------------------
+
+describe('MeshCoreNodesView — hide incomplete nodes and dimming (#6258)', () => {
+  const PK_N = 'd'.repeat(64); // no name
+  const PK_U = 'e'.repeat(64); // unknown type
+  const PK_F = 'f'.repeat(64); // favourite, no name, unknown type
+  const PK_L = '1'.repeat(64); // local, no name
+  const PK_OK = '2'.repeat(64); // complete
+
+  const rawNodes: MeshCoreNode[] = [
+    { publicKey: PK_N, name: '', advType: 1, lastHeard: NOW - HOUR_MS },
+    { publicKey: PK_U, name: 'NoType', advType: 0, lastHeard: NOW - HOUR_MS },
+    { publicKey: PK_F, name: '  ', advType: 0, lastHeard: NOW - HOUR_MS, isFavorite: true },
+    { publicKey: PK_OK, name: 'Complete', advType: 1, lastHeard: NOW - HOUR_MS },
+  ];
+  const rawContacts = [
+    { publicKey: PK_L, advName: '', name: '', advType: 0, isLocal: true, latitude: 1, longitude: 2, lastSeen: NOW - HOUR_MS },
+    { publicKey: PK_OK, advName: 'Complete', advType: 1, latitude: 3, longitude: 4, lastSeen: NOW - HOUR_MS },
+    { publicKey: PK_N, advName: '', advType: 1, latitude: 5, longitude: 6, lastSeen: NOW - HOUR_MS },
+  ] as unknown as MeshCoreContact[];
+
+  function mapContactKeys(): string[] {
+    const last = meshCoreMapProps.mock.calls.at(-1)![0] as { contacts: MeshCoreContact[] };
+    return last.contacts.map(c => c.publicKey).sort();
+  }
+
+  it('keeps every row when hide-incomplete is off', () => {
+    mockUseNodeDisplaySettings.mockReturnValue({ maxNodeAgeHours: 24, maxInfraNodeAgeHours: 720, hideIncompleteNodes: false });
+    render(<MeshCoreNodesView nodes={rawNodes} contacts={rawContacts} />);
+    expect(document.querySelectorAll('.mc-node-row').length).toBe(5);
+  });
+
+  it('drops name-less and unknown-type rows, but keeps favourites and the local node, from list and map', () => {
+    mockUseNodeDisplaySettings.mockReturnValue({ maxNodeAgeHours: 24, maxInfraNodeAgeHours: 720, hideIncompleteNodes: true });
+    render(<MeshCoreNodesView nodes={rawNodes} contacts={rawContacts} />);
+    // Complete, favourite, local remain; PK_N and PK_U are dropped.
+    expect(document.querySelectorAll('.mc-node-row').length).toBe(3);
+    const keys = mapContactKeys();
+    expect(keys).toContain(PK_OK);
+    expect(keys).toContain(PK_L);
+    expect(keys).not.toContain(PK_N);
+  });
+
+  function opacityMap(): ReadonlyMap<string, number> {
+    const last = meshCoreMapProps.mock.calls.at(-1)![0] as { markerOpacityByKey: ReadonlyMap<string, number> };
+    return last.markerOpacityByKey;
+  }
+
+  const dimNodes: MeshCoreNode[] = [
+    { publicKey: PK_A, name: 'Comp', advType: 1, lastHeard: NOW - 12 * HOUR_MS },
+    { publicKey: PK_B, name: 'Rpt', advType: 2, lastHeard: NOW - 12 * HOUR_MS },
+    { publicKey: PK_C, name: 'Fresh', advType: 1, lastHeard: NOW - 0.2 * HOUR_MS },
+  ];
+
+  it('dims markers using the companion window vs the infrastructure window', () => {
+    mockUseNodeDisplaySettings.mockReturnValue({
+      maxNodeAgeHours: 24, maxInfraNodeAgeHours: 120,
+      nodeDimmingEnabled: true, nodeDimmingStartHours: 1, nodeDimmingMinOpacity: 0.2,
+    });
+    render(<MeshCoreNodesView nodes={dimNodes} contacts={[]} />);
+    const m = opacityMap();
+    // companion: (12-1)/(24-1) -> 1 - 0.478*0.8 ~= 0.617
+    expect(m.get(PK_A)).toBeCloseTo(1 - (11 / 23) * 0.8, 3);
+    // infra: (12-1)/(120-1) -> much less dimmed
+    expect(m.get(PK_B)).toBeCloseTo(1 - (11 / 119) * 0.8, 3);
+    expect(m.get(PK_B)!).toBeGreaterThan(m.get(PK_A)!);
+    expect(m.has(PK_C)).toBe(false);
+  });
+
+  it('does not dim when disabled or when the window is 0, and never dims list rows', () => {
+    mockUseNodeDisplaySettings.mockReturnValue({
+      maxNodeAgeHours: 0, maxInfraNodeAgeHours: 0,
+      nodeDimmingEnabled: true, nodeDimmingStartHours: 1, nodeDimmingMinOpacity: 0.2,
+    });
+    render(<MeshCoreNodesView nodes={dimNodes} contacts={[]} />);
+    expect(opacityMap().size).toBe(0);
+    for (const row of Array.from(document.querySelectorAll<HTMLElement>('.mc-node-row'))) {
+      expect(row.style.opacity).toBe('');
+    }
+  });
+
+  it('never dims the local node', () => {
+    mockUseNodeDisplaySettings.mockReturnValue({
+      maxNodeAgeHours: 24, maxInfraNodeAgeHours: 120,
+      nodeDimmingEnabled: true, nodeDimmingStartHours: 1, nodeDimmingMinOpacity: 0.2,
+    });
+    const local = [{ publicKey: PK_L, advName: 'Me', advType: 1, isLocal: true, latitude: 1, longitude: 2, lastSeen: NOW - 20 * HOUR_MS }] as unknown as MeshCoreContact[];
+    render(<MeshCoreNodesView nodes={[]} contacts={local} />);
+    expect(opacityMap().has(PK_L)).toBe(false);
   });
 });

@@ -16,6 +16,7 @@ import { MqttPacketFilter, type ServiceEnvelopeShape } from './mqttPacketFilter.
 import { ingestServiceEnvelope, bootstrapMqttChannelDatabase } from './mqttIngestion.js';
 import { parseGatewayNodeNum } from './utils/okToMqtt.js';
 import meshtasticProtobufService from './meshtasticProtobufService.js';
+import { channelDecryptionService } from './services/channelDecryptionService.js';
 import type { ISourceManager, SourceStatus } from './sourceManagerRegistry.js';
 import type { Source } from '../db/repositories/sources.js';
 import { loadAllNodesAsDeviceInfo } from './utils/dbNodeMapper.js';
@@ -29,6 +30,7 @@ import {
   type StoredHopLimitPolicy,
 } from './mqttHopLimitPolicy.js';
 import { logger } from '../utils/logger.js';
+import type { MqttNativeReadiness } from './services/mqttNative/mqttNativeSendService.js';
 
 export interface MqttBrokerSourceConfig {
   listener: { port: number; host?: string };
@@ -108,6 +110,38 @@ export interface MqttBrokerLocalPacket {
  * - 'client-connected' (clientId: string)
  * - 'client-disconnected' (clientId: string)
  */
+/** #5708: how long a skip-raise mark lasts, and how many may be held. */
+const SKIP_RAISE_TTL_MS = 60_000;
+const SKIP_RAISE_MAX_ENTRIES = 5_000;
+
+/**
+ * #5791: the portnum of a channel-encrypted packet, read with the channel
+ * keys MeshRadar already holds, or null when none of them fits. A phone's
+ * MQTT client proxy uplinks encrypted unless the channel is unencrypted, so
+ * without this a "raise text messages" policy never matched a phone's text.
+ *
+ * Only the portnum is read. `hop_limit` sits in the MeshPacket header, outside
+ * the encrypted bytes, so a raise re-encodes the envelope around the same
+ * ciphertext and nothing is re-encrypted.
+ */
+function peekEncryptedPortnum(packet: {
+  from?: number;
+  to?: number;
+  id?: number;
+  channel?: number;
+  encrypted?: Uint8Array;
+}): number | null {
+  if (!packet.encrypted || packet.encrypted.length === 0) return null;
+  if (typeof packet.from !== 'number' || typeof packet.id !== 'number') return null;
+  return channelDecryptionService.peekPortnum(
+    packet.encrypted,
+    packet.id >>> 0,
+    packet.from >>> 0,
+    typeof packet.channel === 'number' ? packet.channel : undefined,
+    typeof packet.to === 'number' ? packet.to >>> 0 : undefined,
+  );
+}
+
 export class MqttBrokerManager extends EventEmitter implements ISourceManager {
   readonly sourceId: string;
   readonly sourceType: Source['type'] = 'mqtt_broker';
@@ -146,6 +180,9 @@ export class MqttBrokerManager extends EventEmitter implements ISourceManager {
   async start(): Promise<void> {
     if (this.broker) return;
     await bootstrapMqttChannelDatabase(this.sourceId);
+    // #5791: the forward hook reads encrypted portnums from the cached channel
+    // keys and cannot load them itself, so load them before the first packet.
+    if (this.hopLimitPolicy?.raise) void channelDecryptionService.refreshChannelCache();
     this.broker = new MqttBroker({
       port: this.config.listener.port,
       host: this.config.listener.host,
@@ -267,6 +304,24 @@ export class MqttBrokerManager extends EventEmitter implements ISourceManager {
     return { publicKey: null, privateKey: null };
   }
 
+  /**
+   * Whether MQTT-native send (#4305) may publish into this embedded broker.
+   * Its connected gateways downlink what they receive. Only a stopped broker
+   * refuses.
+   */
+  getNativePublishReadiness(): MqttNativeReadiness {
+    if (!this.broker) return { ok: false, code: 'NOT_CONNECTED', reason: 'This MQTT broker is not running.' };
+    return { ok: true };
+  }
+
+  /**
+   * No hint: `rootTopic` here is only the prefix filter (usually `msh`), not
+   * the region root the gateways use, so the admin sets it (#4305).
+   */
+  getNativeRootTopicHint(): string | null {
+    return null;
+  }
+
   /** Publish a raw payload to a topic on this broker. */
   async publish(topic: string, payload: Buffer, retained = false): Promise<void> {
     if (!this.broker) throw new Error('Broker not started');
@@ -286,6 +341,65 @@ export class MqttBrokerManager extends EventEmitter implements ISourceManager {
    * purpose — ingestion and the uplink bridge must see the wire bytes as they
    * arrived — so that caller applies the transform itself.
    */
+  /**
+   * #5708: packets (by sender + packet id) that a bridge with `skipRaise`
+   * republished into this broker. Both radio egress paths call
+   * {@link transformForwardedPayload}, so one lookup there covers both. An
+   * entry lives {@link SKIP_RAISE_TTL_MS}: long enough for every subscriber
+   * and the mqttLink path to see the packet, short enough not to leak.
+   */
+  private readonly skipRaiseUntil = new Map<string, number>();
+
+  markSkipRaise(fromNum: number, packetId: number): void {
+    const now = Date.now();
+    if (this.skipRaiseUntil.size >= SKIP_RAISE_MAX_ENTRIES) {
+      for (const [k, until] of this.skipRaiseUntil) if (until <= now) this.skipRaiseUntil.delete(k);
+      // Still full of live entries: drop the oldest (Map keeps insertion order).
+      while (this.skipRaiseUntil.size >= SKIP_RAISE_MAX_ENTRIES) {
+        const oldest = this.skipRaiseUntil.keys().next().value;
+        if (oldest === undefined) break;
+        this.skipRaiseUntil.delete(oldest);
+      }
+    }
+    this.skipRaiseUntil.set(`${fromNum >>> 0}:${packetId >>> 0}`, now + SKIP_RAISE_TTL_MS);
+  }
+
+  /**
+   * #5013: packets (by sender + packet id) a bridge brought down from its
+   * upstream and republished into this broker, mapped to that bridge's source
+   * id. Every other bridge on this broker sees the republish as a local packet,
+   * and without this it would uplink upstream A's traffic to upstream B. A
+   * bridge asks {@link bridgeOriginOf} before it uplinks. Same lifetime and
+   * bound as the skip-raise marks.
+   */
+  private readonly bridgeOrigin = new Map<string, { bridgeId: string; until: number }>();
+
+  markBridgeOrigin(bridgeId: string, fromNum: number, packetId: number): void {
+    const now = Date.now();
+    if (this.bridgeOrigin.size >= SKIP_RAISE_MAX_ENTRIES) {
+      for (const [k, v] of this.bridgeOrigin) if (v.until <= now) this.bridgeOrigin.delete(k);
+      while (this.bridgeOrigin.size >= SKIP_RAISE_MAX_ENTRIES) {
+        const oldest = this.bridgeOrigin.keys().next().value;
+        if (oldest === undefined) break;
+        this.bridgeOrigin.delete(oldest);
+      }
+    }
+    this.bridgeOrigin.set(`${fromNum >>> 0}:${packetId >>> 0}`, { bridgeId, until: now + SKIP_RAISE_TTL_MS });
+  }
+
+  /** The bridge that brought this packet in within the last minute, or null. */
+  bridgeOriginOf(fromNum: number | null | undefined, packetId: number | null | undefined): string | null {
+    if (fromNum === null || fromNum === undefined || packetId === null || packetId === undefined) return null;
+    const entry = this.bridgeOrigin.get(`${fromNum >>> 0}:${packetId >>> 0}`);
+    return entry !== undefined && entry.until > Date.now() ? entry.bridgeId : null;
+  }
+
+  private shouldSkipRaise(fromNum: number | undefined, packetId: number | undefined): boolean {
+    if (fromNum === undefined || packetId === undefined) return false;
+    const until = this.skipRaiseUntil.get(`${fromNum >>> 0}:${packetId >>> 0}`);
+    return until !== undefined && until > Date.now();
+  }
+
   transformForwardedPayload(topic: string, payload: Buffer): Buffer | null {
     const policy = this.hopLimitPolicy;
     if (!policy) return null;
@@ -293,16 +407,24 @@ export class MqttBrokerManager extends EventEmitter implements ISourceManager {
     const decoded = meshtasticProtobufService.decodeServiceEnvelope(payload, { quiet: true });
     if (!decoded || !decoded.packet) return null;
     const packet = decoded.packet as {
+      from?: number;
+      id?: number;
+      channel?: number;
       hopLimit?: number;
       hopStart?: number;
       decoded?: { portnum?: number };
+      encrypted?: Uint8Array;
     };
-    // An encrypted payload has no readable portnum. Null means "unknown":
-    // never raised, still clamped. See applyHopLimitPolicy().
-    const portnum = typeof packet.decoded?.portnum === 'number' ? packet.decoded.portnum : null;
+    const portnum = typeof packet.decoded?.portnum === 'number'
+      ? packet.decoded.portnum
+      : peekEncryptedPortnum(packet);
     // proto3 omits zero on the wire, so an absent field means hop_limit 0.
     const arrived = packet.hopLimit ?? 0;
-    const next = applyHopLimitPolicy(policy, portnum, arrived);
+    // #5708: a packet from a skip-raise bridge is clamped but never raised.
+    const effective = policy.raise && this.shouldSkipRaise(packet.from, packet.id)
+      ? { ...policy, raise: undefined }
+      : policy;
+    const next = applyHopLimitPolicy(effective, portnum, arrived);
     if (next === arrived) return null;
     packet.hopLimit = next;
     // hop_start is deliberately left alone — see mqttHopLimitPolicy.ts.

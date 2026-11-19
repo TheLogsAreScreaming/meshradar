@@ -23,13 +23,14 @@ A system backup holds **every table in the database** except three (listed below
 - **Keys and credentials**: see [A backup is a secret](#a-backup-is-a-secret)
 - **History and logs**: packet logs (Meshtastic, MeshCore, MQTT), message delivery events, automation runs, mesh issues, estimated positions, audit log, and the logs the automatic features keep
 
-Three tables are left out on purpose:
+Four tables are left out on purpose:
 
 | Table | Why it is not in a backup |
 |-------|---------------------------|
 | `sessions` | Live login sessions. A stolen backup would be a stolen login. |
 | `push_subscriptions` | Per-browser push endpoints and their secrets. Browsers register again on the next visit. |
 | `backup_history` | The index of device-config backup files, which are not part of a system backup. |
+| `meshcore_source_pki_keys` | MeshCore Companion device identity keys that MeshMonitor captures on its own. A stolen backup must not carry a device's identity. |
 
 ::: warning A restore clears push subscriptions
 A restore replaces the `users` table, and the database removes each replaced user's push subscriptions with it. Each browser has to turn push notifications back on. Login sessions are not part of a backup: a restore leaves the sessions of the install you restore onto as they are.
@@ -42,12 +43,15 @@ A restore replaces the `users` table, and the database removes each replaced use
 | What | Table | How it is protected inside the backup |
 |------|-------|---------------------------------------|
 | Channel keys (PSKs) | `channels`, `channel_database`, `mesh_beacon_offers` | **Not protected.** Stored in the clear. Anyone who reads the backup can decrypt those channels. |
-| Account passwords | `users` | bcrypt hashes. MFA secrets are stored as the database holds them. |
+| Account passwords | `users` | bcrypt hashes. MFA secrets are stored as the database holds them. MFA backup codes and passkey recovery codes are bcrypt hashes. |
 | API tokens | `api_tokens` | bcrypt hash of each token. The token itself is never stored. |
+| Passkeys | `user_passkeys` | Public keys only. The private key never leaves the user's device, but the credential IDs tie each passkey to an account. |
 | PKI private keys (direct-message decryption) | `source_pki_keys` | AES-256-GCM, keyed from `SESSION_SECRET` |
 | Analyzer Observer signing keys | `meshcore_observer_keys` | AES-256-GCM, keyed from `SESSION_SECRET` |
 | Analyzer Observer broker passwords | `meshcore_observer_credentials` | AES-256-GCM, keyed from `SESSION_SECRET` |
 | Saved MeshCore repeater and room passwords | `meshcore_nodes` | AES-256-GCM, keyed from `SESSION_SECRET` |
+| MQTT-native send keys | `mqtt_native_identities` | AES-256-GCM, keyed from `SESSION_SECRET` |
+| [Script Secrets](/developers/auto-responder-scripting#script-secrets) (API keys for user scripts) | `script_secrets` | AES-256-GCM, keyed from `SESSION_SECRET`. Secret names are in the clear. |
 
 `SESSION_SECRET` is **not** in the backup. Keep it somewhere else: a backup plus the `SESSION_SECRET` it was made under opens every row in the table above.
 
@@ -202,6 +206,7 @@ The encrypted keys and passwords in a backup can only be opened with the `SESSIO
 - The restore still succeeds, and the encrypted rows are **kept**, not deleted
 - The log names the affected sources (ids only), and the audit log entry for the restore records them
 - Each feature shows its "key rotated" state and asks for the key or password again: PKI direct-message decryption, the Analyzer Observer key and broker login, saved MeshCore repeater passwords
+- Script Secrets show as **Unreadable** in **Settings › Scripts**, and scripts do not receive them until you enter each value again
 
 Set `SESSION_SECRET` back to the original value and restart, and the kept rows work again. Password hashes, API tokens and channel keys do not depend on `SESSION_SECRET`.
 

@@ -8,7 +8,7 @@
  * likely to be wrong untested.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createHmac, createCipheriv } from 'node:crypto';
+import { createHmac, createCipheriv, createHash } from 'node:crypto';
 import { ChannelCrypto } from '@michaelhart/meshcore-decoder';
 import { ALL_SOURCES } from '../db/repositories/base.js';
 
@@ -27,6 +27,18 @@ vi.mock('../services/database.js', () => ({
 }));
 vi.mock('./services/dataEventEmitter.js', () => ({
   dataEventEmitter: { emitMeshCoreMessage: (...a: unknown[]) => emitMeshCoreMessage(...a) },
+}));
+const isReactionsInboundEnabled = vi.fn();
+const resolveInboundReaction = vi.fn();
+const notePendingReaction = vi.fn();
+const resolvePendingReactionsFor = vi.fn();
+const emitReactionResolutions = vi.fn();
+vi.mock('./services/meshcoreReactionIngest.js', () => ({
+  isReactionsInboundEnabled: (...a: unknown[]) => isReactionsInboundEnabled(...a),
+  resolveInboundReaction: (...a: unknown[]) => resolveInboundReaction(...a),
+  notePendingReaction: (...a: unknown[]) => notePendingReaction(...a),
+  resolvePendingReactionsFor: (...a: unknown[]) => resolvePendingReactionsFor(...a),
+  emitReactionResolutions: (...a: unknown[]) => emitReactionResolutions(...a),
 }));
 vi.mock('./services/meshcorePacketLogService.js', () => ({
   default: { isEnabled: vi.fn().mockResolvedValue(false), logPacket: vi.fn() },
@@ -50,6 +62,8 @@ vi.mock('./transports/mqttBrokerClient.js', () => ({
 }));
 
 import { MeshCoreMqttManager } from './meshcoreMqttManager.js';
+import { mc1HashForChannelWire } from '../utils/meshcoreReactionTarget.js';
+import { keyedChannelIndex, channelKeyFingerprint } from './services/meshcoreFrameIngest.js';
 import { calculateMeshCorePacketHash } from './services/meshcoreObserverPacket.js';
 
 const SECRET_HEX = '0123456789abcdef0123456789abcdef'; // 16 bytes
@@ -111,6 +125,11 @@ beforeEach(() => {
   emitMeshCoreMessage.mockClear();
   getAllChannels.mockResolvedValue([{ id: 0, name: 'Public', psk: SECRET_B64 }]);
   lastClient = null;
+  isReactionsInboundEnabled.mockReset().mockResolvedValue(true);
+  resolveInboundReaction.mockReset().mockResolvedValue({ kind: 'not_reaction' });
+  notePendingReaction.mockReset();
+  resolvePendingReactionsFor.mockReset().mockResolvedValue([]);
+  emitReactionResolutions.mockReset();
 });
 
 describe('channel message ingest (#5040 Phase 4)', () => {
@@ -190,10 +209,10 @@ describe('channel message ingest (#5040 Phase 4)', () => {
     await settle();
 
     expect(insertMessage).toHaveBeenCalledTimes(1);
-    expect(insertMessage.mock.calls[0][0].fromPublicKey).toBe('channel-3');
+    expect(insertMessage.mock.calls[0][0].fromPublicKey).toBe(`channel-${keyedChannelIndex(SECRET3_HEX)}`);
   });
 
-  it('still files a channel-0 message under channel 0', async () => {
+  it('files a slot-0 key under its keyed index, not channel-0 (#6308)', async () => {
     getAllChannels.mockResolvedValue([
       { id: 0, name: 'Public', psk: SECRET_B64 },
       { id: 3, name: 'Gauntlet', psk: SECRET3_B64 },
@@ -203,7 +222,7 @@ describe('channel message ingest (#5040 Phase 4)', () => {
       msg(grpTxtFrame(1_700_000_000, 'Alice: on zero')));
     await settle();
 
-    expect(insertMessage.mock.calls[0][0].fromPublicKey).toBe('channel-0');
+    expect(insertMessage.mock.calls[0][0].fromPublicKey).toBe(`channel-${keyedChannelIndex(SECRET_HEX)}`);
   });
 
   it('keeps a message with no "Sender: " prefix verbatim', async () => {
@@ -252,5 +271,204 @@ describe('channel message ingest (#5040 Phase 4)', () => {
     lastClient!.deliver(`meshcore/MCO/${OBSERVER_A}/packets`, msg('0500deadbeef'));
     await settle();
     expect(insertMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('reactions on the MQTT ingest path (#5759)', () => {
+  const TS = 1_700_000_000;
+  const topic = `meshcore/MCO/${OBSERVER_A}/packets`;
+  const REACTION_BODY = '@[Alice]\u{1F44D}\nb45pc4ek';
+  const fields = (targetId: string | null) => ({
+    reactionEmoji: '\u{1F44D}',
+    reactionFormat: 'mc1-channel',
+    reactionTargetHash: 'b45pc4ek',
+    reactionTargetSender: 'Alice',
+    reactionTargetId: targetId,
+    reactionRawText: REACTION_BODY,
+  });
+
+  it('stores senderTimestamp and the MC1 hash on an ordinary row, and keeps the hash off the event', async () => {
+    await started();
+    lastClient!.deliver(topic, msg(grpTxtFrame(TS, 'Alice: Hello')));
+    await settle();
+
+    const [row] = insertMessage.mock.calls[0];
+    expect(row.senderTimestamp).toBe(TS);
+    expect(row.mc1Hash).toBe(mc1HashForChannelWire('Alice: Hello', TS));
+    expect(row.mc1Hash).toMatch(/^[0-9a-z]{8}$/);
+    const emitted = emitMeshCoreMessage.mock.calls[0][0];
+    expect(emitted.senderTimestamp).toBe(TS);
+    expect(emitted).not.toHaveProperty('mc1Hash');
+    expect(resolveInboundReaction).not.toHaveBeenCalled();
+    expect(resolvePendingReactionsFor).toHaveBeenCalledTimes(1);
+    expect(resolvePendingReactionsFor.mock.calls[0][0]).toBe('src-mqtt');
+    expect(resolvePendingReactionsFor.mock.calls[0][1]).toMatchObject({
+      id: row.id, mc1Hash: row.mc1Hash, senderTimestamp: TS, fromName: 'Alice',
+    });
+  });
+
+  it('stores a matched reaction as an emoji row with the target, keeping the raw-text id', async () => {
+    // Same frame, once as chat and once as a reaction: the id must not move.
+    await started();
+    lastClient!.deliver(topic, msg(grpTxtFrame(TS, `Bob: ${REACTION_BODY}`)));
+    await settle();
+    const chatId = insertMessage.mock.calls[0][0].id;
+    insertMessage.mockClear();
+    emitMeshCoreMessage.mockClear();
+    resolvePendingReactionsFor.mockClear();
+
+    resolveInboundReaction.mockResolvedValue({ kind: 'reaction', fields: fields('tgt-1') });
+    await started();
+    lastClient!.deliver(topic, msg(grpTxtFrame(TS, `Bob: ${REACTION_BODY}`)));
+    await settle();
+
+    expect(resolveInboundReaction).toHaveBeenCalledWith(expect.objectContaining({
+      sourceId: 'src-mqtt', scope: 'channel', channelIdx: keyedChannelIndex(SECRET_HEX), body: REACTION_BODY,
+      reactorName: 'Bob', selfName: null, selfKey: null,
+    }));
+    const [row] = insertMessage.mock.calls[0];
+    expect(row.id).toBe(chatId);
+    expect(row).toMatchObject({ text: '\u{1F44D}', fromName: 'Bob', senderTimestamp: TS, ...fields('tgt-1') });
+    expect(row.mc1Hash).toBeNull();
+    const emitted = emitMeshCoreMessage.mock.calls[0][0];
+    expect(emitted).toMatchObject({ text: '\u{1F44D}', reactionEmoji: '\u{1F44D}', reactionTargetId: 'tgt-1' });
+    expect(emitted).not.toHaveProperty('mc1Hash');
+    expect(notePendingReaction).not.toHaveBeenCalled();
+    expect(resolvePendingReactionsFor).not.toHaveBeenCalled();
+  });
+
+  it('records an unmatched reaction as pending', async () => {
+    resolveInboundReaction.mockResolvedValue({ kind: 'reaction', fields: fields(null) });
+    await started();
+    lastClient!.deliver(topic, msg(grpTxtFrame(TS, `Bob: ${REACTION_BODY}`)));
+    await settle();
+
+    const [row] = insertMessage.mock.calls[0];
+    expect(notePendingReaction).toHaveBeenCalledWith('src-mqtt', {
+      id: row.id, reactionFormat: 'mc1-channel', reactionTargetHash: 'b45pc4ek',
+    });
+  });
+
+  it('stores nothing and emits nothing for a duplicate reaction', async () => {
+    resolveInboundReaction.mockResolvedValue({ kind: 'duplicate', existingId: 'x' });
+    await started();
+    lastClient!.deliver(topic, msg(grpTxtFrame(TS, `Bob: ${REACTION_BODY}`)));
+    await settle();
+
+    expect(insertMessage).not.toHaveBeenCalled();
+    expect(emitMeshCoreMessage).not.toHaveBeenCalled();
+  });
+
+  it('stores reaction-shaped text as chat when inbound reactions are off', async () => {
+    isReactionsInboundEnabled.mockResolvedValue(false);
+    await started();
+    lastClient!.deliver(topic, msg(grpTxtFrame(TS, `Bob: ${REACTION_BODY}`)));
+    await settle();
+
+    expect(resolveInboundReaction).not.toHaveBeenCalled();
+    const [row] = insertMessage.mock.calls[0];
+    expect(row.text).toBe(REACTION_BODY);
+    expect(row.reactionEmoji).toBeUndefined();
+    expect(row.mc1Hash).toMatch(/^[0-9a-z]{8}$/);
+  });
+
+  it('a second observer copy of a reaction is still one row and no extra bookkeeping', async () => {
+    resolveInboundReaction.mockResolvedValue({ kind: 'reaction', fields: fields(null) });
+    insertMessage.mockResolvedValueOnce(true).mockResolvedValue(false);
+    await started();
+    const frame = grpTxtFrame(TS, `Bob: ${REACTION_BODY}`);
+    lastClient!.deliver(topic, msg(frame, OBSERVER_A));
+    await settle();
+    lastClient!.deliver(`meshcore/MCO/${OBSERVER_B}/packets`, msg(frame, OBSERVER_B));
+    await settle();
+
+    expect(insertMessage.mock.calls[0][0].id).toBe(insertMessage.mock.calls[1][0].id);
+    expect(emitMeshCoreMessage).toHaveBeenCalledTimes(1);
+    expect(notePendingReaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits late resolutions when an ordinary row lets a waiting reaction resolve', async () => {
+    const resolved = [{ reactionId: 'r1', targetId: 't1', droppedDuplicate: false, row: {} }];
+    resolvePendingReactionsFor.mockResolvedValue(resolved);
+    await started();
+    lastClient!.deliver(topic, msg(grpTxtFrame(TS, 'Alice: Hello')));
+    await settle();
+
+    expect(emitReactionResolutions).toHaveBeenCalledWith('src-mqtt', resolved);
+  });
+
+  it('keeps the senderTimestamp off a clock-less sender (no wire second)', async () => {
+    await started();
+    lastClient!.deliver(topic, msg(grpTxtFrame(0, 'Alice: no clock')));
+    await settle();
+
+    const [row] = insertMessage.mock.calls[0];
+    expect(row).not.toHaveProperty('senderTimestamp');
+    expect(row.mc1Hash).toBeNull();
+  });
+});
+
+describe('slot keys file under a keyed index with provenance (#6308)', () => {
+  const OTHER_SECRET_HEX = '00112233445566778899aabbccddeeff';
+  const OTHER_B64 = Buffer.from(OTHER_SECRET_HEX, 'hex').toString('base64');
+
+  it('stamps keyFingerprint, keySourceId and keyChannelIdx from the slot key', async () => {
+    getAllChannels.mockResolvedValue([{ id: 3, name: 'G', psk: SECRET3_B64, sourceId: 'comp-1' }]);
+    await started();
+    lastClient!.deliver(`meshcore/MCO/${OBSERVER_A}/packets`,
+      msg(grpTxtFrame(1_700_000_000, 'Alice: hi', SECRET3_HEX)));
+    await settle();
+    const row = insertMessage.mock.calls[0][0];
+    expect(row).toMatchObject({
+      fromPublicKey: `channel-${keyedChannelIndex(SECRET3_HEX)}`,
+      keyFingerprint: channelKeyFingerprint(SECRET3_HEX),
+      keySourceId: 'comp-1',
+      keyChannelIdx: 3,
+    });
+    // The emitted event carries the fingerprint so socket gates can apply it.
+    expect(emitMeshCoreMessage.mock.calls[0][0].keyFingerprint).toBe(channelKeyFingerprint(SECRET3_HEX));
+  });
+
+  it('files the same secret held at different slots on two sources under ONE index', async () => {
+    getAllChannels.mockResolvedValue([
+      { id: 3, name: 'A', psk: SECRET3_B64, sourceId: 'comp-1' },
+      { id: 5, name: 'A', psk: SECRET3_B64, sourceId: 'comp-2' },
+    ]);
+    await started();
+    lastClient!.deliver(`meshcore/MCO/${OBSERVER_A}/packets`,
+      msg(grpTxtFrame(1_700_000_000, 'Alice: once', SECRET3_HEX)));
+    await settle();
+    expect(insertMessage.mock.calls[0][0].fromPublicKey).toBe(`channel-${keyedChannelIndex(SECRET3_HEX)}`);
+  });
+
+  it('files two different secrets in the same slot on two sources under two indices', async () => {
+    getAllChannels.mockResolvedValue([
+      { id: 2, name: 'X', psk: SECRET3_B64, sourceId: 'comp-1' },
+      { id: 2, name: 'Y', psk: OTHER_B64, sourceId: 'comp-2' },
+    ]);
+    await started();
+    lastClient!.deliver(`meshcore/MCO/${OBSERVER_A}/packets`,
+      msg(grpTxtFrame(1_700_000_000, 'Alice: x', SECRET3_HEX)));
+    await settle();
+    lastClient!.deliver(`meshcore/MCO/${OBSERVER_A}/packets`,
+      msg(grpTxtFrame(1_700_000_001, 'Alice: y', OTHER_SECRET_HEX)));
+    await settle();
+    const a = insertMessage.mock.calls[0][0].fromPublicKey;
+    const b = insertMessage.mock.calls[1][0].fromPublicKey;
+    expect(a).not.toBe(b);
+    expect(insertMessage.mock.calls[0][0].keySourceId).toBe('comp-1');
+    expect(insertMessage.mock.calls[1][0].keySourceId).toBe('comp-2');
+  });
+
+  it('keeps the content-derived id formula unchanged', async () => {
+    getAllChannels.mockResolvedValue([{ id: 3, name: 'G', psk: SECRET3_B64, sourceId: 'comp-1' }]);
+    await started();
+    const ts = 1_700_000_000;
+    lastClient!.deliver(`meshcore/MCO/${OBSERVER_A}/packets`,
+      msg(grpTxtFrame(ts, 'Alice: stable', SECRET3_HEX)));
+    await settle();
+    const hash = ChannelCrypto.calculateChannelHash(SECRET3_HEX);
+    const digest = createHash('sha256').update(`${hash}\0${ts}\0stable`).digest('hex').slice(0, 24);
+    expect(insertMessage.mock.calls[0][0].id).toBe(`mqtt_src-mqtt_${digest}`);
   });
 });

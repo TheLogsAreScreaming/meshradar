@@ -11,15 +11,19 @@
  * Other port numbers are skipped.
  */
 
+import { mqttConsentStamp } from './utils/mqttConsentCapture.js';
 import meshtasticProtobufService from './meshtasticProtobufService.js';
 import { channelDecryptionService } from './services/channelDecryptionService.js';
-import { dataEventEmitter } from './services/dataEventEmitter.js';
+import { dataEventEmitter, type TelemetryEventMeta } from './services/dataEventEmitter.js';
+import { isAnswerToOwnTelemetryRequest } from './services/ownTelemetryRequests.js';
 import { sendMessagePushNotification } from './services/messagePushNotifier.js';
 import mqttPacketLogService from './services/mqttPacketLogService.js';
 import { autoDeleteByDistanceService } from './services/autoDeleteByDistanceService.js';
 import { aircraftAgeOutService } from './services/aircraftAgeOutService.js';
 import databaseService from '../services/database.js';
 import { isBlankMacAddr } from '../utils/nodeFieldBlanks.js';
+import { isMqttNativeEcho } from './services/mqttNative/mqttNativeState.js';
+import { decryptPkiDmToMqttNativeIdentity, isPkiDmToMqttNativeIdentity } from './services/mqttNative/mqttNativeReceive.js';
 
 /**
  * Public Meshtastic channels that ship with the default key. Used to
@@ -92,11 +96,12 @@ import {
   getStoreForwardRequestResponseName,
   CHANNEL_DB_OFFSET,
   TransportMechanism,
+  readIsAutomationBit,
 } from './constants/meshtastic.js';
 import { calculateDistance } from '../utils/distance.js';
 import { buildRoutePositionsSnapshot } from './utils/tracerouteSnapshot.js';
 import { canonicalTelemetryType, canonicalTelemetryUnit } from './utils/telemetryKeys.js';
-import { resolveLastHeardSec, resolvePositionObservedAtMs } from './utils/replayGuard.js';
+import { resolveLastHeardSec, resolvePositionObservedAtMs, isLiveReception, isFirmwareReplayPacket } from './utils/replayGuard.js';
 import { plausibleRxTime } from './utils/messageTime.js';
 import { shouldDiscardPosition } from '../utils/nullIsland.js';
 import { getDiscardInvalidPositions } from '../utils/positionIngestConfig.js';
@@ -112,6 +117,8 @@ import {
 } from './mqttPacketFilter.js';
 import { maybeRecordMqttCoverageReception } from './utils/coverageMqtt.js';
 import { maybeRecordMqttLink } from './services/crossSourceLinkRecorder.js';
+import { buildMqttFlight, emitPacketFlight } from './services/packetFlights.js';
+import { parseGatewayNodeNum } from './utils/okToMqtt.js';
 import { recordMqttPositionHistory } from './utils/mqttPositionHistory.js';
 import { getCachedSignFlipContext, correctLatLon } from './services/signFlipCorrection.js';
 
@@ -199,7 +206,8 @@ export interface MqttIngestionInput {
 
 export interface MqttIngestionResult {
   ingested: boolean;
-  reason?: 'no-packet' | 'no-decoded' | 'encrypted' | 'unsupported-portnum' | 'ignored' | 'geo-ignored' | 'distance' | 'decode-error';
+  /** `own-echo`: our own MQTT-native publish coming back on the same source (#4305). */
+  reason?: 'no-packet' | 'no-decoded' | 'encrypted' | 'unsupported-portnum' | 'ignored' | 'geo-ignored' | 'distance' | 'decode-error' | 'own-echo';
   portnum?: number;
 }
 
@@ -274,6 +282,21 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
   const packet = envelope.packet;
   if (!packet) return { ingested: false, reason: 'no-packet' };
 
+  // #4305: a PKI DM addressed to this source's own MQTT-native node (a reply
+  // to a DM we sent). Opened with our private key before channel decrypt.
+  if (!packet.decoded && isPkiDmToMqttNativeIdentity(sourceId, packet)) {
+    const dm = await decryptPkiDmToMqttNativeIdentity(sourceId, packet);
+    if (dm) {
+      (packet as { decoded?: Record<string, unknown> }).decoded = {
+        portnum: dm.portnum,
+        payload: dm.payload,
+        emoji: dm.emoji,
+        replyId: dm.replyId,
+        bitfield: dm.bitfield,
+      };
+    }
+  }
+
   // Server-side channel decryption — mirror the TCP path in
   // `meshtasticManager.processMeshPacket`. Public MQTT brokers republish
   // packets in their on-wire encrypted form (`packet.encrypted` set, no
@@ -288,6 +311,7 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         pid,
         fromNum,
         typeof packet.channel === 'number' ? packet.channel : undefined,
+        typeof packet.to === 'number' ? packet.to >>> 0 : undefined,
       );
       if (r.success) {
         // Carry tapback metadata (emoji, replyId) onto the synthesized
@@ -430,6 +454,7 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         updatedAt: nowMs,
       };
       void databaseService.upsertNodeAsync(node).catch(err => logger.error('MQTT upsertNode failed:', err));
+      dataEventEmitter.emitNodeBatchUpdate(fromNum, { lastHeard: lastHeardSec }, sourceId);
       return { ingested: true, portnum };
     }
 
@@ -621,6 +646,14 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
           aircraftAgeOutService.handlePositionReception(sourceId, fromNum, packet.rxTime, Date.now(), { classify: hasAlt });
         }
       }).catch(err => logger.error('MQTT upsertNode failed:', err));
+      // Live UI update, coalesced per source (no automation triggers). Same
+      // fields the TCP path sends on a position packet.
+      dataEventEmitter.emitNodeBatchUpdate(fromNum, {
+        lastHeard: node.lastHeard,
+        latitude: node.latitude,
+        longitude: node.longitude,
+        altitude: node.altitude,
+      }, sourceId);
       return { ingested: true, portnum };
     }
 
@@ -692,6 +725,8 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         replyId,
         createdAt: nowMs,
         sourcePath: 'mqtt_bridge',
+        // Data.bitfield bit 2 (#6449); NULL when the bitfield is absent.
+        isAutomation: readIsAutomationBit(decodedAny.bitfield as number | null | undefined) ?? undefined,
       } as DbMessage;
       (msg as any).sourceId = sourceId;
       // Use the repo's per-source insert — the `databaseService.insertMessage`
@@ -715,6 +750,7 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         createdAt: nowMs,
         updatedAt: nowMs,
       }, sourceId).catch(err => logger.error('MQTT upsertNode failed:', err));
+      dataEventEmitter.emitNodeBatchUpdate(fromNum, { lastHeard: lastHeardSec }, sourceId);
       return { ingested: true, portnum };
     }
 
@@ -722,6 +758,15 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
       const t = payload as Record<string, any>;
       const ts = nowMs;
       const packetId = typeof packet.id === 'number' ? packet.id >>> 0 : undefined;
+      // trigger.telemetry feed, same rules as the TCP path: live readings only
+      // (a retained/replayed frame must not fire on stale values), and a
+      // reading that answers a telemetry request we sent through any source is
+      // flagged so telemetry triggers skip it (request → reply loop guard).
+      const rxTimeSec = typeof packet.rxTime === 'number' ? packet.rxTime : undefined;
+      const telemetryEventMeta: TelemetryEventMeta | undefined =
+        isLiveReception(rxTimeSec, nowMs) && !isFirmwareReplayPacket(fromNum, packetId, rxTimeSec ?? null)
+          ? { answersOwnRequest: isAnswerToOwnTelemetryRequest(Number((decoded as { requestId?: number | string }).requestId ?? 0)) }
+          : undefined;
       const metricsGroups: Array<[string, any]> = [
         ['device', t.deviceMetrics ?? t.device_metrics],
         ['environment', t.environmentMetrics ?? t.environment_metrics],
@@ -749,7 +794,11 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
             packetId,
             packetTimestamp: typeof t.time === 'number' ? t.time * 1000 : undefined,
           };
-          void databaseService.insertTelemetryAsync(tel, sourceId).catch(err => logger.error('MQTT insertTelemetry failed:', err));
+          void databaseService.insertTelemetryAsync(tel, sourceId)
+            .then(() => {
+              if (telemetryEventMeta) dataEventEmitter.emitTelemetry(fromNum, tel, sourceId, telemetryEventMeta);
+            })
+            .catch(err => logger.error('MQTT insertTelemetry failed:', err));
           any = true;
         }
       }
@@ -787,6 +836,7 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         }
       }
       void databaseService.upsertNodeAsync(node, sourceId).catch(err => logger.error('MQTT upsertNode failed:', err));
+      dataEventEmitter.emitNodeBatchUpdate(fromNum, { lastHeard: lastHeardSec }, sourceId);
       return any ? { ingested: true, portnum } : { ingested: false, reason: 'decode-error', portnum };
     }
 
@@ -828,8 +878,43 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
  * inner run, server-decrypted copies correctly record `decryptedBy:'server'`
  * and their resolved portnum/preview.
  */
+/**
+ * #5156: record the `ok_to_mqtt` bit of one ingested envelope on the sender's
+ * node row. Runs after ingest so the server-side decrypt above has already
+ * put the originator's bitfield on `packet.decoded`. UPDATE-only: if the node
+ * row is not written yet (fire-and-forget upserts), the next packet records it.
+ */
+async function recordEnvelopeMqttConsent(input: MqttIngestionInput): Promise<void> {
+  const packet = input.envelope.packet;
+  if (!packet || typeof packet.from !== 'number') return;
+  const stamp = mqttConsentStamp({
+    transportMechanism: TransportMechanism.MQTT,
+    arrivedViaMqtt: true,
+    bitfield: packet.decoded?.bitfield,
+    heardSec: resolveLastHeardSec(packet.rxTime, Date.now()),
+  });
+  if (stamp.mqttOkToMqtt === undefined || stamp.mqttOkToMqttAt === undefined) return;
+  await databaseService.nodes.recordMqttConsent(packet.from >>> 0, input.sourceId, stamp.mqttOkToMqtt, stamp.mqttOkToMqttAt);
+}
+
 export async function ingestServiceEnvelope(input: MqttIngestionInput): Promise<MqttIngestionResult> {
+  // #4305 feedback-loop guard: a packet this same source just published as its
+  // MQTT-native identity, coming back from the broker. It is already stored
+  // (as a sent message) and must not be stored again or re-enter the event
+  // bus. Logged to the packet monitor, nothing else.
+  const echoPacket = input.envelope.packet;
+  if (echoPacket && isMqttNativeEcho(input.sourceId, echoPacket.from, echoPacket.id)) {
+    const echo: MqttIngestionResult = { ingested: false, reason: 'own-echo' };
+    void mqttPacketLogService.logEnvelope(input.sourceId, input.envelope, echo, input.topic, input.localGatewayNodeNum);
+    return echo;
+  }
   const result = await ingestServiceEnvelopeInner(input);
+  // #5156: remember the sender's ok_to_mqtt bit on this source, for the opt-in
+  // anonymous-viewer filter. Only for packets the node table took; an
+  // unreadable bitfield records nothing (unknown consent stays unknown).
+  if (result.ingested) {
+    void recordEnvelopeMqttConsent(input).catch(err => logger.debug('MQTT consent record failed:', err));
+  }
   void mqttPacketLogService.logEnvelope(
     input.sourceId,
     input.envelope,
@@ -851,6 +936,32 @@ export async function ingestServiceEnvelope(input: MqttIngestionInput): Promise<
       sourceId: input.sourceId,
       envelope: input.envelope,
       localGatewayNodeNum: input.localGatewayNodeNum,
+    });
+  }
+  // Live packet traffic on the map (#4835): one flight per gateway reception,
+  // skipped for packets the node table refused. Not tied to the MQTT packet
+  // log setting, stores nothing, and a no-op while no map watches the source.
+  if (
+    result.reason !== 'no-packet' &&
+    result.reason !== 'ignored' &&
+    result.reason !== 'geo-ignored' &&
+    result.reason !== 'distance'
+  ) {
+    emitPacketFlight(input.sourceId, () => {
+      const p = input.envelope.packet;
+      if (!p) return null;
+      const portnum = typeof p.decoded?.portnum === 'number' ? p.decoded.portnum : result.portnum;
+      return buildMqttFlight({
+        sourceId: input.sourceId,
+        fromNum: p.from,
+        gatewayNodeNum: parseGatewayNodeNum(input.envelope.gatewayId),
+        relayNode: p.relayNode,
+        hopStart: p.hopStart,
+        hopLimit: p.hopLimit,
+        kind: typeof portnum === 'number' ? meshtasticProtobufService.getPortNumName(portnum) : 'ENCRYPTED',
+        snr: p.rxSnr,
+        rssi: p.rxRssi,
+      });
     });
   }
   if (

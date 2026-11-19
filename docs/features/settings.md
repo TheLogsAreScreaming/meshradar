@@ -1,28 +1,32 @@
 # Settings
 
 ::: tip Reorganized in 4.0
-In MeshMonitor 4.0 the old "Settings" tab was split in two:
+MeshMonitor 4.0 split the old "Settings" tab:
 
-- **[Global Settings](/features/global-settings)** — appearance, localization, security, notifications, backup, housekeeping. One per deployment.
-- **Device Configuration** — what is written to, or done on, the radio (per source, satellite icon).
-- **Per-Source Settings** — connection, Virtual Node, auto-responder, auto-announce, auto-traceroute, auto-ack, scheduled messages, permissions. Edited in **Dashboard → Sources → Edit Source**. See [Multi-Source](/features/multi-source).
+- **[Global Settings](/features/global-settings)**: language, units, appearance, map, security defaults, backup, maintenance, Solar Monitoring, and Restart / Shutdown. One per deployment.
+- **Device Configuration**: what is written to, or done on, the radio (per source, satellite icon).
+- **Settings** (per source, gear icon): what MeshMonitor stores and does for one source: node display, telemetry, notifications, packet monitor, and the danger zone. Purge telemetry and Erase nodes there act on that source only.
 
-This page covers the **global** options. Connection / Virtual Node / automation knobs now live on the source, not here.
+A source's connection details and Virtual Node are edited with **Edit Source** on the dashboard. Its automations are on its **Automation** tab. See [Multi-Source](/features/multi-source).
+
+This page covers both the global and the per-source options. An entry with a **Location** line names the page that holds it.
 :::
 
-The Global Settings page customizes MeshMonitor's appearance, localization, security defaults, and housekeeping behavior across the entire deployment. Open it from the **Global Settings** gear icon in the dashboard sidebar footer (admin-gated).
+Open Global Settings from the **Global Settings** gear icon in the dashboard sidebar footer. Open a source's own Settings from the gear icon in that source's sidebar.
+
+In 4.17, the theme, units, time and date format, sort order and default landing page became install-wide only: a per-source page no longer keeps its own copy of them.
 
 ![Settings](/images/features/settings.png)
 
 ## Node Connection Configuration {#node-connection}
 
 ::: warning 4.0 — moved to per-source
-Changing the address MeshMonitor connects to is now a **per-source** action. Open **Dashboard → Sources → Edit Source** to change host/port, device path, BLE ID, MQTT credentials, or MeshCore config for any source. The previous single-node "Change Connection" modal has been replaced by the Sources UI.
+Changing the address MeshMonitor connects to is now a **per-source** action. On the dashboard, use **Edit Source** to change the host and port, MQTT credentials, or MeshCore config for any source. The previous single-node "Change Connection" modal has been replaced by the Sources UI.
 
 The `MESHTASTIC_NODE_IP` / `MESHTASTIC_TCP_PORT` env vars only **bootstrap** the first source on a fresh deployment — after first boot, edit the source.
 :::
 
-See [Multi-Source → Connection Types](/features/multi-source) for the full list of supported source types (TCP, Serial, BLE, MQTT, MeshCore) and their configuration fields.
+See [Multi-Source → Connection Types](/features/multi-source) for the supported source types (Meshtastic TCP, MeshCore, MeshCore MQTT ingest, embedded MQTT broker, MQTT bridge and Reticulum) and their configuration fields.
 
 ## Node Display
 
@@ -34,7 +38,7 @@ See [Multi-Source → Connection Types](/features/multi-source) for the full lis
 
 *Formerly labeled "Maximum Age of Active Nodes".*
 
-**Range**: 0-168 hours (`0` = show all, no age cap)
+**Range**: 0-720 hours (`0` = show all, no age cap)
 
 **Default**: 24 hours
 
@@ -91,7 +95,7 @@ MeshMonitor records **First Heard** for each node on each source. It sets the va
 - Filtering out nodes that may have overheard traffic but aren't on your encrypted channel
 - Reducing clutter from unconfigured or unknown devices
 
-**Related Settings**: See [Skip Incomplete Nodes for Automation](/features/automation#skip-incomplete-nodes) to prevent auto-ack and auto-responder from responding to incomplete nodes.
+**Related Settings**: See Skip Incomplete Nodes for [Auto Acknowledge](/features/automation-messages#skip-incomplete-nodes-ack) and [Auto Responder](/features/automation-messages#skip-incomplete-nodes-responder) to prevent either from responding to incomplete nodes.
 
 ### Unknown Nodes Filter
 
@@ -180,6 +184,21 @@ MeshMonitor records **First Heard** for each node on each source. It sets the va
 
 **Note**: Ignoring a node does not affect message delivery or network functionality - it only hides the node from the UI.
 
+### Hidden from Map Filter
+
+**Description**: Find nodes marked **Hide from Map**. Hiding a node removes only its map marker; the node stays in the Node List. This filter lets you find those nodes again without knowing their names.
+
+**Location**: Node List filter panel, "Hidden from map"
+
+**Behavior**:
+- **Show mode**: the list shows only nodes marked Hide from Map
+- **Hide mode**: the list leaves out nodes marked Hide from Map
+
+**How to show a hidden node on the map again**:
+1. Enable "Hidden from map" in the filter panel (Show mode)
+2. Note the node in the list, then open it in the **Messages** tab (its direct-message view)
+3. Click **Show on Map** in the node panel there
+
 ### Security Filter
 
 **Description**: Filter nodes based on detected security issues, allowing you to focus on nodes with security problems or hide them from view.
@@ -212,7 +231,7 @@ MeshMonitor records **First Heard** for each node on each source. It sets the va
 
 ### Likely-Aircraft Detection
 
-**Description**: Flags a node as a likely aircraft (plane, balloon, drone) when its reported altitude sits far above the ground at its position. Flagged nodes get a badge on the map (see [Map Features](/features/maps#map-features)) and can be excluded from Auto-Favorite (see [Automation → Auto Favorite](/features/automation#auto-favorite)).
+**Description**: Flags a node as a likely aircraft (plane, balloon, drone) when its reported altitude sits far above the ground at its position. Flagged nodes get a badge on the map (see [Map Features](/features/maps#map-features)) and can be excluded from Auto-Favorite (see [Automation → Auto Favorite](/features/automation-upkeep#auto-favorite)).
 
 **Location**: Settings → Node Display, per source. Meshtastic sources only (including MQTT bridge/broker sources) — MeshCore does not report altitude the same way and is not classified.
 
@@ -235,7 +254,7 @@ Aircraft pass through and do not come back, so their nodes pile up. Age-out clea
 - **Age out likely aircraft** — off by default. Needs detection on.
 - **Age out after (hours)** — a flagged node not heard for this long is aged out. Default **24**, range 6–168.
 - **Action** — **Ignore** (default) or **Delete**.
-  - **Ignore** puts the node on the [Ignored Nodes](/features/automation#ignored-nodes) list with the reason **Aged-out aircraft**. This happens in MeshMonitor's database only: nothing is sent to any radio. You can un-ignore it there, or with **Un-ignore Node** on its Node Details page. An aircraft you un-ignore by hand is not aged out again until it has been heard and then gone quiet once more.
+  - **Ignore** puts the node on the [Ignored Nodes](/features/automation-upkeep#ignored-nodes) list with the reason **Aged-out aircraft**. This happens in MeshMonitor's database only: nothing is sent to any radio. You can un-ignore it there, or with **Un-ignore Node** on its Node Details page. An aircraft you un-ignore by hand is not aged out again until it has been heard and then gone quiet once more.
   - **Delete** removes the node and all its history, including positions. It cannot be undone.
 - **Last run** — when the sweep last ran on this source, and how many nodes it aged out, reclassified as fixed, and returned.
 
@@ -244,6 +263,32 @@ Aircraft pass through and do not come back, so their nodes pile up. Age-out clea
 When an ignored aircraft sends a new live position, its ignore is lifted and it is classified again. This works on MQTT sources too. Manual and geo ignores are never lifted this way, and replayed or retained MQTT frames never lift an ignore.
 
 The same sweep also looks for nodes that were flagged but sit still: a flagged node heard in the last 24 hours with at least 3 position fixes, all within 200 m of each other, is **reclassified as fixed**. Its flag is cleared and it stays unflagged while it is within 1 km of that spot. If it moves further than 1 km, it is classified normally again. This check runs whenever detection is on, even with age-out off.
+
+#### Marking a node by hand {#aircraft-manual-mark}
+
+The detector can be wrong: a repeater on a mountain top reads as an aircraft, or a drone over a deep valley does not. The node's **Actions** menu on its Node Details page has three entries to fix this:
+
+- **Mark as not aircraft** — shown while the node is flagged. Clears the flag and pins the node's current position. The node stays unflagged while it is within 1 km of that spot, the same rule as **reclassified as fixed**. If it moves further than 1 km, the mark goes away and the node is classified normally again. A node with no known position cannot be marked this way.
+- **Mark as aircraft** — shown while the node is not flagged. Flags the node whatever its altitude says. The mark holds until you clear it. The stationary check above skips the node, but age-out still applies, as for any aircraft.
+- **Clear aircraft override** — shown while the node has a manual mark or a **reclassified as fixed** mark. Drops the mark and classifies the node again from its stored altitude.
+
+Node Details shows who set a manual mark and when ("Marked as not aircraft · By you on …"), so you can tell it apart from the sweep's own **Reclassified as fixed**.
+
+The entries need **Nodes: write** on the node's source, and they do not appear on MeshCore or Reticulum sources or when detection is off for the source. Each change is written to the audit log with the user, node, source and mode. A mark changes MeshMonitor's database only: nothing is sent to the mesh, and it never fires the **became likely aircraft** automation trigger. Turning detection off for the source clears manual marks along with every other classification.
+
+#### Ask new aircraft for their position
+
+A node on a slow broadcast interval gives a trail of one or two points before it flies out of range. With **Ask new aircraft for their position** on, MeshMonitor asks a node for its position when it is first flagged as a likely aircraft: 3 requests, at 0, 2 and 4 minutes, through the source that flagged it.
+
+This is the one aircraft setting that **transmits**, so it is off by default and set per source.
+
+- **Cost:** each request is one packet, relayed up to your hop limit, plus the node's reply.
+- **Limit:** at most 2 aircraft an hour per source (6 requests). The count is stored, so a restart or a settings save does not reset it.
+- **When it stops:** if the node is no longer flagged (it landed, or you marked it as not an aircraft), is ignored or deleted, the source disconnects, or a send is refused (TX disabled).
+- **When it does not fire:** for nodes already flagged when MeshMonitor starts, for your own node, and on MQTT, MeshCore and Reticulum sources. A node must stop being flagged and be flagged again before it is asked again.
+- **Replies:** Meshtastic firmware answers a position request at most once every 3 minutes, whoever asks. The request at 2 minutes gets a reply only if the first one did not; the one at 4 minutes is past the limit.
+
+Needs **Likely-aircraft detection** on. Requests are tagged as automation traffic, so a bridge with **Don't uplink MeshMonitor automation traffic** keeps them off the upstream broker.
 
 ## Sign-flipped Position Correction
 
@@ -289,6 +334,7 @@ The Node Details block provides comprehensive information about the currently se
 
 #### Power Status
 - **Battery Level**: Current battery percentage (0-100%)
+  - The icon shows the charge level: under 10%, 10-50%, 50-85% and over 85%. A node on external power (level 101) shows a charging icon. An unknown level shows a plain battery.
   - Color-coded indicators:
     - 🟢 Green: >75% (good)
     - 🟡 Yellow: 25-75% (moderate)
@@ -356,6 +402,19 @@ The Node Details block provides comprehensive information about the currently se
   - Relative time format (e.g., "5 minutes ago", "2 hours ago")
   - Uses your configured time/date format preferences
 
+### Node channel {#node-channel}
+
+The Channel card shows the channel MeshMonitor has recorded for the node. MeshMonitor records a node's channel only from that node's own traffic that the connected radio decoded with a channel key. Packets that do not prove a channel never change it: PKI direct messages, firmware 2.8 NodeDB replays, spoofed zero-hop packets and Virtual Node MQTT-proxy packets. A row recorded before that rule can name a channel the node has no key for.
+
+With **Nodes: write** on the source, click **Edit** on the Channel card to fix it by hand:
+
+- Pick **None** or one of the source's channels. If the source no longer lists the stored channel, it stays in the list.
+- Tick **Lock (traffic will not change it)**. While a channel is locked, traffic does not change it. The card shows a **Locked** badge. Unlocked, the next key-decoded packet from the node sets the channel again.
+
+The edit changes MeshMonitor's data only. It sends nothing over the mesh. A node merge carries a locked channel to the node that survives, when that node has none.
+
+![Node channel editor](/images/features/5923-node-channel-lock-editor.png)
+
 ### Layout
 
 The Node Details block uses a responsive grid layout:
@@ -409,6 +468,8 @@ direct messages, not that its contact record is invalid. Contact sharing is
 separate from channel sharing, which uses Meshtastic's `/e/#` URL format.
 
 ## Solar Monitoring
+
+**Where**: Global Settings, under Solar Monitoring. One forecast serves the whole install, so a source's Settings page shows a pointer to it.
 
 **Description**: Configure solar production monitoring to visualize expected solar power generation on telemetry graphs.
 
@@ -488,7 +549,7 @@ Raise the threshold if your nodes sit close together and you keep opening the wr
 
 When **Cluster overlapping markers** is on, this zoom also sets where clustering stops: below it, crowded markers group into numbered circles. A value of `0` turns off both the gate and clustering.
 
-**Location**: Settings → Map Settings
+**Location**: Global Settings → Map
 
 ### Cluster Overlapping Markers
 
@@ -500,7 +561,7 @@ When **Cluster overlapping markers** is on, this zoom also sets where clustering
 
 Clustering makes large node sets much faster to draw. On a busy mesh, expect the map to feel slower with clustering off.
 
-**Location**: Settings → Map Settings
+**Location**: Global Settings → Map
 
 ### Discard Invalid Positions
 
@@ -513,7 +574,7 @@ Clustering makes large node sets much faster to draw. On a busy mesh, expect the
 
 **Effect**: When enabled (default), a (0,0) position is dropped **on ingest**, across every source, and never stored. Disable it to store and display these positions as received — useful if you want to identify which nodes are transmitting bad/unset GPS fixes. Out-of-range or otherwise garbage coordinates (NaN, outside ±90/±180°) are always discarded regardless of this setting.
 
-**Location**: Settings → Map Settings
+**Location**: Global Settings → Map
 
 ### Map Tileset Selection
 
@@ -532,7 +593,7 @@ The tileset is now chosen **separately for light and dark appearance** — a **L
 - **ESRI Satellite** - Satellite imagery
 
 **Location**:
-- **Settings Tab**: Map Settings section (Light Mode Tileset / Dark Mode Tileset)
+- **Global Settings**: Map section (Light Mode Tileset / Dark Mode Tileset)
 - **Nodes Tab**: Bottom-center tileset selector (visual picker) — updates whichever slot matches your current appearance
 
 **Effect**: Changes the base map layer displayed on the interactive map. Different tilesets offer different visual styles, levels of detail, and use cases.
@@ -554,7 +615,7 @@ The tileset is now chosen **separately for light and dark appearance** — a **L
 - **High Availability** - Independence from external tile services
 
 **Configuration**:
-1. Navigate to **Settings → Map Settings → Custom Tile Servers**
+1. Navigate to **Global Settings → Map → Custom Tile Servers**
 2. Click **+ Add Custom Tile Server**
 3. Configure:
    - **Name**: Friendly name (e.g., "Local Tiles")
@@ -604,7 +665,7 @@ Description: Offline OpenStreetMap tiles via TileServer GL
 
 ## Elevation / Terrain (Link Profile) {#elevation-terrain-link-profile}
 
-**Description**: Controls the digital elevation model (DEM) source that powers the [Map Analysis Link Profile tool](/features/map-analysis#terrain-link-profile) — the two-point terrain/line-of-sight/Fresnel-zone link-planning tool. Admin-only settings; visible under **Settings → Elevation / Terrain**.
+**Description**: Controls the digital elevation model (DEM) source that powers the [Map Analysis Link Profile tool](/features/map-analysis#terrain-link-profile) — the two-point terrain/line-of-sight/Fresnel-zone link-planning tool. Admin-only settings; visible under **Global Settings → Elevation / Terrain**.
 
 **Fields**:
 - **Enable terrain elevation** — turns the Link Profile tool's terrain chart on or off. When disabled, the toolbar button disappears from Map Analysis for every user and any in-flight request returns an explicit "disabled" message rather than failing silently. Enabled by default.
@@ -628,14 +689,59 @@ This same elevation source drives Map Analysis's [3D terrain view](/features/map
 
 ## Flight matching (ADS-B) {#flight-matching-ads-b}
 
-**Description**: Looks up a node that becomes a [likely aircraft](#likely-aircraft-detection) on a free, public ADS-B feed and shows the flight in its popup and details. Admin-only, global (not per source); under **Settings → Flight matching (ADS-B)**, next to Elevation / Terrain. Off by default.
+**Description**: Looks up a node that becomes a [likely aircraft](#likely-aircraft-detection) on a free, public ADS-B feed and shows the flight in its popup and details. Admin-only, global (not per source); under **Global Settings → Flight matching (ADS-B)**, next to Elevation / Terrain. Off by default.
 
 **Fields**:
 - **Look up likely aircraft on a public ADS-B feed** — the on/off switch. Off means no outside calls at all.
-- **Feed** — **adsb.lol** (default, ODbL open data) or **adsb.fi** (personal, non-commercial use only). airplanes.live is not offered in this version.
-- **API key (optional)** — for adsb.lol's announced future key. Sent only when set; never shown to non-admins.
+- **Feed** — **adsb.lol** (default, ODbL open data), **adsb.fi** (personal, non-commercial use only) or **OpenSky Network** (non-commercial and research use; needs credentials, below). airplanes.live is not offered in this version.
+- **API key (optional)** — for adsb.lol's announced future key. Sent only when set, never to OpenSky; never shown to non-admins.
+- **OpenSky client ID / client secret** — needed for the **OpenSky Network** feed (non-commercial and research use only), which takes no anonymous requests. Create an API client on your OpenSky Account page. The OpenSky option stays disabled, and a save is refused, until both are set. Both are server-only and never shown to non-admins.
 
-At most two lookups per flagging, no packets over the mesh. See [Flight matching (ADS-B)](/features/maps#flight-matching-ads-b) for how matches are chosen and shown.
+Two lookups per flagging, then up to six re-checks (at most eight in all); no packets over the mesh. See [Flight matching (ADS-B)](/features/maps#flight-matching-ads-b) for how matches are chosen and shown.
+
+## Tropospheric ducting overlay {#tropospheric-ducting-overlay}
+
+**Description**: Turns on the [ducting overlay](/features/maps#tropospheric-ducting-overlay) on the Map tab and the Dashboard map. It shows a NOAA GFS forecast of where the lower air bends radio further than usual. Admin-only, global (not per source); under **Global Settings → Tropospheric ducting overlay**.
+
+**Fields**:
+- **Enable the ducting overlay (contacts NOAA)** — off by default. While it is off, the map toggle is hidden for everyone and the server makes no NOAA requests. While it is on, anyone who can view the map can use it. Only an admin can change it: a non-admin who holds `settings:write` saves other settings as usual, but this one stays as it was.
+
+**Notes**:
+- The server asks NOAA for a forecast step only when a viewer opens a step it has not cached. That costs one HTTPS request per step, at most 25 per 6-hour GFS cycle. There is no timer. Nothing goes over the mesh.
+- While the setting is off, `GET /api/ducting/forecast` answers `403` with code `DUCTING_DISABLED`, to admins too.
+- The forecast covers the busiest group of nodes you can see on the map. When your sources have a local node with a position you may see, MeshMonitor centres the area on those nodes first. It never uses nodes you cannot see, so two viewers with different access can get different areas.
+
+## MQTT root directory refresh {#mqtt-root-directory-refresh}
+
+**Description**: Lets the MQTT [Find topics](/features/mqtt-setups) search fetch the current community root list from `https://api.meshtastic.org/resource/mqttRoots`, so new communities show up without a MeshMonitor update. Admin-only, global (not per source); under **Global Settings → MQTT root directory refresh**.
+
+**Fields**:
+- **Refresh the community root list (contacts api.meshtastic.org)** — off by default. While it is off, the finder uses only the list bundled with MeshMonitor and the server makes no requests for it. Only an admin can change it.
+
+**Notes**:
+- The server fetches the list only after someone starts a Meshtastic topic search, at most once a day (once an hour after a failure). There is no timer and nothing runs at startup. Nothing goes over the mesh.
+- The request is a plain GET with no location, broker, topic or user details. It does tell `api.meshtastic.org` (and Cloudflare, which serves it) this server's IP address and that someone used the finder.
+- The list is checked before use and kept in memory only. If the fetch fails or the list looks wrong, the finder keeps the last good copy or the bundled one. The finder shows which copy it used.
+
+## Database Maintenance {#database-maintenance}
+
+**Description**: An optional nightly job that deletes old data and then runs `VACUUM`. It works on SQLite, PostgreSQL and MySQL. It is **off by default** on every backend, so turn it on if you want old data pruned. Under **Settings → Database Maintenance**.
+
+**Fields**:
+- **Enable automatic database maintenance** and **Maintenance Time (24-hour format)**.
+- Retention for each data type, in days (minimum 7, maximum 365): **Message Retention**, **Traceroute Retention**, **Route Segment Retention**, **Neighbor Info Retention**, **Audit Log Retention** (default 90) and **MeshCore CLI History Retention** (default 90).
+- **Run Maintenance Now** runs one pass at once and reports how many records it deleted and how much space it freed.
+
+The job deletes the audit log and CLI history in batches. The first run on a database that has never been cleaned can delete a lot and take a while. See [Database](/development/database#postgresql-memory-and-maintenance) for PostgreSQL tuning.
+
+## MeshCore Messaging {#meshcore-messaging}
+
+**Description**: Install-wide MeshCore message options, under **Settings → MeshCore Messaging**.
+
+**Fields**:
+- **Auto-retry automated MeshCore channel sends** — retries channel messages that automations send.
+- **Remote CLI reply timeout (seconds)** — how long the MeshCore consoles wait for a reply (1 to 60, default 15).
+- **Use other sources to resolve unknown hops** — off by default. When a relay hash in a message route matches none of a source's contacts, MeshMonitor looks it up in the MeshCore nodes of other sources you can read, MQTT feeds included. It changes only what you see and sends nothing. MQTT nodes count once each sends a signed advert after you turn this on. See [Message route line](/features/meshcore#message-route-line).
 
 ## Display Preferences
 
@@ -651,7 +757,7 @@ Admin-only setting that controls where users land at the root URL (`/`).
 - **Unified View** (default) — current behavior; the multi-source dashboard with all sources side-by-side
 - **Any configured source** — `/` redirects to `/source/:sourceId/` so the page opens straight into that source
 
-**Location**: **Settings → Appearance → Default Landing Page** (admin-only — non-admin users do not see this control).
+**Location**: **Global Settings → Appearance → Default Landing Page** (admin-only — non-admin users do not see this control).
 
 **Effect**: Sets a deployment-wide default. Users still have full navigation:
 
@@ -824,11 +930,21 @@ Looking for the icon-based traceroute strip instead? That's a different surface 
 
 **Persistence**: Widget configurations (including selected nodes and order) are automatically saved and restored when you return to the dashboard.
 
+## Public-Instance Mode {#settings-public-instance}
+
+Limits what signed-out visitors and embed maps can see. Signed-in users are not affected.
+The master switch starts off; four toggles (hide long names, hide public keys, round times
+down to the hour, hide message text) start on. Positions always snap to about 1.5 km, and raw
+packet data and file exports are blocked for signed-out viewers. If the CoT feed is also on,
+Settings warns you: the feed is not redacted. See [Public-Instance Mode](./public-instance-mode).
+
 ## Settings Management
 
 ### Save Settings
 
 Saves all changes made in the Settings tab. **Changes are not applied until you click this button.**
+
+You can clear a number field while you edit it. A blank or out-of-range field is outlined with a message, and Save stays off until every number is valid.
 
 **Side Effects**: Settings are stored on the server and will affect all browsers accessing this MeshMonitor instance.
 
@@ -903,7 +1019,9 @@ These actions are **irreversible** and can result in data loss. Use with extreme
 
 **Description**: Restarts the MeshMonitor container (Docker) or shuts down the application (bare metal).
 
-**Who can use it**: Administrators only. The button is disabled for other users. (Changed in 4.17: it used to be open to anyone with `settings:write` on a source.)
+**Where**: Global Settings, under Restart / Shutdown (administrators only). It acts on the whole process, so a source's Danger Zone shows a pointer to it.
+
+**Who can use it**: Administrators only. Other users do not see the section.
 
 **Effect**:
 - **Docker**: The container restarts automatically and will be unavailable for approximately 10-30 seconds

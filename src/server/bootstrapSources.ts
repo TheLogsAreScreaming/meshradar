@@ -21,18 +21,28 @@
  *    a DB row named "Default" (type meshtastic_tcp). When the env var was NOT
  *    set, no row is created: `env.meshtasticNodeIp` carries the placeholder
  *    default '192.168.1.100', which is nobody's real node (#5237).
+ *  - When sourceCount===0 AND MESHCORE_TCP_HOST / MESHCORE_SERIAL_PORT is set →
+ *    also auto-create "Default MeshCore" (type meshcore) (#5874).
  *  - When source rows exist, env is ignored for source creation.
  *  - Sources are sorted: mqtt_broker(0) < meshtastic_tcp/meshcore/reticulum(1) < mqtt_bridge(2).
  *  - ALL meshtastic_tcp sources: constructed via makeMeshtastic() uniformly.
  *  - First tcp source is designated primary via registry.setPrimaryMeshtasticSource().
+ *  - The `defaultMeshtasticSourceId` setting (#5245), when it names a TCP source
+ *    that registers, overrides that designation (registry.setPreferredMeshtasticSource).
  *  - autoConnect===false → skip that source for auto-connect.
  *  - No tcp source configured after loop → nothing connects (#5237).
  */
 
 import { v4 as uuidv4 } from 'uuid';
 import { MeshCoreMqttManager, type MeshCoreMqttSourceConfig } from './meshcoreMqttManager.js';
+import { startMeshCoreMqttBrokerManager } from './meshcoreMqttBrokerSource.js';
 import { logger } from '../utils/logger.js';
 import { applyManagerSettings } from './applyManagerSettings.js';
+import { warnOnDuplicateTcpEndpoints } from './utils/tcpEndpointDuplicates.js';
+import { DEFAULT_MESHTASTIC_SOURCE_SETTING, applyDefaultMeshtasticSource } from './utils/defaultMeshtasticSource.js';
+import { planDefaultSources } from './config/defaultSourceConfig.js';
+import { DEFAULT_MESHTASTIC_VIRTUAL_NODE_PORT } from './config/virtualNodeEnv.js';
+import type { MeshCoreDefaultEnv } from './config/meshcoreEnv.js';
 import { meshcoreConfigFromSource, ensureMeshCoreManagerStarted } from './meshcoreConfig.js';
 import { reticulumConfigFromSource, ensureReticulumManagerStarted } from './reticulumConfig.js';
 import { buildMqttManagerForSource } from './routes/sourceRoutes.js';
@@ -59,6 +69,20 @@ export interface BootstrapDb {
     assignNullSourceIds(sourceId: string): Promise<void>;
   };
 }
+
+/** Parsed MESHCORE_* with nothing set: plans no MeshCore source. */
+const NO_MESHCORE_DEFAULT: MeshCoreDefaultEnv = {
+  transport: null,
+  tcpHost: null,
+  tcpPort: 5000,
+  tcpPortProvided: false,
+  serialPort: null,
+  baudRate: 115200,
+  baudRateProvided: false,
+  deviceType: 'companion',
+  deviceTypeProvided: false,
+  virtualNode: { enabled: false, enabledProvided: false, port: 5000, portProvided: false },
+};
 
 /** Config shape passed to MeshtasticManager constructor. */
 export interface MeshtasticSourceConfig {
@@ -87,8 +111,8 @@ export interface BootstrapDeps {
    */
   db: BootstrapDb;
   /**
-   * Resolved environment config. Only meshtasticNodeIp, meshtasticNodeIpProvided
-   * and meshtasticTcpPort are read.
+   * Resolved environment config. Only meshtasticNodeIp, meshtasticNodeIpProvided,
+   * meshtasticTcpPort and the first-boot Virtual Node fields are read.
    *
    * `meshtasticNodeIpProvided` is false when MESHTASTIC_NODE_IP was never set,
    * in which case `meshtasticNodeIp` holds the placeholder '192.168.1.100' and
@@ -98,6 +122,12 @@ export interface BootstrapDeps {
     meshtasticNodeIp: string;
     meshtasticNodeIpProvided: boolean;
     meshtasticTcpPort: number;
+    /** ENABLE_VIRTUAL_NODE (#5874). Applied only when the Default source is created. */
+    virtualNodeEnabled?: boolean;
+    /** VIRTUAL_NODE_PORT (#5874). */
+    virtualNodePort?: number;
+    /** Parsed MESHCORE_* vars (#5874). Applied only when the sources table is empty. */
+    meshcoreDefault?: MeshCoreDefaultEnv;
   };
   /** Registry that started managers are registered into. */
   registry: SourceManagerRegistry;
@@ -138,17 +168,41 @@ export async function bootstrapSources(deps: BootstrapDeps): Promise<void> {
   // inserted a "Default" row — DISABLED when MESHTASTIC_NODE_IP was not set, by
   // the same reasoning, since discussion #2604. The gate here closes the same
   // hole for whatever path leaves the sources table genuinely empty.
+  //
+  // The MESHCORE_* vars (#5874) follow the same rule: a "Default MeshCore"
+  // source only when the table is empty. On a fresh install migration 050
+  // creates it (beside or instead of the Meshtastic row), so it never reaches
+  // here twice. Both paths plan the rows with `planDefaultSources`.
   const sourceCount = await deps.db.sources.getSourceCount();
   if (sourceCount === 0) {
-    if (deps.env.meshtasticNodeIpProvided) {
+    const rows = planDefaultSources({
+      meshtastic: {
+        host: deps.env.meshtasticNodeIp,
+        port: deps.env.meshtasticTcpPort,
+        hostProvided: deps.env.meshtasticNodeIpProvided,
+        virtualNode: {
+          enabled: deps.env.virtualNodeEnabled === true,
+          port: deps.env.virtualNodePort ?? DEFAULT_MESHTASTIC_VIRTUAL_NODE_PORT,
+        },
+      },
+      meshcore: deps.env.meshcoreDefault ?? NO_MESHCORE_DEFAULT,
+      // #5237: this path never creates the disabled placeholder.
+      createPlaceholder: false,
+      warn: (msg) => logger.warn(msg),
+    });
+    for (const row of rows) {
       await deps.db.sources.createSource({
         id: uuidv4(),
-        name: 'Default',
-        type: 'meshtastic_tcp',
-        config: { host: deps.env.meshtasticNodeIp, port: deps.env.meshtasticTcpPort },
-        enabled: true,
+        name: row.name,
+        type: row.type,
+        config: row.config,
+        enabled: row.enabled,
       });
-      logger.info(`📡 Auto-created default source from environment config`);
+      logger.info(
+        row.type === 'meshcore'
+          ? `📡 Auto-created "${row.name}" source from MESHCORE_* env config`
+          : `📡 Auto-created default source from environment config`,
+      );
     }
   }
 
@@ -173,7 +227,24 @@ export async function bootstrapSources(deps: BootstrapDeps): Promise<void> {
   const enabledSources = [...enabledSourcesRaw].sort(
     (a, b) => typeStartOrder(a.type) - typeStartOrder(b.type),
   );
+
+  // Two sources on one node knock each other off its single TCP slot (#5974).
+  // Warn only; the operator decides which one to keep.
+  warnOnDuplicateTcpEndpoints(
+    enabledSourcesRaw.map((s) => ({ ...s, enabled: true })),
+    (msg) => logger.warn(msg),
+  );
   let firstTcpSourceConfigured = false;
+
+  // Default Meshtastic source (#5245). Set before any manager starts, so the
+  // primary is the chosen source from the moment it registers, whatever its
+  // place in the start order. The registry only honours it while that id is a
+  // registered meshtastic_tcp manager: a disabled, deleted, non-TCP or
+  // autoConnect:false choice leaves today's first-started rule in charge.
+  applyDefaultMeshtasticSource(
+    deps.registry,
+    await deps.db.settings.getSetting(DEFAULT_MESHTASTIC_SOURCE_SETTING),
+  );
 
   for (const source of enabledSources) {
     if (source.type === 'mqtt_broker' || source.type === 'mqtt_bridge') {
@@ -237,6 +308,27 @@ export async function bootstrapSources(deps: BootstrapDeps): Promise<void> {
         logger.info(`Started MeshCore MQTT source ${source.id} (${source.name})`);
       } catch (err) {
         logger.error(`Failed to start MeshCore MQTT source ${source.id} (${source.name}); continuing with other sources:`, err);
+      }
+      continue;
+    }
+
+    if (source.type === 'meshcore_mqtt_broker') {
+      // Embedded MeshCore MQTT broker (#6197): listens for observers, never
+      // transmits on RF. A listen failure leaves the manager registered and
+      // idle so the source card can say why.
+      const cfg = source.config as { autoConnect?: boolean };
+      if (cfg?.autoConnect === false) {
+        logger.info(`Skipping auto-start for MeshCore MQTT broker ${source.id} (${source.name}) — autoConnect disabled`);
+        continue;
+      }
+      try {
+        if (await startMeshCoreMqttBrokerManager(source, deps.registry)) {
+          logger.info(`Started MeshCore MQTT broker ${source.id} (${source.name})`);
+        } else {
+          logger.warn(`MeshCore MQTT broker ${source.id} (${source.name}) has an unusable config; skipping`);
+        }
+      } catch (err) {
+        logger.error(`Failed to start MeshCore MQTT broker ${source.id} (${source.name}); continuing with other sources:`, err);
       }
       continue;
     }

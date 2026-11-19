@@ -55,6 +55,7 @@ export const TABLE_ORDER = [
   'sessions',
   'audit_log',
   'api_tokens',
+  'user_passkeys', // #5841, FK to users
   // 4.0 per-source tables that depend on users
   'channel_database',
   'channel_database_permissions',
@@ -84,6 +85,9 @@ export const TABLE_ORDER = [
   // rxSourceId, no single sourceId, no FKs). Regenerable, but migrated like
   // coverage_receptions so a backend move keeps the map edges.
   'cross_source_links',
+  // 6210: daily per-source direct RF contact rollup (sourceId, no FKs).
+  // Long-retention history the report reads, so migrate it with the data.
+  'direct_rf_contacts',
   // 4114: durable ok_to_mqtt violation history (sourceId, no FKs). Deliberately
   // migrated — unlike the transient packet logs above, this table is long-retention
   // history (90d) that the Analysis report reads, so dropping it on a backend
@@ -120,6 +124,25 @@ export const TABLE_ORDER = [
   'auto_distance_delete_log',
   'auto_key_repair_state',
   'auto_key_repair_log',
+  // 5691: Reliable PKI per-node exchange state + persisted hourly priming timer.
+  'pki_exchange_state',
+  // #5686: local map markers (user planning data; never transmitted).
+  'map_markers',
+  // #5722: per-hop SNR history from MeshCore traces (reception history).
+  'meshcore_hop_snr',
+  // #6276: attempt log of MeshCore traces sent (answered, timeout, failed).
+  'meshcore_trace_runs',
+  // #6274: per-repeater first-seen ledger for the confirmed new-neighbour alert.
+  'meshcore_neighbor_watch',
+  // #5862: node rename history (names the nodes broadcast).
+  'node_name_history',
+  // #5794: saved MQTT broker presets (global, admin-curated).
+  'mqtt_broker_presets',
+  // #5892: MeshCore CLI command history (per-source, redacted).
+  'meshcore_cli_history',
+  // #5785: remembered MeshCore remote-admin logins (honoured only while the
+  // source's companion key matches selfPublicKey).
+  'meshcore_admin_sessions',
   'solar_estimates',
   'system_backup_history',
   // 3271: global estimated positions (no sourceId, no FK — one row per nodeNum)
@@ -150,6 +173,16 @@ export const TABLE_ORDER = [
   // brokers that don't verify the signed token. Same one-row-per-source shape
   // as meshcore_observer_keys above.
   'meshcore_observer_credentials',
+  // Global script secrets: names in the clear, values as AES-256-GCM envelopes
+  // keyed from SESSION_SECRET. No FKs.
+  'script_secrets',
+  // 6195: per-source encrypted Ed25519 device identity private key for MeshCore
+  // Companion sources, used for server-side DM decryption (#6194 echo match).
+  // Same one-row-per-source shape as meshcore_observer_keys above.
+  'meshcore_source_pki_keys',
+  // 4305: per-source generated Meshtastic identity (sealed X25519 key) and
+  // persisted send state for MQTT-native send. One row per source.
+  'mqtt_native_identities',
   // per-source async message store (Dead Drop / Mailbox)
   'dead_drop_messages',
   // 3653: global Automation Engine tables. No sourceId / no FK to users; the
@@ -161,6 +194,7 @@ export const TABLE_ORDER = [
   'automation_variables',
   'automation_variable_values',
   'automation_home_anchors',
+  'automation_fire_state',
   // 3770: global MeshCore saved-regions catalog. No sourceId / no FK.
   'meshcore_saved_regions',
   // 5277 P4b: global saved Coverage surveys (UUID PK, no sourceId, no FK).

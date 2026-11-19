@@ -8,9 +8,11 @@ import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
 import { ScopeSelectField, type ScopeMode } from './ScopeSelectField';
-import { MeshCoreReceiveOnlyNote } from './MeshCoreReceiveOnlyNote';
-import { UiIcon } from '../icons';
-import styles from './MeshCoreAutoAckSection.module.css';
+import { ConfigSection } from '../shared/config/ConfigSection';
+import { AutomationEngineNote } from '../shared/config/AutomationEngineNote';
+import { ConfigGroup } from '../shared/config/ConfigGroup';
+import { SplitLongMessagesField } from '../shared/automation/SplitLongMessagesField';
+import { meshCoreReceiveOnlyText } from './meshCoreReceiveOnlyText';
 
 interface MeshCoreAutoAckSectionProps {
   baseUrl: string;
@@ -270,42 +272,26 @@ export const MeshCoreAutoAckSection: React.FC<MeshCoreAutoAckSectionProps> = ({ 
   return (
     <NumberInputScope scope={numberScope}>
     <>
-      <div className="automation-section-header" style={{
-        display: 'flex',
-        alignItems: 'center',
-        marginBottom: '1.5rem',
-        marginTop: '2rem',
-        padding: '1rem 1.25rem',
-        background: 'var(--color-surface-hover)',
-        border: '1px solid var(--color-surface-active)',
-        borderRadius: '8px',
-      }}>
-        <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <input
-            type="checkbox"
-            checked={settings.enabled}
-            onChange={(e) => update('enabled', e.target.checked)}
-            disabled={!canWrite}
-            style={{ width: 'auto', margin: 0, cursor: canWrite ? 'pointer' : 'not-allowed' }}
-          />
-          {t('meshcore.automation.autoack.title', 'Auto-Acknowledge')}
-        </h2>
-      </div>
-
-      <MeshCoreReceiveOnlyNote receiveOnly={receiveOnly} />
-
-      <div className="settings-section" style={{ opacity: settings.enabled ? 1 : 0.5, transition: 'opacity 0.2s' }}>
-        <p style={{ marginBottom: '1rem', color: '#666', lineHeight: 1.5, marginLeft: '1.75rem' }}>
-          {t(
-            'meshcore.automation.autoack.description',
-            'Automatically reply to incoming MeshCore messages that match a regex pattern. Supports per-channel allowlist, DM trigger, and template macros.',
-          )}
-        </p>
-
+      <ConfigSection
+        title={t('meshcore.automation.autoack.title', 'Auto-Acknowledge')}
+        notice={<AutomationEngineNote />}
+        enabled={settings.enabled}
+        onEnabledChange={(v) => update('enabled', v)}
+        enableLabel={t('meshcore.automation.autoack.title', 'Auto-Acknowledge')}
+        docsUrl="https://meshmonitor.org/features/automation#auto-acknowledge"
+        canWrite={canWrite}
+        receiveOnly={receiveOnly}
+        receiveOnlyNote={meshCoreReceiveOnlyText(t)}
+        description={t(
+          'meshcore.automation.autoack.description',
+          'Automatically reply to incoming MeshCore messages that match a regex pattern. Supports per-channel allowlist, DM trigger, and template macros.',
+        )}
+      >
+        <ConfigGroup name="trigger" title={t('automation.group.trigger', 'Trigger')}>
         {/* Regex */}
-        <div className="setting-item" style={{ marginTop: '1rem' }}>
+        <div className="setting-item">
           <label htmlFor="meshcoreAutoAckRegex">
-            {t('meshcore.automation.autoack.regex_label', 'Trigger Pattern (regex)')}
+            {t('automation.auto_ack.regex_label', 'Trigger Pattern (regular expression)')}
             <span className="setting-description">
               {t(
                 'meshcore.automation.autoack.regex_description',
@@ -325,11 +311,13 @@ export const MeshCoreAutoAckSection: React.FC<MeshCoreAutoAckSectionProps> = ({ 
             style={{ fontFamily: 'monospace' }}
           />
         </div>
+        </ConfigGroup>
 
+        <ConfigGroup name="where" title={t('automation.group.where', 'Where')}>
         {/* Channel selection */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label>
-            {t('meshcore.automation.autoack.active_channels', 'Active Channels')}
+            {t('automation.auto_ack.active_channels', 'Active Channels')}
             <span className="setting-description">
               {t(
                 'meshcore.automation.autoack.active_channels_description',
@@ -382,9 +370,92 @@ export const MeshCoreAutoAckSection: React.FC<MeshCoreAutoAckSectionProps> = ({ 
             ))}
           </div>
         </div>
+        </ConfigGroup>
 
+        <ConfigGroup name="who" title={t('automation.group.who', 'Who')}>
+        {/* Per-sender ignore list (#4391) */}
+        <div className="setting-item">
+          <label htmlFor="meshcoreAutoAckIgnoredNodes">
+            {t('automation.auto_ack.node_ignore_list', 'Sender Ignore List')}
+            <span className="setting-description">
+              {t(
+                'meshcore.automation.autoack.node_ignore_list_description',
+                'Never auto-acknowledge these senders — use it to break a bot echo loop. One entry per line, or comma-separated. An entry is either a public key (full key or any leading prefix, with or without a leading "!") or a contact/sender name. Names are matched ignoring case and extra spaces, and are the only way to exclude a channel sender, because MeshCore channel packets carry no sender key.',
+              )}
+            </span>
+          </label>
+          <textarea
+            id="meshcoreAutoAckIgnoredNodes"
+            value={settings.ignoredNodes}
+            onChange={(e) => update('ignoredNodes', e.target.value)}
+            placeholder={'a1b2c3d4e5f6\nEcho Bot'}
+            disabled={disabled || !canWrite}
+            className="setting-input"
+            rows={3}
+            style={{ fontFamily: 'monospace', resize: 'vertical', minHeight: '70px' }}
+          />
+        </div>
+        </ConfigGroup>
+
+        <ConfigGroup name="timing" title={t('automation.group.timing', 'Timing')}>
+        {/* Cooldown */}
+        <div className="setting-item">
+          <label>
+            {t('automation.auto_ack.cooldown_label', 'Per-Sender Cooldown')}
+            <span className="setting-description">
+              {t(
+                'meshcore.automation.autoack.cooldown_description',
+                'Minimum seconds between acknowledgements for the same sender. 0 disables the cooldown.',
+              )}
+            </span>
+          </label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
+            <NumberInput
+              value={settings.cooldownSeconds}
+              onChange={(v) => update('cooldownSeconds', v)}
+              min={0}
+              max={3600}
+              integer
+              disabled={disabled || !canWrite}
+              style={{ width: '100px', padding: '2px 4px' }}
+            />
+            <span style={{ fontSize: '0.85rem', color: 'var(--color-text-subtle)' }}>
+              {t('automation.auto_ack.cooldown_help', 'seconds (0 = no cooldown)')}
+            </span>
+          </div>
+        </div>
+
+        {/* Pre-send delay (#3876) — wait before replying so a repeater can finish its TX. */}
+        <div className="setting-item">
+          <label>
+            {t('automation.auto_ack.presend_delay_label', 'Pre-Send Delay')}
+            <span className="setting-description">
+              {t(
+                'meshcore.automation.autoack.presend_delay_description',
+                'Wait this many seconds before sending the reply. Gives a repeater time to finish its own transmission so a zero-hop ack is not dropped. 0 sends immediately.',
+              )}
+            </span>
+          </label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
+            <NumberInput
+              value={settings.preSendDelaySeconds}
+              onChange={(v) => update('preSendDelaySeconds', v)}
+              min={0}
+              max={120}
+              integer
+              disabled={disabled || !canWrite}
+              style={{ width: '100px', padding: '2px 4px' }}
+            />
+            <span style={{ fontSize: '0.85rem', color: 'var(--color-text-subtle)' }}>
+              {t('automation.auto_ack.presend_delay_help', 'seconds (0 = send immediately, max 120)')}
+            </span>
+          </div>
+        </div>
+        </ConfigGroup>
+
+        <ConfigGroup name="delivery" title={t('automation.group.delivery', 'Delivery')}>
         {/* Always respond via DM */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label>
             {t('meshcore.automation.autoack.response_delivery', 'Response Delivery')}
             <span className="setting-description">
@@ -415,85 +486,8 @@ export const MeshCoreAutoAckSection: React.FC<MeshCoreAutoAckSectionProps> = ({ 
           </div>
         </div>
 
-        {/* Cooldown */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
-          <label>
-            {t('meshcore.automation.autoack.cooldown_label', 'Per-Sender Cooldown')}
-            <span className="setting-description">
-              {t(
-                'meshcore.automation.autoack.cooldown_description',
-                'Minimum seconds between acknowledgements for the same sender. 0 disables the cooldown.',
-              )}
-            </span>
-          </label>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
-            <NumberInput
-              value={settings.cooldownSeconds}
-              onChange={(v) => update('cooldownSeconds', v)}
-              min={0}
-              max={3600}
-              integer
-              disabled={disabled || !canWrite}
-              style={{ width: '100px', padding: '2px 4px' }}
-            />
-            <span style={{ fontSize: '0.85rem', color: 'var(--color-text-subtle)' }}>
-              {t('meshcore.automation.autoack.cooldown_help', 'seconds (0 = no cooldown)')}
-            </span>
-          </div>
-        </div>
-
-        {/* Pre-send delay (#3876) — wait before replying so a repeater can finish its TX. */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
-          <label>
-            {t('meshcore.automation.autoack.presend_delay_label', 'Pre-Send Delay')}
-            <span className="setting-description">
-              {t(
-                'meshcore.automation.autoack.presend_delay_description',
-                'Wait this many seconds before sending the reply. Gives a repeater time to finish its own transmission so a zero-hop ack is not dropped. 0 sends immediately.',
-              )}
-            </span>
-          </label>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
-            <NumberInput
-              value={settings.preSendDelaySeconds}
-              onChange={(v) => update('preSendDelaySeconds', v)}
-              min={0}
-              max={120}
-              integer
-              disabled={disabled || !canWrite}
-              style={{ width: '100px', padding: '2px 4px' }}
-            />
-            <span style={{ fontSize: '0.85rem', color: 'var(--color-text-subtle)' }}>
-              {t('meshcore.automation.autoack.presend_delay_help', 'seconds (0 = send immediately, max 120)')}
-            </span>
-          </div>
-        </div>
-
-        {/* Per-sender ignore list (#4391) */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
-          <label htmlFor="meshcoreAutoAckIgnoredNodes">
-            {t('meshcore.automation.autoack.node_ignore_list', 'Sender Ignore List')}
-            <span className="setting-description">
-              {t(
-                'meshcore.automation.autoack.node_ignore_list_description',
-                'Never auto-acknowledge these senders — use it to break a bot echo loop. One entry per line, or comma-separated. An entry is either a public key (full key or any leading prefix, with or without a leading "!") or a contact/sender name. Names are matched ignoring case and extra spaces, and are the only way to exclude a channel sender, because MeshCore channel packets carry no sender key.',
-              )}
-            </span>
-          </label>
-          <textarea
-            id="meshcoreAutoAckIgnoredNodes"
-            value={settings.ignoredNodes}
-            onChange={(e) => update('ignoredNodes', e.target.value)}
-            placeholder={'a1b2c3d4e5f6\nEcho Bot'}
-            disabled={disabled || !canWrite}
-            className="setting-input"
-            rows={3}
-            style={{ fontFamily: 'monospace', resize: 'vertical', minHeight: '70px' }}
-          />
-        </div>
-
         {/* MeshCore scope/region for the ack reply (#3833) */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label>
             {t('meshcore.automation.autoack.scope_label', 'Reply Scope')}
             <span className="setting-description">
@@ -515,8 +509,21 @@ export const MeshCoreAutoAckSection: React.FC<MeshCoreAutoAckSectionProps> = ({ 
           </div>
         </div>
 
+        {/* Long replies (#5564): truncate (default) or split into up to 3 sends. */}
+        <div className="setting-item">
+          <label>{t('meshcore.automation.autoack.split_label', 'Long Replies')}</label>
+          <SplitLongMessagesField
+            id="meshcoreAutoAckSplitLongMessages"
+            checked={settings.splitLongMessages}
+            onChange={(v) => update('splitLongMessages', v)}
+            disabled={disabled || !canWrite}
+          />
+        </div>
+        </ConfigGroup>
+
+        <ConfigGroup name="message" title={t('automation.group.message', 'Message')}>
         {/* Message template */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label htmlFor="meshcoreAutoAckMessage">
             {t('meshcore.automation.autoack.message_label', 'Acknowledgement Message')}
             <span className="setting-description" style={{ display: 'block', marginTop: '0.25rem' }}>
@@ -535,7 +542,7 @@ export const MeshCoreAutoAckSection: React.FC<MeshCoreAutoAckSectionProps> = ({ 
           />
           <div style={{ marginTop: '0.5rem' }}>
             <label style={{ fontSize: '0.9rem', color: 'var(--color-text-subtle)' }}>
-              {t('meshcore.automation.autoack.sample_preview', 'Sample preview')}:
+              {t('automation.auto_ack.sample_preview', 'Sample Message Preview')}:
             </label>
             <div style={{
               marginTop: '0.25rem',
@@ -551,45 +558,13 @@ export const MeshCoreAutoAckSection: React.FC<MeshCoreAutoAckSectionProps> = ({ 
             </div>
           </div>
         </div>
+        </ConfigGroup>
 
-        {/* Long replies (#5564): truncate (default) or split into up to 3 sends. */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
-          <label>
-            {t('meshcore.automation.autoack.split_label', 'Long Replies')}
-            <span className="setting-description">
-              {t(
-                'meshcore.automation.autoack.split_description',
-                'A MeshCore message holds about 150 bytes in a DM and 120 to 130 bytes on a channel. A longer reply is cut to fit unless you split it. Applies to DM and channel replies.',
-              )}
-            </span>
-          </label>
-          <div className={styles.toggleRow}>
-            <input
-              type="checkbox"
-              id="meshcoreAutoAckSplitLongMessages"
-              checked={settings.splitLongMessages}
-              onChange={(e) => update('splitLongMessages', e.target.checked)}
-              disabled={disabled || !canWrite}
-            />
-            <label htmlFor="meshcoreAutoAckSplitLongMessages" className={styles.toggleLabel}>
-              {t('meshcore.automation.autoack.split_toggle', 'Split long messages')}
-            </label>
-          </div>
-          <div className={styles.warning} role="note">
-            <UiIcon name="alert" size={14} />
-            <span>
-              {t(
-                'meshcore.automation.autoack.split_warning',
-                'Long replies go out as up to 3 messages, 10 seconds apart, each marked like "(1/3)". Each one is repeated by every repeater in range.',
-              )}
-            </span>
-          </div>
-        </div>
-
+        <ConfigGroup name="test" title={t('automation.group.test', 'Test')}>
         {/* Regex test */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <div className="setting-item">
           <label htmlFor="meshcoreAutoAckTestMessages">
-            {t('meshcore.automation.autoack.pattern_testing', 'Pattern Testing')}
+            {t('automation.auto_ack.pattern_testing', 'Pattern Testing')}
             <span className="setting-description">
               {t(
                 'meshcore.automation.autoack.pattern_testing_description',
@@ -660,7 +635,8 @@ export const MeshCoreAutoAckSection: React.FC<MeshCoreAutoAckSectionProps> = ({ 
             </div>
           </div>
         </div>
-      </div>
+        </ConfigGroup>
+      </ConfigSection>
     </>
     </NumberInputScope>
   );

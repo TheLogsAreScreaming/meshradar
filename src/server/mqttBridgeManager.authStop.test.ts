@@ -27,6 +27,7 @@ vi.mock('../services/database.js', () => ({
 vi.mock('./sourceManagerRegistry.js', () => ({
   sourceManagerRegistry: {
     getManager: (id: string) => registry.managers.get(id),
+    getAllManagers: () => Array.from(registry.managers.values()),
     on: vi.fn(),
     off: vi.fn(),
   },
@@ -110,6 +111,9 @@ function makeParentBroker() {
   parent.sourceType = 'mqtt_broker';
   parent.getLocalNodeInfo = () => ({ nodeNum: BROKER_NODE });
   parent.publish = vi.fn().mockResolvedValue(undefined);
+  parent.markSkipRaise = vi.fn();
+  parent.markBridgeOrigin = vi.fn();
+  parent.bridgeOriginOf = vi.fn().mockReturnValue(null);
   return parent;
 }
 

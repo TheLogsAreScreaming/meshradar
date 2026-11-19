@@ -24,13 +24,15 @@ vi.mock('react-i18next', async () => {
 let grants: (resource: string, action: string) => boolean = () => true;
 vi.mock('../ToastContainer', () => ({ useToast: () => ({ showToast: vi.fn() }) }));
 vi.mock('../../contexts/AuthContext', () => ({
-  useAuth: () => ({ hasPermission: (resource: string, action: string) => grants(resource, action) }),
+  useAuth: () => ({ authStatus: { user: { isAdmin: true } }, hasPermission: (resource: string, action: string) => grants(resource, action) }),
 }));
 vi.mock('../../hooks/useCsrfFetch', () => ({ useCsrfFetch: () => vi.fn() }));
 vi.mock('@tanstack/react-query', () => ({ useQueryClient: () => ({ invalidateQueries: vi.fn() }) }));
 vi.mock('./MeshCoreIgnoredNodesSection', () => ({ MeshCoreIgnoredNodesSection: () => null }));
 vi.mock('./MeshCoreMessageFiltersSection', () => ({ MeshCoreMessageFiltersSection: () => null }));
 vi.mock('./MeshCoreNodeDisplaySection', () => ({ MeshCoreNodeDisplaySection: () => null }));
+vi.mock('./MeshCoreTelemetrySettingsSection', () => ({ MeshCoreTelemetrySettingsSection: () => <div data-testid="telemetry-settings-section" /> }));
+vi.mock('../settings/TelemetryDataActions', () => ({ default: () => <div data-testid="telemetry-data-section" /> }));
 // Fetches on mount; its own tests cover it. Here only its placement matters.
 const contactSyncProps = vi.fn();
 vi.mock('./MeshCoreContactSyncSection', () => ({
@@ -70,6 +72,7 @@ function renderView(props: { canOpenDeviceConfiguration?: boolean; onOpenDeviceC
       actions={actions as never}
       baseUrl=""
       sourceId="src-a"
+      contacts={[]}
       {...props}
     />,
   );
@@ -87,13 +90,21 @@ beforeEach(() => {
   grants = () => true;
 });
 
+describe('MeshCoreSettingsView: telemetry sections (#6258)', () => {
+  it('mounts the telemetry settings and telemetry data sections', () => {
+    renderView();
+    expect(screen.getByTestId('telemetry-settings-section')).toBeTruthy();
+    expect(screen.getByTestId('telemetry-data-section')).toBeTruthy();
+  });
+});
+
 describe('MeshCoreSettingsView: controls that moved to Device Configuration', () => {
   it('shows none of the moved controls', () => {
     renderView();
     for (const name of MOVED_BUTTONS) expect(screen.queryByRole('button', { name })).toBeNull();
     expect(screen.queryByRole('heading', { name: 'Default path hash size' })).toBeNull();
     expect(screen.queryByRole('heading', { name: 'Default region / scope' })).toBeNull();
-    expect(screen.queryByRole('heading', { name: 'Device actions' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: /^Device actions/ })).toBeNull();
     expect(screen.queryByTestId('contact-sync')).toBeNull();
   });
 
@@ -139,7 +150,7 @@ describe('MeshCoreSettingsView: controls that moved to Device Configuration', ()
 describe('MeshCoreSettingsView: a viewer who cannot open Device Configuration', () => {
   it('keeps the device actions and the contact sync here, so the move costs them nothing', () => {
     renderView({ canOpenDeviceConfiguration: false });
-    expect(screen.getByRole('heading', { name: 'Device actions' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /^Device actions/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Refresh contacts' })).not.toBeDisabled();
     expect(screen.getByRole('button', { name: 'Discover Nearby Nodes' })).not.toBeDisabled();
     expect(screen.getByTestId('contact-sync')).toBeInTheDocument();

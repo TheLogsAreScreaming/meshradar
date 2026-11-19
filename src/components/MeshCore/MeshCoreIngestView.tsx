@@ -13,19 +13,31 @@
  *   Nodes     everything learned from adverts
  *   Channels  messages decrypted with keys we hold
  *   Packets   the existing MeshCorePacketMonitorView, reachable at last
+ *   Notifications  the shared NotificationsTab, for signed-in users (#6307)
  *
  * There is no Telemetry tab: observer battery/uptime/noise floor land as
  * ordinary telemetry rows, so the cross-source Telemetry page already graphs
  * them and a fourth copy here would drift.
  */
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import apiService from '../../services/api';
 import { UiIcon } from '../icons';
 import { MeshCorePacketMonitorView } from './MeshCorePacketMonitorView';
 import styles from './MeshCoreIngestView.module.css';
+import { MeshCoreClockOffset } from './MeshCoreClockOffset';
+import { meshcoreClockOffsetMs } from '../../utils/meshcoreMessageTime';
+import { useAuth } from '../../contexts/AuthContext';
+import { useMeshCoreViewAccess } from './meshCoreViewAccess';
+import { usePushNotificationNavigation } from '../../hooks/usePushNotificationNavigation';
+import { useSource } from '../../contexts/SourceContext';
+import { isMeshCoreMqttBrokerSourceType } from '../../utils/meshcoreSourceTypes';
+import { MeshCoreBrokerDiagnostics } from './MeshCoreBrokerDiagnostics';
 
-type IngestTab = 'overview' | 'nodes' | 'channels' | 'packets';
+// Same shared tab the device page mounts; loaded on demand (it is large).
+const NotificationsTab = lazy(() => import('../NotificationsTab'));
+
+type IngestTab = 'overview' | 'nodes' | 'channels' | 'packets' | 'notifications';
 
 interface ObserverRow {
   publicKey: string;
@@ -58,9 +70,17 @@ interface IngestNode {
 interface IngestMessage {
   id?: string | number;
   channelIdx?: number | null;
+  /** Name of the key's channel; set only for rows the viewer may read (#6308). */
+  channelName?: string | null;
+  /** Older row whose key could not be recovered (#6308); admins only. */
+  legacy?: boolean;
   text?: string | null;
   fromName?: string | null;
   timestamp?: number | null;
+  /** Server arrival time (ms): the time shown (#5973). */
+  createdAt?: number | null;
+  /** Wire sender second, for the sender clock offset (#5973). */
+  senderTimestamp?: number | null;
   /** Ignore / Block (#5408): set by the server from the source's current lists. */
   filtered?: 'ignore' | 'block';
 }
@@ -98,6 +118,24 @@ export const MeshCoreIngestView: React.FC<MeshCoreIngestViewProps> = ({ sourceId
   const [nodes, setNodes] = useState<IngestNode[]>([]);
   const [messages, setMessages] = useState<IngestMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // The embedded broker source (#6197) reuses this page and adds its
+  // per-connection diagnostics to the Overview tab.
+  const { sourceType } = useSource();
+  const isBroker = isMeshCoreMqttBrokerSourceType(sourceType);
+
+  // Notifications tab (#6307): the shared NotificationsTab, shown by the same
+  // rule as the device page (signed in).
+  const { authStatus } = useAuth();
+  const isAdmin = authStatus?.user?.isAdmin ?? false;
+  const showNotifications = useMeshCoreViewAccess(false).includes('notifications');
+  const { pendingNavigation, clearPendingNavigation } = usePushNotificationNavigation();
+  useEffect(() => {
+    if (!pendingNavigation) return;
+    // A click-through for another source is left alone.
+    if (pendingNavigation.sourceId && pendingNavigation.sourceId !== sourceId) return;
+    if (pendingNavigation.type === 'channel') setTab('channels');
+    clearPendingNavigation();
+  }, [pendingNavigation, sourceId, clearPendingNavigation]);
 
   const prefix = useMemo(
     // ApiService.get() does NOT prepend /api — baseUrl is the app base only.
@@ -169,6 +207,9 @@ export const MeshCoreIngestView: React.FC<MeshCoreIngestViewProps> = ({ sourceId
     { id: 'nodes', label: t('meshcore.ingest.tab_nodes', 'Nodes') },
     { id: 'channels', label: t('meshcore.ingest.tab_channels', 'Channels') },
     { id: 'packets', label: t('meshcore.ingest.tab_packets', 'Packets') },
+    ...(showNotifications
+      ? [{ id: 'notifications' as const, label: t('meshcore.ingest.tab_notifications', 'Notifications') }]
+      : []),
   ];
 
   return (
@@ -217,6 +258,8 @@ export const MeshCoreIngestView: React.FC<MeshCoreIngestViewProps> = ({ sourceId
       </nav>
 
       {error && <div className={styles.error}>{error}</div>}
+
+      {tab === 'overview' && isBroker && <MeshCoreBrokerDiagnostics sourceId={sourceId} />}
 
       {tab === 'overview' && (
         <section className={styles.panel}>
@@ -309,10 +352,24 @@ export const MeshCoreIngestView: React.FC<MeshCoreIngestViewProps> = ({ sourceId
               {messages.map((m, i) => (
                 <li key={m.id ?? i} className={styles.message}>
                   <span className={styles.messageMeta}>
-                    {m.channelIdx != null ? `#${m.channelIdx}` : ''} {m.fromName || ''}
+                    {m.channelIdx != null
+                      ? (m.channelName || t('meshcore.ingest.channel_unnamed', { id: m.channelIdx, defaultValue: 'Channel {{id}}' }))
+                      : ''}{' '}
+                    {m.legacy && (
+                      <span className={styles.legacyTag}>
+                        {t('meshcore.ingest.channel_legacy', '(older, key unknown)')}
+                      </span>
+                    )}{' '}
+                    {m.fromName || ''}
                   </span>
                   <span className={styles.messageText}>{m.text}</span>
-                  <span className={styles.messageAge}>{formatAge(m.timestamp ?? null)}</span>
+                  <span className={styles.messageAge}>
+                    {/* Receipt time and sender clock offset (#5973). */}
+                    {formatAge(m.createdAt ?? m.timestamp ?? null)}
+                    {m.createdAt != null && (
+                      <MeshCoreClockOffset offsetMs={meshcoreClockOffsetMs(m.createdAt, m.senderTimestamp)} />
+                    )}
+                  </span>
                 </li>
               ))}
             </ul>
@@ -321,7 +378,15 @@ export const MeshCoreIngestView: React.FC<MeshCoreIngestViewProps> = ({ sourceId
       )}
 
       {tab === 'packets' && (
-        <MeshCorePacketMonitorView baseUrl={baseUrl} sourceId={sourceId} />
+        <MeshCorePacketMonitorView baseUrl={baseUrl} sourceId={sourceId} onNodeClick={() => setTab('nodes')} />
+      )}
+
+      {tab === 'notifications' && showNotifications && (
+        <div className={styles.notificationsPane}>
+          <Suspense fallback={null}>
+            <NotificationsTab isAdmin={isAdmin} />
+          </Suspense>
+        </div>
       )}
     </div>
   );

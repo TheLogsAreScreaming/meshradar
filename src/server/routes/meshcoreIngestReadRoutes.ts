@@ -14,6 +14,7 @@
  * Mounted BEFORE `meshcoreRouteGuard` in the barrel; see `anyMeshCoreRouteGuard`.
  */
 import { resolveMeshcoreKeyAccess, filterKeyedMessages } from '../utils/meshcoreKeyAccess.js';
+import { applyMeshCorePositionOverridesForViewer } from '../utils/meshcorePositionOverride.js';
 import { Router, type Request, type Response } from 'express';
 import { optionalAuth, requirePermission } from '../auth/authMiddleware.js';
 import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
@@ -23,6 +24,9 @@ import { mayViewSourceEndpoint } from '../utils/sourceConfigRedaction.js';
 import { logger } from '../../utils/logger.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { meshcoreMessageFilter } from '../services/meshcoreMessageFilter.js';
+import { listKeyedChannelsForViewer, keyedChannelNames } from '../utils/meshcoreKeyedChannels.js';
+import { meshcoreChannelIndexOf } from '../utils/meshcoreMessageMerge.js';
+import { MESHCORE_UNRESOLVED_KEY_FINGERPRINT, isKeyedChannelIndex } from '../services/meshcoreFrameIngest.js';
 
 const router = Router({ mergeParams: true });
 
@@ -120,7 +124,9 @@ router.get(
     try {
       const mgr = ingestManagerFor(req);
       if (!mgr) return refuseDeviceSource(res);
-      const nodes = await mgr.getAllNodes();
+      // #5842: an enabled location override wins over the advert position;
+      // a private one only for a caller with nodes_private:read.
+      const nodes = await applyMeshCorePositionOverridesForViewer(await mgr.getAllNodes(), req.user, (req.params as { id: string }).id);
       return ok(res, { nodes, count: nodes.length });
     } catch (error) {
       logger.error('[API] MeshCore ingest nodes failed:', error);
@@ -149,19 +155,75 @@ router.get(
       const limit =
         Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_MESSAGE_LIMIT) : DEFAULT_MESSAGE_LIMIT;
 
-      // Ignore / Block (#5408): computed from the current lists at read time.
-      const messages = meshcoreMessageFilter.annotate(
-        (req.params as { id?: string }).id ?? '',
-        // #5552: rows decrypted with a virtual-channel key need that grant.
-        filterKeyedMessages(
-          await mgr.getRecentMessagesAsync(limit),
-          await resolveMeshcoreKeyAccess((req as Request & { user?: { id: number; isAdmin?: boolean } }).user),
-        ),
+      const sourceId = (req.params as { id?: string }).id ?? '';
+      // Every MQTT channel row is key-gated (#6308): a viewer needs `messages:read`
+      // here AND read access to a channel holding the key.
+      const visible = filterKeyedMessages(
+        await mgr.getRecentMessagesAsync(limit),
+        await resolveMeshcoreKeyAccess((req as Request & { user?: { id: number; isAdmin?: boolean } }).user),
       );
+      // Names attach only to rows that passed the gate, so a name never reaches
+      // a viewer who cannot read the channel.
+      const needsNames = visible.some((m) => {
+        const idx = meshcoreChannelIndexOf(m);
+        return idx !== null && isKeyedChannelIndex(idx);
+      });
+      const names = needsNames ? await keyedChannelNames(sourceId) : new Map<number, string>();
+      // Ignore / Block (#5408): computed from the current lists at read time.
+      const messages = meshcoreMessageFilter.annotate(sourceId, visible).map((m) => {
+        const channelIdx = meshcoreChannelIndexOf(m);
+        const legacy = m.keyFingerprint === MESHCORE_UNRESOLVED_KEY_FINGERPRINT;
+        return {
+          ...m,
+          ...(channelIdx !== null ? { channelIdx } : {}),
+          ...(channelIdx !== null && !legacy && names.has(channelIdx) ? { channelName: names.get(channelIdx) } : {}),
+          ...(legacy ? { legacy: true } : {}),
+        };
+      });
       return ok(res, { messages, count: messages.length });
     } catch (error) {
       logger.error('[API] MeshCore ingest messages failed:', error);
       return fail(res, 500, 'INGEST_MESSAGES_FAILED', 'Failed to fetch ingest messages');
+    }
+  },
+);
+
+/**
+ * GET /api/sources/:id/meshcore/ingest/channels
+ *
+ * The channels a Notifications picker can offer for this source (#6307): the
+ * keyed channels the viewer may read, with their names. Every MQTT channel row
+ * is filed under a keyed index (#6308), so there is no slot list. An entry with
+ * `legacy: true` is an unresolved pre-#6308 slot; only admins receive it.
+ * `/api/channels/all` is left alone: it also feeds the channel_N grant editor.
+ */
+router.get(
+  '/ingest/channels',
+  optionalAuth(),
+  requirePermission('messages', 'read', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const mgr = ingestManagerFor(req);
+      if (!mgr) return refuseDeviceSource(res);
+      const sourceId = (req.params as { id: string }).id;
+
+      const keyed = await listKeyedChannelsForViewer(req.user, sourceId);
+      const channels = keyed
+        .map((k) => ({
+          id: k.id,
+          name: k.name,
+          role: 2,
+          uplinkEnabled: false,
+          downlinkEnabled: false,
+          keyed: !k.legacy,
+          virtual: k.virtual,
+          ...(k.legacy ? { legacy: true } : {}),
+        }))
+        .sort((a, b) => a.id - b.id);
+      return ok(res, channels);
+    } catch (error) {
+      logger.error('[API] MeshCore ingest channels failed:', error);
+      return fail(res, 500, 'INGEST_CHANNELS_FAILED', 'Failed to list ingest channels');
     }
   },
 );

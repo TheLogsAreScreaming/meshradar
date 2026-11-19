@@ -270,27 +270,32 @@ button.unified-source-pill.is-active {
   font-weight: 600;
 }
 
-/* Protocol badge appended inside a source tag to mark MeshCore traffic, which
-   otherwise looks identical to Meshtastic in the unified feed. */
-.unified-msg-card__proto-badge {
-  margin-left: 5px;
-  padding: 0 4px;
-  border-radius: 3px;
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  background: color-mix(in srgb, currentColor 18%, transparent);
-}
-
 .unified-msg-card__channel {
   color: var(--color-text-subtle);
   font-size: 12px;
 }
 
+.unified-msg-card__channel-tag {
+  background: var(--color-surface);
+  color: var(--color-text-subtle);
+  border: 1px solid color-mix(in srgb, var(--color-text-subtle) 25%, transparent);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
 .unified-msg-card__sender {
   color: var(--color-text-disabled);
   font-size: 12px;
+}
+
+/* Sender flagged the packet as sent by an automation (#6449). */
+.unified-msg-card__automation {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text-disabled);
 }
 
 .unified-msg-card__time {

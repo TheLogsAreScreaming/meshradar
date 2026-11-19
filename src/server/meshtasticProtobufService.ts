@@ -4,11 +4,36 @@
  * This service provides proper protobuf parsing using the official Meshtastic
  * protobuf definitions and protobufjs library.
  */
+import type { WireWaypoint } from './services/waypointGeofence.js';
 import { loadProtobufDefinitions, getProtobufRoot, type FromRadio, type MeshPacket } from './protobufLoader.js';
 import { logger } from '../utils/logger.js';
-import { PortNum, DEFAULT_HOP_LIMIT, resolveHopLimit } from './constants/meshtastic.js';
+import { PortNum, DEFAULT_HOP_LIMIT, resolveHopLimit, WANT_CONFIG_NONCE_FULL, DATA_BITFIELD_IS_AUTOMATION } from './constants/meshtastic.js';
 import { decodeTakV2Payload, takV2Variant, takV2DictName, TAK_V2_UNCOMPRESSED } from './takV2Decoder.js';
 import { safeJson } from './utils/redactSecrets.js';
+
+/**
+ * `Data.bitfield` fields for a client-built packet (#6449). An automation send
+ * sets `is_automation` (bit 2); a manual send leaves `bitfield` absent so its
+ * wire bytes are unchanged. Firmware ORs its own bits in with `|=`.
+ */
+export function automationBitfield(isAutomation?: boolean): { bitfield?: number } {
+  return isAutomation ? { bitfield: DATA_BITFIELD_IS_AUTOMATION } : {};
+}
+
+/**
+ * Hand-encode `ToRadio { want_config_id: nonce }` (field 3, varint) for when
+ * the protobuf definitions are unavailable.
+ */
+function encodeWantConfigFallback(nonce: number): Uint8Array {
+  const bytes = [0x18];
+  let v = nonce >>> 0;
+  while (v > 0x7f) {
+    bytes.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  bytes.push(v);
+  return new Uint8Array(bytes);
+}
 
 export class MeshtasticProtobufService {
   private static instance: MeshtasticProtobufService;
@@ -40,26 +65,25 @@ export class MeshtasticProtobufService {
   /**
    * Create a ToRadio message with want_config_id using proper protobuf encoding
    */
-  createWantConfigRequest(): Uint8Array {
+  createWantConfigRequest(nonce: number = WANT_CONFIG_NONCE_FULL): Uint8Array {
     const root = getProtobufRoot();
     if (!root) {
       logger.error('❌ Protobuf definitions not loaded');
-      // Fallback to simple manual encoding
-      return new Uint8Array([0x18, 0x01]);
+      return encodeWantConfigFallback(nonce);
     }
 
     try {
       const ToRadio = root.lookupType('meshtastic.ToRadio');
-      // Try sending a different config ID - maybe 0xFFFFFFFF to request all configs
+      // WANT_CONFIG_NONCE_FULL asks for config plus the whole NodeDB;
+      // WANT_CONFIG_NONCE_ONLY_CONFIG asks for config only (#5974).
       const toRadio = ToRadio.create({
-        wantConfigId: 0xFFFFFFFF  // Request ALL config sections
+        wantConfigId: nonce
       });
 
       return ToRadio.encode(toRadio).finish();
     } catch (error) {
       logger.error('❌ Failed to create want_config_id request:', error);
-      // Fallback to simple manual encoding
-      return new Uint8Array([0x18, 0x01]);
+      return encodeWantConfigFallback(nonce);
     }
   }
 
@@ -75,7 +99,7 @@ export class MeshtasticProtobufService {
    *   Meshtastic Python resolves traceroute hops the same way, from
    *   `localConfig.lora.hop_limit`.
    */
-  createTracerouteMessage(destination: number, channel?: number, hopLimit: number = DEFAULT_HOP_LIMIT, packetId?: number): Uint8Array {
+  createTracerouteMessage(destination: number, channel?: number, hopLimit: number = DEFAULT_HOP_LIMIT, packetId?: number, isAutomation: boolean = false): Uint8Array {
     const root = getProtobufRoot();
     if (!root) {
       logger.error('❌ Protobuf definitions not loaded');
@@ -98,7 +122,8 @@ export class MeshtasticProtobufService {
         portnum: PortNum.TRACEROUTE_APP,
         payload: payload,
         dest: destination,
-        wantResponse: true
+        wantResponse: true,
+        ...automationBitfield(isAutomation),
       });
 
       // Create the MeshPacket
@@ -128,14 +153,19 @@ export class MeshtasticProtobufService {
   }
 
   /**
-   * Create a position request ToRadio using proper protobuf encoding
-   * This sends a position packet with wantResponse=true to request the destination node's position
+   * Create a position request ToRadio: an EMPTY Position with wantResponse=true.
+   *
+   * The request never carries our own coordinates (#6047). A request with
+   * lat/lon goes through Traffic Management position dedup on relays, which
+   * can drop it silently (no NAK), while an empty request is never deduped.
+   * The target's reply does not depend on the request's contents, and our
+   * own position still reaches the mesh through normal position broadcasts.
    */
   createPositionRequestMessage(
     destination: number,
     channel?: number,
-    position?: { latitude: number; longitude: number; altitude?: number | null },
-    hopLimit: number = DEFAULT_HOP_LIMIT
+    hopLimit: number = DEFAULT_HOP_LIMIT,
+    isAutomation: boolean = false
   ): { data: Uint8Array; packetId: number; requestId: number } {
     const root = getProtobufRoot();
     if (!root) {
@@ -148,26 +178,9 @@ export class MeshtasticProtobufService {
       const packetId = Math.floor(Math.random() * 0xffffffff);
       const requestId = Math.floor(Math.random() * 0xffffffff);
 
-      // Create Position message for position exchange
-      // According to Meshtastic protocol: send your position with wantResponse=true to exchange positions
+      // Empty Position payload: a pure request (#6047).
       const Position = root.lookupType('meshtastic.Position');
-      const positionData: any = {};
-
-      if (position) {
-        // Send actual position for position exchange
-        positionData.latitudeI = Math.round(position.latitude * 1e7);  // Convert to fixed-point
-        positionData.longitudeI = Math.round(position.longitude * 1e7); // Convert to fixed-point
-        if (position.altitude !== null && position.altitude !== undefined) {
-          positionData.altitude = Math.round(position.altitude);
-        }
-        positionData.time = Math.floor(Date.now() / 1000); // Unix timestamp
-      }
-      // If no position provided, send empty position (fallback behavior)
-
-      const positionMessage = Position.create(positionData);
-
-      // Encode the Position as payload
-      const payload = Position.encode(positionMessage).finish();
+      const payload = Position.encode(Position.create({})).finish();
 
       // For broadcast (0xFFFFFFFF), don't request response or ACK — just broadcast position
       const isBroadcast = destination === 0xFFFFFFFF;
@@ -179,7 +192,8 @@ export class MeshtasticProtobufService {
         payload: payload,
         dest: destination,
         wantResponse: !isBroadcast, // Only request position exchange for unicast
-        requestId: requestId
+        requestId: requestId,
+        ...automationBitfield(isAutomation),
       });
 
       // Create the MeshPacket with explicit ID
@@ -214,8 +228,9 @@ export class MeshtasticProtobufService {
   createNodeInfoRequestMessage(
     destination: number,
     channel?: number,
-    userInfo?: { id: string; longName: string; shortName: string; hwModel?: number; role?: number },
-    hopLimit: number = DEFAULT_HOP_LIMIT
+    userInfo?: { id: string; longName: string; shortName: string; hwModel?: number; role?: number; publicKey?: Uint8Array },
+    hopLimit: number = DEFAULT_HOP_LIMIT,
+    isAutomation: boolean = false
   ): { data: Uint8Array; packetId: number; requestId: number } {
     const root = getProtobufRoot();
     if (!root) {
@@ -244,9 +259,14 @@ export class MeshtasticProtobufService {
         if (userInfo.role !== undefined) {
           userData.role = userInfo.role;
         }
-        // NOTE: publicKey is intentionally omitted. The device firmware handles its own
-        // key distribution. Broadcasting a DB-cached key risks distributing stale keys
-        // if the device has regenerated its key pair. See issue #2275.
+        // NOTE: a DB-cached publicKey is never sent. Broadcasting a stale key
+        // would teach other nodes the wrong identity (#2275). The one exception
+        // is a Reliable PKI priming send (#5691), whose whole purpose is to give
+        // the node our key: the caller passes the key the radio itself reported
+        // in its security config on this connection, and only a 32-byte one.
+        if (userInfo.publicKey && userInfo.publicKey.length === 32) {
+          userData.publicKey = userInfo.publicKey;
+        }
       }
       // If no user info provided, send empty user (fallback behavior)
 
@@ -262,7 +282,8 @@ export class MeshtasticProtobufService {
         payload: payload,
         dest: destination,
         wantResponse: true, // Request nodeinfo exchange from destination
-        requestId: requestId
+        requestId: requestId,
+        ...automationBitfield(isAutomation),
       });
 
       // Create the MeshPacket with explicit ID
@@ -297,7 +318,8 @@ export class MeshtasticProtobufService {
     destination: number,
     channel?: number,
     telemetryType?: 'device' | 'environment' | 'airQuality' | 'power' | 'localStats',
-    hopLimit: number = DEFAULT_HOP_LIMIT
+    hopLimit: number = DEFAULT_HOP_LIMIT,
+    isAutomation: boolean = false
   ): { data: Uint8Array; packetId: number; requestId: number } {
     const root = getProtobufRoot();
     if (!root) {
@@ -363,7 +385,8 @@ export class MeshtasticProtobufService {
         payload: payload,
         dest: destination,
         wantResponse: true, // Request telemetry from destination
-        requestId: requestId
+        requestId: requestId,
+        ...automationBitfield(isAutomation),
       });
 
       // Create MeshPacket with explicit ID
@@ -398,7 +421,8 @@ export class MeshtasticProtobufService {
   createNeighborInfoRequestMessage(
     destination: number,
     channel?: number,
-    hopLimit: number = DEFAULT_HOP_LIMIT
+    hopLimit: number = DEFAULT_HOP_LIMIT,
+    isAutomation: boolean = false
   ): { data: Uint8Array; packetId: number; requestId: number } {
     const root = getProtobufRoot();
     if (!root) {
@@ -425,7 +449,8 @@ export class MeshtasticProtobufService {
         payload: payload,
         dest: destination,
         wantResponse: true, // Request neighbor info from destination
-        requestId: requestId
+        requestId: requestId,
+        ...automationBitfield(isAutomation),
       });
 
       // Create MeshPacket with explicit ID
@@ -455,7 +480,7 @@ export class MeshtasticProtobufService {
   /**
    * Create a text message ToRadio using proper protobuf encoding
    */
-  createTextMessage(text: string, destination?: number, channel?: number, replyId?: number, emoji?: number, pkiEncrypted?: boolean, hopLimit?: number): { data: Uint8Array; messageId: number } {
+  createTextMessage(text: string, destination?: number, channel?: number, replyId?: number, emoji?: number, pkiEncrypted?: boolean, hopLimit?: number, isAutomation: boolean = false): { data: Uint8Array; messageId: number } {
     const root = getProtobufRoot();
     if (!root) {
       logger.error('❌ Protobuf definitions not loaded');
@@ -469,7 +494,8 @@ export class MeshtasticProtobufService {
         portnum: PortNum.TEXT_MESSAGE_APP,
         payload: new TextEncoder().encode(text),
         replyId: replyId,
-        emoji: emoji
+        emoji: emoji,
+        ...automationBitfield(isAutomation),
       });
 
       // Generate a unique message ID so we can track this message
@@ -529,16 +555,7 @@ export class MeshtasticProtobufService {
    * with hop limit 0 goes out without `want_ack`: the firmware rewrites hop 0 to
    * the node default on want_ack packets from the phone API (#5121).
    */
-  createWaypointMessage(waypoint: {
-    id: number;
-    latitude: number;
-    longitude: number;
-    expire: number; // epoch seconds; 0 = no expiry; non-zero past = delete tombstone
-    lockedTo?: number;
-    name?: string;
-    description?: string;
-    icon?: number; // unicode codepoint
-  }, options?: { destination?: number; channel?: number; hopLimit?: number }): { data: Uint8Array; packetId: number } {
+  createWaypointMessage(waypoint: WireWaypoint, options?: { destination?: number; channel?: number; hopLimit?: number; isAutomation?: boolean }): { data: Uint8Array; packetId: number } {
     const root = getProtobufRoot();
     if (!root) {
       logger.error('❌ Protobuf definitions not loaded');
@@ -557,6 +574,22 @@ export class MeshtasticProtobufService {
         description: waypoint.description ?? '',
         icon: waypoint.icon ?? 0,
       };
+      // Geofence fields 9-13 (#5922). Only set when present, so a waypoint
+      // without a geofence encodes exactly as it did before.
+      if (waypoint.geofenceRadiusM && waypoint.geofenceRadiusM > 0) {
+        waypointPayload.geofenceRadius = Math.round(waypoint.geofenceRadiusM);
+      }
+      if (waypoint.boundingBox) {
+        waypointPayload.boundingBox = {
+          longitudeWestI: Math.round(waypoint.boundingBox.west * 1e7),
+          latitudeSouthI: Math.round(waypoint.boundingBox.south * 1e7),
+          longitudeEastI: Math.round(waypoint.boundingBox.east * 1e7),
+          latitudeNorthI: Math.round(waypoint.boundingBox.north * 1e7),
+        };
+      }
+      if (waypoint.notifyOnEnter) waypointPayload.notifyOnEnter = true;
+      if (waypoint.notifyOnExit) waypointPayload.notifyOnExit = true;
+      if (waypoint.notifyFavoritesOnly) waypointPayload.notifyFavoritesOnly = true;
       const wpMessage = Waypoint.create(waypointPayload);
       const payload = Waypoint.encode(wpMessage).finish();
 
@@ -564,6 +597,7 @@ export class MeshtasticProtobufService {
       const dataMessage = Data.create({
         portnum: PortNum.WAYPOINT_APP,
         payload,
+        ...automationBitfield(options?.isAutomation),
       });
 
       const packetId = Math.floor(Math.random() * 0xffffffff);
@@ -1232,6 +1266,10 @@ export class MeshtasticProtobufService {
     viaMqtt?: boolean;
     isFavorite?: boolean;
     isIgnored?: boolean;
+    isKeyManuallyVerified?: boolean;
+    isMuted?: boolean;
+    hasXeddsaSigned?: boolean;
+    heardOnCurrentLora?: boolean;
   }): Promise<Uint8Array | null> {
     const root = getProtobufRoot();
     if (!root) {
@@ -1304,6 +1342,10 @@ export class MeshtasticProtobufService {
         viaMqtt: info.viaMqtt,
         isFavorite: info.isFavorite,
         isIgnored: info.isIgnored,
+        isKeyManuallyVerified: info.isKeyManuallyVerified,
+        isMuted: info.isMuted,
+        hasXeddsaSigned: info.hasXeddsaSigned,
+        heardOnCurrentLora: info.heardOnCurrentLora,
       });
 
       const fromRadio = FromRadio.create({
@@ -1604,7 +1646,7 @@ export class MeshtasticProtobufService {
    * @returns Encoded FromRadio bytes or null on failure
    */
   async createFromRadioTextMessage(message: {
-    id?: string;  // Database message ID (format: "fromNum_packetId") - used to extract original packet ID
+    id?: string;  // Database message ID (format: "${sourceId}_${fromNum}_${packetId}"; packet id is the last segment) - used to extract original packet ID
     fromNodeNum: number;
     toNodeNum: number;
     text: string;
@@ -1612,11 +1654,19 @@ export class MeshtasticProtobufService {
     timestamp: number;
     requestId?: number | null;
     hopLimit?: number | null;
+    /** Original hop_start; with it, clients show hops away = hopStart - hopLimit */
+    hopStart?: number | null;
+    /** The packet reached us over MQTT */
+    viaMqtt?: boolean | null;
     rxTime?: number | null;
     rxSnr?: number | null;
     rxRssi?: number | null;
     replyId?: number | null;
     emoji?: number | null;
+    /** Mark the packet pki_encrypted so clients (Android) file the DM under the PKC channel, not channel 0 */
+    pkiEncrypted?: boolean;
+    /** Sender set Data.bitfield is_automation (#6449); carried through so the app sees it too */
+    isAutomation?: boolean | null;
   }): Promise<Uint8Array | null> {
     const root = getProtobufRoot();
     if (!root) {
@@ -1638,6 +1688,7 @@ export class MeshtasticProtobufService {
       const dataFields: Record<string, unknown> = {
         portnum: PortNum.TEXT_MESSAGE_APP,
         payload: textBytes,
+        ...automationBitfield(message.isAutomation === true),
       };
 
       // Add replyId if present (links this message/reaction to another message)
@@ -1653,13 +1704,14 @@ export class MeshtasticProtobufService {
       const dataMessage = Data.create(dataFields);
 
       // Generate a packet ID - prefer the original packet ID if available
-      // Message IDs are stored in format "fromNum_packetId", so we can extract the original
+      // Message IDs are stored as "${sourceId}_${fromNodeNum}_${packetId}" (older rows may be
+      // "fromNum_packetId"), so the packet id is always the last segment (#6164)
       // This is critical for tapbacks to link correctly to their original messages
       let packetId = message.requestId;
       if (!packetId && message.id) {
         const idParts = message.id.split('_');
         if (idParts.length > 1) {
-          const extractedId = parseInt(idParts[1], 10);
+          const extractedId = parseInt(idParts[idParts.length - 1], 10);
           if (!isNaN(extractedId) && extractedId > 0) {
             packetId = extractedId;
           }
@@ -1686,7 +1738,13 @@ export class MeshtasticProtobufService {
         rxTime: rxTimeSeconds,
         rxSnr: message.rxSnr || 0,
         rxRssi: message.rxRssi || 0,
-        hopLimit: message.hopLimit || 3,
+        // With hop_start the clients show hops away = hopStart - hopLimit, so the
+        // stored hopLimit is kept as is (0 included). Without it, keep the old default.
+        ...(Number(message.hopStart) > 0
+          ? { hopStart: Number(message.hopStart), hopLimit: Number(message.hopLimit ?? 0) }
+          : { hopLimit: message.hopLimit || 3 }),
+        ...(message.viaMqtt ? { viaMqtt: true } : {}),
+        ...(message.pkiEncrypted ? { pkiEncrypted: true } : {}),
       });
 
       // Wrap in FromRadio

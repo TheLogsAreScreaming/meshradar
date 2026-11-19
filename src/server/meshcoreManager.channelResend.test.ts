@@ -13,6 +13,7 @@ import { dataEventEmitter } from './services/dataEventEmitter.js';
 import { encodeGroupTextPayload } from './utils/meshcoreGroupEcho.js';
 import { isMeshCoreResendError } from './errors/meshcoreResendError.js';
 import { isTxDisabledError } from './errors/txDisabledError.js';
+import { mc1HashForDm, mc1HashForOwnChannelText } from '../utils/meshcoreReactionTarget.js';
 
 interface BridgeCall { cmd: string; params: Record<string, unknown>; }
 
@@ -26,6 +27,11 @@ const SECRET_B64 = Buffer.from(SECRET).toString('base64');
 
 let sourceCounter = 0;
 let retryEnabled = false;
+// #6178: per-source Required Repeater (legacy single key) the mock returns.
+let requiredRepeaterSetting: string | null = null;
+// #6193: per-source Required Repeaters list (JSON string) + ANY/ALL mode.
+let requiredRepeatersListSetting: string | null = null;
+let requiredRepeaterModeSetting: string | null = null;
 
 function makeManager(sourceId: string): { manager: MeshCoreManager; calls: BridgeCall[] } {
   const m = new MeshCoreManager(sourceId);
@@ -89,13 +95,21 @@ describe('MeshCoreManager.resendChannelMessage (#5512)', () => {
   beforeEach(() => {
     sourceId = `resend-src-${++sourceCounter}`;
     retryEnabled = false;
+    requiredRepeaterSetting = null;
+    requiredRepeatersListSetting = null;
+    requiredRepeaterModeSetting = null;
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(T0);
     vi.spyOn(databaseService, 'channels', 'get').mockReturnValue({
       getChannelById: vi.fn(async (idx: number) => (idx === CHANNEL ? { id: CHANNEL, psk: SECRET_B64 } : null)),
     } as any);
     vi.spyOn(databaseService, 'settings', 'get').mockReturnValue({
-      getSettingForSource: vi.fn(async () => null),
+      getSettingForSource: vi.fn(async (_src: string, key: string) => {
+        if (key === 'meshcoreRequiredRepeater') return requiredRepeaterSetting;
+        if (key === 'meshcoreRequiredRepeaters') return requiredRepeatersListSetting;
+        if (key === 'meshcoreRequiredRepeaterMode') return requiredRepeaterModeSetting;
+        return null;
+      }),
       setSourceSetting: vi.fn(async () => {}),
       getSettingAsBoolean: vi.fn(async (_key: string, def: boolean) => (retryEnabled ? true : def)),
     } as any);
@@ -112,6 +126,26 @@ describe('MeshCoreManager.resendChannelMessage (#5512)', () => {
     const row = await databaseService.meshcore.getMessageForSource(id, sourceId);
     expect(row?.senderTimestamp).toBe(sends(calls)[0].params.sender_timestamp);
     expect(row?.senderTimestamp).toBe(Math.floor(T0 / 1000));
+  });
+
+  it('stores the MC1 hash of our own channel send and DM next to the wire second (#5759)', async () => {
+    const { manager } = makeManager(sourceId);
+    const sec = Math.floor(T0 / 1000);
+    const chId = await sendOne(manager, 'hello mesh');
+    const chRow = await databaseService.meshcore.getMessageForSource(chId, sourceId);
+    expect(chRow?.mc1Hash).toBe(mc1HashForOwnChannelText('hello mesh', sec));
+    expect(chRow?.mc1Hash).toHaveLength(8);
+
+    const peer = 'b'.repeat(64);
+    await manager.sendMessage('hi there', peer);
+    await settle();
+    const msgs = (manager as any).messages as Array<{ id: string; text: string; senderTimestamp?: number }>;
+    const dm = msgs[msgs.length - 1];
+    expect(dm.text).toBe('hi there');
+    expect(dm.senderTimestamp).toBe(sec);
+    const dmRow = await databaseService.meshcore.getMessageForSource(dm.id, sourceId);
+    expect(dmRow?.senderTimestamp).toBe(sec);
+    expect(dmRow?.mc1Hash).toBe(mc1HashForDm('hi there', sec));
   });
 
   it('resends the same text on the same channel with the ORIGINAL timestamp, adding no row or message event', async () => {
@@ -253,6 +287,156 @@ describe('MeshCoreManager.resendChannelMessage (#5512)', () => {
     await expectRefusal(manager.resendChannelMessage(id), 'ALREADY_HEARD');
   });
 
+  describe('Required Repeater gate (#6178)', () => {
+    const REQ = 'bb'.repeat(32); // 64-char full repeater public key
+    const OTHER = 'cc'.repeat(32);
+
+    const addRelay = (m: MeshCoreManager, publicKey: string) => {
+      (m as any).contacts.set(publicKey, { publicKey, advType: MeshCoreDeviceType.REPEATER });
+    };
+
+    it('refuses only once the REQUIRED repeater is uniquely heard', async () => {
+      const { manager } = makeManager(sourceId);
+      addRelay(manager, REQ);
+      addRelay(manager, OTHER);
+      requiredRepeaterSetting = REQ;
+      const id = await sendOne(manager);
+      // 'bb' uniquely resolves to REQ among the known relays.
+      await databaseService.meshcore.recordHeardRepeater({
+        sourceId, messageId: id, repeaterHash: 'bb', repeaterName: null, snr: 4, heardAt: T0 + 1000,
+      });
+      vi.setSystemTime(T0 + 31_000);
+      await expectRefusal(manager.resendChannelMessage(id), 'ALREADY_HEARD');
+    });
+
+    it('still resends when a DIFFERENT repeater relayed it', async () => {
+      const { manager, calls } = makeManager(sourceId);
+      addRelay(manager, REQ);
+      addRelay(manager, OTHER);
+      requiredRepeaterSetting = REQ;
+      const id = await sendOne(manager);
+      const before = sends(calls).length;
+      // 'cc' resolves to OTHER, not the required REQ → not heard → resend allowed.
+      await databaseService.meshcore.recordHeardRepeater({
+        sourceId, messageId: id, repeaterHash: 'cc', repeaterName: null, snr: 4, heardAt: T0 + 1000,
+      });
+      vi.setSystemTime(T0 + 31_000);
+      await manager.resendChannelMessage(id);
+      expect(sends(calls).length).toBe(before + 1);
+    });
+
+    it('still resends when the heard prefix is ambiguous', async () => {
+      const { manager, calls } = makeManager(sourceId);
+      addRelay(manager, REQ);
+      addRelay(manager, 'bb' + 'ab'.repeat(31)); // also starts with 'bb'
+      requiredRepeaterSetting = REQ;
+      const id = await sendOne(manager);
+      const before = sends(calls).length;
+      await databaseService.meshcore.recordHeardRepeater({
+        sourceId, messageId: id, repeaterHash: 'bb', repeaterName: null, snr: 4, heardAt: T0 + 1000,
+      });
+      vi.setSystemTime(T0 + 31_000);
+      await manager.resendChannelMessage(id);
+      expect(sends(calls).length).toBe(before + 1);
+    });
+
+    // #6193 — list + ANY/ALL mode, read through readRequiredRepeaters.
+    it('ANY mode (list): refuses once ONE listed repeater is uniquely heard', async () => {
+      const { manager } = makeManager(sourceId);
+      addRelay(manager, REQ);
+      addRelay(manager, OTHER);
+      requiredRepeatersListSetting = JSON.stringify([REQ, OTHER]);
+      requiredRepeaterModeSetting = 'any';
+      const id = await sendOne(manager);
+      await databaseService.meshcore.recordHeardRepeater({
+        sourceId, messageId: id, repeaterHash: 'cc', repeaterName: null, snr: 4, heardAt: T0 + 1000,
+      });
+      vi.setSystemTime(T0 + 31_000);
+      await expectRefusal(manager.resendChannelMessage(id), 'ALREADY_HEARD');
+    });
+
+    it('ALL mode (list): resends until EVERY listed repeater is heard', async () => {
+      const { manager, calls } = makeManager(sourceId);
+      addRelay(manager, REQ);
+      addRelay(manager, OTHER);
+      requiredRepeatersListSetting = JSON.stringify([REQ, OTHER]);
+      requiredRepeaterModeSetting = 'all';
+      const id = await sendOne(manager);
+      const before = sends(calls).length;
+      // Only REQ ('bb') heard so far → ALL not satisfied → resend allowed.
+      await databaseService.meshcore.recordHeardRepeater({
+        sourceId, messageId: id, repeaterHash: 'bb', repeaterName: null, snr: 4, heardAt: T0 + 1000,
+      });
+      vi.setSystemTime(T0 + 31_000);
+      await manager.resendChannelMessage(id);
+      expect(sends(calls).length).toBe(before + 1);
+
+      // Now OTHER ('cc') is also heard → ALL satisfied → refuse.
+      await databaseService.meshcore.recordHeardRepeater({
+        sourceId, messageId: id, repeaterHash: 'cc', repeaterName: null, snr: 4, heardAt: T0 + 2000,
+      });
+      vi.setSystemTime(T0 + 62_000);
+      await expectRefusal(manager.resendChannelMessage(id), 'ALREADY_HEARD');
+    });
+
+    it('back-compat: the legacy single key still gates when no list is set', async () => {
+      const { manager } = makeManager(sourceId);
+      addRelay(manager, REQ);
+      addRelay(manager, OTHER);
+      requiredRepeaterSetting = REQ; // legacy key only, no list
+      const id = await sendOne(manager);
+      await databaseService.meshcore.recordHeardRepeater({
+        sourceId, messageId: id, repeaterHash: 'bb', repeaterName: null, snr: 4, heardAt: T0 + 1000,
+      });
+      vi.setSystemTime(T0 + 31_000);
+      await expectRefusal(manager.resendChannelMessage(id), 'ALREADY_HEARD');
+    });
+
+    it('the list wins over the legacy key when both are set', async () => {
+      const { manager, calls } = makeManager(sourceId);
+      addRelay(manager, REQ);
+      addRelay(manager, OTHER);
+      // Legacy says REQ, but the list says OTHER — the list must win.
+      requiredRepeaterSetting = REQ;
+      requiredRepeatersListSetting = JSON.stringify([OTHER]);
+      const id = await sendOne(manager);
+      const before = sends(calls).length;
+      // Hearing REQ ('bb') must NOT satisfy a list of [OTHER].
+      await databaseService.meshcore.recordHeardRepeater({
+        sourceId, messageId: id, repeaterHash: 'bb', repeaterName: null, snr: 4, heardAt: T0 + 1000,
+      });
+      vi.setSystemTime(T0 + 31_000);
+      await manager.resendChannelMessage(id);
+      expect(sends(calls).length).toBe(before + 1);
+    });
+  });
+
+  it('never resends a reaction row (#5762)', async () => {
+    const { manager, calls } = makeManager(sourceId);
+    const id = await sendOne(manager);
+    const reactionId = 'sent-reaction-1';
+    await databaseService.meshcore.insertMessage({
+      id: reactionId, fromPublicKey: SELF_KEY, fromName: SELF_NAME, toPublicKey: `channel-${CHANNEL}`,
+      text: '\u{1F44D}', timestamp: T0, sourceId, senderTimestamp: Math.floor(T0 / 1000),
+      reactionEmoji: '\u{1F44D}', reactionFormat: 'mc1-channel', reactionTargetHash: 'abcdefgh',
+      reactionTargetId: id, createdAt: T0,
+    } as any, sourceId);
+    vi.setSystemTime(T0 + 31_000);
+    const before = sends(calls).length;
+    await expectRefusal(manager.resendChannelMessage(reactionId), 'RESEND_UNAVAILABLE');
+    expect(sends(calls)).toHaveLength(before);
+  });
+
+  it('withResendInfo skips reaction rows (#5762)', async () => {
+    const { manager } = makeManager(sourceId);
+    const spy = vi.spyOn(databaseService.messageEvents, 'getEventsForMessages').mockResolvedValue([]);
+    await (manager as any).withResendInfo([
+      { id: 'm1', senderTimestamp: 5, toPublicKey: 'channel-1', fromPublicKey: SELF_KEY, text: 'x', timestamp: 1 },
+      { id: 'm2', senderTimestamp: 5, toPublicKey: 'channel-1', fromPublicKey: SELF_KEY, text: 'e', timestamp: 1, reactionEmoji: 'e' },
+    ]);
+    expect(spy.mock.calls[0][1]).toEqual(['m1']);
+  });
+
   it('refuses a message older than one hour', async () => {
     const { manager } = makeManager(sourceId);
     const id = await sendOne(manager);
@@ -280,14 +464,59 @@ describe('MeshCoreManager.resendChannelMessage (#5512)', () => {
     await expectRefusal(manager.resendChannelMessage('rx-1'), 'NOT_OWN_MESSAGE');
   });
 
-  it('refuses a DM', async () => {
-    const { manager } = makeManager(sourceId);
+  it('resends a DM to the recipient with the ORIGINAL timestamp (#6194)', async () => {
+    const { manager, calls } = makeManager(sourceId);
+    const peer = 'b'.repeat(64);
     await databaseService.meshcore.insertMessage({
-      id: 'dm-1', fromPublicKey: SELF_KEY, toPublicKey: 'b'.repeat(64), text: 'hi', timestamp: T0, createdAt: T0,
+      id: 'dm-1', fromPublicKey: SELF_KEY, toPublicKey: peer, text: 'hi', timestamp: T0, createdAt: T0,
       senderTimestamp: Math.floor(T0 / 1000),
     }, sourceId);
     vi.setSystemTime(T0 + 31_000);
-    await expectRefusal(manager.resendChannelMessage('dm-1'), 'NOT_CHANNEL_MESSAGE');
+    const result = await manager.resendChannelMessage('dm-1');
+    expect(result).toEqual({ id: 'dm-1', resendCount: 1, lastResendAt: T0 + 31_000 });
+    const sent = sends(calls).at(-1)!;
+    expect(sent.params.to).toBe(peer);
+    expect(sent.params.channel_idx).toBeUndefined();
+    expect(sent.params.sender_timestamp).toBe(Math.floor(T0 / 1000));
+    // Registered for DM self-echo correlation under the original id (#6194).
+    expect([...(manager as any).pendingDmSends.keys()]).toEqual(['dm-1']);
+  });
+
+  it('never resends a DM the recipient already acknowledged (#6194)', async () => {
+    const { manager } = makeManager(sourceId);
+    await databaseService.meshcore.insertMessage({
+      id: 'dm-ack', fromPublicKey: SELF_KEY, toPublicKey: 'b'.repeat(64), text: 'hi', timestamp: T0, createdAt: T0,
+      senderTimestamp: Math.floor(T0 / 1000),
+    }, sourceId);
+    // Delivery is persisted as a `delivered` message-event (not a row column).
+    await databaseService.messageEvents.recordEvent({
+      sourceId, messageId: 'dm-ack', eventType: 'delivered', provenance: 'observed', timestamp: T0 + 1000,
+    });
+    vi.setSystemTime(T0 + 31_000);
+    await expectRefusal(manager.resendChannelMessage('dm-ack'), 'ALREADY_DELIVERED');
+  });
+
+  it('refuses a DM a repeater already relayed (#6194)', async () => {
+    const { manager } = makeManager(sourceId);
+    await databaseService.meshcore.insertMessage({
+      id: 'dm-heard', fromPublicKey: SELF_KEY, toPublicKey: 'b'.repeat(64), text: 'hi', timestamp: T0, createdAt: T0,
+      senderTimestamp: Math.floor(T0 / 1000),
+    }, sourceId);
+    await databaseService.meshcore.recordHeardRepeater({
+      sourceId, messageId: 'dm-heard', repeaterHash: 'ab', repeaterName: null, snr: 4, heardAt: T0 + 1000,
+    });
+    vi.setSystemTime(T0 + 31_000);
+    await expectRefusal(manager.resendChannelMessage('dm-heard'), 'ALREADY_HEARD');
+  });
+
+  it('refuses a room post (#6194)', async () => {
+    const { manager } = makeManager(sourceId);
+    await databaseService.meshcore.insertMessage({
+      id: 'room-1', fromPublicKey: SELF_KEY, toPublicKey: 'b'.repeat(64), text: 'hi', timestamp: T0, createdAt: T0,
+      senderTimestamp: Math.floor(T0 / 1000), messageType: 'room_post',
+    }, sourceId);
+    vi.setSystemTime(T0 + 31_000);
+    await expectRefusal(manager.resendChannelMessage('room-1'), 'NOT_RESENDABLE');
   });
 
   it('refuses an unknown id, and another source\'s message', async () => {

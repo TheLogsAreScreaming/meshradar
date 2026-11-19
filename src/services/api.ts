@@ -26,6 +26,7 @@ import type { NodeTransportClass } from '../utils/nodeTransport.js';
 import type { ReplaySettings, TrafficReplayResponse } from '../utils/trafficManagementReplay.js';
 import type { OutlierPreview, OutlierPurgeResult } from '../utils/telemetryOutliers.js';
 import type { FlightMatch } from '../types/flightMatch.js';
+import type { PkiExchangeState } from '../types/pkiExchange.js';
 import type { TranslationRequest, TranslationResponse, TranslationLanguageOption, StoredTranslation } from '../types/translation.js';
 
 /** Body of the telemetry outlier preview/purge requests (#5333). */
@@ -88,6 +89,54 @@ export interface SignalTrendMetric {
 }
 
 /** Response of GET /api/telemetry/:nodeId/signal-trend (#4110). */
+/** One rename in a node's history (#5862), merged across readable sources. */
+export interface NodeNameHistoryEntry {
+  oldLongName: string | null;
+  newLongName: string | null;
+  oldShortName: string | null;
+  newShortName: string | null;
+  /** ms since epoch */
+  changedAt: number;
+  sourceIds: string[];
+}
+
+/** One anchor behind an estimated position (#4609, #5900). */
+export interface PositionEstimateAnchor {
+  anchorNodeNum: number;
+  anchorNodeId: string;
+  anchorLongName: string | null;
+  anchorShortName: string | null;
+  anchorLat: number;
+  anchorLon: number;
+  kind: 'traceroute' | 'neighbor';
+  snrDb: number | null;
+  observedAt: number;
+  weight: number;
+  distanceKm: number;
+}
+
+/** GET /api/nodes/:nodeNum/position-estimate payload (#4609, #5900). */
+export interface PositionEstimateRationale {
+  nodeNum: number;
+  nodeId: string;
+  latitude: number;
+  longitude: number;
+  uncertaintyKm: number | null;
+  observationCount: number;
+  /** ms epoch of the estimator run that wrote this estimate. */
+  updatedAt: number;
+  nEff: number | null;
+  radiusMethod: 'single_anchor' | 'blended' | 'convergence' | null;
+  uniqueAnchors: number;
+  uniqueAnchorsIsLowerBound: boolean;
+  singleAnchorDefaultKm: number;
+  /** Only the anchors the caller may see, strongest first. */
+  anchors: PositionEstimateAnchor[];
+  anchorsStored: number;
+  anchorsTruncated: boolean;
+  maxStoredAnchors: number;
+}
+
 export interface SignalTrendResult {
   trend: SignalTrend;
   basis: 'rssi' | 'snr' | null;
@@ -344,8 +393,35 @@ interface AdminCommandAccepted extends AdminCommandResult {
   success: boolean;
   /** Present only when the server opened a background operation. */
   operationId?: string;
+  /** Present when the save started a verify job (`verify: true`, #4487). */
+  verifyJobId?: string;
   status?: string;
 }
+
+/** Mirrors VerifyJob in src/server/services/adminVerifyJobService.ts. */
+export interface AdminVerifyJob {
+  id: string;
+  sourceId: string;
+  destinationNodeNum: number;
+  command: string;
+  section: string;
+  status: 'waiting' | 'checking' | 'resending' | 'verified' | 'differs' | 'refused' | 'gave_up' | 'cancelled' | 'failed';
+  createdAt: number;
+  completedAt: number | null;
+  deadline: number;
+  sends: number;
+  maxSends: number;
+  checks: number;
+  nextCheckAt: number | null;
+  lastCheckOutcome: 'no_reply' | 'not_applied' | 'applied' | 'differs' | null;
+  pendingFields: string[];
+  differingFields: string[];
+  error: { code: string; message: string } | null;
+}
+
+export const VERIFY_JOB_TERMINAL: ReadonlySet<AdminVerifyJob['status']> = new Set([
+  'verified', 'differs', 'refused', 'gave_up', 'cancelled', 'failed',
+]);
 
 /** A snapshot of a background admin operation, as returned by the poll endpoint. */
 interface AdminOperationSnapshot {
@@ -505,9 +581,37 @@ class ApiService {
     return this.request<T>('PUT', endpoint, body);
   }
 
+  // Generic PATCH method
+  async patch<T>(endpoint: string, body?: unknown): Promise<T> {
+    return this.request<T>('PATCH', endpoint, body);
+  }
+
   // Generic DELETE method
   async delete<T>(endpoint: string): Promise<T> {
     return this.request<T>('DELETE', endpoint);
+  }
+
+  /**
+   * Run a free-form Meshtastic remote-admin CLI command against a remote node
+   * through the source's Virtual Node (#6154). `args` is the user's raw
+   * argument string (everything after `meshtastic --dest !xxxxxxxx`). Throws
+   * ApiError on a non-2xx response; the error body carries `code` and `output`.
+   */
+  async sendMeshtasticCli(
+    sourceId: string,
+    destNodeId: string,
+    args: string,
+    opts?: { confirm?: boolean }
+  ): Promise<{ output: string; stdout: string; stderr: string; exitCode: number; elapsedMs: number }> {
+    const body = await this.post<{
+      success: boolean;
+      data: { output: string; stdout: string; stderr: string; exitCode: number; elapsedMs: number };
+    }>(`/api/sources/${encodeURIComponent(sourceId)}/meshtastic/admin/cli`, {
+      destNodeId,
+      args,
+      ...(opts?.confirm ? { confirm: true } : {}),
+    });
+    return body.data;
   }
 
   /**
@@ -661,9 +765,14 @@ class ApiService {
     this.configFetched = true;
   }
 
-  async getConfig() {
+  /**
+   * Read `/api/config`. Pass the viewed source's id so the node address and
+   * port are that source's, not the env default (#6353).
+   */
+  async getConfig(sourceId?: string | null) {
     await this.ensureBaseUrl();
-    const response = await fetch(`${this.baseUrl}/api/config`);
+    const params = sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : '';
+    const response = await fetch(`${this.baseUrl}/api/config${params}`);
     if (!response.ok) throw new Error('Failed to fetch config');
 
     // Verify we got JSON, not HTML
@@ -744,6 +853,8 @@ class ApiService {
     uplinkEnabled?: boolean;
     downlinkEnabled?: boolean;
     positionPrecision?: number;
+    /** AES-CCM channel (#5248). Omit to keep the device's current setting. */
+    useAead?: boolean;
   }, sourceId?: string | null): Promise<Channel> {
     await this.ensureBaseUrl();
     const response = await fetch(`${this.baseUrl}/api/channels/${channelId}`, {
@@ -884,8 +995,10 @@ class ApiService {
     });
   }
 
-  async exportChannel(channelId: number): Promise<void> {
-    return this.download(`/api/channels/${channelId}/export`, {
+  async exportChannel(channelId: number, sourceId?: string | null): Promise<void> {
+    // The route requires ?sourceId (requireSourceId('query')); without it every export 400s.
+    const qs = sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : '';
+    return this.download(`/api/channels/${channelId}/export${qs}`, {
       defaultName: `channel-${channelId}-${Date.now()}.json`,
     });
   }
@@ -908,12 +1021,16 @@ class ApiService {
     return result.channel;
   }
 
-  async decodeChannelUrl(url: string): Promise<any> {
+  /**
+   * Decode a Meshtastic or MeshCore channel URL for preview. `sourceId` is
+   * optional: for a MeshCore URL it lets the server name the import slot.
+   */
+  async decodeChannelUrl(url: string, sourceId?: string | null): Promise<any> {
     await this.ensureBaseUrl();
     const response = await fetch(`${this.baseUrl}/api/channels/decode-url`, {
       method: 'POST',
       headers: this.getHeadersWithCsrf(),
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, ...(sourceId ? { sourceId } : {}) }),
     });
 
     if (!response.ok) {
@@ -925,7 +1042,7 @@ class ApiService {
   }
 
 
-  async importConfig(url: string, nodeNum?: number, sourceId?: string | null): Promise<{ success: boolean; imported: { channels: number; channelDetails: any[]; loraConfig: boolean; failedChannels?: number; failedChannelDetails?: Array<{ index: number; name: string }> }; requiresReboot?: boolean }> {
+  async importConfig(url: string, nodeNum?: number, sourceId?: string | null): Promise<{ success: boolean; protocol?: 'meshcore'; slot?: number; alreadyPresent?: boolean; imported: { channels: number; channelDetails: any[]; loraConfig: boolean; failedChannels?: number; failedChannelDetails?: Array<{ index: number; name: string }> }; requiresReboot?: boolean }> {
     await this.ensureBaseUrl();
     // Use admin endpoint if nodeNum is provided (for remote nodes), otherwise use standard endpoint
     const endpoint = nodeNum !== undefined ? '/api/admin/import-config' : '/api/channels/import-config';
@@ -1010,6 +1127,17 @@ class ApiService {
   async getFlightMatch(sourceId: string, nodeNum: number): Promise<FlightMatch | null> {
     const body = await this.get<{ success: boolean; data?: FlightMatch | null }>(
       `/api/sources/${encodeURIComponent(sourceId)}/nodes/${nodeNum >>> 0}/flight-match`,
+    );
+    return body?.data ?? null;
+  }
+
+  /**
+   * Reliable PKI exchange state for one node on one source (#5691).
+   * Unwraps the `ok()` envelope; null when nothing is recorded.
+   */
+  async getPkiExchangeState(sourceId: string, nodeNum: number): Promise<PkiExchangeState | null> {
+    const body = await this.get<{ success: boolean; data?: PkiExchangeState | null }>(
+      `/api/sources/${encodeURIComponent(sourceId)}/nodes/${nodeNum >>> 0}/pki-exchange`,
     );
     return body?.data ?? null;
   }
@@ -1267,6 +1395,30 @@ class ApiService {
    * (issue #4110). `sourceId` is required by the endpoint — callers must only
    * invoke this when a concrete source is selected.
    */
+  /**
+   * A node's rename history (#5862). `nodeId` is `!aabbccdd`, a decimal
+   * nodeNum, or a MeshCore public key. Newest first.
+   */
+  async getNodeNameHistory(nodeId: string): Promise<NodeNameHistoryEntry[]> {
+    const body = await this.get<{ success: boolean; data: { entries: NodeNameHistoryEntry[] } }>(
+      `/api/nodes/${encodeURIComponent(nodeId)}/name-history`,
+    );
+    return body.data?.entries ?? [];
+  }
+
+  /**
+   * The rationale behind a node's ESTIMATED position (#4609, #5900): how the
+   * radius was derived and which anchors fed it. 404s (rejects) for a node with
+   * no estimate. The server wraps the payload as `{ success, data }`;
+   * `request()` does not unwrap, so read `body.data`.
+   */
+  async getPositionEstimate(nodeNum: number): Promise<PositionEstimateRationale> {
+    const body = await this.get<{ success: boolean; data: PositionEstimateRationale }>(
+      `/api/nodes/${encodeURIComponent(String(nodeNum))}/position-estimate`,
+    );
+    return body.data;
+  }
+
   async getSignalTrend(nodeId: string, sourceId: string): Promise<SignalTrendResult> {
     // Validate the node id up front (throws on a malformed id) for consistency
     // with getTelemetry and the other node-scoped methods.
@@ -1452,7 +1604,7 @@ class ApiService {
     return response.json();
   }
 
-  async purgeNodes(olderThanHours: number) {
+  async purgeNodes(olderThanHours: number, sourceId?: string) {
     // Validate hours parameter
     const validatedHours = validateHours(olderThanHours);
 
@@ -1461,7 +1613,7 @@ class ApiService {
       method: 'POST',
       headers: this.getHeadersWithCsrf(),
       credentials: 'include',
-      body: JSON.stringify({ olderThanHours: validatedHours }),
+      body: JSON.stringify(sourceId ? { olderThanHours: validatedHours, sourceId } : { olderThanHours: validatedHours }),
     });
 
     if (!response.ok) {
@@ -1472,7 +1624,7 @@ class ApiService {
     return response.json();
   }
 
-  async purgeTelemetry(olderThanHours: number) {
+  async purgeTelemetry(olderThanHours: number, sourceId?: string) {
     // Validate hours parameter
     const validatedHours = validateHours(olderThanHours);
 
@@ -1481,7 +1633,8 @@ class ApiService {
       method: 'POST',
       headers: this.getHeadersWithCsrf(),
       credentials: 'include',
-      body: JSON.stringify({ olderThanHours: validatedHours }),
+      // sourceId scopes the purge to one source; omitted = every source.
+      body: JSON.stringify(sourceId ? { olderThanHours: validatedHours, sourceId } : { olderThanHours: validatedHours }),
     });
 
     if (!response.ok) {
@@ -1731,8 +1884,12 @@ class ApiService {
     });
 
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error || 'Failed to set MQTT configuration');
+      const error = await response.json().catch(() => ({}));
+      // Keep `code` and the body so the form can localise INVALID_MQTT_ROOT (#6338).
+      throw new ApiError(error.error || 'Failed to set MQTT configuration', response.status, {
+        code: error.code,
+        body: error,
+      });
     }
 
     return response.json();
@@ -1819,8 +1976,12 @@ class ApiService {
     });
 
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error || `Failed to set ${moduleType} configuration`);
+      const error = await response.json().catch(() => ({})) as { error?: string; code?: string };
+      // ApiError keeps the machine code so a caller can show its own text (#5745).
+      throw new ApiError(error.error || `Failed to set ${moduleType} configuration`, response.status, {
+        code: error.code,
+        body: error,
+      });
     }
 
     return response.json();
@@ -1859,6 +2020,27 @@ class ApiService {
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
       throw new Error(error.error || 'Failed to set node notes');
+    }
+
+    return response.json();
+  }
+
+  /**
+   * Set or clear a node's channel by hand and lock or unlock it (#5923).
+   * MeshRadar-local only. `channel: null` clears it.
+   */
+  async setNodeChannel(nodeId: string, channel: number | null, locked: boolean, sourceId: string) {
+    await this.ensureBaseUrl();
+    const response = await fetch(`${this.baseUrl}/api/nodes/${encodeURIComponent(nodeId)}/channel`, {
+      method: 'POST',
+      headers: this.getHeadersWithCsrf(),
+      credentials: 'include',
+      body: JSON.stringify({ channel, locked, sourceId }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || 'Failed to set node channel');
     }
 
     return response.json();
@@ -2088,6 +2270,17 @@ class ApiService {
     return this.followAdminOperation<T>(accepted, options);
   }
 
+  /** Verified-save jobs (#4487): every admin sees every job. */
+  async getVerifyJobs(): Promise<AdminVerifyJob[]> {
+    const res = await this.get<{ success: boolean; data: AdminVerifyJob[] }>('/api/admin/verify-jobs');
+    return res.data ?? [];
+  }
+
+  async cancelVerifyJob(id: string): Promise<AdminVerifyJob> {
+    const res = await this.post<{ success: boolean; data: AdminVerifyJob }>(`/api/admin/verify-jobs/${encodeURIComponent(id)}/cancel`);
+    return res.data;
+  }
+
   /**
    * Follow a background admin operation to completion (#4482).
    *
@@ -2276,6 +2469,7 @@ class ApiService {
     description?: string;
     isEnabled?: boolean;
     enforceNameValidation?: boolean;
+    useAead?: boolean;
     /** Defaults to 'meshtastic'. A MeshCore `#name` may omit `psk`. */
     protocol?: 'meshtastic' | 'meshcore';
   }): Promise<{
@@ -2297,6 +2491,7 @@ class ApiService {
       description?: string;
       isEnabled?: boolean;
       enforceNameValidation?: boolean;
+      useAead?: boolean;
     }
   ): Promise<{
     success: boolean;
@@ -2693,6 +2888,8 @@ export interface ChannelDatabaseEntry {
   description: string | null;
   isEnabled: boolean;
   enforceNameValidation: boolean;
+  /** AES-CCM channel, firmware 2.8.1+ (#5248). */
+  useAead?: boolean;
   sortOrder: number;
   decryptedPacketCount: number;
   lastDecryptedAt: number | null;

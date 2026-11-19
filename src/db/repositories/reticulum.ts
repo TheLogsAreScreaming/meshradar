@@ -16,7 +16,7 @@
  * the full column rationale (rssi/snr/quality included, position/telemetry
  * and LoRa-parameter columns excluded — those are Phase 3).
  */
-import { and, asc, desc, eq, inArray, isNotNull, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, lt, notInArray, or, sql } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase, SourceScope } from './base.js';
 import { DatabaseType } from '../types.js';
 import { SettingsRepository } from './settings.js';
@@ -139,6 +139,24 @@ export interface ReticulumInterfaceRow {
   radioState: boolean | null;
   /** Loose JSON text — read-only RNode board/firmware info (R2). */
   deviceInfoJson: string | null;
+  /**
+   * Live RNode interface gauges (migration 222, issue #6120). RNS reports
+   * these only for an RNode LoRa interface; null for every other interface.
+   * Airtime/channel-load/cpu-load are percentages, noise-floor/interference
+   * are dBm, battery-percent is 0-100, and `interferenceLastTs` is RNS epoch
+   * SECONDS.
+   */
+  airtimeShort: number | null;
+  airtimeLong: number | null;
+  channelLoadShort: number | null;
+  channelLoadLong: number | null;
+  noiseFloor: number | null;
+  interference: number | null;
+  interferenceLastTs: number | null;
+  interferenceLastDbm: number | null;
+  cpuLoad: number | null;
+  batteryState: string | null;
+  batteryPercent: number | null;
 }
 
 /** The radio-config + device-info subset of {@link ReticulumInterfaceRow} (migration 145). */
@@ -185,6 +203,22 @@ export interface UpsertInterfaceInput {
   rxBytes: number;
   /** ms epoch of this poll; defaults to `Date.now()`. */
   lastSeenAt?: number;
+  /**
+   * Live RNode interface gauges (migration 222, issue #6120). The bridge sends
+   * these on every poll — null for non-RNode interfaces. Omitted (undefined)
+   * is treated the same as null.
+   */
+  airtimeShort?: number | null;
+  airtimeLong?: number | null;
+  channelLoadShort?: number | null;
+  channelLoadLong?: number | null;
+  noiseFloor?: number | null;
+  interference?: number | null;
+  interferenceLastTs?: number | null;
+  interferenceLastDbm?: number | null;
+  cpuLoad?: number | null;
+  batteryState?: string | null;
+  batteryPercent?: number | null;
 }
 
 export interface ReticulumMessageRow {
@@ -621,6 +655,19 @@ export class ReticulumRepository extends BaseRepository {
       lastSeenAt,
       createdAt: now,
       updatedAt: now,
+      // Live RNode interface gauges (migration 222, #6120). Each poll is a full
+      // snapshot, so these are overwritten every time — null for non-RNode ifaces.
+      airtimeShort: iface.airtimeShort ?? null,
+      airtimeLong: iface.airtimeLong ?? null,
+      channelLoadShort: iface.channelLoadShort ?? null,
+      channelLoadLong: iface.channelLoadLong ?? null,
+      noiseFloor: iface.noiseFloor ?? null,
+      interference: iface.interference ?? null,
+      interferenceLastTs: iface.interferenceLastTs ?? null,
+      interferenceLastDbm: iface.interferenceLastDbm ?? null,
+      cpuLoad: iface.cpuLoad ?? null,
+      batteryState: iface.batteryState ?? null,
+      batteryPercent: iface.batteryPercent ?? null,
     };
     const updateSet = {
       interfaceType: values.interfaceType,
@@ -633,6 +680,17 @@ export class ReticulumRepository extends BaseRepository {
       rxBytes: values.rxBytes,
       lastSeenAt: values.lastSeenAt,
       updatedAt: now,
+      airtimeShort: values.airtimeShort,
+      airtimeLong: values.airtimeLong,
+      channelLoadShort: values.channelLoadShort,
+      channelLoadLong: values.channelLoadLong,
+      noiseFloor: values.noiseFloor,
+      interference: values.interference,
+      interferenceLastTs: values.interferenceLastTs,
+      interferenceLastDbm: values.interferenceLastDbm,
+      cpuLoad: values.cpuLoad,
+      batteryState: values.batteryState,
+      batteryPercent: values.batteryPercent,
       // createdAt intentionally omitted — preserved from the original insert.
     };
 
@@ -666,6 +724,46 @@ export class ReticulumRepository extends BaseRepository {
       .from(reticulumInterfaces)
       .where(this.withSourceScope(reticulumInterfaces, sourceId));
     return Number(rows[0]?.count ?? 0);
+  }
+
+  /**
+   * Prune interface rows for `sourceId` that are absent from the latest
+   * `interface_stats` snapshot. `interface_stats` is a full snapshot each poll
+   * (like `path_table`), so an interface disabled in the RNS config simply
+   * stops appearing — but {@link upsertInterface} only ever upserts the names
+   * it is given, so a removed interface's last status would otherwise linger
+   * forever (issue #6121). This mirrors {@link replacePaths}'s snapshot
+   * semantics, but as a *prune* rather than a delete-then-reinsert: the
+   * per-interface upsert is kept so radio-config fields written elsewhere
+   * (see {@link setInterfaceRadioConfig}) survive, and only the names no longer
+   * present are removed.
+   *
+   * `keepNames` is the set of interface names in the current snapshot. An empty
+   * `keepNames` deletes ALL rows for the source (the snapshot reports zero
+   * interfaces) — `notInArray` against an empty list is skipped to avoid any
+   * dialect's invalid-SQL edge case, and a plain source-scoped delete is used
+   * instead. Fail-closed on a missing/empty `sourceId`, so this can never touch
+   * another source's rows.
+   */
+  async pruneInterfacesNotIn(sourceId: string, keepNames: string[]): Promise<void> {
+    if (!sourceId) {
+      throw new Error('ReticulumRepository.pruneInterfacesNotIn requires a sourceId');
+    }
+    const { reticulumInterfaces } = this.tables;
+
+    if (keepNames.length === 0) {
+      await this.db
+        .delete(reticulumInterfaces)
+        .where(this.withSourceScope(reticulumInterfaces, sourceId));
+      return;
+    }
+
+    await this.db
+      .delete(reticulumInterfaces)
+      .where(and(
+        this.withSourceScope(reticulumInterfaces, sourceId),
+        notInArray(reticulumInterfaces.interfaceName, keepNames),
+      ));
   }
 
   /** Get a single interface row scoped by `(sourceId, interfaceName)`. */

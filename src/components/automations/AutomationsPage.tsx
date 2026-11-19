@@ -12,15 +12,34 @@ import { isValidCron } from 'cron-validator';
 import apiService from '../../services/api';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
+import { loadNodeOptions } from './loadNodeOptions';
 import AutomationBuilder, { type VariableOption, type SourceOption, type UnifiedChannelOption, type ScriptOption, type NodeMultiOption, type AutomationOption } from './AutomationBuilder';
 import AutomationTester from './AutomationTester';
 import LiveTracePanel from './LiveTracePanel';
 import TemplateGallery, { type InstalledAutomationRow } from './TemplateGallery';
+import TelemetryTriggerNotice from './TelemetryTriggerNotice';
 import { StepList, type TraceStep } from './outcomeMeta';
 import { summarizeTriggerEvent, parseJsonColumn } from './eventSummary';
 import { UiIcon } from '../icons';
 import { compile, decompile, outputNameErrors, type WorkflowForm } from './compile';
+import { BLOCK_BY_TYPE } from './catalog';
+import { emptySendFinding } from '../../types/automation';
+import { tracePathScheduleParamErrors } from '../../types/tracePathSchedule';
+import { scheduleStatus } from './scheduleStatus';
 import './AutomationsPage.css';
+
+/** One line per action whose text is empty (#5697), named as the builder names it. */
+function emptySendLines(config: unknown): string[] {
+  const nodes = (config as { nodes?: unknown } | null)?.nodes;
+  if (!Array.isArray(nodes)) return [];
+  const out: string[] = [];
+  for (const n of nodes as Array<{ type?: unknown; params?: Record<string, unknown> }>) {
+    if (typeof n?.type !== 'string') continue;
+    const f = emptySendFinding(n.type, n.params);
+    if (f) out.push(`${BLOCK_BY_TYPE[n.type]?.label ?? n.type}: ${f.detail}`);
+  }
+  return out;
+}
 
 interface Automation {
   id: string; name: string; description: string | null; enabled: boolean; config: string;
@@ -44,7 +63,7 @@ const VARIABLE_SCOPES: { value: Variable['scope']; label: string }[] = [
 ];
 
 const DEFAULT_FORM: WorkflowForm = {
-  trigger: { type: 'trigger.message', params: { textContains: 'ping' } },
+  trigger: { type: 'trigger.message', params: { textContains: 'ping', senderKind: 'human' } },
   rules: [{ conditions: [], actions: [{ type: 'action.tapback', params: { emoji: '👍' } }] }],
   combine: null,
 };
@@ -68,6 +87,15 @@ function validateForm(form: WorkflowForm): string[] {
     const thr = form.trigger.params.thresholdMeters;
     if (thr != null && thr !== '' && !(Number(thr) > 0)) {
       errs.push('Home-distance threshold must be greater than 0 metres.');
+    }
+  }
+  // #5723: the same limits the server enforces, said before the save round trip.
+  for (const rule of form.rules ?? []) {
+    for (const action of rule.actions ?? []) {
+      if (action.type !== 'action.tracePathSchedule') continue;
+      for (const e of tracePathScheduleParamErrors('', action.params ?? {})) {
+        errs.push(e.replace('action.tracePathSchedule "" ', 'Scheduled trace paths: '));
+      }
     }
   }
   if (form.trigger.type === 'trigger.schedule') {
@@ -192,12 +220,15 @@ function AutomationsList() {
         <button className="ae-btn" onClick={() => setBrowsing(true)}>Browse templates</button>
       </div>
       {error && <div className="ae-error-list">{error}</div>}
+      <TelemetryTriggerNotice automations={items} />
       {items.length === 0 && <div className="ae-empty">No automations yet. Create one to get started.</div>}
-      {items.map((a) => (
+      {items.map((a) => {
+        const windowStatus = scheduleStatus(a.config, Date.now());
+        return (
         <div className="ae-card" key={a.id}>
           <div className="ae-row">
             <div className="ae-row-main">
-              <div className="ae-row-title">{a.name}<span className="ae-chip">{triggerLabel(a)}</span></div>
+              <div className="ae-row-title">{a.name}<span className="ae-chip">{triggerLabel(a)}</span>{windowStatus && <span className="ae-chip">{windowStatus}</span>}</div>
               {a.description && <div className="ae-muted">{a.description}</div>}
             </div>
             <div className="ae-btn-row">
@@ -211,7 +242,8 @@ function AutomationsList() {
             </div>
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -294,39 +326,7 @@ function AutomationEditor({ automation, onClose }: { automation: Automation | 'n
     apiService.get<{ regions: Array<{ name: string }> }>('/api/automations/regions')
       .then((r) => setRegions((r.regions ?? []).map((x) => x.name)))
       .catch(() => setRegions([]));
-    apiService.get<Array<{
-      nodeNum: number;
-      longName?: string;
-      shortName?: string;
-      nodeId?: string;
-      mobile?: number;
-      isMobile?: boolean;
-      asset?: { retentionDays: number };
-      user?: { id?: string; longName?: string; shortName?: string };
-    }>>('/api/nodes')
-      .then((list) => {
-        const rows = Array.isArray(list) ? list : [];
-        setNodes(rows
-          .filter((n) => {
-            const num = Number(n.nodeNum);
-            // Drop broadcast / unset MeshCore stubs from the hand-picker.
-            return Number.isFinite(num) && num > 0 && num !== 0xffffffff;
-          })
-          .map((n) => {
-            const nodeNum = Number(n.nodeNum);
-            const nodeId = n.nodeId || n.user?.id || `!${(nodeNum >>> 0).toString(16).padStart(8, '0')}`;
-            return {
-              nodeNum,
-              longName: n.longName || n.user?.longName,
-              shortName: n.shortName || n.user?.shortName,
-              nodeId,
-              mobile: n.mobile,
-              isMobile: n.isMobile,
-              asset: n.asset,
-            };
-          }));
-      })
-      .catch(() => setNodes([]));
+    void loadNodeOptions().then(setNodes);
   }, []);
 
   const switchToJson = () => { setJsonText(JSON.stringify(compile(form), null, 2)); setMode('json'); };
@@ -350,6 +350,12 @@ function AutomationEditor({ automation, onClose }: { automation: Automation | 'n
     } else {
       try { config = JSON.parse(jsonText); } catch { setErrors(['Config is not valid JSON']); setSaving(false); return; }
     }
+    // #5697: an empty message is allowed (the user may be drafting) but the
+    // save says so, once, with a way back to the form.
+    const emptyLines = emptySendLines(config);
+    if (emptyLines.length > 0 && !window.confirm(
+      `Some steps will not send what you expect:\n\n${emptyLines.map((l) => `• ${l}`).join('\n')}\n\nSave anyway?`,
+    )) { setSaving(false); return; }
     try {
       const body = { name, description, enabled, config };
       if (isNew) await apiService.post('/api/automations', body);

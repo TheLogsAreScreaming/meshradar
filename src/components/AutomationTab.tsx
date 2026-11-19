@@ -7,6 +7,8 @@ import { useAutomation } from '../contexts/AutomationContext';
 import { useSettings } from '../contexts/SettingsContext';
 import { DeviceInfo, Channel } from '../types/device';
 import SectionNav from './SectionNav';
+import { UiIcon } from './icons';
+import sectionNavLayout from './SectionNav.module.css';
 import { automationNavItems } from './search/configSections';
 import { AutomationTokenReference } from './AutomationTokenReference';
 import { buildMeshtasticTokenGroups } from './meshtasticAutomationTokens';
@@ -24,6 +26,8 @@ import AutoAnnounceSection from './AutoAnnounceSection';
 import AutoResponderSection from './AutoResponderSection';
 import ForwardingSection from './forwarding/ForwardingSection';
 import { useSource } from '../contexts/SourceContext';
+import { useAuth } from '../contexts/AuthContext';
+import { AutomationEngineNoteContext } from './shared/config/automationEngineNoteContext';
 import AutoKeyManagementSection from './AutoKeyManagementSection';
 import TimerTriggersSection from './TimerTriggersSection';
 import GeofenceTriggersSection from './GeofenceTriggersSection';
@@ -50,6 +54,12 @@ interface AutomationTabProps {
 const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes, currentNodeId, txDisabled = false }) => {
   const { t } = useTranslation();
   const { sourceId } = useSource();
+  const { hasPermission } = useAuth();
+  // #5807: UI gating only (the server enforces). Outside a SourceProvider
+  // there is no source to check, so fall back to a grant on any source rather
+  // than locking every section for non-admins in legacy views.
+  const canWrite = hasPermission('automation', 'write', sourceId ? { sourceId } : { anySource: true });
+  const canReadEngine = hasPermission('automations', 'read');
   const forwardingChannels = React.useMemo(
     () => channels.map(c => ({ index: c.id, name: c.displayName || c.name || '' })).sort((a, b) => a.index - b.index),
     [channels],
@@ -74,6 +84,7 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
     autoAckMessageDirect, setAutoAckMessageDirect,
     autoAckChannels, setAutoAckChannels,
     autoAckSkipIncompleteNodes, setAutoAckSkipIncompleteNodes,
+    autoAckRespondToAutomation, setAutoAckRespondToAutomation,
     autoAckIgnoredNodes, setAutoAckIgnoredNodes,
     autoAckMatrix, setAutoAckMatrix,
     autoAckCooldownSeconds, setAutoAckCooldownSeconds,
@@ -81,12 +92,15 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
     autoAckMaxAttempts, setAutoAckMaxAttempts,
     autoAckHopLimit, setAutoAckHopLimit,
     autoAckMaxResponses, setAutoAckMaxResponses,
+    hopEmojiZeroHop, setHopEmojiZeroHop,
+    hopEmojiMqtt, setHopEmojiMqtt,
     autoAckTestMessages, setAutoAckTestMessages,
     autoAnnounceEnabled, setAutoAnnounceEnabled,
     autoAnnounceIntervalHours, setAutoAnnounceIntervalHours,
     autoAnnounceMessage, setAutoAnnounceMessage,
     autoAnnounceChannelIndexes, setAutoAnnounceChannelIndexes,
     autoAnnounceHopLimit, setAutoAnnounceHopLimit,
+    autoAnnounceSplitLongMessages, setAutoAnnounceSplitLongMessages,
     autoAnnounceOnStart, setAutoAnnounceOnStart,
     autoAnnounceUseSchedule, setAutoAnnounceUseSchedule,
     autoAnnounceSchedule, setAutoAnnounceSchedule,
@@ -102,6 +116,7 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
     autoResponderEnabled, setAutoResponderEnabled,
     autoResponderTriggers, setAutoResponderTriggers,
     autoResponderSkipIncompleteNodes, setAutoResponderSkipIncompleteNodes,
+    autoResponderRespondToAutomation, setAutoResponderRespondToAutomation,
     autoKeyManagementEnabled, setAutoKeyManagementEnabled,
     autoKeyManagementIntervalMinutes, setAutoKeyManagementIntervalMinutes,
     autoKeyManagementMaxExchanges, setAutoKeyManagementMaxExchanges,
@@ -118,8 +133,9 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
   } = useAutomation();
 
   return (
+    <AutomationEngineNoteContext.Provider value={canReadEngine}>
     <SaveBarGroup id="automation">
-      <div className="settings-tab">
+      <div className={`settings-tab ${sectionNavLayout.shell}`}>
         <SectionNav
           searchable
           searchPlaceholder={t('config_search.filter_automation', 'Search automations...')}
@@ -127,7 +143,7 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
           noMatchesLabel={t('config_search.no_sections', 'No matching sections')}
           items={automationNavItems(t)}
         />
-        <div className="settings-content">
+        <div className={`settings-content ${sectionNavLayout.body}`}>
           <AutomationTokenReference
             title={t('automation.tokens.title', 'Available message tokens')}
             intro={t(
@@ -142,7 +158,9 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
             })}
             footer={
               <>
-                {/* eslint-disable-line meshmonitor-ui/no-hardcoded-ui-glyph -- #3962 5.4 PR6: verbatim move from App.tsx (which predates this components/-scoped rule); UiIcon migration out of scope for this extraction */}💡 {t('automation.tokens.engine_tip', 'Want maximum flexibility? Try the')}{' '}
+                {/* UiIcon, not a hardcoded emoji (#4173 review L30). */}
+                <UiIcon name="info" size={14} />{' '}
+                {t('automation.tokens.engine_tip', 'Want maximum flexibility? Try the')}{' '}
                 <Link to="/automations" style={{ color: 'var(--color-accent-alt)', fontWeight: 'bold' }}>
                   {t('automation.engine_link', 'Automation Engine')}
                 </Link>{' '}
@@ -215,6 +233,7 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
               channels={channels}
               enabledChannels={autoAckChannels}
               skipIncompleteNodes={autoAckSkipIncompleteNodes}
+              respondToAutomation={autoAckRespondToAutomation}
               ignoredNodes={autoAckIgnoredNodes}
               matrix={autoAckMatrix}
               testMessages={autoAckTestMessages}
@@ -227,6 +246,10 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
               hopLimit={autoAckHopLimit}
               maxResponses={autoAckMaxResponses}
               onMaxResponsesChange={setAutoAckMaxResponses}
+              hopEmojiZeroHop={hopEmojiZeroHop}
+              onHopEmojiZeroHopChange={setHopEmojiZeroHop}
+              hopEmojiMqtt={hopEmojiMqtt}
+              onHopEmojiMqttChange={setHopEmojiMqtt}
               onHopLimitChange={setAutoAckHopLimit}
               baseUrl={baseUrl}
               onEnabledChange={setAutoAckEnabled}
@@ -235,9 +258,12 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
               onMessageDirectChange={setAutoAckMessageDirect}
               onChannelsChange={setAutoAckChannels}
               onSkipIncompleteNodesChange={setAutoAckSkipIncompleteNodes}
+              onRespondToAutomationChange={setAutoAckRespondToAutomation}
               onIgnoredNodesChange={setAutoAckIgnoredNodes}
               onMatrixChange={setAutoAckMatrix}
               onTestMessagesChange={setAutoAckTestMessages}
+              canWrite={canWrite}
+              receiveOnly={txDisabled}
             />
           </div>
           <div id="auto-announce">
@@ -257,6 +283,8 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
               onChannelIndexesChange={setAutoAnnounceChannelIndexes}
               hopLimit={autoAnnounceHopLimit}
               onHopLimitChange={setAutoAnnounceHopLimit}
+              splitLongMessages={autoAnnounceSplitLongMessages}
+              onSplitLongMessagesChange={setAutoAnnounceSplitLongMessages}
               onAnnounceOnStartChange={setAutoAnnounceOnStart}
               onUseScheduleChange={setAutoAnnounceUseSchedule}
               onScheduleChange={setAutoAnnounceSchedule}
@@ -266,6 +294,8 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
               onNodeInfoEnabledChange={setAutoAnnounceNodeInfoEnabled}
               onNodeInfoChannelsChange={setAutoAnnounceNodeInfoChannels}
               onNodeInfoDelayChange={setAutoAnnounceNodeInfoDelaySeconds}
+              canWrite={canWrite}
+              receiveOnly={txDisabled}
             />
           </div>
           <div id="auto-responder">
@@ -274,10 +304,14 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
               triggers={autoResponderTriggers}
               channels={channels}
               skipIncompleteNodes={autoResponderSkipIncompleteNodes}
+              respondToAutomation={autoResponderRespondToAutomation}
               baseUrl={baseUrl}
               onEnabledChange={setAutoResponderEnabled}
               onTriggersChange={setAutoResponderTriggers}
               onSkipIncompleteNodesChange={setAutoResponderSkipIncompleteNodes}
+              onRespondToAutomationChange={setAutoResponderRespondToAutomation}
+              canWrite={canWrite}
+              receiveOnly={txDisabled}
             />
           </div>
           {sourceId && (
@@ -312,6 +346,8 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
               channels={channels}
               baseUrl={baseUrl}
               onTriggersChange={setTimerTriggers}
+              canWrite={canWrite}
+              receiveOnly={txDisabled}
             />
           </div>
           <div id="geofence-triggers">
@@ -350,6 +386,7 @@ const AutomationTab: React.FC<AutomationTabProps> = ({ baseUrl, channels, nodes,
         </div>
       </div>
     </SaveBarGroup>
+    </AutomationEngineNoteContext.Provider>
   );
 };
 

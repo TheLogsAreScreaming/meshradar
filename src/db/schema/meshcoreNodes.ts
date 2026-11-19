@@ -48,6 +48,31 @@ export const meshcoreNodesSqlite = sqliteTable('meshcore_nodes', {
   // position? false = it did not, though latitude/longitude above still hold
   // the last known fix (#3504). NULL = unknown (no advert seen since 194).
   lastAdvertHadPosition: integer('lastAdvertHadPosition', { mode: 'boolean' }),
+  // #5909 (migration 215): did the latest ADVERT signature check out? Written
+  // only by meshcore_mqtt ingest. NULL = never checked (device sources, or a
+  // row that predates 215).
+  advertSignatureVerified: integer('advertSignatureVerified', { mode: 'boolean' }),
+  // #6281 (migration 227): security scanner flags. Written only by the scanner
+  // (setNodeSecurityFlags) and the clear route; upsertNode never touches them.
+  isExcessivePackets: integer('isExcessivePackets', { mode: 'boolean' }).default(false),
+  packetRatePerHour: integer('packetRatePerHour'),
+  advertRatePerHour: integer('advertRatePerHour'),
+  packetRateLastChecked: integer('packetRateLastChecked'), // ms
+  isTimeOffsetIssue: integer('isTimeOffsetIssue', { mode: 'boolean' }).default(false),
+  timeOffsetSeconds: integer('timeOffsetSeconds'),
+  timeOffsetSource: text('timeOffsetSource'), // 'advert' | 'message'
+  timeOffsetCheckedAt: integer('timeOffsetCheckedAt'), // ms
+  // #6274 (migration 230): set once this reporter's neighbour table has had its
+  // first evaluation. Only the neighbour watch writes it; upsertNode never does.
+  neighborWatchBaselinedAt: integer('neighborWatchBaselinedAt'), // ms
+  // #5842 (migration 206): MeshRadar-only location override, parallel to the
+  // Meshtastic `nodes.positionOverride*` columns. Advert ingest never writes
+  // these, and the override is never copied into latitude/longitude above.
+  positionOverrideEnabled: integer('positionOverrideEnabled', { mode: 'boolean' }).default(false),
+  latitudeOverride: real('latitudeOverride'),
+  longitudeOverride: real('longitudeOverride'),
+  altitudeOverride: real('altitudeOverride'),
+  positionOverrideIsPrivate: integer('positionOverrideIsPrivate', { mode: 'boolean' }).default(false),
 
   // Telemetry
   batteryMv: integer('batteryMv'),   // Battery voltage in millivolts
@@ -88,6 +113,15 @@ export const meshcoreNodesSqlite = sqliteTable('meshcore_nodes', {
   telemetryEnabled: integer('telemetryEnabled', { mode: 'boolean' }).default(false),
   telemetryIntervalMinutes: integer('telemetryIntervalMinutes').default(60),
   lastTelemetryRequestAt: integer('lastTelemetryRequestAt'),
+  // Retry-burst / cooldown state (migration 220, #6033). Distinct from
+  // lastTelemetryRequestAt (a request stamp) so a save or restart never
+  // re-arms a cooldown or resets the miss count. lastTelemetrySuccessAt is
+  // the last time a scheduled poll actually returned rows; telemetryMissCount
+  // is the consecutive empty/timeout count; telemetryCooldownUntil (epoch ms)
+  // blocks eligibility until it passes. NULL = none.
+  lastTelemetrySuccessAt: integer('lastTelemetrySuccessAt'),
+  telemetryMissCount: integer('telemetryMissCount').default(0),
+  telemetryCooldownUntil: integer('telemetryCooldownUntil'),
 
   // Per-node neighbours-retrieval config (migration 153, #4618). Read by the
   // MeshCoreNeighboursScheduler; a separate column set from the telemetry trio
@@ -99,8 +133,9 @@ export const meshcoreNodesSqlite = sqliteTable('meshcore_nodes', {
   // Per-node time-sync config (migration 156, #4916). Read by the
   // MeshCoreTimeSyncScheduler; a THIRD separate column set so time-sync,
   // telemetry, and neighbours each keep an independent per-node cadence.
-  // Default 720 min (12h) — one sync costs four packets on the air (login +
-  // reply, then `time <epoch>` + reply), so this is far slower than the
+  // Default 720 min (12h) — one sync costs 2-4 packets on the air
+  // (`time <epoch>` + reply, plus login + reply when no admin session is
+  // remembered, #5785), so this is far slower than the
   // 15-min Meshtastic auto time-sync default.
   timeSyncEnabled: integer('timeSyncEnabled', { mode: 'boolean' }).default(false),
   timeSyncIntervalMinutes: integer('timeSyncIntervalMinutes').default(720),
@@ -118,6 +153,9 @@ export const meshcoreNodesSqlite = sqliteTable('meshcore_nodes', {
   lastRoomPostAt: integer('lastRoomPostAt'),
   roomSyncFailureCount: integer('roomSyncFailureCount').default(0),
   roomSyncLastError: text('roomSyncLastError'),
+  // Last SUCCESSFUL room login from this source (migration 237, #6408).
+  // Non-NULL = joined: Room Sync may re-join with a blank-password ACL login.
+  lastRoomLoginOkAt: integer('lastRoomLoginOkAt'),
   roomCredential: text('roomCredential'),
 
   // MeshCore per-contact forwarding route (migration 068).
@@ -154,6 +192,24 @@ export const meshcoreNodesPostgres = pgTable('meshcore_nodes', {
   altitude: pgDoublePrecision('altitude'),
   positionSource: pgText('positionSource'),
   lastAdvertHadPosition: pgBoolean('lastAdvertHadPosition'),
+  // #5909 (migration 215): did the latest ADVERT signature check out? Written
+  // only by meshcore_mqtt ingest. NULL = never checked (device sources, or a
+  // row that predates 215).
+  advertSignatureVerified: pgBoolean('advertSignatureVerified'),
+  isExcessivePackets: pgBoolean('isExcessivePackets').default(false),
+  packetRatePerHour: pgInteger('packetRatePerHour'),
+  advertRatePerHour: pgInteger('advertRatePerHour'),
+  packetRateLastChecked: pgBigint('packetRateLastChecked', { mode: 'number' }),
+  isTimeOffsetIssue: pgBoolean('isTimeOffsetIssue').default(false),
+  timeOffsetSeconds: pgInteger('timeOffsetSeconds'),
+  timeOffsetSource: pgText('timeOffsetSource'),
+  timeOffsetCheckedAt: pgBigint('timeOffsetCheckedAt', { mode: 'number' }),
+  neighborWatchBaselinedAt: pgBigint('neighborWatchBaselinedAt', { mode: 'number' }),
+  positionOverrideEnabled: pgBoolean('positionOverrideEnabled').default(false),
+  latitudeOverride: pgDoublePrecision('latitudeOverride'),
+  longitudeOverride: pgDoublePrecision('longitudeOverride'),
+  altitudeOverride: pgDoublePrecision('altitudeOverride'),
+  positionOverrideIsPrivate: pgBoolean('positionOverrideIsPrivate').default(false),
 
   batteryMv: pgInteger('batteryMv'),
   uptimeSecs: pgBigint('uptimeSecs', { mode: 'number' }),
@@ -178,6 +234,10 @@ export const meshcoreNodesPostgres = pgTable('meshcore_nodes', {
   telemetryEnabled: pgBoolean('telemetryEnabled').default(false),
   telemetryIntervalMinutes: pgInteger('telemetryIntervalMinutes').default(60),
   lastTelemetryRequestAt: pgBigint('lastTelemetryRequestAt', { mode: 'number' }),
+  // Retry-burst / cooldown state (migration 220, #6033). See SQLite comment.
+  lastTelemetrySuccessAt: pgBigint('lastTelemetrySuccessAt', { mode: 'number' }),
+  telemetryMissCount: pgInteger('telemetryMissCount').default(0),
+  telemetryCooldownUntil: pgBigint('telemetryCooldownUntil', { mode: 'number' }),
 
   neighborsEnabled: pgBoolean('neighborsEnabled').default(false),
   neighborsIntervalMinutes: pgInteger('neighborsIntervalMinutes').default(60),
@@ -186,8 +246,9 @@ export const meshcoreNodesPostgres = pgTable('meshcore_nodes', {
   // Per-node time-sync config (migration 156, #4916). Read by the
   // MeshCoreTimeSyncScheduler; a THIRD separate column set so time-sync,
   // telemetry, and neighbours each keep an independent per-node cadence.
-  // Default 720 min (12h) — one sync costs four packets on the air (login +
-  // reply, then `time <epoch>` + reply), so this is far slower than the
+  // Default 720 min (12h) — one sync costs 2-4 packets on the air
+  // (`time <epoch>` + reply, plus login + reply when no admin session is
+  // remembered, #5785), so this is far slower than the
   // 15-min Meshtastic auto time-sync default.
   timeSyncEnabled: pgBoolean('timeSyncEnabled').default(false),
   timeSyncIntervalMinutes: pgInteger('timeSyncIntervalMinutes').default(720),
@@ -200,6 +261,7 @@ export const meshcoreNodesPostgres = pgTable('meshcore_nodes', {
   lastRoomPostAt: pgBigint('lastRoomPostAt', { mode: 'number' }),
   roomSyncFailureCount: pgInteger('roomSyncFailureCount').default(0),
   roomSyncLastError: pgText('roomSyncLastError'),
+  lastRoomLoginOkAt: pgBigint('lastRoomLoginOkAt', { mode: 'number' }),
   roomCredential: pgText('roomCredential'),
 
   outPath: pgText('out_path'),
@@ -231,6 +293,24 @@ export const meshcoreNodesMysql = mysqlTable('meshcore_nodes', {
   altitude: myDouble('altitude'),
   positionSource: myVarchar('positionSource', { length: 16 }),
   lastAdvertHadPosition: myBoolean('lastAdvertHadPosition'),
+  // #5909 (migration 215): did the latest ADVERT signature check out? Written
+  // only by meshcore_mqtt ingest. NULL = never checked (device sources, or a
+  // row that predates 215).
+  advertSignatureVerified: myBoolean('advertSignatureVerified'),
+  isExcessivePackets: myBoolean('isExcessivePackets').default(false),
+  packetRatePerHour: myInt('packetRatePerHour'),
+  advertRatePerHour: myInt('advertRatePerHour'),
+  packetRateLastChecked: myBigint('packetRateLastChecked', { mode: 'number' }),
+  isTimeOffsetIssue: myBoolean('isTimeOffsetIssue').default(false),
+  timeOffsetSeconds: myInt('timeOffsetSeconds'),
+  timeOffsetSource: myVarchar('timeOffsetSource', { length: 16 }),
+  timeOffsetCheckedAt: myBigint('timeOffsetCheckedAt', { mode: 'number' }),
+  neighborWatchBaselinedAt: myBigint('neighborWatchBaselinedAt', { mode: 'number' }),
+  positionOverrideEnabled: myBoolean('positionOverrideEnabled').default(false),
+  latitudeOverride: myDouble('latitudeOverride'),
+  longitudeOverride: myDouble('longitudeOverride'),
+  altitudeOverride: myDouble('altitudeOverride'),
+  positionOverrideIsPrivate: myBoolean('positionOverrideIsPrivate').default(false),
 
   batteryMv: myInt('batteryMv'),
   uptimeSecs: myBigint('uptimeSecs', { mode: 'number' }),
@@ -255,6 +335,10 @@ export const meshcoreNodesMysql = mysqlTable('meshcore_nodes', {
   telemetryEnabled: myBoolean('telemetryEnabled').default(false),
   telemetryIntervalMinutes: myInt('telemetryIntervalMinutes').default(60),
   lastTelemetryRequestAt: myBigint('lastTelemetryRequestAt', { mode: 'number' }),
+  // Retry-burst / cooldown state (migration 220, #6033). See SQLite comment.
+  lastTelemetrySuccessAt: myBigint('lastTelemetrySuccessAt', { mode: 'number' }),
+  telemetryMissCount: myInt('telemetryMissCount').default(0),
+  telemetryCooldownUntil: myBigint('telemetryCooldownUntil', { mode: 'number' }),
 
   neighborsEnabled: myBoolean('neighborsEnabled').default(false),
   neighborsIntervalMinutes: myInt('neighborsIntervalMinutes').default(60),
@@ -263,8 +347,9 @@ export const meshcoreNodesMysql = mysqlTable('meshcore_nodes', {
   // Per-node time-sync config (migration 156, #4916). Read by the
   // MeshCoreTimeSyncScheduler; a THIRD separate column set so time-sync,
   // telemetry, and neighbours each keep an independent per-node cadence.
-  // Default 720 min (12h) — one sync costs four packets on the air (login +
-  // reply, then `time <epoch>` + reply), so this is far slower than the
+  // Default 720 min (12h) — one sync costs 2-4 packets on the air
+  // (`time <epoch>` + reply, plus login + reply when no admin session is
+  // remembered, #5785), so this is far slower than the
   // 15-min Meshtastic auto time-sync default.
   timeSyncEnabled: myBoolean('timeSyncEnabled').default(false),
   timeSyncIntervalMinutes: myInt('timeSyncIntervalMinutes').default(720),
@@ -277,6 +362,7 @@ export const meshcoreNodesMysql = mysqlTable('meshcore_nodes', {
   lastRoomPostAt: myBigint('lastRoomPostAt', { mode: 'number' }),
   roomSyncFailureCount: myInt('roomSyncFailureCount').default(0),
   roomSyncLastError: myVarchar('roomSyncLastError', { length: 32 }),
+  lastRoomLoginOkAt: myBigint('lastRoomLoginOkAt', { mode: 'number' }),
   roomCredential: myVarchar('roomCredential', { length: 1024 }),
 
   outPath: myVarchar('out_path', { length: 255 }),

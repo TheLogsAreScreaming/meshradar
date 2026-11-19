@@ -20,6 +20,7 @@ import { PermissionTestHelper } from '../test-helpers/permissionTestHelper.js';
 import { UserTestHelper } from '../test-helpers/userTestHelper.js';
 import { migration as baselineMigration } from '../migrations/001_v37_baseline.js';
 import { migration as sourceIdPermsMigration } from '../migrations/022_add_source_id_to_permissions.js';
+import { migration as passkeysMigration } from '../migrations/207_create_user_passkeys.js';
 
 // Mock dependencies before importing routes
 vi.mock('../../services/database.js', () => ({
@@ -87,6 +88,10 @@ const meshcoreManager = {
     const result = await meshcoreManager.loginToNode(publicKey, password);
     return { result: result || null, outcome: result ? 'ok' : 'rejected', attempts: 1 };
   }),
+  // #5785 remembered admin sessions.
+  recordAdminSession: vi.fn().mockResolvedValue(undefined),
+  clearAdminSession: vi.fn().mockResolvedValue(undefined),
+  getAdminSession: vi.fn().mockResolvedValue({ active: false, loggedInAt: null, isAdmin: null, reason: 'none' }),
   requestNodeStatus: vi.fn().mockResolvedValue({ batteryMv: 4200, uptimeSecs: 3600 }),
   requestNodeStatusDetailed: vi.fn(async (publicKey: string) => ({
     status: await meshcoreManager.requestNodeStatus(publicKey),
@@ -253,6 +258,8 @@ describe('MeshCore Routes', () => {
     baselineMigration.up(db);
     // Add sourceId column to permissions (migration 022)
     sourceIdPermsMigration.up(db);
+    // Passkey columns on users (migration 207, #5841)
+    passkeysMigration.up(db);
 
     const drizzleDb = drizzle(db, { schema });
     const authRepo = new AuthRepository(drizzleDb, 'sqlite');
@@ -553,6 +560,42 @@ describe('MeshCore Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.error).toContain('port');
     });
+
+    // SSRF-05 (issue #6080): a TCP connect must not be usable to reach loopback,
+    // link-local or cloud-metadata addresses.
+    it('should reject a loopback tcpHost', async () => {
+      const response = await authenticatedAgent
+        .post('/api/sources/test-source/meshcore/connect')
+        .send({ connectionType: 'tcp', tcpHost: '127.0.0.1', tcpPort: 8000 });
+      expect(response.status).toBe(400);
+      expect(response.body.error).toMatch(/not permitted/i);
+    });
+
+    it('should reject the IPv4-mapped IPv6 loopback tcpHost (hex-group bypass)', async () => {
+      const response = await authenticatedAgent
+        .post('/api/sources/test-source/meshcore/connect')
+        .send({ connectionType: 'tcp', tcpHost: '::ffff:7f00:1', tcpPort: 8000 });
+      expect(response.status).toBe(400);
+      expect(response.body.error).toMatch(/not permitted/i);
+    });
+
+    it('should reject the cloud-metadata tcpHost', async () => {
+      const response = await authenticatedAgent
+        .post('/api/sources/test-source/meshcore/connect')
+        .send({ connectionType: 'tcp', tcpHost: '169.254.169.254', tcpPort: 80 });
+      expect(response.status).toBe(400);
+      expect(response.body.error).toMatch(/not permitted/i);
+    });
+
+    it('should allow a LAN (RFC1918) tcpHost — connecting to a local device is the feature', async () => {
+      const response = await authenticatedAgent
+        .post('/api/sources/test-source/meshcore/connect')
+        .send({ connectionType: 'tcp', tcpHost: '192.168.1.50', tcpPort: 5000 });
+      // Host validation passes (RFC1918 allowed); the stub manager.connect
+      // resolves, so the route returns 200.
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+    });
   });
 
   describe('POST /api/sources/test-source/meshcore/messages/send', () => {
@@ -847,6 +890,10 @@ describe('MeshCore Routes', () => {
       ['clkreboot'],
       ['factory reset'],
       ['set factory mode'],
+      ['poweroff'],
+      ['shutdown'],
+      [`set prv.key ${'ab'.repeat(64)}`],
+      ['SET   prv.key abcd'],
     ])('rejects danger command %s without confirm', async (cmd) => {
       const response = await authenticatedAgent
         .post('/api/sources/test-source/meshcore/admin/cli')
@@ -996,6 +1043,10 @@ describe('MeshCore Routes', () => {
       ['clkreboot'],
       ['factory reset'],
       ['set factory mode'],
+      ['poweroff'],
+      ['shutdown'],
+      [`set prv.key ${'ab'.repeat(64)}`],
+      ['SET   prv.key abcd'],
     ])('rejects danger command %s without confirm', async (cmd) => {
       const response = await authenticatedAgent
         .post('/api/sources/test-source/meshcore/cli')
@@ -1366,7 +1417,7 @@ describe('MeshCore Routes', () => {
       const response = await authenticatedAgent
         .post('/api/sources/test-source/meshcore/config/sync-time');
       expect(response.status).toBe(409);
-      expect(response.body.error).toMatch(/Companion device/i);
+      expect(response.body.error).toMatch(/Companion/i);
     });
 
     it('returns 502 with the real reason when the device rejects the command (issue #3570)', async () => {
@@ -1769,7 +1820,7 @@ describe('MeshCore Routes', () => {
       expect(res.body.data).toMatchObject({ type: 'status', written: 16 });
       expect(requestTelemetryForNode).toHaveBeenCalledWith(
         meshcoreManager,
-        { publicKey: POLL_PUBKEY, advType: 2 },
+        { publicKey: POLL_PUBKEY, advType: 2, name: null },
         { includeStatus: true, includeLpp: false },
       );
       expect(meshcoreManager.recordMeshTx).toHaveBeenCalledTimes(1);
@@ -1798,7 +1849,7 @@ describe('MeshCore Routes', () => {
       expect(res.status).toBe(200);
       expect(requestTelemetryForNode).toHaveBeenCalledWith(
         meshcoreManager,
-        { publicKey: POLL_PUBKEY, advType: null },
+        { publicKey: POLL_PUBKEY, advType: null, name: null },
         { includeStatus: false, includeLpp: true },
       );
     });
@@ -2001,7 +2052,7 @@ describe('MeshCore Routes', () => {
     });
 
     it('rejects a sub-floor interval — the 1-hour floor is server-enforced', async () => {
-      // A time-sync costs four packets on the air, so a mistyped small value
+      // A time-sync costs 2-5 packets on the air (#5785), so a mistyped small value
       // must not be accepted just because the UI happened to allow it.
       const res = await authenticatedAgent
         .patch(`/api/sources/test-source/meshcore/nodes/${TS_PUBKEY}/time-sync-config`)
@@ -2309,6 +2360,18 @@ describe('MeshCore Routes', () => {
         .delete(`/api/sources/test-source/meshcore/contacts/${VALID_PUBKEY}`);
       expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
+    });
+
+    it('succeeds for a leftover non-key row that has nothing stored (#5774)', async () => {
+      // A corrupted room-post author prefix: not 64-hex, no row, no memory entry.
+      const GHOST = '6afffdfffdfffd';
+      meshcoreManager.removeContact.mockResolvedValueOnce(false);
+      meshcoreManager.forgetLocalContact.mockResolvedValueOnce(false);
+      const response = await authenticatedAgent
+        .delete(`/api/sources/test-source/meshcore/contacts/${GHOST}`);
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ success: true, removed: false });
+      expect(meshcoreManager.forgetLocalContact).toHaveBeenCalledWith(GHOST);
     });
 
     it('returns 404 when the source has no registered manager', async () => {
@@ -2886,6 +2949,23 @@ describe('MeshCore Routes', () => {
     const VALID_KEY = 'a'.repeat(128); // 128 hex chars = 64-byte expanded key
 
     describe('POST (import)', () => {
+      // P9 #6255: restoring a key is admin only (both protocols).
+      let adminAgent: ReturnType<typeof request.agent>;
+      beforeEach(async () => {
+        const adminName = `keyadmin${Date.now()}${Math.floor(Math.random() * 1e6)}`;
+        await userModel.create({ username: adminName, password: 'password123', authProvider: 'local', isAdmin: true });
+        adminAgent = request.agent(app);
+        await adminAgent.post('/api/auth/login').send({ username: adminName, password: 'password123' });
+      });
+
+      it('403 for a non-admin with configuration:write', async () => {
+        const response = await authenticatedAgent
+          .post('/api/sources/test-source/meshcore/config/private-key')
+          .send({ privateKey: VALID_KEY, confirm: true });
+        expect(response.status).toBe(403);
+        expect(meshcoreManager.importPrivateKey).not.toHaveBeenCalled();
+      });
+
       it('requires authentication', async () => {
         const response = await request(app)
           .post('/api/sources/test-source/meshcore/config/private-key')
@@ -2894,7 +2974,7 @@ describe('MeshCore Routes', () => {
       });
 
       it('requires confirm:true (destructive identity replace)', async () => {
-        const response = await authenticatedAgent
+        const response = await adminAgent
           .post('/api/sources/test-source/meshcore/config/private-key')
           .send({ privateKey: VALID_KEY });
         expect(response.status).toBe(400);
@@ -2903,7 +2983,7 @@ describe('MeshCore Routes', () => {
       });
 
       it('rejects keys shorter than 128 hex chars', async () => {
-        const response = await authenticatedAgent
+        const response = await adminAgent
           .post('/api/sources/test-source/meshcore/config/private-key')
           .send({ privateKey: 'a'.repeat(64), confirm: true }); // 64 hex = old (wrong) length
         expect(response.status).toBe(400);
@@ -2912,7 +2992,7 @@ describe('MeshCore Routes', () => {
       });
 
       it('rejects keys with invalid hex characters', async () => {
-        const response = await authenticatedAgent
+        const response = await adminAgent
           .post('/api/sources/test-source/meshcore/config/private-key')
           .send({ privateKey: 'g'.repeat(128), confirm: true });
         expect(response.status).toBe(400);
@@ -2922,7 +3002,7 @@ describe('MeshCore Routes', () => {
 
       it('accepts a valid 128-char hex key', async () => {
         meshcoreManager.importPrivateKey.mockResolvedValueOnce(true);
-        const response = await authenticatedAgent
+        const response = await adminAgent
           .post('/api/sources/test-source/meshcore/config/private-key')
           .send({ privateKey: VALID_KEY, confirm: true });
         expect(response.status).toBe(200);
@@ -2932,7 +3012,7 @@ describe('MeshCore Routes', () => {
 
       it('returns 409 when the device rejects the import', async () => {
         meshcoreManager.importPrivateKey.mockResolvedValueOnce(false);
-        const response = await authenticatedAgent
+        const response = await adminAgent
           .post('/api/sources/test-source/meshcore/config/private-key')
           .send({ privateKey: VALID_KEY, confirm: true });
         expect(response.status).toBe(409);

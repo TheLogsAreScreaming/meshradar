@@ -17,6 +17,7 @@ import { SourceNav, type SourceNavItem } from '../nav/SourceNav';
 import type { ReticulumView } from '../../types/reticulum';
 import {
   DEVICE_CONFIGURATION_NAV_ENTRY,
+  MAP_NAV_ENTRY,
   SOURCE_SETTINGS_NAV_ENTRY,
   sharedSourceNavPresentation,
   type SharedSourceNavEntry,
@@ -31,9 +32,12 @@ interface ReticulumSubToolbarProps {
   onSelect: (view: ReticulumView) => void;
   expanded: boolean;
   onToggleExpanded: () => void;
-  /** Source connection mode; the 'configuration' item is shown only for 'own'
-   *  mode (editable RNode radio config exists only when the bridge owns the
-   *  radio), mirroring how MeshCore hides Meshtastic-only panels. */
+  /** Shared "Pin sidebar" state (#5481/#6118); the toggle shows when both are set. */
+  pinned?: boolean;
+  onTogglePin?: () => void;
+  /** Source connection mode. Not used to filter items any more: the
+   *  'configuration' page holds the LXMF identity settings in every mode
+   *  (#6011); only its RNode radio sections are own-mode only. */
   sourceMode?: string | null;
 }
 
@@ -52,8 +56,9 @@ const ITEMS: Item[] = [
   // Not mode-gated: the path table exists in every mode (build spec §4.4).
   { id: 'paths', labelKey: 'reticulum.nav.paths', fallback: 'Paths', icon: 'route' },
   // 'map' (Phase 3) — peer positions shared via Sideband telemetry. Always shown.
-  { id: 'map', labelKey: 'reticulum.nav.map', fallback: 'Map', icon: 'map' },
-  // 'configuration' (Phase 3) — editable RNode radio config; own-mode only (filtered below).
+  { id: 'map', ...MAP_NAV_ENTRY },
+  // 'configuration' — LXMF identity (every mode, #6011) plus, in own mode,
+  // the editable RNode radio config (Phase 3).
   // Icon + label shared with every source type (#5683): never spell them here.
   { id: 'configuration', ...DEVICE_CONFIGURATION_NAV_ENTRY },
   { id: 'info', labelKey: 'reticulum.nav.info', fallback: 'Info', icon: 'info' },
@@ -70,20 +75,18 @@ export const ReticulumSubToolbar: React.FC<ReticulumSubToolbarProps> = ({
   onSelect,
   expanded,
   onToggleExpanded,
-  sourceMode,
+  pinned,
+  onTogglePin,
 }) => {
   const { t } = useTranslation();
 
   const items = useMemo<SourceNavItem[]>(() => (
-    ITEMS
-      // 'configuration' (editable RNode radio config) exists only in 'own' mode.
-      .filter(item => item.id !== 'configuration' || sourceMode === 'own')
-      .map(item => ({
-        id: item.id,
-        ...sharedSourceNavPresentation(item, t),
-        onClick: () => onSelect(item.id),
-      }))
-  ), [t, onSelect, sourceMode]);
+    ITEMS.map(item => ({
+      id: item.id,
+      ...sharedSourceNavPresentation(item, t),
+      onClick: () => onSelect(item.id),
+    }))
+  ), [t, onSelect]);
 
   return (
     <SourceNav
@@ -93,6 +96,10 @@ export const ReticulumSubToolbar: React.FC<ReticulumSubToolbarProps> = ({
       collapsed={!expanded}
       mobileVariant="bottom-bar"
       onToggleCollapsed={onToggleExpanded}
+      pinned={pinned}
+      onTogglePin={onTogglePin}
+      pinLabel={t('nav.pin_sidebar', 'Pin sidebar')}
+      unpinLabel={t('nav.unpin_sidebar', 'Unpin sidebar')}
       collapseLabel={t('reticulum.nav.collapse', 'Collapse')}
       expandLabel={t('reticulum.nav.expand', 'Expand')}
       ariaLabel={t('reticulum.nav.label', 'Reticulum navigation')}

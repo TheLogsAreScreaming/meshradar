@@ -27,6 +27,19 @@ export interface NodeSourceRef {
   protocol: 'Meshtastic' | 'MeshCore';
 }
 
+/**
+ * One gateway that relayed this node, attached by mergeUnifiedSourceData
+ * (#6175). `sourceId` ties it to its owning MQTT source so the popup can nest
+ * gateway chips under that source's "Seen by" row.
+ */
+export interface NodeGatewayRef {
+  sourceId: string;
+  gatewayId: string;
+  gatewayNodeNum: number | null;
+  receptionCount: number;
+  lastHeard: number;
+}
+
 export interface NodeCardMeshCoreDetails {
   publicKey: string;
   rssi?: number;
@@ -51,6 +64,8 @@ export interface NodeCardModel {
   hops?: number | null;
   snr?: number | null;
   battery?: number | null;
+  /** Battery volts (MeshCore: batteryMv / 1000). Unset for Meshtastic. */
+  voltage?: number | null;
   altitude?: number | null;
   /** Meshtastic position precision (0-32 bits). Rendered as a human accuracy
    *  estimate ("~91 m") via `formatPrecisionAccuracy`; 0/null hidden. (#4176) */
@@ -71,6 +86,10 @@ export interface NodeCardModel {
    *  epoch-ms `firstHeard` is divided down like `lastHeard`). Null = unknown. */
   firstHeard?: number | null;
   sources?: NodeSourceRef[];
+  /** Gateways that relayed this node on MQTT sources (#6175), attached on
+   *  Unified rows. Drives the "Seen by" gateway chips and the colour-by-gateway
+   *  map ring. Absent when no MQTT source saw the node / capture is disabled. */
+  gateways?: NodeGatewayRef[];
   /** The row's own source, on per-source payloads (a Dashboard source view).
    *  Unified rows carry `sources` instead. Used by the #5374 flight-match line. */
   sourceId?: string;
@@ -92,6 +111,8 @@ export interface NodeCardModel {
   aircraftAgedOut?: boolean;
   /** #5364/#5365 Phase 2: carries the sticky "reclassified as fixed" mark. */
   aircraftFixed?: boolean;
+  /** #5715: a person's mark ('not_aircraft' | 'aircraft'); null/absent when none. */
+  aircraftManualMark?: 'not_aircraft' | 'aircraft' | null;
   /** #5363: the shown position is the mirror of this reported pair. Null
    *  (or absent) when the position was not auto-corrected. */
   signFlipReported?: { latitude: number; longitude: number } | null;
@@ -135,6 +156,8 @@ function toMeshtasticModel(raw: unknown, opts?: ToNodeCardModelOptions): NodeCar
   const nodeNum = typeof node.nodeNum === 'number' ? node.nodeNum : undefined;
 
   const longName = pick<string>(node, 'longName', 'longName')
+    ?? pick<string>(node, 'shortName', 'shortName')
+    ?? pick<string>(node, 'nodeId', 'id')
     ?? opts?.nodeFallbackLabel
     ?? (nodeNum !== undefined ? `Node ${nodeNum}` : 'Unknown');
   const shortName = pick<string>(node, 'shortName', 'shortName');
@@ -171,6 +194,7 @@ function toMeshtasticModel(raw: unknown, opts?: ToNodeCardModelOptions): NodeCar
   const positionTimestamp = typeof node.positionTimestamp === 'number' ? node.positionTimestamp : null;
 
   const sources = Array.isArray(node.sources) ? (node.sources as NodeSourceRef[]) : undefined;
+  const gateways = Array.isArray(node.gateways) ? (node.gateways as NodeGatewayRef[]) : undefined;
   const sourceId = typeof node.sourceId === 'string' && node.sourceId ? node.sourceId : undefined;
 
   // Likely-aircraft classification (#5364/#5365 Phase 1) — flat top-level
@@ -181,6 +205,8 @@ function toMeshtasticModel(raw: unknown, opts?: ToNodeCardModelOptions): NodeCar
   // Phase 2 marks (#5364/#5365): same predicate as the map's aged-out filter.
   const aircraftAgedOut = node.isIgnored === true && typeof node.aircraftAgedOutAt === 'number';
   const aircraftFixed = typeof node.aircraftFixedAt === 'number';
+  const aircraftManualMark =
+    node.aircraftManualMark === 'not_aircraft' || node.aircraftManualMark === 'aircraft' ? node.aircraftManualMark : null;
   // #5363: set by the server's sign-flip correction, flat on both node shapes.
   const signFlipReported =
     node.positionSignFlipCorrected === true
@@ -207,6 +233,7 @@ function toMeshtasticModel(raw: unknown, opts?: ToNodeCardModelOptions): NodeCar
     lastHeard,
     firstHeard,
     sources,
+    gateways,
     sourceId,
     isFavorite: node.isFavorite === true,
     likelyAircraft,
@@ -214,6 +241,7 @@ function toMeshtasticModel(raw: unknown, opts?: ToNodeCardModelOptions): NodeCar
     heightAboveGround,
     aircraftAgedOut,
     aircraftFixed,
+    aircraftManualMark,
     signFlipReported,
   };
 }
@@ -229,6 +257,7 @@ function toMeshCoreModel(raw: unknown): NodeCardModel {
   const outPath = typeof c.outPath === 'string' ? c.outPath : undefined;
   const lastSeen = typeof c.lastSeen === 'number' ? c.lastSeen : undefined;
   const firstHeardMs = typeof c.firstHeard === 'number' ? c.firstHeard : undefined;
+  const voltage = typeof c.batteryMv === 'number' && c.batteryMv > 0 ? c.batteryMv / 1000 : null;
   // #5363: set by the server's sign-flip correction on MeshCore rows too.
   const signFlipReported =
     c.positionSignFlipCorrected === true
@@ -238,10 +267,11 @@ function toMeshCoreModel(raw: unknown): NodeCardModel {
       : null;
 
   return {
-    longName: advName || name || 'MeshCore',
+    longName: advName || name || (publicKey ? `${publicKey.slice(0, 12)}…` : 'MeshCore'),
     nodeId: publicKey || undefined,
     lastHeard: lastSeen !== undefined ? Math.floor(lastSeen / 1000) : null,
     firstHeard: firstHeardMs !== undefined ? Math.floor(firstHeardMs / 1000) : null,
+    voltage,
     meshcore: { publicKey, rssi, snr, pathLen, outPath, lastSeen },
     // Aircraft classification is Meshtastic-only (D2, #5364/#5365) — a
     // MeshCore contact is never flagged.

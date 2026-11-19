@@ -3,8 +3,8 @@
 MeshMonitor supports two notification methods: **Web Push** notifications for browsers/PWAs and **Apprise** for external notification services. Choose the method that works best for your needs, or use both!
 
 ::: tip 4.0 — notifications are scoped
-- **Per-user, per-source Apprise URLs** — set from **Settings → Notifications**; each user configures their own URLs for each source they subscribe to, so home-source alerts can go to your phone without spamming the warehouse-mesh Discord channel.
-- **Security Digest Apprise URL** — a single admin-set URL in **Settings → Security** that fires the weak-key / duplicate-key digest, independent of any user's preferences.
+- **Per-user, per-source Apprise URLs** — set on each source's **Notifications** tab; each user configures their own URLs for each source they subscribe to, so home-source alerts can go to your phone without spamming the warehouse-mesh Discord channel.
+- **Security Digest Apprise URL** — a single admin-set URL on the **Security** tab that fires the weak-key / duplicate-key digest, independent of any user's preferences.
 :::
 
 ![Notifications](/images/features/notifications.png)
@@ -356,10 +356,10 @@ Admins can send test notifications:
 1. Go to **Configuration → Notifications**
 2. Scroll to "Test Notifications" section
 3. Click **"🧪 Send Test Notification"**
-4. All subscribed users (including yourself) will receive a test notification
+4. Every browser **you** have subscribed receives a test notification
 
-::: warning Test Sends to ALL Users
-The test notification is sent to ALL subscribed users, not just the admin. Use sparingly!
+::: tip Only you receive the test
+The test goes to your own subscriptions, on every source you subscribed a browser on. Other users are not notified. The button shows only when this browser is subscribed.
 :::
 
 ## Apprise Notifications Setup
@@ -389,7 +389,7 @@ See the [full list of supported services](https://github.com/caronc/apprise#supp
 
 1. Navigate to **Configuration → Notifications** in MeshMonitor
 2. In the **Notification Services** section at the top, toggle **"Apprise Notifications"** to enabled (green border)
-3. Click **"Save Notification Settings"**
+3. Click **"Save Preferences"**
 4. The **Apprise Configuration** section will appear below
 
 ### Configuring Notification URLs
@@ -455,7 +455,7 @@ All configured services will receive notifications for new messages.
 After configuring your URLs:
 
 1. Click **"Save Configuration"** to save your Apprise URLs
-2. Click **"Test Connection"** to verify the configuration works
+2. Click **"Send Test Notification"** to verify the configuration works (admins only)
 3. You should receive test notifications on all configured services
 4. Send a test message in MeshMonitor to verify real notifications work
 
@@ -477,7 +477,7 @@ For complete URL format documentation for all services, see the [Apprise Wiki](h
 
 ### Persistent Configuration
 
-Apprise URLs are stored in `/data/apprise-config/urls.txt` inside the Docker container, which is mapped to the persistent `/data` volume. This means your Apprise configuration will survive:
+Apprise URLs are stored in the MeshMonitor database with the rest of your notification settings, per user and per source. This means your Apprise configuration will survive:
 
 - Container restarts
 - Container upgrades
@@ -489,7 +489,7 @@ Apprise URLs are stored in `/data/apprise-config/urls.txt` inside the Docker con
 Apprise URLs contain authentication tokens that allow sending notifications to your services. Keep these URLs secure:
 
 - Don't commit them to version control
-- Restrict access to the Notifications configuration page (admin only)
+- Each user's URLs are stored with that user's own settings and are not shown to other users
 - Rotate tokens if compromised
 - Use read-only or limited-permission tokens when possible
 :::
@@ -499,13 +499,13 @@ Apprise URLs contain authentication tokens that allow sending notifications to y
 #### URLs Not Saving
 
 - Check that you clicked **"Save Configuration"** after entering URLs
-- Verify the `/data` volume is writable
+- Check that you are on the source you meant to configure: URLs are saved per source
 - Check Docker logs for errors: `docker logs meshmonitor`
 
 #### Notifications Not Receiving
 
 1. Verify Apprise is enabled in Notification Services section
-2. Click **"Test Connection"** to verify URLs are correct
+2. Click **"Send Test Notification"** (admins only) to verify URLs are correct
 3. Check Docker logs for error messages:
    ```bash
    docker logs meshmonitor | grep -i apprise
@@ -522,7 +522,7 @@ Apprise URLs contain authentication tokens that allow sending notifications to y
 
 ## Muting Channels and DMs
 
-You can silence notifications for a specific channel or direct message conversation without disabling notifications globally. Mutes are stored on the server and apply across all your devices and browsers.
+You can silence notifications for a specific channel or direct message conversation without disabling notifications globally. Mutes are stored on the server, per source, and apply across all your devices and browsers. Muting a channel on one source does not mute it on another.
 
 ### Muting a Channel
 
@@ -561,9 +561,13 @@ If a message contains a keyword on your notification **whitelist**, it will stil
 Time-based mutes expire automatically — no server-side job runs. Expiry is checked at the moment each notification is evaluated, so a mute that expires while you are away is correctly lifted the next time a message arrives.
 :::
 
+### MeshCore Channels
+
+A MeshCore channel has the same bell button, in the conversation toolbar of the MeshCore **Channels** view, with the same choices. MeshCore channel messages raise no push, Apprise or sound alert, so there the mute only hides unread marks: the dot on the channel row, its share of the header total, and the sidebar Channels dot.
+
 ### Cross-Device Sync
 
-Mute preferences are stored in your user account on the MeshMonitor server (in `user_notification_preferences`). They apply regardless of which browser or device you use to access MeshMonitor.
+Mute preferences are stored in your user account on the MeshMonitor server (in `user_notification_preferences`), with the settings of the source they belong to. They apply regardless of which browser or device you use to access MeshMonitor.
 
 ## Notification Settings
 
@@ -576,15 +580,27 @@ Users can enable or disable notification services independently:
 
 Both services can be enabled simultaneously, and they share the same filtering preferences.
 
-### Settings Are Saved Per Source
+### Mesh-Wide Default and Per-Source Settings
 
-Every setting on the **Notifications** tab is saved for the source you are looking at, and only that source: the Web Push and Apprise switches, Apprise URLs, enabled channels, keyword lists, the direct message, emoji, MQTT, new-node, traceroute, server-event and waypoint toggles, and the message format. Channel numbers and node IDs mean different things on each source, so one source never uses another's settings.
+One set of notification settings covers the whole mesh. Open **Mesh-wide default** at the top of the **Notifications** tab to set the switches every source shares (Web Push, Apprise and its URLs, direct messages, emoji, MQTT, new nodes, traceroutes, inactive node, low battery, server events, waypoints, mentions, node-name prefix) and which sources Web Push may notify you about. The default applies to every source you can read that has no settings of its own. It never reaches a source you cannot read: every notification still checks your permission on the source it came from.
 
-A source you have never saved settings for uses the **built-in defaults**. The tab shows a note saying so, and the first **Save** creates that source's own settings.
+Channel choices and channel mutes are never mesh-wide, because channel numbers mean a different channel on each source. Set them on the source.
+
+The rest of the tab edits the source you are looking at. Saving there gives that source **its own settings**, which replace the mesh-wide default for that source only. The tab says which one a source uses; **Use mesh-wide default** drops the source's own settings again.
+
+::: info Upgrading to the mesh-wide default
+Settings you saved for a source before this change become that source's own settings, unchanged, so nothing you receive changes until you edit. Until you save a mesh-wide default, a source with no settings of its own uses the built-in defaults below, as before.
+:::
+
+### Settings Saved for a Source
+
+Every setting below the mesh-wide panel is saved for the source you are looking at, and only that source: the Web Push and Apprise switches, Apprise URLs, enabled channels, keyword lists, the direct message, emoji, MQTT, new-node, traceroute, server-event and waypoint toggles, and the message format. Channel numbers and node IDs mean different things on each source, so one source never uses another's settings.
+
+A source you have never saved settings for uses your mesh-wide default, or, until you save one, the **built-in defaults**. The tab shows a note saying so, and the first **Save** creates that source's own settings.
 
 | Setting | Built-in default |
 | --- | --- |
-| Web Push | On (you still have to subscribe the browser on that source) |
+| Web Push | On (you still have to subscribe this browser) |
 | Apprise | Off, no URLs |
 | Enabled channels | None |
 | Direct messages | On |
@@ -592,24 +608,26 @@ A source you have never saved settings for uses the **built-in defaults**. The t
 | MQTT messages | On |
 | Newly found nodes | Off |
 | Successful traceroutes | Off |
+| Automatic traces (MeshCore) | Off |
 | Server events | Off |
 | Waypoint arrivals | Off, 10 km radius |
+| Mentions (MeshCore) | Off |
 | Inactive node / low battery | Off (20 %, 3300 mV) |
 | Whitelist | Empty |
 | Blacklist | Empty |
 | Message format | The default template |
 
-So on a source you have not set up, you are notified of direct messages only, over Web Push, if this browser is subscribed on that source. Channel messages, new-node alerts and traceroute alerts are off until you turn them on and save.
+So on a source you have not set up, with no mesh-wide default, you are notified of direct messages only, over Web Push, if this browser is subscribed. Channel messages, new-node alerts and traceroute alerts are off until you turn them on and save.
 
-::: warning Changed in the next release
+::: warning Changed in 4.17
 A source with no saved settings used to borrow the settings you saved for another source: its channel ticks, keywords, toggles and Apprise URLs. It now uses the defaults above. If you run several sources and only ever saved settings on one, open the **Notifications** tab on each of the others and save what you want there. In particular, Apprise is off on a source until you turn it on and add URLs for that source, and channel, new-node and traceroute alerts are off until you turn them on. The defaults also changed: new-node and traceroute alerts used to default to on, and the keyword lists used to start with `Hi`, `Help` and `Test`, `Copy`. Settings you already saved are not changed.
 :::
 
 Three things are not per source:
 
 - **Channel and DM mutes** set before per-source mutes existed still apply on a Meshtastic source that has no settings of its own. They are copied into that source's settings on its first save.
-- **Inactive node and low battery alerts** use one watch list per user: the nodes you picked on any source's tab are watched wherever they appear, and the alert goes out through whichever of your sources has Web Push or Apprise set up.
-- **Web Push for new nodes, traceroutes and server events** goes only to browsers subscribed on the source the event came from, the same as message notifications.
+- **Inactive node and low battery alerts** use one watch list per user: the nodes you picked on any source's tab are watched wherever they appear, and the alert goes out through whichever of your sources has Web Push or Apprise set up. They are about the node, not the source: an inactive alert fires only when no source you can read still hears the node, and a low-battery alert fires once and lists every source that reports it.
+- **Web Push subscriptions** are one per browser for the whole mesh. Which sources may push to you is the **Web Push from** list in the mesh-wide default (every source you can read, or only the ones you tick). Subscribing from a source adds it to that list if you narrowed it. When you upgrade, each browser keeps one subscription, and the sources it was subscribed on become your list, so no browser starts or stops getting a source.
 
 ### Filtering Preferences
 
@@ -617,7 +635,7 @@ Notification filtering applies to **both Web Push and Apprise** notifications:
 
 - **Whitelist**: Keywords that always trigger notifications (highest priority)
 - **Blacklist**: Keywords that never trigger notifications (second priority)
-- **Emoji Reactions**: Enable/disable notifications for emoji-only messages (third priority)
+- **Emoji Reactions**: Enable/disable notifications for reactions: tapbacks and emoji-only messages (third priority)
 - **Newly Found Nodes**: Enable/disable notifications when new nodes are discovered
 - **Successful Traceroutes**: Enable/disable notifications for completed traceroute responses
 - **Waypoint Arrivals**: Enable/disable notifications when a waypoint arrives from the mesh nearby
@@ -627,7 +645,7 @@ Notification filtering applies to **both Web Push and Apprise** notifications:
 The filtering follows this priority order for **message notifications**:
 1. **Whitelist** → Always send notification if keyword matches
 2. **Blacklist** → Never send notification if keyword matches
-3. **Emoji Reactions** → Filter emoji-only messages if disabled
+3. **Emoji Reactions** → Filter tapbacks and emoji-only messages if disabled
 4. **Channel/DM Settings** → Send only if channel is enabled or DM is enabled
 
 **Special Event Notifications** (bypass message filtering):
@@ -636,7 +654,7 @@ The filtering follows this priority order for **message notifications**:
 - **Waypoint Arrivals** → Sent the first time a waypoint arrives from the mesh inside your radius (see below)
 
 ::: tip Emoji Reaction Filtering
-When "Emoji Reactions" is disabled, notifications will be suppressed for messages containing only emojis (e.g., "👍", "😀", "❤️"). Messages with emojis mixed with text will still trigger notifications normally. This is useful for reducing notification noise from emoji reactions and tapbacks.
+When "Emoji Reactions" is disabled, notifications are suppressed for tapbacks (reactions sent with the protocol's reaction flag, whatever they contain) and for messages containing only emojis (e.g., "👍", "😀", "❤️"), keycap emoji such as "1️⃣" included. Typed messages that mix emojis with text still trigger notifications normally.
 :::
 
 ::: info Special Event Notifications
@@ -675,7 +693,7 @@ Write a token as <code v-pre>{{ name }}</code>. Anything else in the template is
 | <code v-pre>{{ channelName }}</code> | Channel name. Empty for a direct message |
 | <code v-pre>{{ senderName }}</code> | Sender's long name |
 | <code v-pre>{{ senderShortName }}</code> | Sender's short name (the long name when there is none) |
-| <code v-pre>{{ text }}</code> | The message text, cut to 100 characters |
+| <code v-pre>{{ text }}</code> | The message text, cut to 100 characters unless you raise it (see [Message text length](#message-text-length)) |
 | <code v-pre>{{ serviceLabel }}</code> | Network type: Meshtastic, MeshCore, MQTT or Reticulum |
 | <code v-pre>{{ isDM }}</code> | `DM` for a direct message, empty otherwise |
 
@@ -691,8 +709,29 @@ Examples:
 
 - **One pair for channels and direct messages.** Your templates apply to both. For a direct message <code v-pre>{{ channelName }}</code> is empty, and a separator left dangling beside an empty token (`·`, `•`, `|`, `:`, `,`, `-`, `/`) is dropped, so <code v-pre>{{ channelName }} · {{ sourceName }}</code> reads `Home Base` for a DM, not `· Home Base`. The preview shows both cases.
 - **Unknown tokens are rejected when you save.** A typo such as <code v-pre>{{ source_name }}</code> is flagged under the field and the save fails with a message that names it. Only the seven tokens above are valid here; Automation tokens such as <code v-pre>{{ trigger.text }}</code> are not.
-- **Limits.** A title template can be 200 characters and a body template 500. The rendered title is cut at 150 characters and the body at 400. The title is one line; the body may have several.
+- **Limits.** A title template can be 200 characters and a body template 500. The rendered title is cut at 150 characters. The body is cut at 400, or at 300 more than your text length when that is larger (never more than 1000). The title is one line; the body may have several.
 - **Plain text only.** `<` and `>` are not allowed in a template, and nothing in a notification is treated as markup.
+
+#### Message text length
+
+By default the <code v-pre>{{ text }}</code> token shows the first 100 characters of a message. A Meshtastic message is at most about 230 characters and a MeshCore message about 160, so a longer limit shows most messages in full. Set it under **Message Notification Format**:
+
+- **Message text length: Web Push / desktop** applies to browser push and to desktop notifications.
+- **Message text length: Apprise** applies to Apprise targets. It appears when Apprise is on for the source.
+
+Pick a whole number from 20 to 1000, or leave the box empty to keep 100. Nothing changes until you set a value. Each setting is saved per user and per source, and applies to Meshtastic and MeshCore sources alike. It changes only how much text a notification shows, never who gets one or how many go out. Keyword filters always match the full message.
+
+Long text costs nothing on the mesh, but the receiving service may cut it:
+
+| Apprise target | Body limit |
+|---|---|
+| Discord | 2000 |
+| Pushover | 1024 |
+| Telegram | 4096 |
+| SMS targets | 160 |
+
+For a target with a short limit, add `?overflow=split` (send the rest as more messages) or `?overflow=truncate` (cut at the limit) to its Apprise URL. Web Push also shortens an oversized body by itself so the payload fits the push service's size limit.
+
 - **A template that renders to nothing falls back to the default**, so a notification is never blank.
 - **Filters are not affected.** Whitelist and blacklist keywords match the original message text, never the formatted notification. A template changes what a notification says, not whether it is sent.
 - **Prefix with Node Name still works.** With that option on, `[YourNodeName] ` goes in front of the body after your template is rendered. It never goes in the title.
@@ -739,18 +778,79 @@ None. This feature transmits nothing; it reacts to packets that already arrived.
 
 ### MeshCore Sources
 
-MeshCore sources have their own **Notifications** tab, and the settings are tailored to what MeshCore actually supports. Because MeshCore and Meshtastic expose different capabilities, the notification options shown for a MeshCore source are a subset:
+MeshCore sources have their own **Notifications** tab. Message notifications use the same rules as Meshtastic: the direct-message toggle, per-channel enable and mute, keyword allow/block lists, the emoji-reaction toggle and message templates. What the tab offers depends on the device:
 
-| Notification | MeshCore | Notes |
-|---|---|---|
-| **Low Battery** | ✅ | MeshCore reports battery as a **voltage (mV)**, so the threshold is in millivolts (default 3300 mV) rather than a 0–100 percentage. |
-| **Inactive Node** | ✅ | Alerts when a monitored MeshCore node hasn't been heard within the configured window. |
-| **Newly Found Nodes** | ✅ | Sent the first time a contact advertises (display name + device type: Companion / Repeater / Room Server). |
-| **Server Events** | ✅ | Source connect/disconnect/reconnect. |
-| **Web Push / Apprise / Monitored-node picker** | ✅ | Delivery and node selection work the same as Meshtastic. |
-| Direct Messages, Emoji Reactions, MQTT, Traceroutes, Waypoint arrivals, Channel selection, Keyword filtering, percentage battery threshold | ❌ | Hidden for MeshCore — these depend on Meshtastic-only protocol features or data. |
+| Notification | Companion | Repeater | Notes |
+|---|---|---|---|
+| **Direct messages and room posts** | ✅ | — | One toggle covers both. Muting a DM or a room in its view also silences its notifications. |
+| **Channel messages** | ✅ | ✅ | Pick channels in the list; it includes slots above 7 and keyed/virtual channels. A channel muted in the Channels view stays silent. A Repeater notifies only for channels it can decrypt. |
+| **Keywords, emoji reactions, templates** | ✅ | ✅ | Same as Meshtastic. |
+| **Successful traces and path discoveries** | ✅ | — | Uses the Traceroutes toggle for traces and discoveries you start. Failed or timed-out traces and pings do not notify. |
+| **Automatic traces and path discoveries** | ✅ | — | Off by default. Covers traces you did not start: auto-pathfinding, scheduled traces and automations. Auto-pathfinding can send about one alert per contact per day. |
+| **Low Battery** | ✅ | ✅ | MeshCore reports battery as a **voltage (mV)**, so the threshold is in millivolts (default 3300 mV) rather than a 0–100 percentage. |
+| **Inactive Node** | ✅ | ✅ | Alerts when a monitored MeshCore node hasn't been heard within the configured window. |
+| **Newly Found Nodes** | ✅ | ✅ | Sent the first time a contact advertises (display name + device type: Companion / Repeater / Room Server). A Repeater hears every advert on the mesh, so its alert is limited; see below. |
+| **Mentions** | ✅ | — | Sent when a channel message or room post names this source's own node as `@[Name]`. Off by default. See below. |
+| **Server Events** | ✅ | ✅ | Lost and restored connection to the source's radio. The first connect after start is silent; the Disconnect button notifies, a source edit or shutdown does not. |
+| **Web Push / Apprise / Desktop / Monitored-node picker** | ✅ | ✅ | Delivery and node selection work the same as Meshtastic. |
+| MQTT, Waypoint arrivals, percentage battery threshold | — | — | No MeshCore equivalent. |
 
-Preferences are saved per source, so a MeshCore source and a Meshtastic source can have independent thresholds. The monitored-node watch list is the exception: nodes picked on any source's tab are watched together (see [Settings Are Saved Per Source](#settings-are-saved-per-source)).
+**Volume.** Channel messages stay off until you pick channels. The same message heard on two of your sources notifies once, naming both. A mention and its message notify once. Your own messages never notify.
+
+### MeshCore MQTT Region Feeds
+
+A MeshCore MQTT ingest source has a **Notifications** tab on its page, for signed-in users. It has no radio, so it offers only what a feed can supply:
+
+| Notification | Notes |
+|---|---|
+| **Channel messages** | The picker lists channels this source has messages on, named by key (a channel shared by two sources is one channel), limited to the ones you can read. Nothing fires until you pick channels. |
+| **Keywords, emoji reactions, templates** | Same as Meshtastic. |
+| **Inactive Node, Low Battery** | Pick nodes in the monitored-node picker. Low battery reads the observer's reported voltage, in millivolts. |
+| **Server Events** | Startup, plus MQTT broker connection lost and restored (see below). |
+| Direct messages, traces, mentions, new nodes, MQTT, waypoints | Not available. A region feed has no radio and no own node. |
+
+**A region feed can be busy.** A channel such as Public can carry a whole region's traffic, and there is no rate cap: each channel you tick can send many alerts. Pick channels with care. The tab says so next to the picker.
+
+**Channels are named by key.** The feed decrypts with every key MeshMonitor holds and files each message under the channel that key belongs to, so the picker lists channels by name, not by slot number. Two sources that hold the same key share one channel. Older messages whose key could not be identified show as "Channel N (older messages)" and only admins see them.
+
+**Who receives what.** A user needs `messages:read` on the source. A channel message only reaches users who can read the key that opened it. The Public channel reaches every signed-in user with `messages:read` on the feed.
+
+**Broker connection alerts.** The same alerts exist for a Meshtastic MQTT bridge's upstream broker. A drop notifies only after the link stays down for **two minutes**, so a flapping link stays silent. A rejected login or an eviction stop notifies at once, because no retry is coming. A restore notifies once after a loss that notified. Saving or restarting the source never notifies. The alert names the source and never the broker address.
+
+**Who receives what.** A user needs `messages:read` on the source. A channel message a Repeater decrypted with another source's key only reaches users who can read that key; anonymous push subscribers never get it.
+
+**Clicking a notification** opens that channel, room or direct message on the MeshCore page.
+
+**Sounds.** The MeshCore **Settings** view has the same audio notification settings as Meshtastic: a master toggle and a sound per channel (direct messages and room posts share the DM sound).
+
+::: tip Upgrading
+Earlier versions hid the direct-message toggle for MeshCore but saved it as on. If you subscribed to push on a MeshCore source, you now start receiving its direct messages and room posts. Turn **Direct messages and room posts** off on that source's Notifications tab if you don't want them.
+:::
+
+**Repeater new-node alerts.** A Repeater source alerts on a node only when the node's advert carried a valid signature and the node is new to that source. Two limits apply, and neither is a setting:
+
+- **Learning period.** For 48 hours after the source first logs the mesh, nothing alerts, and nodes heard in that time never alert later. A Repeater that has logged for longer than that alerts from the first advert after you update. Only a **Purge non-favourite nodes** that removes nodes starts the period again. A restart, reconnect, source edit or preference change does not.
+- **Hourly cap.** At most 10 alerts per source per hour. Alerts over the cap are dropped, and the next alert that goes out ends with "(+N more new nodes since the last alert)".
+
+The counters are stored per source, so a restart cannot reopen a full hour. MeshMonitor sends nothing over the air for these alerts, and a Repeater never sends an Auto Welcome.
+
+::: tip Upgrading
+Earlier versions showed the **Newly Found Nodes** toggle on Repeater sources, then hid it. A Repeater source whose toggle was saved as on starts alerting once its learning period ends. Turn it off on that source's Notifications tab if you don't want these alerts.
+:::
+
+Preferences are saved per source, so a MeshCore source and a Meshtastic source can have independent thresholds. The monitored-node watch list is the exception: nodes picked on any source's tab are watched together (see [Settings Saved for a Source](#settings-saved-for-a-source)).
+
+#### MeshCore Mentions
+
+Turn on **Mentions** on a MeshCore source's **Notifications** tab to be alerted when someone names that source's node. MeshCore clients write a mention as `@[Name]`, and a reply starts with `@[Name]:`, so a reply to you alerts too.
+
+- The whole name must match the node's current name, ignoring case. `@[Bob]` does not alert a node called `Bobby`. If you rename the node, old mentions of the previous name no longer match.
+- Channel messages and room posts are checked. Direct messages are not.
+- **At most one alert per sender every 5 minutes**, per source. Other senders still get through. The limit is stored, so a restart does not reset it.
+- Your own messages, and senders you have ignored or blocked, never alert.
+- The alert goes to users who have the option on for that source and can read its messages. Channel selection and keyword filters do not apply to it, but a muted channel or room stays silent.
+- A mention and the message notification for the same message arrive as one alert.
+- A MeshCore MQTT source has no node of its own, so it has nothing to mention.
 
 ### Client-Side Settings (Web Push Only)
 
@@ -776,8 +876,51 @@ Notification permissions are controlled by the browser. If denied, you must rese
 
 **Apprise:**
 - Bundled Apprise API runs automatically in Docker container
-- Configuration stored in persistent `/data/apprise-config/` directory
+- Each user's Apprise URLs are stored in the database, per source
 - No environment variables required
+
+## One Notification When Several Sources Hear a Packet
+
+With two or more sources on the same mesh, each source that hears a packet used to raise its own notification. MeshMonitor now sends **one** notification per packet to each recipient, however many sources heard it.
+
+**What counts as the same packet:** the same sender, packet id and port number, heard again within **60 seconds** of the first copy. The window is fixed; it is not a setting. A copy that arrives later than that is a new notification. So is a packet with a different id or port, so a node's text, position and node info stay apart.
+
+This also covers MQTT: if a radio source and an MQTT source both deliver a packet, or a source hears its own packet come back through MQTT, you are alerted once.
+
+**Your settings for each source still decide.** Each source's copy is checked against your settings for *that* source (its own, or your mesh-wide default) and your permission on it. A copy that would not have notified you (channel off, muted, blacklisted, MQTT alerts off, no read permission, source not in your Web Push list) does not count and never uses up the notification. The first copy that passes is the one you get.
+
+**Which sources are named:** only sources whose copy passed your own checks. You never see the name of a source you cannot read.
+
+**What each delivery method does:**
+
+| Method | First copy | Later copies inside 60 s |
+|--------|-----------|--------------------------|
+| **Web Push** | Sent at once, naming the source that heard it first | The notification on screen is replaced, without a new sound or vibration, by one that lists every source: `LongFast · Hilltop, Valley`. A click opens the source that heard it first |
+| **Apprise** | Held for **5 seconds** to collect the sources | Copies inside those 5 seconds add their source; then **one** message lists them all. A copy after that is not sent |
+| **Desktop app** | Held for **5 seconds**, like Apprise | Same as Apprise. The list only names sources the user the notification is shown for can read |
+
+The 5-second hold starts at the first copy and never moves, so a stream of copies cannot delay or repeat the message. Saving settings does not touch it. On a clean shutdown, held messages are sent before the server stops.
+
+**Which events are covered:**
+
+| Event | Deduplicated across sources? |
+|-------|------------------------------|
+| Channel messages and direct messages (Meshtastic radio and MQTT) | Yes, by sender + packet id + port |
+| New MeshCore device | Yes, by the device's public key |
+| Waypoint alerts | Yes, by waypoint id |
+| New Meshtastic node | Yes. You get it from the first source **you** can read that heard the node, once |
+| Server events (start, node connect / disconnect) | **No.** These are about a source, so you get one per source |
+| Inactive node, low battery | Yes, by node: see [Settings Saved for a Source](#settings-saved-for-a-source) |
+| Traceroute results | No. A traceroute belongs to the source that ran it |
+| Security digest, automation notifications | No. A report and an explicit rule; neither is a packet |
+
+::: info After a restart
+The 60-second memory and the 5-second hold live in the server's memory only. If the server restarts between two copies of one packet, you may get one extra notification for that packet. A crash (not a clean shutdown) can lose Apprise or desktop messages still inside their 5-second hold.
+:::
+
+::: tip Custom templates
+When Web Push lists several sources, it re-renders the template you saved for the source that heard the packet first, with <code v-pre>{{ sourceName }}</code> set to the joined list. A template without <code v-pre>{{ sourceName }}</code> shows the same text for the update.
+:::
 
 ## Troubleshooting
 
@@ -994,9 +1137,12 @@ Content-Type: application/json
       "p256dh": "base64-encoded-key",
       "auth": "base64-encoded-key"
     }
-  }
+  },
+  "sourceId": "your-source-id"
 }
 ```
+
+`sourceId` is required. A browser subscribes once per source, and needs `messages:read` on that source.
 
 ### Unsubscribe from Push Notifications
 
@@ -1005,9 +1151,12 @@ POST /api/push/unsubscribe
 Content-Type: application/json
 
 {
-  "endpoint": "https://push.service.com/..."
+  "endpoint": "https://push.service.com/...",
+  "sourceId": "your-source-id"
 }
 ```
+
+This removes the subscription for that source only. The response carries `remainingSources`, the number of other sources the same browser is still subscribed on. `POST /api/push/unsubscribe-all` with only `endpoint` removes the browser from every source.
 
 ### Get VAPID Public Key
 
@@ -1034,10 +1183,13 @@ Content-Type: application/json
 
 Response:
 {
-  "sent": 5,
+  "success": true,
+  "sent": 1,
   "failed": 0
 }
 ```
+
+The test goes to the calling admin's own subscriptions only.
 
 ### Update VAPID Subject (Admin Only)
 
@@ -1050,19 +1202,17 @@ Content-Type: application/json
 }
 ```
 
-### Get VAPID Status (Admin Only)
+### Get VAPID Status
 
 ```http
 GET /api/push/status
 
 Response:
 {
-  "status": {
-    "configured": true,
-    "publicKey": "BFz...",
-    "subject": "mailto:admin@example.com",
-    "subscriptionCount": 5
-  }
+  "configured": true,
+  "publicKey": "BFz...",
+  "subject": "mailto:admin@example.com",
+  "subscriptionCount": 5
 }
 ```
 

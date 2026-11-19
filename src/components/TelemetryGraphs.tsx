@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next';
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import './TelemetryGraphs.css';
-import { type TemperatureUnit, formatTemperature, getTemperatureUnit, isTemperatureType } from '../utils/temperature';
+import { type TemperatureUnit, formatTemperature, isTemperatureType } from '../utils/temperature';
 import { logger } from '../utils/logger';
 import { useToast } from './ToastContainer';
 import { useCsrfFetch } from '../hooks/useCsrfFetch';
@@ -17,8 +17,8 @@ import { useWidgetRange } from '../hooks/useWidgetRange';
 import { useSource } from '../contexts/SourceContext';
 import { useResolvedSourceId } from '../hooks/useResolvedSourceId';
 import { getLatestValue } from '../utils/telemetry';
-import { telemetryDisplayScale } from '../utils/telemetryFormat';
 import { telemetryDotProp } from '../utils/telemetryChartDensity';
+import { formatTelemetryNumber } from '../utils/telemetryFormat';
 import TelemetryGauge from './TelemetryGauge';
 import TelemetryNumericLabel from './TelemetryNumericLabel';
 import { getTelemetryLabel } from './TelemetryChart';
@@ -29,13 +29,14 @@ import {
   getTelemetryCategory,
   type TelemetryCategory,
 } from '../utils/telemetryCategory';
-import { buildTelemetryFilename, telemetrySeriesToCsv } from '../utils/telemetryChartCsv';
-import { downloadTextFile } from '../utils/nodeExport';
+import { downloadTelemetryCsv, resolveSeriesDisplay } from '../utils/telemetrySeriesDisplay';
+import { TELEMETRY_RANGE_PRESETS, TELEMETRY_RETENTION_HOURS } from '../utils/telemetryRangePresets';
 import { UiIcon } from './icons';
 import DeviceCounterNote from './DeviceCounterNote';
 import TelemetryOutlierDialog from './TelemetryOutlierDialog/TelemetryOutlierDialog';
 import { isDeviceCounterType } from '../utils/deviceCounters';
 import { isTransportSeriesComponentType } from '../utils/transportSeries';
+import type { TranslateFn } from '../types/translate';
 
 /** Telemetry types that represent discrete integer values where fractional display is meaningless */
 const INTEGER_TELEMETRY_TYPES = new Set([
@@ -80,26 +81,6 @@ interface TelemetryGraphsProps {
 /** localStorage key for the Device Info telemetry time-range selection. */
 const TELEMETRY_RANGE_STORAGE_KEY = 'deviceInfoTelemetryHours';
 
-/** Server-side telemetry retention window (see TELEMETRY_RETENTION_HOURS). */
-const TELEMETRY_RETENTION_HOURS = 168;
-
-/**
- * Selectable telemetry windows, shortest to longest. Capped at the retention
- * window so no button can request data that has already been purged. Hours are
- * fractional where needed (0.25h = 15 minutes); the backend parses with
- * parseFloat and averages each window down to a manageable point count.
- */
-const TELEMETRY_RANGE_PRESETS: { label: string; hours: number }[] = [
-  { label: '15m', hours: 0.25 },
-  { label: '1h', hours: 1 },
-  { label: '3h', hours: 3 },
-  { label: '6h', hours: 6 },
-  { label: '12h', hours: 12 },
-  { label: '24h', hours: 24 },
-  { label: '48h', hours: 48 },
-  { label: '3d', hours: 72 },
-  { label: '7d', hours: 168 },
-].filter(p => p.hours <= TELEMETRY_RETENTION_HOURS);
 
 /**
  * Helper function to calculate minimum timestamp from telemetry data
@@ -111,6 +92,110 @@ const getMinTimestamp = (data: TelemetryData[]): number => {
     if (item.timestamp < minTime) minTime = item.timestamp;
   });
   return minTime;
+};
+
+/**
+ * Build the plotted points for one chart: telemetry points (converted to the
+ * display temperature unit), the solar overlay inside the telemetry window, and
+ * a null gap point wherever samples are more than 3 hours apart.
+ *
+ * Pure, so the widget can memoize it on its inputs instead of re-running it
+ * (and formatting a time label per point) on every render.
+ */
+const prepareChartData = (
+  data: TelemetryData[],
+  isTemperature: boolean,
+  globalMinTime: number | undefined,
+  temperatureUnit: TemperatureUnit,
+  solarEstimates: Map<number, number>,
+  timeFormat: TimeFormat,
+): ChartData[] => {
+  // Create a map of all unique timestamps from both telemetry and solar data
+  const allTimestamps = new Map<number, ChartData>();
+
+  // Use global minimum time if provided (for uniform axes), otherwise use chart-specific minimum
+  const minTelemetryTime = globalMinTime !== undefined ? globalMinTime : getMinTimestamp(data);
+  const maxTelemetryTime = Date.now();
+
+  // Add telemetry data points
+  data.forEach(item => {
+    allTimestamps.set(item.timestamp, {
+      timestamp: item.timestamp,
+      value: isTemperature ? formatTemperature(item.value, 'C', temperatureUnit) : item.value,
+      time: formatTime(new Date(item.timestamp), timeFormat),
+    });
+  });
+
+  // Add solar data points (at their own timestamps)
+  // Only include solar data within the GLOBAL telemetry time range
+  // This prevents solar data from extending the time axis beyond actual telemetry data
+  if (solarEstimates.size > 0 && minTelemetryTime !== Infinity) {
+    // Use current time with a 5-minute buffer to account for minor clock differences
+    const now = maxTelemetryTime + 5 * 60 * 1000;
+
+    solarEstimates.forEach((wattHours, timestamp) => {
+      // Filter out data outside GLOBAL telemetry time bounds
+      // Solar data should never extend the graph range beyond actual telemetry
+      if (timestamp < minTelemetryTime || timestamp > now) return;
+
+      if (allTimestamps.has(timestamp)) {
+        // If telemetry exists at this timestamp, add solar data to it
+        allTimestamps.get(timestamp)!.solarEstimate = wattHours;
+      } else {
+        // Create a new point for solar-only data
+        // Use null (not undefined) - Line will connect over these with connectNulls={true}
+        allTimestamps.set(timestamp, {
+          timestamp,
+          value: null, // null = solar-only (will be skipped by Line with connectNulls)
+          time: formatTime(new Date(timestamp), timeFormat),
+          solarEstimate: wattHours,
+        });
+      }
+    });
+  }
+
+  // Convert to array and sort by timestamp
+  const sortedData = Array.from(allTimestamps.values()).sort((a, b) => a.timestamp - b.timestamp);
+
+  // Insert gaps when telemetry points are more than 3 hours apart
+  const threeHours = 3 * 60 * 60 * 1000; // 3 hours in milliseconds
+  const dataWithGaps: ChartData[] = [];
+
+  for (let i = 0; i < sortedData.length; i++) {
+    dataWithGaps.push(sortedData[i]);
+
+    // Check if we should insert a gap before the next point
+    if (i < sortedData.length - 1) {
+      const timeDiff = sortedData[i + 1].timestamp - sortedData[i].timestamp;
+
+      if (timeDiff > threeHours) {
+        // Insert a gap point to break the line
+        dataWithGaps.push({
+          timestamp: sortedData[i].timestamp + 1, // Just after current point
+          value: null, // Use null to create a gap in the line
+          time: '',
+          solarEstimate: undefined,
+        });
+      }
+    }
+  }
+
+  return dataWithGaps;
+};
+
+/** Shared empty defaults, so a missing value keeps the same identity across renders. */
+const EMPTY_SOLAR_ESTIMATES = new Map<number, number>();
+const EMPTY_TELEMETRY: TelemetryData[] = [];
+
+const groupByType = (data: TelemetryData[]): Map<string, TelemetryData[]> => {
+  const grouped = new Map<string, TelemetryData[]>();
+  data.forEach(item => {
+    if (!grouped.has(item.telemetryType)) {
+      grouped.set(item.telemetryType, []);
+    }
+    grouped.get(item.telemetryType)!.push(item);
+  });
+  return grouped;
 };
 
 // Telemetry types that should show solar by default (power/environmental)
@@ -174,10 +259,9 @@ interface TelemetryGraphWidgetProps {
   chartColors: { bg: string; surface: string; text: string };
   getTelemetryLabel: (type: string) => string;
   getColor: (type: string) => string;
-  prepareChartData: (data: TelemetryData[], isTemperature?: boolean, globalMinTime?: number) => ChartData[];
   timeFormat: TimeFormat;
   hours: number;
-  t: (key: string, opts?: Record<string, unknown>) => string;
+  t: TranslateFn;
   canEditSettings: boolean;
 }
 
@@ -187,7 +271,7 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
   baseUrl,
   data,
   isPaxcounterCombined,
-  bleData = [],
+  bleData = EMPTY_TELEMETRY,
   temperatureUnit,
   globalTimeRange,
   globalMinTime,
@@ -205,7 +289,6 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
   chartColors,
   getTelemetryLabel,
   getColor,
-  prepareChartData,
   timeFormat,
   hours,
   t,
@@ -237,45 +320,54 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
   }, [mode]);
 
   const isTemperature = isTemperatureType(type);
-  const chartData = prepareChartData(data, isTemperature, globalMinTime);
-  // Humanize uptime and auto-scale current/power the same way the Dashboard
-  // widget does (#3261). Temperature keeps its own C/F handling below.
-  const display = telemetryDisplayScale(type, data.map(d => d.value), data[0]?.unit || '');
-  const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : display.unit;
+  // Humanize uptime, auto-scale current/power (#3261) and convert C/F, shared
+  // with the cross-source dashboard (#5896).
+  const display = useMemo(
+    () => resolveSeriesDisplay(type, data.map(d => d.value), data[0]?.unit || '', temperatureUnit),
+    [type, data, temperatureUnit]
+  );
+  const unit = display.unit;
   const label = isPaxcounterCombined ? 'Paxcounter' : getTelemetryLabel(type);
   const color = getColor(type);
 
-  if (isPaxcounterCombined) {
-    const bleByTimestamp = new Map<number, number>();
-    bleData.forEach(item => bleByTimestamp.set(item.timestamp, item.value));
-    chartData.forEach(point => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const p = point as any;
-      p.paxWifi = point.value;
-      p.paxBle = bleByTimestamp.get(point.timestamp) ?? null;
-      bleByTimestamp.delete(point.timestamp);
-    });
-    bleByTimestamp.forEach((value, timestamp) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const point: any = {
-        timestamp,
-        value: null,
-        time: '',
-        paxWifi: null,
-        paxBle: value,
-      };
-      chartData.push(point);
-    });
-    chartData.sort((a, b) => a.timestamp - b.timestamp);
-  }
+  // Built once per data change, not on every render: the widget re-renders on
+  // each parent update and on every chart-width measurement, and this walks
+  // (and labels) every point.
+  const scaledChartData = useMemo(() => {
+    const chartData = prepareChartData(data, isTemperature, globalMinTime, temperatureUnit, solarEstimates, timeFormat);
+
+    if (isPaxcounterCombined) {
+      const bleByTimestamp = new Map<number, number>();
+      bleData.forEach(item => bleByTimestamp.set(item.timestamp, item.value));
+      chartData.forEach(point => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const p = point as any;
+        p.paxWifi = point.value;
+        p.paxBle = bleByTimestamp.get(point.timestamp) ?? null;
+        bleByTimestamp.delete(point.timestamp);
+      });
+      bleByTimestamp.forEach((value, timestamp) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const point: any = {
+          timestamp,
+          value: null,
+          time: '',
+          paxWifi: null,
+          paxBle: value,
+        };
+        chartData.push(point);
+      });
+      chartData.sort((a, b) => a.timestamp - b.timestamp);
+    }
+
+    // Apply the display scale to the plotted series. The solar overlay lives on
+    // its own axis (watt-hours) and is left untouched.
+    return !isTemperature && display.factor !== 1
+      ? chartData.map(d => ({ ...d, value: d.value == null ? d.value : d.value * display.factor }))
+      : chartData;
+  }, [data, isTemperature, globalMinTime, temperatureUnit, solarEstimates, timeFormat, isPaxcounterCombined, bleData, display.factor]);
 
   const latest = getLatestValue(data);
-
-  // Apply the display scale to the plotted series. The solar overlay lives on
-  // its own axis (watt-hours) and is left untouched.
-  const scaledChartData = !isTemperature && display.factor !== 1
-    ? chartData.map(d => ({ ...d, value: d.value == null ? d.value : d.value * display.factor }))
-    : chartData;
 
   const canExportCsv = scaledChartData.length > 0;
   const handleExportCsv = () => {
@@ -292,27 +384,15 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
         paxBle: p.paxBle as number | null | undefined,
       };
     });
-    const csv = telemetrySeriesToCsv(rows, {
-      nodeId,
-      telemetryType: type,
-      unit,
-      hours,
-    });
-    downloadTextFile(
-      buildTelemetryFilename(nodeId, type, hours),
-      `\uFEFF${csv}`,
-      'text/csv;charset=utf-8',
-    );
+    downloadTelemetryCsv(rows, { nodeId, telemetryType: type, unit, hours });
   };
 
   // Gauge/numeric modes display a single raw value, so convert it (and the
   // gauge range) to the selected unit. Ranges persist in base units (Celsius
   // for temperature, the stored A/W for current/power), so edits made in the
   // displayed unit are converted back before saving.
-  const toDisplayTemp = (v: number) =>
-    isTemperature ? formatTemperature(v, 'C', temperatureUnit) : v * display.factor;
-  const toStoredTemp = (v: number) =>
-    isTemperature ? formatTemperature(v, temperatureUnit, 'C') : v / display.factor;
+  const toDisplayTemp = display.toDisplay;
+  const toStoredTemp = display.toStored;
   const handleRangeChange = (r: { min: number; max: number }) =>
     setRange({ min: toStoredTemp(r.min), max: toStoredTemp(r.max) });
 
@@ -477,14 +557,12 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
                 color: chartColors.text,
               }}
               labelStyle={{ color: chartColors.text }}
-              formatter={
-                display.formatValue
-                  ? (value, name) =>
-                      // Leave the solar overlay (watt-hours) untouched.
-                      name === 'solarEstimate' || typeof value !== 'number'
-                        ? value
-                        : display.formatValue!(value)
-                  : undefined
+              formatter={(value, name) =>
+                // Leave the solar overlay (watt-hours) untouched; round the
+                // rest (bucket averages are long floats, #4173 review L20).
+                name === 'solarEstimate' || typeof value !== 'number'
+                  ? value
+                  : (display.formatValue ?? formatTelemetryNumber)(value)
               }
               labelFormatter={value => {
                 const date = new Date(value);
@@ -523,6 +601,7 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
                   dot={telemetryDotProp(scaledChartData.length, chartWidth, getColor('paxcounterWifi'))}
                   activeDot={{ r: 5 }}
                   connectNulls={true}
+                  isAnimationActive={false}
                 />
                 <Line
                   yAxisId="left"
@@ -534,6 +613,7 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
                   dot={telemetryDotProp(scaledChartData.length, chartWidth, getColor('paxcounterBle'))}
                   activeDot={{ r: 5 }}
                   connectNulls={true}
+                  isAnimationActive={false}
                 />
               </>
             ) : (
@@ -546,6 +626,7 @@ const TelemetryGraphWidget: React.FC<TelemetryGraphWidgetProps> = ({
                 dot={telemetryDotProp(scaledChartData.length, chartWidth, color)}
                 activeDot={{ r: 5 }}
                 connectNulls={true}
+                isAnimationActive={false}
               />
             )}
           </ComposedChart>
@@ -615,7 +696,7 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
 
     // Fetch telemetry data using TanStack Query
     const {
-      data: telemetryData = [],
+      data: telemetryData = EMPTY_TELEMETRY,
       isLoading: loading,
       error: telemetryError,
       refetch: refetchTelemetry,
@@ -644,7 +725,7 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
     }, [telemetryData]);
 
     // Fetch solar estimates using TanStack Query
-    const { data: solarEstimates = new Map() } = useSolarEstimates({
+    const { data: solarEstimates = EMPTY_SOLAR_ESTIMATES } = useSolarEstimates({
       baseUrl,
       startTimestamp: telemetryTimeBounds?.start,
       endTimestamp: telemetryTimeBounds?.end,
@@ -817,95 +898,6 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       }
     };
 
-    const groupByType = (data: TelemetryData[]): Map<string, TelemetryData[]> => {
-      const grouped = new Map<string, TelemetryData[]>();
-      data.forEach(item => {
-        if (!grouped.has(item.telemetryType)) {
-          grouped.set(item.telemetryType, []);
-        }
-        grouped.get(item.telemetryType)!.push(item);
-      });
-      return grouped;
-    };
-
-    const prepareChartData = (
-      data: TelemetryData[],
-      isTemperature: boolean = false,
-      globalMinTime?: number
-    ): ChartData[] => {
-      // Create a map of all unique timestamps from both telemetry and solar data
-      const allTimestamps = new Map<number, ChartData>();
-
-      // Use global minimum time if provided (for uniform axes), otherwise use chart-specific minimum
-      const minTelemetryTime = globalMinTime !== undefined ? globalMinTime : getMinTimestamp(data);
-      const maxTelemetryTime = Date.now();
-
-      // Add telemetry data points
-      data.forEach(item => {
-        allTimestamps.set(item.timestamp, {
-          timestamp: item.timestamp,
-          value: isTemperature ? formatTemperature(item.value, 'C', temperatureUnit) : item.value,
-          time: formatTime(new Date(item.timestamp), timeFormat),
-        });
-      });
-
-      // Add solar data points (at their own timestamps)
-      // Only include solar data within the GLOBAL telemetry time range
-      // This prevents solar data from extending the time axis beyond actual telemetry data
-      if (solarEstimates.size > 0 && minTelemetryTime !== Infinity) {
-        // Use current time with a 5-minute buffer to account for minor clock differences
-        const now = maxTelemetryTime + 5 * 60 * 1000;
-
-        solarEstimates.forEach((wattHours, timestamp) => {
-          // Filter out data outside GLOBAL telemetry time bounds
-          // Solar data should never extend the graph range beyond actual telemetry
-          if (timestamp < minTelemetryTime || timestamp > now) return;
-
-          if (allTimestamps.has(timestamp)) {
-            // If telemetry exists at this timestamp, add solar data to it
-            allTimestamps.get(timestamp)!.solarEstimate = wattHours;
-          } else {
-            // Create a new point for solar-only data
-            // Use null (not undefined) - Line will connect over these with connectNulls={true}
-            allTimestamps.set(timestamp, {
-              timestamp,
-              value: null, // null = solar-only (will be skipped by Line with connectNulls)
-              time: formatTime(new Date(timestamp), timeFormat),
-              solarEstimate: wattHours,
-            });
-          }
-        });
-      }
-
-      // Convert to array and sort by timestamp
-      const sortedData = Array.from(allTimestamps.values()).sort((a, b) => a.timestamp - b.timestamp);
-
-      // Insert gaps when telemetry points are more than 3 hours apart
-      const threeHours = 3 * 60 * 60 * 1000; // 3 hours in milliseconds
-      const dataWithGaps: ChartData[] = [];
-
-      for (let i = 0; i < sortedData.length; i++) {
-        dataWithGaps.push(sortedData[i]);
-
-        // Check if we should insert a gap before the next point
-        if (i < sortedData.length - 1) {
-          const timeDiff = sortedData[i + 1].timestamp - sortedData[i].timestamp;
-
-          if (timeDiff > threeHours) {
-            // Insert a gap point to break the line
-            dataWithGaps.push({
-              timestamp: sortedData[i].timestamp + 1, // Just after current point
-              value: null, // Use null to create a gap in the line
-              time: '',
-              solarEstimate: undefined,
-            });
-          }
-        }
-      }
-
-      return dataWithGaps;
-    };
-
     const getColor = (type: string): string => {
       const colors: { [key: string]: string } = {
         batteryLevel: '#82ca9d',
@@ -1027,6 +1019,10 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       </div>
     );
 
+    // Memoized so each chart widget gets the same series arrays across renders
+    // and its own memoized chart data survives unrelated parent updates.
+    const groupedData = useMemo(() => groupByType(telemetryData), [telemetryData]);
+
     if (loading) {
       return <div className="telemetry-loading">{t('telemetry.loading')}</div>;
     }
@@ -1054,7 +1050,6 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
       return <div className="telemetry-empty">{t('telemetry.no_data')}</div>;
     }
 
-    const groupedData = groupByType(telemetryData);
 
     // Calculate global time range across all telemetry data (excluding solar)
     // Min time: earliest telemetry datapoint, Max time: current time
@@ -1187,10 +1182,9 @@ const TelemetryGraphs: React.FC<TelemetryGraphsProps> = React.memo(
                   chartColors={chartColors}
                   getTelemetryLabel={getTelemetryLabel}
                   getColor={getColor}
-                  prepareChartData={prepareChartData}
                   timeFormat={timeFormat}
                   hours={effectiveHours}
-                  t={t as (key: string, opts?: Record<string, unknown>) => string}
+                  t={t}
                   canEditSettings={canEditSettings}
                 />
               ))}

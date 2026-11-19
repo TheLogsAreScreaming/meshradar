@@ -45,13 +45,20 @@ export interface PositionObservation {
   kind: 'traceroute' | 'neighbor';
 }
 
+/**
+ * The part of an observation the solver reads. Meshtastic uses the full
+ * `PositionObservation`; MeshCore (computed on read, per source) supplies its
+ * own richer shape. One solver serves both.
+ */
+export type SolverObservation = Pick<PositionObservation, 'anchorLat' | 'anchorLon' | 'snrDb' | 'timestamp'>;
+
 /** An observation plus the weight it received in the solve (#4609). */
-export interface WeightedObservation {
-  observation: PositionObservation;
+export interface WeightedObservation<O extends SolverObservation = PositionObservation> {
+  observation: O;
   weight: number;
 }
 
-export interface SolvedPosition {
+export interface SolvedPosition<O extends SolverObservation = PositionObservation> {
   latitude: number;
   longitude: number;
   uncertaintyKm: number;
@@ -62,13 +69,19 @@ export interface SolvedPosition {
    * radius instead of just showing it (#4609).
    */
   nEff: number;
+  /**
+   * Distinct anchor POSITIONS behind the solve (#5900). Repeat observations of
+   * one anchor collapse to one, so a node seen six times through one relay
+   * reports 1 here and 6 in `observationCount`.
+   */
+  uniqueAnchors: number;
   /** Which branch of the uncertainty math produced `uncertaintyKm` (#4609). */
   radiusMethod: RadiusMethod;
   /**
    * Positive-weight observations with the weight each received, strongest
    * first. These are the anchors that actually moved the centroid.
    */
-  usedObservations: WeightedObservation[];
+  usedObservations: WeightedObservation<O>[];
 }
 
 export interface RecomputeResult {
@@ -107,6 +120,26 @@ const MAX_TRACEROUTES_PER_SOURCE = 100000;
  */
 export const MAX_STORED_ANCHORS_PER_NODE = 20;
 
+/**
+ * Coordinate tolerance, in degrees, for treating two anchors as the same place
+ * (#5900). 1e-6° is about 0.11 m of latitude: tight enough that two real nodes
+ * a few metres apart stay distinct, loose enough to absorb float noise from a
+ * position that went through a DB round trip or a precision de-offset.
+ */
+export const ANCHOR_POSITION_TOLERANCE_DEG = 1e-6;
+
+/**
+ * Key for "the same physical anchor position" (#5900). Keyed on the rounded
+ * coordinates alone, not on the anchor's node number: two nodes on one roof
+ * add no more spatial spread than one node heard twice, so counting them as
+ * independent would re-create the same false confidence.
+ */
+export function anchorPositionKey(lat: number, lon: number): string {
+  const lat6 = Math.round(lat / ANCHOR_POSITION_TOLERANCE_DEG);
+  const lon6 = Math.round(lon / ANCHOR_POSITION_TOLERANCE_DEG);
+  return `${lat6}:${lon6}`;
+}
+
 function nodeNumToId(nodeNum: number): string {
   return `!${nodeNum.toString(16).padStart(8, '0')}`;
 }
@@ -117,7 +150,7 @@ function nodeNumToId(nodeNum: number): string {
  * strength, so a stronger link pulls the estimate toward that anchor. Absent
  * SNR defaults to weight 1 (still time-decayed).
  */
-export function observationWeight(obs: PositionObservation, now: number): number {
+export function observationWeight(obs: SolverObservation, now: number): number {
   const ageMs = Math.max(0, now - obs.timestamp);
   const timeDecay = Math.exp(-DECAY_CONSTANT * ageMs);
   const snrWeight = obs.snrDb !== undefined && Number.isFinite(obs.snrDb)
@@ -150,14 +183,19 @@ export function observationWeight(obs: PositionObservation, now: number): number
  * genuinely balanced multi-anchor solve). This does not change balanced
  * multi-anchor estimates, only the degenerate near-single cases.
  *
+ * Repeat-observation guard (issue #5900): `nEff` is computed over unique anchor
+ * positions (see `anchorPositionKey`), not raw observations, and a solve backed
+ * by one position is always `single_anchor`. Without this, six replies through
+ * one relay gave nEff ≈ 5.75 and a zero spread, so the radius fell to the 50 m
+ * floor for what is one anchor's worth of information.
+ *
  * @returns null if there are no usable (positive-weight) observations.
  */
-export function solveNodePosition(observations: PositionObservation[], now: number): SolvedPosition | null {
+export function solveNodePosition<O extends SolverObservation>(observations: O[], now: number): SolvedPosition<O> | null {
   if (observations.length === 0) return null;
 
-  const used: Array<{ obs: PositionObservation; w: number }> = [];
+  const used: Array<{ obs: O; w: number }> = [];
   let wSum = 0;
-  let w2Sum = 0;
   let wLat = 0;
   let wLon = 0;
 
@@ -166,7 +204,6 @@ export function solveNodePosition(observations: PositionObservation[], now: numb
     if (!(w > 0) || !Number.isFinite(w)) continue;
     used.push({ obs, w });
     wSum += w;
-    w2Sum += w * w;
     wLat += obs.anchorLat * w;
     wLon += obs.anchorLon * w;
   }
@@ -184,8 +221,23 @@ export function solveNodePosition(observations: PositionObservation[], now: numb
   // substituted onto the node as though it were a fix.
   if (isBogusPosition(latitude, longitude)) return null;
 
-  // Kish effective sample size — robust to skewed weights.
-  const nEff = (wSum * wSum) / w2Sum;
+  // Kish effective sample size, taken over unique anchor POSITIONS (#5900).
+  // nEff measures how evenly the weight is spread, but it reads every term as
+  // independent evidence. Six traceroute replies through one relay are one
+  // place, not six, so summing the weights per position first makes them count
+  // once. The centroid and the RMS spread below are unchanged by this: both are
+  // linear in the weights, so per-position sums give the same answer.
+  const weightByPosition = new Map<string, number>();
+  for (const { obs, w } of used) {
+    const key = anchorPositionKey(obs.anchorLat, obs.anchorLon);
+    weightByPosition.set(key, (weightByPosition.get(key) ?? 0) + w);
+  }
+  const uniqueAnchors = weightByPosition.size;
+  let positionW2Sum = 0;
+  for (const pw of weightByPosition.values()) positionW2Sum += pw * pw;
+  // One position is one anchor however many times it was heard: pin nEff to
+  // exactly 1 rather than trusting the float division to land there.
+  const nEff = uniqueAnchors === 1 ? 1 : (wSum * wSum) / positionW2Sum;
 
   let weightedDist2 = 0;
   for (const { obs, w } of used) {
@@ -202,7 +254,9 @@ export function solveNodePosition(observations: PositionObservation[], now: numb
   // (nEff >= 2, a balanced multi-anchor solve). This closes issue #3616: a
   // strong anchor that dominates the weights (nEff barely above 1) no longer
   // skips the radio-range default and report a spuriously tight radius.
-  const confidence = Math.min(1, Math.max(0, nEff - 1));
+  // A single anchor position always takes the radio-range default (#5900):
+  // repeat observations cannot triangulate.
+  const confidence = uniqueAnchors <= 1 ? 0 : Math.min(1, Math.max(0, nEff - 1));
   // Both terms are already >= MIN_UNCERTAINTY_KM (statisticalKm is floored and
   // DEFAULT_SINGLE_ANCHOR_KM is far above it), so the outer Math.max is a
   // belt-and-braces guard rather than a branch the radius can actually take.
@@ -219,7 +273,7 @@ export function solveNodePosition(observations: PositionObservation[], now: numb
       : confidence >= 1 ? 'convergence'
         : 'blended';
 
-  const usedObservations: WeightedObservation[] = used
+  const usedObservations: WeightedObservation<O>[] = used
     .map(({ obs, w }) => ({ observation: obs, weight: w }))
     .sort((a, b) => b.weight - a.weight);
 
@@ -229,9 +283,45 @@ export function solveNodePosition(observations: PositionObservation[], now: numb
     uncertaintyKm,
     observationCount: observations.length,
     nEff,
+    uniqueAnchors,
     radiusMethod,
     usedObservations,
   };
+}
+
+/**
+ * Pick the observations to persist for the rationale view, at most `cap`.
+ *
+ * `used` is strongest-first. A plain prefix would let one well-heard relay fill
+ * every slot and hide the other anchors, and the API counts unique anchors from
+ * the stored rows (#5900). So the strongest observation of each distinct
+ * position goes in first, then the remaining slots take the next-strongest
+ * observations of any position. The result stays strongest-first.
+ */
+export function selectAnchorsToStore(used: WeightedObservation[], cap: number): WeightedObservation[] {
+  if (used.length <= cap) return used;
+  const chosen = new Set<WeightedObservation>();
+  const seen = new Set<string>();
+  for (const u of used) {
+    if (chosen.size >= cap) break;
+    const key = anchorPositionKey(u.observation.anchorLat, u.observation.anchorLon);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    chosen.add(u);
+  }
+  for (const u of used) {
+    if (chosen.size >= cap) break;
+    chosen.add(u);
+  }
+  return used.filter((u) => chosen.has(u));
+}
+
+/**
+ * Count distinct anchor positions in a set of stored anchor rows (#5900), with
+ * the same tolerance the solver used.
+ */
+export function countUniqueAnchorPositions(rows: Array<{ anchorLat: number; anchorLon: number }>): number {
+  return new Set(rows.map((r) => anchorPositionKey(r.anchorLat, r.anchorLon))).size;
 }
 
 /** Safely JSON-parse an array of numbers; returns [] on any problem. */
@@ -478,9 +568,9 @@ class PositionEstimationService {
         radiusMethod: solved.radiusMethod,
       });
 
-      // usedObservations is already sorted strongest-first, so slicing keeps the
-      // anchors that actually determined the pin.
-      for (const { observation, weight } of solved.usedObservations.slice(0, MAX_STORED_ANCHORS_PER_NODE)) {
+      // Strongest-first, with every distinct anchor position represented before
+      // any position gets a second row (#5900).
+      for (const { observation, weight } of selectAnchorsToStore(solved.usedObservations, MAX_STORED_ANCHORS_PER_NODE)) {
         anchorInputs.push({
           nodeNum,
           anchorNodeNum: observation.anchorNodeNum,
@@ -509,7 +599,19 @@ class PositionEstimationService {
     // to keep under the configured maximum. The repository cascades the
     // matching anchor rows.
     const anchorNodeNums = [...anchors.keys()];
-    await databaseService.deleteEstimatedPositionsByNodeNumsAsync([...anchorNodeNums, ...rejectedNodeNums]);
+    // Also clear rows this run did not write (#5900): a node with no
+    // observation left in the lookback window would otherwise keep its old
+    // estimate forever, including one written by the pre-#5900 math with a
+    // false 50 m radius. Every estimate on disk now comes from the current
+    // window and the current math.
+    const written = new Set(inputs.map((i) => i.nodeNum));
+    const existing = await databaseService.getAllEstimatedPositionsAsync();
+    const staleNodeNums = existing
+      .map((e) => Number(e.nodeNum))
+      .filter((n) => !written.has(n));
+    await databaseService.deleteEstimatedPositionsByNodeNumsAsync([
+      ...new Set([...anchorNodeNums, ...rejectedNodeNums, ...staleNodeNums]),
+    ]);
 
     const durationMs = Date.now() - start;
     logger.debug(

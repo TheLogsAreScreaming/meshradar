@@ -56,6 +56,8 @@ const basePrefs = {
   lowBatteryVoltageThreshold: 3300,
   notifyOnServerEvents: false,
   notifyOnWaypoint: false,
+  notifyOnMention: false,
+  notifyOnAutoTrace: false,
   waypointRadiusKm: 10,
   waypointCenterLat: null,
   waypointCenterLon: null,

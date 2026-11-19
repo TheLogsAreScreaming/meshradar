@@ -18,6 +18,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../../utils/logger.js';
+import { getSystemBackupDir, getRestoreMarkerFile } from '../config/dataDir.js';
 import databaseService from '../../services/database.js';
 import { systemBackupService } from './systemBackupService.js';
 import { BACKUP_IDENTIFIER_PATTERN, planRestoreTables } from './systemBackupTables.js';
@@ -28,11 +29,10 @@ import { getMeshCoreObserverKeyStore } from './meshcoreObserverKeyStore.js';
 import { getMeshCoreObserverCredentialStore } from './meshcoreObserverCredentialStore.js';
 import { getSourcePkiKeyStore } from './sourcePkiKeyStore.js';
 import { getMeshCoreCredentialStore } from './meshcoreCredentialStore.js';
+import { getScriptSecretStore } from './scriptSecretStore.js';
+import { markRestoreCheckStarted, markRestoreCheckFinished, markRestoredThisBoot } from './restoreBootState.js';
 import { Pool } from 'pg';
 import mysql from 'mysql2/promise';
-
-const SYSTEM_BACKUP_DIR = process.env.SYSTEM_BACKUP_DIR || '/data/system-backups';
-const RESTORE_MARKER_FILE = '/data/.restore-completed';
 
 /**
  * PostgreSQL and MySQL cap a statement at 65,535 bind parameters. Rows go in
@@ -48,8 +48,12 @@ const MAX_INSERT_ROWS = 500;
 export interface UnreadableSecrets {
   unreadableObserverKeys: string[];
   unreadablePkiKeys: string[];
+  /** #4305: MQTT-native send identities whose private key cannot be opened. */
+  unreadableMqttNativeKeys: string[];
   unreadableObserverCredentials: string[];
   unreadableMeshcoreNodeCredentials: string[];
+  /** Script Secret names (not values). */
+  unreadableScriptSecrets: string[];
 }
 
 interface RestoreResult {
@@ -82,6 +86,7 @@ class SystemRestoreService {
    */
   markRestoreStarted(): void {
     this.restoreInProgress = true;
+    markRestoreCheckStarted();
     logger.debug('[RestoreService] Restore marked as started');
   }
 
@@ -92,6 +97,7 @@ class SystemRestoreService {
   markRestoreComplete(): void {
     this.restoreInProgress = false;
     this.restoreCompleteResolve();
+    markRestoreCheckFinished();
     logger.debug('[RestoreService] Restore marked as complete');
   }
 
@@ -166,7 +172,7 @@ class SystemRestoreService {
 
       // Phase 4: Restore database atomically
       logger.debug('Phase 4: Restoring database...');
-      const backupPath = path.join(SYSTEM_BACKUP_DIR, dirname);
+      const backupPath = path.join(getSystemBackupDir(), dirname);
       const dbConfig = getDatabaseConfig();
 
       if (dbConfig.type === 'postgres' && dbConfig.postgresUrl) {
@@ -188,7 +194,13 @@ class SystemRestoreService {
 
       // Phase 4b: say so when a restored key or credential cannot be read
       // under this install's SESSION_SECRET (#5596).
-      const unreadable = await this.findUnreadableSecrets(new Set(planRestoreTables(metadata.tables).tables));
+      const restoredTables = new Set(planRestoreTables(metadata.tables).tables);
+      const unreadable = await this.findUnreadableSecrets(restoredTables);
+
+      // Script Secrets live decrypted in memory; load the restored set.
+      if (restoredTables.has('script_secrets')) {
+        await getScriptSecretStore().reloadCache();
+      }
 
       // Phase 5: Run schema migrations if needed
       if (migrationRequired) {
@@ -228,14 +240,17 @@ class SystemRestoreService {
 
       // Write restore marker to prevent accidental re-restoration
       try {
-        fs.writeFileSync(RESTORE_MARKER_FILE, dirname, 'utf8');
-        logger.info(`📝 Restore marker written to: ${RESTORE_MARKER_FILE}`);
+        fs.writeFileSync(getRestoreMarkerFile(), dirname, 'utf8');
+        logger.info(`📝 Restore marker written to: ${getRestoreMarkerFile()}`);
         logger.info('ℹ️  This prevents accidental re-restore on next restart');
         logger.info('ℹ️  To restore again, remove RESTORE_FROM_BACKUP from environment or delete the marker file');
       } catch (error) {
         logger.warn('⚠️  Failed to write restore marker file:', error);
         logger.warn('⚠️  Re-restore protection may not work properly');
       }
+
+      // #6354: the startup retention purges skip their first run on this boot.
+      markRestoredThisBoot();
 
       return {
         success: true,
@@ -275,10 +290,10 @@ class SystemRestoreService {
    * Find restored keys and credentials the current SESSION_SECRET cannot
    * decrypt, and warn about each kind (#5596).
    *
-   * Four things in a backup are AES-256-GCM envelopes keyed from
+   * Several things in a backup are AES-256-GCM envelopes keyed from
    * SESSION_SECRET: Analyzer Observer signing keys, Observer broker
-   * credentials, per-source PKI private keys, and the repeater/room passwords
-   * saved on MeshCore nodes. A backup restored onto an install with a
+   * credentials, per-source PKI private keys and MQTT-native send keys, the
+   * repeater/room passwords saved on MeshCore nodes, and Script Secrets. A backup restored onto an install with a
    * different secret brings the rows back intact but unreadable. Restore does
    * what each store already does for a rotated secret: it KEEPS the row.
    * Nothing is deleted or rewritten, so putting the original SESSION_SECRET
@@ -334,6 +349,20 @@ class SystemRestoreService {
       );
     }
 
+    const unreadableMqttNativeKeys = await check('mqtt_native_identities', 'MQTT-native send keys', async () => {
+      const store = getSourcePkiKeyStore();
+      return (await databaseService.mqttNativeIdentities.listAll())
+        .filter((row) => store.isEnvelopeRotated(row.encryptedPrivateKey))
+        .map((row) => row.sourceId);
+    });
+    if (unreadableMqttNativeKeys.length > 0) {
+      logger.warn(
+        `⚠️  Restored ${unreadableMqttNativeKeys.length} MQTT-native send key(s) that the current SESSION_SECRET ` +
+          `cannot decrypt (sources: ${unreadableMqttNativeKeys.join(', ')}). The rows were kept. Set ` +
+          'SESSION_SECRET to the value the backup was made under; until then those sources cannot send over MQTT.'
+      );
+    }
+
     const unreadableObserverCredentials = await check(
       'meshcore_observer_credentials',
       'Analyzer Observer broker credentials',
@@ -372,11 +401,24 @@ class SystemRestoreService {
       );
     }
 
+    const unreadableScriptSecrets = await check('script_secrets', 'script secrets', () =>
+      getScriptSecretStore().findUnreadable(),
+    );
+    if (unreadableScriptSecrets.length > 0) {
+      logger.warn(
+        `⚠️  Restored ${unreadableScriptSecrets.length} script secret(s) that the current SESSION_SECRET cannot ` +
+          `decrypt (${unreadableScriptSecrets.join(', ')}). The rows were kept, and scripts do not receive them. ` +
+          'Set SESSION_SECRET to the value the backup was made under, or enter each value again in Settings › Scripts.'
+      );
+    }
+
     return {
       unreadableObserverKeys,
       unreadablePkiKeys,
+      unreadableMqttNativeKeys,
       unreadableObserverCredentials,
       unreadableMeshcoreNodeCredentials,
+      unreadableScriptSecrets,
     };
   }
 
@@ -393,9 +435,9 @@ class SystemRestoreService {
     logger.info(`🔍 RESTORE_FROM_BACKUP environment variable detected: ${restoreFrom}`);
 
     // Check if this backup has already been restored (safety mechanism)
-    if (fs.existsSync(RESTORE_MARKER_FILE)) {
+    if (fs.existsSync(getRestoreMarkerFile())) {
       try {
-        const lastRestored = fs.readFileSync(RESTORE_MARKER_FILE, 'utf8').trim();
+        const lastRestored = fs.readFileSync(getRestoreMarkerFile(), 'utf8').trim();
         if (lastRestored === restoreFrom) {
           logger.warn('⚠️  ========================================');
           logger.warn('⚠️  RESTORE ALREADY COMPLETED');
@@ -423,7 +465,7 @@ class SystemRestoreService {
     }
 
     // Check if backup exists
-    const backupPath = path.join(SYSTEM_BACKUP_DIR, restoreFrom);
+    const backupPath = path.join(getSystemBackupDir(), restoreFrom);
     if (!fs.existsSync(backupPath)) {
       logger.error(`❌ Backup directory not found: ${backupPath}`);
       throw new Error(`Backup directory not found: ${restoreFrom}`);
@@ -445,7 +487,7 @@ class SystemRestoreService {
   async canRestore(dirname: string): Promise<{ can: boolean; reason?: string }> {
     try {
       // Check if backup exists
-      const backupPath = path.join(SYSTEM_BACKUP_DIR, dirname);
+      const backupPath = path.join(getSystemBackupDir(), dirname);
       if (!fs.existsSync(backupPath)) {
         return { can: false, reason: 'Backup directory not found' };
       }
@@ -504,21 +546,6 @@ class SystemRestoreService {
   }
 
   /**
-   * The column list for a table's INSERT, taken from the first row of its
-   * file. Column names are interpolated into the statement, so anything that
-   * is not a plain SQL identifier is rejected, which rolls the restore back.
-   */
-  private insertColumns(tableName: string, row: BackupRow): string[] {
-    const columns = Object.keys(row);
-    for (const col of columns) {
-      if (!BACKUP_IDENTIFIER_PATTERN.test(col)) {
-        throw new Error(`Invalid column name in backup for table ${tableName}: ${col}`);
-      }
-    }
-    return columns;
-  }
-
-  /**
    * Restore database using SQLite (synchronous transaction)
    */
   private restoreSQLite(backupPath: string, tables: string[]): { rowsRestored: number; tablesRestored: number } {
@@ -538,24 +565,39 @@ class SystemRestoreService {
             continue;
           }
 
+          // The live table's columns (#6350): backup columns it lacks are
+          // skipped rather than failing the INSERT.
+          const live = (db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>)
+            .map(c => c.name);
+          if (live.length === 0) {
+            logger.warn(`⚠️  Skipping table not in database: ${tableName}`);
+            continue;
+          }
+          // SQLite matches column names without regard to case.
+          const filter = new RestoreColumnFilter(tableName, live, true);
+
           // Clear existing table data
           db.prepare(`DELETE FROM ${tableName}`).run();
 
-          // Insert backup data, one row at a time off the file.
-          let columns: string[] | null = null;
-          let stmt: { run: (...values: unknown[]) => unknown } | null = null;
+          // Insert backup data, one row at a time off the file. Rows that
+          // carry a different column set get their own statement.
+          const statements = new Map<string, { run: (...values: unknown[]) => unknown }>();
           let rows = 0;
           for (const row of readTableFileSync(tableFile)) {
-            if (!columns || !stmt) {
-              columns = this.insertColumns(tableName, row);
+            const columns = filter.columnsFor(row);
+            const key = columns.join(',');
+            let stmt = statements.get(key);
+            if (!stmt) {
               const placeholders = columns.map(() => '?').join(', ');
               stmt = db.prepare<unknown[]>(
                 `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`
               );
+              statements.set(key, stmt);
             }
             stmt.run(...columns.map(col => toSqliteValue(row[col])));
             rows++;
           }
+          filter.logSkipped();
 
           totalRowsRestored += rows;
           tablesRestored++;
@@ -596,32 +638,35 @@ class SystemRestoreService {
             continue;
           }
 
-          // Check if table exists in PostgreSQL
-          const tableExists = await client.query(
-            `SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1)`,
+          // The live table's columns (#6350). None means the table is absent.
+          const liveResult = await client.query(
+            `SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position`,
             [tableName]
           );
-          if (!tableExists.rows[0].exists) {
+          const live = (liveResult.rows as Array<{ column_name: string }>).map(r => r.column_name);
+          if (live.length === 0) {
             logger.warn(`⚠️  Skipping table not in database: ${tableName}`);
             continue;
           }
+          // Quoted PostgreSQL identifiers are case-sensitive.
+          const filter = new RestoreColumnFilter(tableName, live, false);
 
           // Clear existing table data (quote table name for case-sensitivity)
           await client.query(`DELETE FROM "${tableName}"`);
 
           // Insert backup data in multi-row statements, streamed off the file.
-          let columns: string[] | null = null;
-          let quotedColumns = '';
+          // A batch holds rows with one column set; a row with another set
+          // flushes it first.
           let rows = 0;
-          let batchRows = MAX_INSERT_ROWS;
-          const flush = async (batch: BackupRow[]): Promise<void> => {
-            if (batch.length === 0 || !columns) return;
-            const cols = columns;
+          const flush = async (batch: BackupRow[], cols: string[]): Promise<void> => {
+            if (batch.length === 0) return;
             // PostgreSQL uses $1, $2, etc. for placeholders
             const tuples = batch
               .map((_, r) => `(${cols.map((__, c) => `$${r * cols.length + c + 1}`).join(', ')})`)
               .join(', ');
             const values = batch.flatMap(row => cols.map(col => row[col] ?? null));
+            // Quote column names to preserve case-sensitivity.
+            const quotedColumns = cols.map(c => `"${c}"`).join(', ');
             // OVERRIDING SYSTEM VALUE: several tables declare `id` as GENERATED
             // ALWAYS AS IDENTITY, which refuses an explicit id without it. The
             // clause is a no-op for every other table.
@@ -633,20 +678,22 @@ class SystemRestoreService {
           };
 
           let pending: BackupRow[] = [];
+          let pendingColumns: string[] = [];
           for (const row of readTableFileSync(tableFile)) {
-            if (!columns) {
-              columns = this.insertColumns(tableName, row);
-              // Quote column names to preserve case-sensitivity
-              quotedColumns = columns.map(c => `"${c}"`).join(', ');
-              batchRows = insertBatchRows(columns.length);
+            const columns = filter.columnsFor(row);
+            if (pending.length > 0 && columns.join(',') !== pendingColumns.join(',')) {
+              await flush(pending, pendingColumns);
+              pending = [];
             }
+            pendingColumns = columns;
             pending.push(row);
-            if (pending.length >= batchRows) {
-              await flush(pending);
+            if (pending.length >= insertBatchRows(columns.length)) {
+              await flush(pending, pendingColumns);
               pending = [];
             }
           }
-          await flush(pending);
+          await flush(pending, pendingColumns);
+          filter.logSkipped();
 
           totalRowsRestored += rows;
           tablesRestored++;
@@ -719,31 +766,32 @@ class SystemRestoreService {
             continue;
           }
 
-          // Check if table exists in MySQL
-          const [tableCheck] = await connection.query(
-            `SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_schema = ? AND table_name = ?`,
+          // The live table's columns (#6350). None means the table is absent.
+          const [liveRows] = await connection.query(
+            `SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`,
             [parsed.database, tableName]
           );
-          const tableExists = (tableCheck as any[])[0]?.cnt > 0;
-          if (!tableExists) {
+          const live = (liveRows as Array<{ name: string }>).map(r => r.name);
+          if (live.length === 0) {
             logger.warn(`⚠️  Skipping table not in database: ${tableName}`);
             continue;
           }
+          // MySQL matches column names without regard to case.
+          const filter = new RestoreColumnFilter(tableName, live, true);
 
           // Clear existing table data (use backticks for MySQL identifiers)
           await connection.execute(`DELETE FROM \`${tableName}\``);
 
           // Insert backup data in multi-row statements, streamed off the file.
-          let columns: string[] | null = null;
-          let quotedColumns = '';
+          // A batch holds rows with one column set; a row with another set
+          // flushes it first.
           let rows = 0;
-          let batchRows = MAX_INSERT_ROWS;
-          const flush = async (batch: BackupRow[]): Promise<void> => {
-            if (batch.length === 0 || !columns) return;
-            const cols = columns;
+          const flush = async (batch: BackupRow[], cols: string[]): Promise<void> => {
+            if (batch.length === 0) return;
             // MySQL uses ? for placeholders like SQLite
             const tuple = `(${cols.map(() => '?').join(', ')})`;
             const values = batch.flatMap(row => cols.map(col => row[col] ?? null));
+            const quotedColumns = cols.map(c => `\`${c}\``).join(', ');
             await connection.query(
               `INSERT INTO \`${tableName}\` (${quotedColumns}) VALUES ${batch.map(() => tuple).join(', ')}`,
               values
@@ -752,19 +800,22 @@ class SystemRestoreService {
           };
 
           let pendingMysql: BackupRow[] = [];
+          let pendingColumns: string[] = [];
           for (const row of readTableFileSync(tableFile)) {
-            if (!columns) {
-              columns = this.insertColumns(tableName, row);
-              quotedColumns = columns.map(c => `\`${c}\``).join(', ');
-              batchRows = insertBatchRows(columns.length);
+            const columns = filter.columnsFor(row);
+            if (pendingMysql.length > 0 && columns.join(',') !== pendingColumns.join(',')) {
+              await flush(pendingMysql, pendingColumns);
+              pendingMysql = [];
             }
+            pendingColumns = columns;
             pendingMysql.push(row);
-            if (pendingMysql.length >= batchRows) {
-              await flush(pendingMysql);
+            if (pendingMysql.length >= insertBatchRows(columns.length)) {
+              await flush(pendingMysql, pendingColumns);
               pendingMysql = [];
             }
           }
-          await flush(pendingMysql);
+          await flush(pendingMysql, pendingColumns);
+          filter.logSkipped();
 
           totalRowsRestored += rows;
           tablesRestored++;
@@ -813,6 +864,82 @@ class SystemRestoreService {
     } catch {
       return null;
     }
+  }
+}
+
+/**
+ * Picks, for each backup row, the columns its INSERT may name (#6350).
+ *
+ * A backup column the live table lacks is skipped, not inserted: an old
+ * SQLite install can carry legacy columns (camelCase `showAccuracyRegions`
+ * beside the authoritative `show_accuracy_regions`) that a fresh schema never
+ * had. `logSkipped()` warns once per table with every skipped name.
+ *
+ * Every backup column name is still checked against BACKUP_IDENTIFIER_PATTERN
+ * first, and anything else is rejected, which rolls the restore back.
+ *
+ * The choice is per row, so rows with differing key sets each insert what
+ * they carry, and a column a row omits takes the table's default. Columns
+ * come back in the live table's order, so key order in the file does not
+ * matter.
+ */
+export class RestoreColumnFilter {
+  /** Live column name (lower-cased when case-insensitive) to its position. */
+  private readonly live = new Map<string, number>();
+  private readonly decided = new Map<string, boolean>();
+  private readonly claimed = new Set<string>();
+  private readonly skipped: string[] = [];
+
+  constructor(
+    private readonly tableName: string,
+    liveColumns: string[],
+    private readonly caseInsensitive: boolean,
+  ) {
+    liveColumns.forEach((name, i) => this.live.set(this.norm(name), i));
+  }
+
+  /** The row's columns to insert, in live-table order. */
+  columnsFor(row: BackupRow): string[] {
+    const keep: string[] = [];
+    for (const key of Object.keys(row)) {
+      let ok = this.decided.get(key);
+      if (ok === undefined) {
+        ok = this.decide(key);
+        this.decided.set(key, ok);
+      }
+      if (ok) keep.push(key);
+    }
+    if (keep.length === 0) {
+      throw new Error(`Backup row for table ${this.tableName} has no column the table has`);
+    }
+    return keep.sort((a, b) => (this.live.get(this.norm(a)) ?? 0) - (this.live.get(this.norm(b)) ?? 0));
+  }
+
+  /** Warn once with every backup column this table skipped. */
+  logSkipped(): void {
+    if (this.skipped.length === 0) return;
+    logger.warn(
+      `⚠️  Restore of ${this.tableName}: skipped backup column(s) the table does not have: ${this.skipped.join(', ')}`
+    );
+  }
+
+  private decide(key: string): boolean {
+    if (!BACKUP_IDENTIFIER_PATTERN.test(key)) {
+      throw new Error(`Invalid column name in backup for table ${this.tableName}: ${key}`);
+    }
+    const norm = this.norm(key);
+    // A second spelling of a claimed column (a case variant) would name the
+    // column twice in one INSERT.
+    if (!this.live.has(norm) || this.claimed.has(norm)) {
+      this.skipped.push(key);
+      return false;
+    }
+    this.claimed.add(norm);
+    return true;
+  }
+
+  private norm(name: string): string {
+    return this.caseInsensitive ? name.toLowerCase() : name;
   }
 }
 

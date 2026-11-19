@@ -115,11 +115,25 @@ describe('MeshCoreMessageStream — resend (#5512)', () => {
     expect(resendButton()).toBeNull();
   });
 
-  it('never offers it on received messages or DMs', () => {
+  it('never offers it on a received message', () => {
     renderStream([
       sent({ id: 'rx', fromPublicKey: 'channel-1', fromName: 'Bob' }),
-      sent({ id: 'dm', toPublicKey: 'b'.repeat(64) }),
     ]);
+    expect(resendButton()).toBeNull();
+  });
+
+  it('offers it on our own unheard, unacked DM (#6194)', () => {
+    renderStream([sent({ id: 'dm', toPublicKey: 'b'.repeat(64) })]);
+    expect(resendButton()).not.toBeNull();
+  });
+
+  it('never offers it on a DM the recipient acknowledged (delivered, #6194)', () => {
+    renderStream([sent({ id: 'dm', toPublicKey: 'b'.repeat(64), deliveryStatus: 'delivered' })]);
+    expect(resendButton()).toBeNull();
+  });
+
+  it('never offers it on a room post (#6194)', () => {
+    renderStream([sent({ id: 'room', toPublicKey: 'b'.repeat(64), messageType: 'room_post' })]);
     expect(resendButton()).toBeNull();
   });
 
@@ -149,6 +163,11 @@ describe('MeshCoreMessageStream — resend (#5512)', () => {
     expect(onResend).not.toHaveBeenCalled();
   });
 
+  it('never offers Resend on our own reaction row', () => {
+    renderStream([sent({ id: 'rx', text: '👍', reactionEmoji: '👍', reactionTargetId: 'gone' })]);
+    expect(resendButton()).toBeNull();
+  });
+
   it('hides the button when a channel_heard update arrives', () => {
     const { rerender } = renderStream([sent()]);
     expect(resendButton()).not.toBeNull();
@@ -161,6 +180,78 @@ describe('MeshCoreMessageStream — resend (#5512)', () => {
       />,
     );
     expect(resendButton()).toBeNull();
+  });
+});
+
+describe('MeshCoreMessageStream — Required Repeater gate (#6178)', () => {
+  const REQ = 'b'.repeat(64);
+  const OTHER = 'c'.repeat(64);
+  const contacts = [
+    { publicKey: REQ, advType: 2, advName: 'Backbone' },
+    { publicKey: OTHER, advType: 2, advName: 'Nearby' },
+  ];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0 + 31_000);
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const renderRequired = (messages: MeshCoreMessage[], mode: 'any' | 'all' = 'any', keys: string[] = [REQ]) =>
+    render(
+      <MeshCoreMessageStream
+        messages={messages}
+        selfPublicKey={SELF}
+        contacts={contacts}
+        requiredRepeaterKeys={keys}
+        requiredRepeaterMode={mode}
+        onSend={async () => true}
+        onResendMessage={vi.fn(async () => null)}
+      />,
+    );
+
+  it('keeps Resend when only a DIFFERENT repeater relayed it', () => {
+    renderRequired([sent({ heardBy: [{ hash: 'cc', name: 'Nearby', snr: 3 }] })]);
+    const btn = screen.queryByRole('button', { name: 'Resend' });
+    expect(btn).not.toBeNull();
+    // Tooltip explains the required repeater has not relayed it yet.
+    expect(btn!.getAttribute('title')).toContain('Backbone');
+  });
+
+  it('hides Resend once the REQUIRED repeater is uniquely heard', () => {
+    renderRequired([sent({ heardBy: [{ hash: 'bb', name: 'Backbone', snr: 3 }] })]);
+    expect(screen.queryByRole('button', { name: 'Resend' })).toBeNull();
+  });
+
+  it('keeps Resend (default tooltip) when no repeater has been heard yet', () => {
+    renderRequired([sent()]);
+    const btn = screen.queryByRole('button', { name: 'Resend' });
+    expect(btn).not.toBeNull();
+    expect(btn!.getAttribute('title')).not.toContain('Backbone');
+  });
+
+  // #6193 — list + ANY/ALL mode.
+  it('ANY mode: one of several listed repeaters heard hides Resend', () => {
+    renderRequired([sent({ heardBy: [{ hash: 'cc', name: 'Nearby', snr: 3 }] })], 'any', [REQ, OTHER]);
+    expect(screen.queryByRole('button', { name: 'Resend' })).toBeNull();
+  });
+
+  it('ALL mode: keeps Resend until EVERY listed repeater is heard', () => {
+    const { rerender } = renderRequired([sent({ heardBy: [{ hash: 'bb', name: 'Backbone', snr: 3 }] })], 'all', [REQ, OTHER]);
+    // Only REQ heard so far → ALL not satisfied → button stays.
+    expect(screen.queryByRole('button', { name: 'Resend' })).not.toBeNull();
+    rerender(
+      <MeshCoreMessageStream
+        messages={[sent({ heardBy: [{ hash: 'bb', name: 'Backbone', snr: 3 }, { hash: 'cc', name: 'Nearby', snr: 3 }] })]}
+        selfPublicKey={SELF}
+        contacts={contacts}
+        requiredRepeaterKeys={[REQ, OTHER]}
+        requiredRepeaterMode="all"
+        onSend={async () => true}
+        onResendMessage={vi.fn(async () => null)}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Resend' })).toBeNull();
   });
 });
 

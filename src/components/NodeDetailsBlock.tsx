@@ -11,18 +11,25 @@ import { hasAccuracyCell } from '../utils/precisionOffset';
 import { TimeFormat, DateFormat, useSettings } from '../contexts/SettingsContext';
 import { useMapContext } from '../contexts/MapContext';
 import { useChannels, useDeviceConfig } from '../hooks/useServerData';
-import apiService, { SignalTrendResult } from '../services/api';
+import SignalTrendBadge from './SignalTrendBadge';
 import './NodeDetailsBlock.css';
-import { UiIcon, type UiIconName } from './icons';
+import { UiIcon } from './icons';
 import { MeshtasticContactShare } from './MeshtasticContactShare';
 import { NodeSkyView } from './gnss/NodeSkyView';
 import { Firmware28SilenceNotice } from './Firmware28SilenceNotice';
 import { ShowCoverageLink } from './Analysis/ShowCoverageLink';
+import { DirectRfSection } from './DirectRfSection';
 import { RemoteAdminLink } from './RemoteAdminLink';
 import { formatAircraftSummary } from '../utils/aircraftClassification';
 import { SignFlipNotice } from './SignFlipNotice';
 import FlightMatchLine from './FlightMatchLine';
+import AircraftMarkNote from './AircraftMarkNote';
+import PkiExchangeStatusCard from './PkiExchangeStatusCard';
 import AssetTrackingSection from './AssetTrackingSection';
+import NodeNameHistory from './NodeNameHistory';
+import PositionEstimateRationaleBox from './PositionEstimateRationaleBox';
+import NodeChannelEditor from './NodeChannelEditor';
+import { usePublicInstanceView } from '../hooks/usePublicInstanceView';
 
 interface NodeDetailsBlockProps {
   node: DeviceInfo | null;
@@ -36,6 +43,12 @@ interface NodeDetailsBlockProps {
   canEditNotes?: boolean;
   /** Persist the edited note. Resolves on success, rejects on failure. */
   onSaveNotes?: (notes: string) => Promise<void>;
+  /**
+   * When true (and `onSaveChannel` is provided), the Channel card can set,
+   * clear and lock the node's channel (#5923). Needs nodes:write.
+   */
+  canEditChannel?: boolean;
+  onSaveChannel?: (channel: number | null, locked: boolean) => Promise<void>;
   /**
    * Active source id. Required to fetch the per-node signal trend badge (#4110);
    * when absent (or a MeshCore/no-source context) the badge is simply omitted.
@@ -60,50 +73,9 @@ interface NodeDetailsBlockProps {
 
 const MAX_NODE_NOTES_LENGTH = 2000;
 
-/** Semantic icon for a signal trend direction (#4110). */
-function signalTrendIcon(trend: SignalTrendResult['trend']): UiIconName {
-  switch (trend) {
-    case 'improving': return 'chevronUp';
-    case 'degrading': return 'chevronDown';
-    default: return 'forward';
-  }
-}
-
-/**
- * Build a human-readable tooltip summarizing the day-vs-week deltas behind a
- * signal-trend badge (#4110). Kept plain-text so it works as a `title` attr.
- * `translate` is i18next's `t` so the descriptive words are localized (the
- * RSSI/SNR acronyms and dB units are left as-is).
- */
-function buildSignalTrendTooltip(
-  trend: SignalTrendResult,
-  translate: (key: string, opts?: Record<string, unknown>) => string,
-): string {
-  const parts: string[] = [];
-  const signed = (n: number) => `${n >= 0 ? '+' : ''}${n}`;
-  const metricLine = (label: string, m: NonNullable<SignalTrendResult['rssi']>) =>
-    translate('node_details.signal_trend_tooltip_metric', {
-      label,
-      delta: signed(m.delta),
-      unit: m.unit,
-      recent: m.recent,
-      baseline: m.baseline,
-      defaultValue: `${label} ${signed(m.delta)} ${m.unit} (24h avg ${m.recent} vs 7d ${m.baseline})`,
-    });
-  if (trend.rssi) parts.push(metricLine('RSSI', trend.rssi));
-  if (trend.snr) parts.push(metricLine('SNR', trend.snr));
-  if (trend.noiseFloorRising && trend.noiseFloor) {
-    parts.push(translate('node_details.signal_trend_tooltip_noise', {
-      delta: signed(trend.noiseFloor.delta),
-      unit: trend.noiseFloor.unit,
-      defaultValue: `Noise floor rising ${signed(trend.noiseFloor.delta)} ${trend.noiseFloor.unit}`,
-    }));
-  }
-  return parts.join('\n');
-}
-
-const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = '24', dateFormat = 'MM/DD/YYYY', canEditNotes = false, onSaveNotes, sourceId, assetTracking, canOpenRemoteAdmin = false }) => {
+const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = '24', dateFormat = 'MM/DD/YYYY', canEditNotes = false, onSaveNotes, canEditChannel = false, onSaveChannel, sourceId, assetTracking, canOpenRemoteAdmin = false }) => {
   const { t } = useTranslation();
+  const publicView = usePublicInstanceView();
   const { channels } = useChannels();
   const { currentNodeId } = useDeviceConfig();
   const { nodeHopsCalculation, distanceUnit } = useSettings();
@@ -127,32 +99,13 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
   const [notesSaving, setNotesSaving] = useState(false);
   const [notesError, setNotesError] = useState<string | null>(null);
 
-  // #4110: derived signal trend / link-attenuation badge. Fetched from the
-  // backend (which computes it from stored RSSI/SNR/noise-floor telemetry) when
-  // a concrete source is selected. Null while loading or when unavailable.
-  // Deliberately fetched once per node selection (not polled): the trend is a
-  // day-vs-week aggregate, so sub-session refresh would not change the verdict.
-  const [signalTrend, setSignalTrend] = useState<SignalTrendResult | null>(null);
+  // #4110: the derived signal-trend badge fetches its own data (SignalTrendBadge).
   const nodeIdForTrend = node?.user?.id
     ?? (nodeNum != null ? `!${nodeNum.toString(16).padStart(8, '0')}` : null);
 
   useEffect(() => {
     localStorage.setItem('nodeDetailsCollapsed', isCollapsed.toString());
   }, [isCollapsed]);
-
-  useEffect(() => {
-    // The endpoint requires a sourceId; skip the fetch entirely without one.
-    if (!nodeIdForTrend || !sourceId) {
-      setSignalTrend(null);
-      return;
-    }
-    let cancelled = false;
-    setSignalTrend(null);
-    apiService.getSignalTrend(nodeIdForTrend, sourceId)
-      .then(result => { if (!cancelled) setSignalTrend(result); })
-      .catch(() => { if (!cancelled) setSignalTrend(null); });
-    return () => { cancelled = true; };
-  }, [nodeIdForTrend, sourceId]);
 
   // Re-sync draft/baseline whenever the selected node or its stored note changes.
   useEffect(() => {
@@ -361,7 +314,7 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
    */
   const formatLastHeard = (lastHeard: number | undefined): string => {
     if (lastHeard === undefined || lastHeard === null) return 'N/A';
-    return formatRelativeTime(lastHeard * 1000, timeFormat, dateFormat, false);
+    return formatRelativeTime(lastHeard * 1000, timeFormat, dateFormat, false, { coarseHour: publicView.coarseTime });
   };
 
   /**
@@ -473,21 +426,8 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
 
           {/* Signal Trend (#4110) — derived link-attenuation badge. Rendered
               only when there is enough history to say something meaningful. */}
-          {signalTrend && signalTrend.trend !== 'insufficient' && (
-            <div className="node-detail-card">
-              <div className="node-detail-label">{t('node_details.signal_trend', 'Signal Trend')}</div>
-              <div
-                className={`node-detail-value signal-trend signal-trend-${signalTrend.trend}`}
-                title={buildSignalTrendTooltip(signalTrend, t)}
-              >
-                <span className="signal-trend-arrow" aria-hidden="true"><UiIcon name={signalTrendIcon(signalTrend.trend)} size={14} /></span>
-                {' '}
-                {t(`node_details.signal_trend_${signalTrend.trend}`,
-                  signalTrend.trend === 'improving' ? 'Improving'
-                    : signalTrend.trend === 'degrading' ? 'Degrading'
-                    : 'Stable')}
-              </div>
-            </div>
+          {nodeIdForTrend && sourceId && (
+            <SignalTrendBadge nodeId={nodeIdForTrend} sourceId={sourceId} />
           )}
 
           {/* Channel Utilization */}
@@ -584,7 +524,7 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
                   title={t('node_details.position_updated_tooltip', 'When this node last reported its position (server receive time)')}
                 >
                   {t('node_details.position_updated', 'Updated {{when}}', {
-                    when: formatRelativeTime(node.positionTimestamp, timeFormat, dateFormat, false),
+                    when: formatRelativeTime(node.positionTimestamp, timeFormat, dateFormat, false, { coarseHour: publicView.coarseTime }),
                   })}
                 </span>
               )}
@@ -639,16 +579,18 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
             </div>
           </div>
         )}
-        {node.aircraftFixedAt != null && (
-          <div className="node-detail-card" data-testid="node-details-aircraft-fixed">
-            <div className="node-detail-label">
-              <UiIcon name="aircraft" size={14} /> {t('node_popup.aircraft_fixed', 'Reclassified as fixed')}
-            </div>
-          </div>
-        )}
+        {/* Manual mark vs automatic fixed mark (#5715) */}
+        <AircraftMarkNote node={node} timeFormat={timeFormat} dateFormat={dateFormat} />
 
-        {/* Channel */}
-        {node.channel !== undefined && (
+        {/* Channel — editable and lockable with nodes:write (#5923) */}
+        {(canEditChannel && onSaveChannel) ? (
+          <NodeChannelEditor
+            channel={node.channel}
+            locked={node.channelLocked === true}
+            channels={channels || []}
+            onSave={onSaveChannel}
+          />
+        ) : node.channel !== undefined && (
           <div className="node-detail-card">
             <div className="node-detail-label">{t('node_details.channel')}</div>
             <div className="node-detail-value">
@@ -680,6 +622,16 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
               {publicKey}
             </div>
           </div>
+        )}
+
+        {/* Reliable PKI (#5691): did our last encrypted DM/request get an answer? */}
+        {publicKey && sourceId && (
+          <PkiExchangeStatusCard
+            sourceId={sourceId}
+            nodeNum={node.nodeNum}
+            timeFormat={timeFormat}
+            dateFormat={dateFormat}
+          />
         )}
 
         {shareableContact && (
@@ -885,6 +837,30 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
             </div>
           ) : null}
         </div>
+
+        {/* Estimated-position rationale (#5900) — only when the displayed
+            position is an estimate, never for GPS or an override. */}
+        {positionSource.kind === 'estimated' && node.nodeNum != null
+          && node.position?.latitude != null && node.position?.longitude != null && (
+          <PositionEstimateRationaleBox
+            nodeNum={node.nodeNum}
+            distanceUnit={distanceUnit}
+            timeFormat={timeFormat}
+            dateFormat={dateFormat}
+          />
+        )}
+
+        {/* Direct RF (#6210): zero-hop RF receptions by this source's radio.
+            Renders nothing without a source or on an error. Sends nothing. */}
+        <DirectRfSection sourceId={sourceId} nodeKey={node.user?.id ?? null} timeFormat={timeFormat} dateFormat={dateFormat} />
+
+        {/* Name history (#5862) — renders nothing until the node is renamed. */}
+        <NodeNameHistory
+          nodeId={node.user?.id ?? (node.nodeNum != null ? String(node.nodeNum) : null)}
+          currentName={`${node.user?.longName ?? ''}\u0000${node.user?.shortName ?? ''}`}
+          timeFormat={timeFormat}
+          dateFormat={dateFormat}
+        />
 
         {/* Asset tracking (#5354) — sits right below Notes. */}
         {assetTracking && node.nodeNum != null && (

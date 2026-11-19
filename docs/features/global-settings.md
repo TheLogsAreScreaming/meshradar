@@ -6,42 +6,44 @@
 
 ## Opening Global Settings
 
-Click the **gear icon** titled **Global Settings** in the dashboard sidebar footer (it collapses into a hamburger on mobile). The Global Settings page is admin-gated — regular users see their own **Profile / Preferences** page instead.
+Click the **gear icon** titled **Global Settings** in the dashboard sidebar footer (it collapses into a hamburger on mobile). The icon shows to anyone with **settings: read** on at least one source. Saving needs **settings: write**, and some sections show to administrators only: Default Meshtastic source, Remote Administration, Apprise API Server, Elevation / Terrain, Flight matching (ADS-B), Message Translation, Channel Database, Scripts and Analytics.
 
 ![Global Settings page with tabbed sections](/images/features/global-settings.png)
 
 ## What lives here
 
-MeshMonitor has three settings pages. **Device Configuration** (satellite icon, per source) holds what MeshMonitor writes to, or does on, the radio. **Settings** (gear icon, per source) holds what MeshMonitor stores and does for that one source. **Global Settings** holds what applies to the whole install. MeshCore and Reticulum source pages link here from the foot of their left nav rail and from the top of their Settings page.
+MeshMonitor has three settings pages. **Device Configuration** (satellite icon, per source) holds what MeshMonitor writes to, or does on, the radio. **Settings** (gear icon, per source) holds what MeshMonitor stores and does for that one source. **Global Settings** holds what applies to the whole install. Every source's Settings page (Meshtastic, MeshCore and Reticulum) shows a banner at the top: **These settings apply to this source only**. The banner links to Global Settings for language, units, map, notifications and other install-wide settings. MeshCore and Reticulum source pages also link here from the foot of their left nav rail.
+
+![Banner on a source Settings page](/images/features/source-settings-global-banner.png)
+
+### Language, Units & Formats, Sorting
+
+- System language (Weblate-sourced translations)
+- Temperature and distance units, time and date format
+- Preferred node list sorting
 
 ### Appearance
 
-- Theme (15+ built-ins + custom themes)
-- Default map center and zoom (honored by embed maps and the dashboard)
-- Default map tileset (OSM, MapTiler, custom TileServer GL)
-- Date/time format applied to all logs and panels
+- Theme (15 built-ins + custom themes), icon style, map pin style and node list style
 - **Default Landing Page** (admin-only) — what users see at the root URL: **Unified View** (default) or any configured source. See [Settings → Default Landing Page](/features/settings#default-landing-page).
 
-### Localization
+Since 4.17 the theme, units, time and date format, sort order and landing page are install-wide only. A per-source page can no longer hold its own copy, so every page shows the same theme. The upgrade removes old per-source copies.
 
-- System language (Weblate-sourced translations, 20+ locales)
-- Units (metric / imperial)
+### Map
+
+- Light and dark map tilesets, custom tile servers, the map click zoom gate, marker clustering and **Discard Invalid Positions**. See [Settings → Map Settings](/features/settings#map-settings).
 
 ### Notifications
 
-- Push notification VAPID keys (auto-generated)
-- Security Digest Apprise URL (weak-key / duplicate-key alerts — lives under the Security tab)
-- News popup toggle (controls whether the dashboard renders the news feed)
-
-Individual Apprise URLs (per user, per source) are not here — users configure those in their own **Settings → Notifications** page.
+The **Apprise API Server** section (admin only) holds the server-wide Apprise endpoint. Notification preferences are per user and per source: each user sets them on a source's **Notifications** tab. The Security Digest lives on a source's **Security** tab. See [Notifications](/features/notifications).
 
 ### Security
 
-- Session lifetime
-- Anonymous access policy
-- MFA enforcement defaults
-- Rate-limiter thresholds
+Session lifetime, anonymous access, rate limits and similar server policy are set with environment variables, not on this page. See [Production Deployment](/configuration/production).
+
 - **PKI direct message decryption**: the install-wide enable switch (the per-source switch is on each source's **Settings** page). See [PKI Direct Message Decryption](/features/pki-dm-decryption).
+- **Reliable PKI**: the default for every source, Off, As needed or Avoid PKI (each Meshtastic source can override it on its **Settings** page). See [Reliable PKI](/features/reliable-pki).
+- **Node name anti-spam** (admin only): off by default. Replaces links in node names with a placeholder before they are stored. See [Node name anti-spam](/features/security#node-name-anti-spam).
 
 ### Channel Database
 
@@ -64,10 +66,21 @@ The destination retention cap. It applies to every Reticulum source. A Reticulum
 - Schedule automatic backups
 - See [System Backup](/features/system-backup) for the full workflow
 
-### Housekeeping
+### Database Maintenance
 
-- Auto heap management (periodic memory reclamation on Postgres/MySQL)
-- Maintenance windows (message purge, telemetry retention, auto-delete-by-distance)
+Shown on SQLite, PostgreSQL and MySQL installs. An optional scheduled job deletes messages, traceroutes, route segments, neighbor info, audit log entries and MeshCore CLI history older than the retention you set for each (7 to 365 days). It is off until an admin turns it on. On PostgreSQL and MySQL nothing is pruned until you do. See [Settings → Database Maintenance](/features/settings#database-maintenance).
+
+### Default Meshtastic source
+
+Admin only. Picks the Meshtastic TCP source used where a request names no source: API calls without a `sourceId`, the v1 `default` source, and device pages opened without a source. **Automatic** (the default) uses the first Meshtastic TCP source started at boot. The section shows which source is in use now. See [Multi-Source → Default Meshtastic source](/features/multi-source#default-meshtastic-source).
+
+### Tropospheric ducting overlay
+
+An admin-only switch for the [ducting overlay](/features/maps#tropospheric-ducting-overlay) on the Map tab and the Dashboard map. Off by default. See [Settings → Tropospheric ducting overlay](/features/settings#tropospheric-ducting-overlay).
+
+### MQTT root directory refresh
+
+An admin-only switch that lets the MQTT **Find topics** search fetch the current community root list from `api.meshtastic.org`. Off by default. See [Settings → MQTT root directory refresh](/features/settings#mqtt-root-directory-refresh).
 
 ### Position Estimation
 
@@ -88,16 +101,22 @@ save. Gated by `settings:write`.
 
 ## Per-source settings (for comparison)
 
-Anything that depends on *which* node you're connected to lives on the source, not here. Open **Dashboard → Edit Source** for:
+Anything that depends on *which* node you're connected to lives on the source, not here.
 
-- Connection details (host/port/device/credentials)
+On the dashboard, **Edit Source** holds:
+
+- Connection details (host, port, credentials)
 - Virtual Node
-- Auto-Responder, Auto-Announce, Auto-Traceroute, Auto-Ack
-- Scheduled Messages
-- Permissions
+
+On the source's own **Settings** page:
+
+- Node display, telemetry, packet monitor and solar settings
 - PKI direct message decryption switch (Meshtastic)
+- Reliable PKI override (Meshtastic)
 - MQTT Bridge Configuration (bridge sources)
 - Receive-only mode, saved regions, node display, and message filters (MeshCore)
+
+Elsewhere on the source: Auto-Responder, Auto-Announce, Auto-Traceroute, Auto-Ack and the other automations are on its **Automation** tab, and what is written to the radio is under **Device Configuration**. Per-source permissions are set on the **Users** page.
 
 See [Multi-Source](/features/multi-source) for the full per-source list.
 

@@ -27,10 +27,13 @@ import LoginModal from '../components/LoginModal';
 import UserMenu from '../components/UserMenu';
 import { appBasename } from '../init';
 import { ReticulumPage } from '../components/Reticulum/ReticulumPage';
-import type { ReticulumStatus } from '../types/reticulum';
+import { CyclingConnectionStatus } from '../components/AppHeader/CyclingConnectionStatus';
+import { reticulumHeaderMetrics } from '../components/Reticulum/reticulumHeaderMetrics';
+import type { ReticulumStatus, ReticulumInterfaceRow } from '../types/reticulum';
 import '../components/AppHeader/AppHeader.css';
 import { UiIcon } from '../components/icons';
 import styles from './ReticulumSourcePage.module.css';
+import topbarStyles from './SourcePageTopbar.module.css';
 
 function ReticulumSourceInner() {
   const { t } = useTranslation();
@@ -46,6 +49,7 @@ function ReticulumSourceInner() {
 
   const [showLogin, setShowLogin] = useState(false);
   const [rnsStatus, setRnsStatus] = useState<ReticulumStatus | null>(null);
+  const [rnsInterfaces, setRnsInterfaces] = useState<ReticulumInterfaceRow[]>([]);
 
   if (!sourceId) {
     return (
@@ -60,6 +64,16 @@ function ReticulumSourceInner() {
   const statusLoading = rnsStatus === null;
   const connected = rnsStatus?.connected ?? false;
 
+  // Battery + Ch/Air for the header, from the first Up RNode interface (#6120).
+  // undefined when nothing reports them, so the badge shows only the status.
+  const headerMetrics = reticulumHeaderMetrics(rnsInterfaces);
+  const connectionStatus = statusLoading ? 'connecting' : connected ? 'connected' : 'disconnected';
+  const connectionStatusText = statusLoading
+    ? t('source.status_connecting', 'Connecting')
+    : connected
+      ? t('header.status.connected', 'Connected')
+      : t('header.status.disconnected', 'Disconnected');
+
   return (
     <div className="dashboard-page">
       <header className="dashboard-topbar">
@@ -73,25 +87,27 @@ function ReticulumSourceInner() {
         {/* #4939: the back-to-sources button already anchors the header, so the
             MeshRadar logo + wordmark are redundant on a per-source page — show
             only the source name. */}
-        <div className="dashboard-topbar-logo">
+        <div className={`dashboard-topbar-logo ${topbarStyles.logo}`}>
           {sourceName && (
-            <span className="dashboard-topbar-title">{sourceName}</span>
+            // Shared one-line, ellipsised title (#4173 review N1).
+            <span className={`dashboard-topbar-title ${topbarStyles.title}`} title={sourceName}>{sourceName}</span>
           )}
         </div>
         <div className="dashboard-topbar-actions">
           <div className="connection-status-container">
-            <div className="connection-status">
-              <span
-                className={`status-indicator ${statusLoading ? 'connecting' : connected ? 'connected' : 'disconnected'}`}
-              />
-              <span>
-                {statusLoading
-                  ? t('source.status_connecting', 'Connecting')
-                  : connected
-                    ? t('header.status.connected', 'Connected')
-                    : t('header.status.disconnected', 'Disconnected')}
-              </span>
-            </div>
+            {/* Mirrors the Meshtastic header: the badge cycles
+                Connected → Battery → Airtime when the source's first Up RNode
+                interface reports those gauges (#6120). Reticulum status polls
+                (no realtime push, build spec R4), so the update-method
+                indicator reflects polling. */}
+            <CyclingConnectionStatus
+              connectionStatus={connectionStatus}
+              connectionStatusText={connectionStatusText}
+              webSocketConnected={false}
+              metrics={headerMetrics}
+              onClick={() => { /* no system-status popup on a Reticulum source */ }}
+              title={connectionStatusText}
+            />
           </div>
           {isAuthenticated ? (
             <UserMenu />
@@ -104,7 +120,12 @@ function ReticulumSourceInner() {
       </header>
 
       {canReadNodes ? (
-        <ReticulumPage baseUrl={appBasename} sourceId={sourceId} onStatusChange={setRnsStatus} />
+        <ReticulumPage
+          baseUrl={appBasename}
+          sourceId={sourceId}
+          onStatusChange={setRnsStatus}
+          onInterfacesChange={setRnsInterfaces}
+        />
       ) : (
         <div className={styles.gate}>
           <h2>{t('reticulum.title', 'Reticulum')}</h2>

@@ -18,11 +18,13 @@ import {
   stepOutputNameOf,
 } from '../../../types/automation.js';
 import { parseHopLimitOverride } from '../../../utils/hopLimitOverride.js';
-import { type EngineEvalContext, interpolateAsync, resolveOperand, capStepOutput } from './engineContext.js';
+import { type EngineEvalContext, type AirtimeGateVerdict, interpolateAsync, resolveOperand, capStepOutput } from './engineContext.js';
+import { logger } from '../../../utils/logger.js';
 import { isTxDisabledError } from '../../errors/txDisabledError.js';
 import { hopCountEmoji } from '../../../utils/hopEmoji.js';
 import { tokenizeArgv } from '../../utils/argvTokenizer.js';
 import { type MeshCoreAdvertMode, LEGACY_MESHCORE_ADVERT_MODE, resolveMeshCoreAdvertMode } from '../../../types/meshcoreAdvert.js';
+import { parseTracePathEntry, type TracePathEntry } from '../../../types/tracePathSchedule.js';
 
 export type NodeManageOp = 'favorite' | 'unfavorite' | 'ignore' | 'unignore' | 'delete';
 
@@ -41,6 +43,8 @@ export interface ActionDeps {
     /** MeshCore scope/region override (#3833). undefined = inherit channel/default;
      *  '' = explicit unscoped; non-empty = that region. Ignored by Meshtastic. */
     scopeOverride?: string | null;
+    /** Split a long message into up to 3 marked parts instead of cutting it (MeshCore #6316, Meshtastic #6330). */
+    splitLongMessages?: boolean;
     /**
      * App-level DM resend cap (#4340 Phase 3), 1–3. Absent = one direct send —
      * today's behaviour for every existing automation. Honoured ONLY for a
@@ -55,6 +59,13 @@ export interface ActionDeps {
      * with no ACK request and no queue retry.
      */
     hopLimitOverride?: number;
+    /**
+     * Reticulum/LXMF only (#6143): the LXMF hash of the message this send
+     * replies to. Set when "Reply to the triggering message" is ticked on a
+     * Reticulum target. Ignored by Meshtastic/MeshCore, which thread replies
+     * via the packet id / `@[name]` mention instead.
+     */
+    replyToHash?: string;
   }): Promise<unknown>;
   sendTapback(a: {
     sourceId: string | null;
@@ -64,6 +75,8 @@ export interface ActionDeps {
     replyId?: number;
     /** Hop-limit override (#5121) — see sendMessage. */
     hopLimitOverride?: number;
+    /** MeshCore only (#5762): id of the received message to react to. */
+    meshcoreMessageId?: string;
   }): Promise<unknown>;
   manageNode(a: { sourceId: string | null; nodeNum: number; op: NodeManageOp }): Promise<unknown>;
   /** Ask a node/mesh for data or to announce (#3835). `target` is raw — a node # for
@@ -76,6 +89,19 @@ export interface ActionDeps {
     telemetryType?: TelemetryKind;
     /** MeshCore advert reach for op `advert` (Meshtastic ignores it). */
     advertMode?: MeshCoreAdvertMode;
+  }): Promise<unknown>;
+  /**
+   * Run one path of an `action.tracePathSchedule` block on one source (#5723).
+   * The real implementation decides whether the path is due and under the
+   * source's hourly cap, records the run, and sends at most one trace. The
+   * dry run reports what it would do and neither records nor sends.
+   */
+  runScheduledTrace(a: {
+    sourceId: string;
+    /** Stable identity of this path across runs and restarts. */
+    pathKey: string;
+    path: TracePathEntry;
+    autoReturn: boolean;
   }): Promise<unknown>;
   /** Reboot the physical device behind a source (#3995). `seconds` is the
    *  Meshtastic reboot delay; MeshCore ignores it. `targetNodeNum` (#4126) is an
@@ -160,6 +186,10 @@ export interface SetAutomationEnabledResult {
  */
 export function actionStepDetail(node: AutomationNode, value: unknown): Record<string, unknown> | undefined {
   if (value == null || typeof value !== 'object') return undefined;
+  // Airtime cutoff: say what was held back and why. Whitelisted fields only —
+  // a dry-run skip carries the rendered text, which must not reach the run log.
+  const airtime = airtimeStepDetail(value);
+  if (airtime) return airtime;
   const v = value as Record<string, unknown>;
   // #5636: an empty send that was held back, with why.
   if (v.emptySend === true && typeof v.reason === 'string') return { skipped: true, reason: v.reason };
@@ -174,6 +204,34 @@ export function actionStepDetail(node: AutomationNode, value: unknown): Record<s
   }
   if (node.type !== 'action.setAutomationEnabled') return undefined;
   return { automationId: v.automationId, name: v.name, mode: v.mode, enabled: v.enabled, previous: v.previous };
+}
+
+/**
+ * Run-log detail for an airtime-cutoff skip: one skip, an all-skipped array
+ * (`sourceIds` lists every held-back source), or a partial array where some
+ * targets sent (`partial: true`, `airtimeSkipped` lists the held-back ones).
+ * Undefined when the cutoff played no part.
+ */
+function airtimeStepDetail(value: unknown): Record<string, unknown> | undefined {
+  const pick = (k: AirtimeSkip) => ({
+    skipped: true, airtimeCutoff: true, sourceId: k.sourceId,
+    channelUtilization: k.channelUtilization, threshold: k.threshold, reason: k.reason,
+  });
+  if (!Array.isArray(value)) return isAirtimeSkip(value) ? pick(value) : undefined;
+  const skips = value.filter(isAirtimeSkip);
+  if (skips.length === 0) return undefined;
+  const sids = [...new Set(skips.map((k) => k.sourceId))];
+  if (skips.length === value.length) {
+    return sids.length === 1 && skips.length === 1
+      ? pick(skips[0])
+      : { skipped: true, airtimeCutoff: true, sourceIds: sids, reason: `airtime cutoff held back every send (${sids.join(', ')}): ${skips[0].reason}` };
+  }
+  return {
+    partial: true,
+    airtimeCutoff: true,
+    airtimeSkipped: sids,
+    reason: `partly sent: the airtime cutoff held back ${skips.length} of ${value.length} sends (${sids.join(', ')})`,
+  };
 }
 
 /**
@@ -244,6 +302,19 @@ async function isMeshCoreSource(ctx: EngineEvalContext, sourceId: string | null)
 }
 
 /**
+ * True when the action's target source speaks Reticulum (LXMF) (#6143). Same
+ * best-effort contract as {@link isMeshCoreSource}: a provider that can't report
+ * a protocol returns false, so behavior is unchanged. Reticulum is its own
+ * protocol — Meshtastic/MeshCore-only actions (tapback, node manage, request
+ * data, device reboot) are recorded no-ops on it, and a send resolves the DM
+ * target as an LXMF hash string rather than a node number.
+ */
+async function isReticulumSource(ctx: EngineEvalContext, sourceId: string | null): Promise<boolean> {
+  if (!sourceId) return false;
+  return (await ctx.data.getSourceProtocol?.(sourceId)) === 'reticulum';
+}
+
+/**
  * Run a mesh-send action dep call and push its result into `results`. A
  * `TxDisabledError` from a TX-disabled Meshtastic source (#4294) is caught and
  * converted into the file's existing skip shape — mirroring the MeshCore-
@@ -260,6 +331,95 @@ async function pushOrSkipTxDisabled<T>(results: unknown[], fn: () => Promise<T>)
     }
     throw error;
   }
+}
+
+/** What an action records when the airtime cutoff held its send back. */
+export interface AirtimeSkip {
+  skipped: true;
+  airtimeCutoff: true;
+  sourceId: string;
+  channelUtilization: number | null;
+  threshold: number;
+  reason: string;
+  /** Dry run only: the text that would have been sent, for the Test panel. */
+  text?: string;
+}
+
+/** True for a result the airtime cutoff produced. The one test every caller shares. */
+export function isAirtimeSkip(v: unknown): v is AirtimeSkip {
+  return v != null && typeof v === 'object' && (v as { airtimeCutoff?: unknown }).airtimeCutoff === true
+    && (v as { skipped?: unknown }).skipped === true;
+}
+
+/**
+ * True when an action's result is airtime skips only: one skip, or an array
+ * of results that are all skips. A mixed array (some sent, some skipped)
+ * is not, so the rule's cooldown keeps its stamp.
+ */
+export function isAllAirtimeSkipped(v: unknown): boolean {
+  if (Array.isArray(v)) return v.length > 0 && v.every(isAirtimeSkip);
+  return isAirtimeSkip(v);
+}
+
+function pct(n: number | null): string {
+  return n == null ? '?' : String(Math.round(n * 10) / 10);
+}
+
+/**
+ * Ask the source's airtime cutoff whether this send may go. Returns the skip
+ * to record, or null to send. Fails open: no provider hook, a null verdict
+ * (MeshCore / Reticulum / MQTT / not connected) or a throw all send.
+ *
+ * A manual "Run now" ignores the cutoff — the user asked for this send — but
+ * still asks, so the run log can say the cutoff was bypassed.
+ */
+async function airtimeGate(ctx: EngineEvalContext, sid: string | null): Promise<AirtimeSkip | null> {
+  if (!sid || !ctx.data.getAirtimeGate) return null;
+  let verdict: AirtimeGateVerdict | null;
+  try {
+    verdict = await ctx.data.getAirtimeGate(sid);
+  } catch {
+    return null;
+  }
+  if (!verdict || !verdict.gated) return null;
+  const figures = `channel utilization ${pct(verdict.channelUtilization)}% is over the ${pct(verdict.threshold)}% cutoff`;
+  if (ctx.manual) {
+    const bypassed = ctx.airtimeBypassed ?? (ctx.airtimeBypassed = []);
+    if (!bypassed.some((b) => b.sourceId === sid)) {
+      bypassed.push({ sourceId: sid, channelUtilization: verdict.channelUtilization, threshold: verdict.threshold });
+    }
+    logger.info(`[AutomationEngine] Run now ignored the airtime cutoff on ${sid}: ${figures}`);
+    return null;
+  }
+  return {
+    skipped: true,
+    airtimeCutoff: true,
+    sourceId: sid,
+    channelUtilization: verdict.channelUtilization,
+    threshold: verdict.threshold,
+    reason: `airtime cutoff: ${figures}, so nothing was sent`,
+  };
+}
+
+/**
+ * {@link pushOrSkipTxDisabled} behind the airtime cutoff: when the source is
+ * over its cutoff the dep is never called and an {@link AirtimeSkip} is
+ * recorded instead. Checked per target, so one busy source does not hold
+ * back a quiet one. `extra` rides on the skip (the dry run's rendered text).
+ */
+async function pushOrSkipMesh<T>(
+  results: unknown[],
+  ctx: EngineEvalContext,
+  sid: string | null,
+  fn: () => Promise<T>,
+  extra?: { text?: string },
+): Promise<void> {
+  const skip = await airtimeGate(ctx, sid);
+  if (skip) {
+    results.push(ctx.dryRun && extra?.text != null ? { ...skip, text: extra.text } : skip);
+    return;
+  }
+  await pushOrSkipTxDisabled(results, fn);
 }
 
 /**
@@ -442,6 +602,8 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
       // Only forward the key when set, so the default (inherit) call shape — and
       // thus the run-log resolvedParams and existing tests — is unchanged.
       const scopeArg = scopeOverride !== undefined ? { scopeOverride } : {};
+      // #6316: only forward when on, so the default call shape is unchanged.
+      const splitArg = p.splitLongMessages === true ? { splitLongMessages: true } : {};
 
       // #4340 Phase 3. Only forward the key when set, so the default (unset)
       // call shape — and thus the run-log resolvedParams and every existing
@@ -471,6 +633,33 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
       for (const sid of sourceIds) {
         const proto = (await ctx.data.getSourceProtocol?.(sid)) ?? null;
         const meshcore = proto === 'meshcore';
+
+        // Reticulum/LXMF (#6143): every message is a direct address-to-address
+        // send — there are NO channels and no broadcast. A send therefore needs
+        // a destination LXMF hash (resolved as a string, never through num()).
+        // With none, record a clear skip rather than falling back to a channel
+        // broadcast the way Meshtastic/MeshCore do. "On channels" is ignored.
+        if (proto === 'reticulum') {
+          const to = rawTo == null ? undefined : await str(ctx, rawTo);
+          if (to == null) {
+            results.push({
+              skipped: true,
+              reason: 'Reticulum/LXMF has no channels, so a message needs a destination address — none resolved, nothing was sent',
+            });
+            continue;
+          }
+          // "Reply to the triggering message" → set the outgoing replyToHash to
+          // the triggering LXMF message's own hash (carried on the context).
+          const triggerHash = ctx.trigger.fields.messageHash;
+          const replyToHashArg = p.replyToTrigger
+            && ctx.trigger.triggerType === 'trigger.message'
+            && typeof triggerHash === 'string' && triggerHash.length > 0
+            ? { replyToHash: triggerHash }
+            : {};
+          await pushOrSkipMesh(results, ctx, sid, () => deps.sendMessage({ sourceId: sid, text, channel: fallbackChannel, destination: to, ...replyToHashArg }), { text });
+          continue;
+        }
+
         // MeshCore DM targets are contact public-key strings; Meshtastic DM
         // targets are node numbers (#4018) — resolve per the target source's
         // own protocol, not the trigger's. A `to` value can't be valid for both
@@ -486,7 +675,7 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
           // unknown), so the chosen scope governs a DM's propagation just as it does
           // a channel broadcast — dropping it forced DMs onto the source default.
           // 'inherit' still leaves scopeArg empty, so DMs default as before.
-          await pushOrSkipTxDisabled(results, () => deps.sendMessage({ sourceId: sid, text, channel: fallbackChannel, destination, replyId, ...scopeArg, ...attemptsArg, ...hopLimitArg }));
+          await pushOrSkipMesh(results, ctx, sid, () => deps.sendMessage({ sourceId: sid, text, channel: fallbackChannel, destination, replyId, ...scopeArg, ...splitArg, ...attemptsArg, ...hopLimitArg }), { text });
           continue;
         }
         const srcChannels = (await ctx.data.getChannels?.(sid)) ?? [];
@@ -494,7 +683,7 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
           if (sel.protocol && proto && sel.protocol !== proto) continue; // wrong-protocol channel
           const match = srcChannels.find((c) => c.name.toLowerCase() === sel.name.toLowerCase() && c.role !== 0);
           if (!match) continue; // channel not present on this source
-          await pushOrSkipTxDisabled(results, () => deps.sendMessage({ sourceId: sid, text, channel: match.id, destination, replyId, ...scopeArg, ...attemptsArg, ...hopLimitArg }));
+          await pushOrSkipMesh(results, ctx, sid, () => deps.sendMessage({ sourceId: sid, text, channel: match.id, destination, replyId, ...scopeArg, ...splitArg, ...attemptsArg, ...hopLimitArg }), { text });
         }
       }
 
@@ -558,7 +747,9 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
       const hopLimit = parseHopLimitOverride(p.hopLimit) ?? null;
 
       const results: unknown[] = [];
-      await pushOrSkipTxDisabled(results, () => deps.broadcastWaypoint({
+      // Airtime gate BEFORE the dep: the dep stamps the 30-minute floor, and a
+      // skipped send must not use it up.
+      await pushOrSkipMesh(results, ctx, wpSource, () => deps.broadcastWaypoint({
         sourceId: wpSource,
         automationKey: `${ctx.automationId ?? 'unsaved'}:${waypointKey}`,
         latitude,
@@ -619,14 +810,28 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
 
       const results: unknown[] = [];
       for (const sid of sourceIds) {
-        // MeshCore has no tapback / emoji-reaction concept. Skip as a recorded
-        // no-op rather than letting the deps throw, which would log a failed run
-        // for every MeshCore message a tapback automation happens to match.
-        if (await isMeshCoreSource(ctx, sid)) {
-          results.push({ skipped: true, reason: 'tapback is not supported on MeshCore' });
+        // Reticulum/LXMF has no tapback/reaction concept (#6143): recorded skip.
+        if (await isReticulumSource(ctx, sid)) {
+          results.push({ skipped: true, reason: 'tapback is not supported on Reticulum' });
           continue;
         }
-        await pushOrSkipTxDisabled(results, () => deps.sendTapback({ sourceId: sid, emoji, channel, destination, replyId, ...tapbackHopArg }));
+        // MeshCore (#5762): react only to a MeshCore message this same source
+        // received. Anything else is a recorded skip, not a failed run.
+        if (await isMeshCoreSource(ctx, sid)) {
+          // A reaction is not itself reactable (#5763): record the skip.
+          if (ctx.trigger.fields.protocol === 'meshcore' && ctx.trigger.fields.isTapback === true) {
+            results.push({ skipped: true, reason: 'meshcore reaction: TARGET_IS_REACTION' });
+            continue;
+          }
+          const meshcoreMessageId = ctx.trigger.fields.meshcoreMessageId;
+          if (ctx.trigger.fields.protocol !== 'meshcore' || sid !== ctx.trigger.sourceId || typeof meshcoreMessageId !== 'string') {
+            results.push({ skipped: true, reason: 'tapback on MeshCore needs a triggering MeshCore message on the same source' });
+            continue;
+          }
+          await pushOrSkipMesh(results, ctx, sid, () => deps.sendTapback({ sourceId: sid, emoji, meshcoreMessageId }));
+          continue;
+        }
+        await pushOrSkipMesh(results, ctx, sid, () => deps.sendTapback({ sourceId: sid, emoji, channel, destination, replyId, ...tapbackHopArg }));
       }
       // Unwrap the single-target case so the result shape (and run-log
       // resolvedParams) matches the original one-target behavior.
@@ -635,6 +840,13 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
 
     case 'action.nodeManage': {
       const op = String(p.op ?? '') as NodeManageOp;
+      // Reticulum has no Meshtastic node numbers and no favorite/ignore/node DB
+      // of this shape (#6143), so every nodeManage op is a recorded no-op on it
+      // — checked before the node-number resolution so a Reticulum trigger
+      // (no subject node number) records a skip rather than throwing.
+      if (await isReticulumSource(ctx, sourceId)) {
+        return { skipped: true, reason: `nodeManage:${op || '(none)'} is not supported on Reticulum` };
+      }
       const nodeNum = p.nodeNum != null ? await num(ctx, p.nodeNum) : (ctx.trigger.subjectNodeNum ?? undefined);
       if (nodeNum == null) throw new Error('action.nodeManage: no target node');
       if (!['favorite', 'unfavorite', 'ignore', 'unignore', 'delete'].includes(op)) {
@@ -671,6 +883,12 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
 
       const results: unknown[] = [];
       for (const sid of sourceIds) {
+        // Reticulum has no telemetry/traceroute/nodeinfo/advert request mechanism
+        // of this shape (#6143) → recorded no-op, like the MeshCore skips below.
+        if (await isReticulumSource(ctx, sid)) {
+          results.push({ skipped: true, reason: `${op} request is not supported on Reticulum` });
+          continue;
+        }
         const meshcore = await isMeshCoreSource(ctx, sid);
         // MeshCore has no position / nodeinfo-exchange request → skip as a no-op.
         if (meshcore && (op === 'position' || op === 'nodeinfo')) {
@@ -688,9 +906,43 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
           }
           if (!target) throw new Error(`action.requestData: no target node for "${op}"`);
         }
-        await pushOrSkipTxDisabled(results, () => deps.requestData({ sourceId: sid, op, target, channel, telemetryType: op === 'telemetry' ? telemetryType : undefined, ...(advertMode ? { advertMode } : {}) }));
+        await pushOrSkipMesh(results, ctx, sid, () => deps.requestData({ sourceId: sid, op, target, channel, telemetryType: op === 'telemetry' ? telemetryType : undefined, ...(advertMode ? { advertMode } : {}) }));
       }
       return results.length === 1 ? results[0] : results;
+    }
+
+    case 'action.tracePathSchedule': {
+      // #5723: N MeshCore trace paths, each on its own interval. This runs on
+      // every firing of the automation; only paths that are due (and inside
+      // the source's hourly cap) are traced. The per-hop SNRs are stored by
+      // the passive trace capture (#5722), not here.
+      const sourceIds = Array.isArray(p.sourceIds) && p.sourceIds.length > 0
+        ? (p.sourceIds as unknown[]).map(String)
+        : (sourceId ? [sourceId] : []);
+      if (sourceIds.length === 0) throw new Error('action.tracePathSchedule: pick a MeshCore source (this trigger has none)');
+      const paths: TracePathEntry[] = [];
+      for (const raw of Array.isArray(p.paths) ? p.paths : []) {
+        const parsed = parseTracePathEntry(raw);
+        if ('value' in parsed) paths.push(parsed.value);
+      }
+      const autoReturn = p.autoReturn === true || p.autoReturn === 'true';
+      const results: unknown[] = [];
+      for (const sid of sourceIds) {
+        if (!(await isMeshCoreSource(ctx, sid))) {
+          results.push({ sourceId: sid, skipped: true, reason: 'scheduled trace paths are MeshCore only' });
+          continue;
+        }
+        for (const path of paths) {
+          const pathKey = `${ctx.automationId ?? 'unsaved'}:${node.id}:${path.publicKey}`;
+          // Gate BEFORE the dep, so a skipped path keeps its due slot.
+          await pushOrSkipMesh(results, ctx, sid, () => deps.runScheduledTrace({ sourceId: sid, pathKey, path, autoReturn }));
+        }
+      }
+      // Nothing was due on this tick: tell the engine this step was idle.
+      if (results.length > 0 && results.every((r) => (r as { notDue?: unknown } | null)?.notDue === true)) {
+        ctx.idleActions = (ctx.idleActions ?? 0) + 1;
+      }
+      return results;
     }
 
     case 'action.deviceReboot': {
@@ -715,6 +967,11 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
         : [sourceId];
       const results: unknown[] = [];
       for (const sid of sourceIds) {
+        // Reticulum has no device-reboot mechanism (#6143) → recorded no-op.
+        if (await isReticulumSource(ctx, sid)) {
+          results.push({ skipped: true, reason: 'device reboot is not supported on Reticulum' });
+          continue;
+        }
         // A remote-admin target rides the Meshtastic session-passkey mechanism,
         // which MeshCore sources don't have. In a mixed multi-source select,
         // skip those as a recorded no-op (matching tapback/nodeManage) instead
@@ -723,7 +980,13 @@ export async function executeAction(node: AutomationNode, ctx: EngineEvalContext
           results.push({ skipped: true, reason: 'remote-admin reboot is not supported on MeshCore' });
           continue;
         }
-        await pushOrSkipTxDisabled(results, () => deps.rebootDevice({ sourceId: sid, seconds, targetNodeNum }));
+        // A local reboot is a command to our own radio and sends nothing on the
+        // mesh; only a remote-admin reboot goes over the air, so only it is gated.
+        if (targetNodeNum != null) {
+          await pushOrSkipMesh(results, ctx, sid, () => deps.rebootDevice({ sourceId: sid, seconds, targetNodeNum }));
+        } else {
+          await pushOrSkipTxDisabled(results, () => deps.rebootDevice({ sourceId: sid, seconds, targetNodeNum }));
+        }
       }
       return results.length === 1 ? results[0] : results;
     }

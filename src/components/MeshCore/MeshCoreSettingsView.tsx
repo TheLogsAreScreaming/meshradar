@@ -4,9 +4,12 @@ import { useQueryClient } from '@tanstack/react-query';
 import { ConnectionStatus, MeshCoreActions, SavedRegion } from './hooks/useMeshCore';
 import { useToast } from '../ToastContainer';
 import { useAuth } from '../../contexts/AuthContext';
+import { useSource } from '../../contexts/SourceContext';
 import { useCsrfFetch } from '../../hooks/useCsrfFetch';
 import { UiIcon } from '../icons';
 import { MeshCoreNodeDisplaySection } from './MeshCoreNodeDisplaySection';
+import { MeshCoreTelemetrySettingsSection } from './MeshCoreTelemetrySettingsSection';
+import TelemetryDataActions from '../settings/TelemetryDataActions';
 import { MeshCoreReceiveOnlyNote } from './MeshCoreReceiveOnlyNote';
 import { MeshCoreDeviceActionsSection } from './MeshCoreDeviceActionsSection';
 import { MovedSettingNote } from '../common/MovedSettingNote';
@@ -14,12 +17,18 @@ import { GlobalSettingsLink } from '../nav/GlobalSettingsLink';
 import { MeshCoreIgnoredNodesSection } from './MeshCoreIgnoredNodesSection';
 import { MeshCoreMessageFiltersSection } from './MeshCoreMessageFiltersSection';
 import { MeshCoreContactSyncSection } from './MeshCoreContactSyncSection';
+import { MeshCoreReactionsSection } from './MeshCoreReactionsSection';
+import { MeshCoreRequiredRepeaterSection } from './MeshCoreRequiredRepeaterSection';
+import AudioNotificationSettings from '../AudioNotificationSettings';
+import { useOptionalMuteSettings } from '../../contexts/SettingsContext';
+import { MeshCoreContact } from '../../utils/meshcoreHelpers';
 
 /**
  * MeshCoreSettingsView — what MeshRadar stores and does for this MeshCore
  * source: connect / disconnect, software receive-only, whether MeshRadar
  * answers discovery requests, node display, ignore and filter lists, the
- * saved-regions catalogue, and purging stored messages.
+ * saved-regions catalogue, telemetry retention and purge, and purging stored
+ * messages.
  *
  * What is written to or done on the radio lives on Device Configuration
  * (#5683 follow-up): default path hash size, default region / scope, radio
@@ -43,6 +52,9 @@ interface MeshCoreSettingsViewProps {
   baseUrl: string;
   /** Source UUID — passed through to MeshCoreNodeDisplaySection (#4412 Phase 4 WP2). */
   sourceId: string;
+  /** This source's contacts — the Required Repeater picker (#6178) lists the
+   *  relays among them. */
+  contacts: MeshCoreContact[];
   /** True when this MeshCore source is in strict receive-only mode (#4547
    *  Phase 2). Plumbed here in WP1; WP2 wires the toggle itself plus the
    *  gating of Send advert / Discover ×3 / Discover regions. */
@@ -60,13 +72,17 @@ export const MeshCoreSettingsView: React.FC<MeshCoreSettingsViewProps> = ({
   actions,
   baseUrl,
   sourceId,
+  contacts,
   receiveOnly = false,
   canOpenDeviceConfiguration = true,
   onOpenDeviceConfiguration,
 }) => {
   const { t } = useTranslation();
   const { showToast } = useToast();
-  const { hasPermission } = useAuth();
+  const { hasPermission, authStatus } = useAuth();
+  const { sourceName } = useSource();
+  const audioSettings = useOptionalMuteSettings();
+  const isAdmin = authStatus?.user?.isAdmin ?? false;
   const csrfFetch = useCsrfFetch();
   const queryClient = useQueryClient();
   const [savingReceiveOnly, setSavingReceiveOnly] = useState(false);
@@ -224,7 +240,7 @@ export const MeshCoreSettingsView: React.FC<MeshCoreSettingsViewProps> = ({
       <h2 style={{ color: 'var(--color-text)', marginBottom: '1rem' }}>
         {t('nav.settings', 'Settings')}
       </h2>
-      <GlobalSettingsLink variant="inline" />
+      <GlobalSettingsLink variant="banner" />
 
       <div className="form-section">
         <h3>{t('meshcore.connection', 'Connection')}</h3>
@@ -288,6 +304,18 @@ export const MeshCoreSettingsView: React.FC<MeshCoreSettingsViewProps> = ({
         </p>
       </div>
 
+      <MeshCoreReactionsSection
+        baseUrl={baseUrl}
+        sourceId={sourceId}
+        onOutboundChanged={() => { void actions.refreshStatus(); }}
+      />
+
+      <MeshCoreRequiredRepeaterSection
+        baseUrl={baseUrl}
+        sourceId={sourceId}
+        contacts={contacts}
+      />
+
       {/* Radio contact list sync and the device actions live on Device
           Configuration (#5683 follow-up). A viewer who cannot open that page
           keeps them here: see the module comment. */}
@@ -325,6 +353,9 @@ export const MeshCoreSettingsView: React.FC<MeshCoreSettingsViewProps> = ({
       )}
 
       <MeshCoreNodeDisplaySection baseUrl={baseUrl} sourceId={sourceId} />
+
+      {/* Telemetry visualization window and favorite retention, saved per source (#6258). */}
+      <MeshCoreTelemetrySettingsSection baseUrl={baseUrl} sourceId={sourceId} />
 
       {/* Ignore / Block (#5408) */}
       <MeshCoreIgnoredNodesSection sourceId={sourceId} />
@@ -457,6 +488,28 @@ export const MeshCoreSettingsView: React.FC<MeshCoreSettingsViewProps> = ({
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Admin-only purge / outlier cleanup, scoped to this source (#6258). */}
+      {isAdmin && (
+        <div className="form-section danger-zone">
+          <h3>{t('meshcore.settings.telemetry_data', 'Telemetry data')}</h3>
+          <TelemetryDataActions
+            sourceId={sourceId}
+            sources={[{ id: sourceId, name: sourceName ?? sourceId }]}
+          />
+        </div>
+      )}
+
+      {audioSettings && (
+        <div className="form-section">
+          <h3>{t('meshcore.settings.audio_notifications', 'Audio notifications')}</h3>
+          <AudioNotificationSettings
+            enabled={audioSettings.enableAudioNotifications}
+            onEnabledChange={audioSettings.setEnableAudioNotifications}
+            meshcoreDeviceType={status?.deviceType}
+          />
         </div>
       )}
 

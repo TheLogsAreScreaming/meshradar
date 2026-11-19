@@ -13,6 +13,7 @@ import configRoutes from './configRoutes.js';
 import { createRouteTestApp, type RouteTestHarness } from '../test-helpers/routeTestApp.js';
 import { sourceManagerRegistry, type ISourceManager } from '../sourceManagerRegistry.js';
 import { TxDisabledError } from '../errors/txDisabledError.js';
+import { ModuleConfigNotAppliedError, ModuleConfigUnverifiedError } from '../errors/moduleConfigVerifyError.js';
 import { MeshtasticManager } from '../meshtasticManager.js';
 
 describe('configRoutes', () => {
@@ -98,6 +99,61 @@ describe('configRoutes', () => {
         const resB = await agent.get('/').query({ sourceId: harness.sourceB });
         expect(resB.body.localNodeInfo).toBeUndefined();
       } finally {
+        await harness.db.settings.deleteSetting(writerKey);
+      }
+    });
+
+    // #6157: DeviceMetadata.ble_address lives only in the live manager's
+    // in-memory state (not the nodes row), so the handler reads it from the
+    // resolved source manager and includes it only when non-empty.
+    // #6321: bootloaderVersion rides the same path (0/absent omitted).
+    it('includes the manager\'s bleAddress/bootloaderVersion when the node advertises them, omits them otherwise', async () => {
+      await harness.db.nodes.upsertNode(
+        {
+          nodeNum: 2732916558,
+          nodeId: '!a2e175ba',
+          longName: 'BLE Node',
+          shortName: 'BLE',
+          firmwareVersion: '2.8.0',
+          rebootCount: 1,
+          lastHeard: Math.floor(Date.now() / 1000),
+        },
+        harness.sourceA,
+      );
+      const writerKey = new MeshtasticManager(harness.sourceA).localNodeSettingKey('localNodeNum');
+      await harness.db.settings.setSetting(writerKey, '2732916558');
+
+      const makeManager = (bleAddress: string | undefined, bootloaderVersion?: number): ISourceManager =>
+        ({
+          sourceId: harness.sourceA,
+          sourceType: 'meshtastic_tcp',
+          start: vi.fn().mockResolvedValue(undefined),
+          stop: vi.fn().mockResolvedValue(undefined),
+          getStatus: vi.fn().mockReturnValue({ sourceId: harness.sourceA, sourceName: 'A', sourceType: 'meshtastic_tcp', connected: true }),
+          getLocalNodeInfo: vi.fn().mockReturnValue({
+            nodeNum: 2732916558, nodeId: '!a2e175ba', longName: 'BLE Node', shortName: 'BLE',
+            firmwareVersion: '2.8.0', bleAddress, bootloaderVersion,
+          }),
+          isLocalNodeBridged: vi.fn().mockReturnValue(false),
+        }) as unknown as ISourceManager;
+
+      try {
+        const agent = await harness.loginAs(harness.admin);
+
+        await sourceManagerRegistry.addManager(makeManager('AA:BB:CC:DD:EE:FF', 0x020600));
+        const present = await agent.get('/').query({ sourceId: harness.sourceA });
+        expect(present.status).toBe(200);
+        expect(present.body.deviceMetadata.bleAddress).toBe('AA:BB:CC:DD:EE:FF');
+        expect(present.body.deviceMetadata.bootloaderVersion).toBe(0x020600);
+        await sourceManagerRegistry.removeManager(harness.sourceA);
+
+        await sourceManagerRegistry.addManager(makeManager(undefined));
+        const absent = await agent.get('/').query({ sourceId: harness.sourceA });
+        expect(absent.status).toBe(200);
+        expect(absent.body.deviceMetadata).not.toHaveProperty('bleAddress');
+        expect(absent.body.deviceMetadata).not.toHaveProperty('bootloaderVersion');
+      } finally {
+        await sourceManagerRegistry.removeManager(harness.sourceA);
         await harness.db.settings.deleteSetting(writerKey);
       }
     });
@@ -578,7 +634,7 @@ describe('configRoutes', () => {
         const agent = await harness.loginAs(harness.limited);
         const res = await post(agent, harness.sourceA, 'Available');
         expect(res.status).toBe(200);
-        expect(setGenericModuleConfig).toHaveBeenCalledWith('statusmessage', { nodeStatus: 'Available' });
+        expect(setGenericModuleConfig).toHaveBeenCalledWith('statusmessage', { nodeStatus: 'Available' }, { verify: true });
       });
 
       it('403s for a user with only configuration:read', async () => {
@@ -650,13 +706,58 @@ describe('configRoutes', () => {
       it('accepts an empty status (Clear)', async () => {
         const res = await post(agent, harness.sourceA, '');
         expect(res.status).toBe(200);
-        expect(setGenericModuleConfig).toHaveBeenCalledWith('statusmessage', { nodeStatus: '' });
+        expect(setGenericModuleConfig).toHaveBeenCalledWith('statusmessage', { nodeStatus: '' }, { verify: true });
       });
 
       it('rejects a status that is not a string', async () => {
         const res = await post(agent, harness.sourceA, { text: 'x' });
         expect(res.status).toBe(400);
         expect(setGenericModuleConfig).not.toHaveBeenCalled();
+      });
+    });
+
+    // #5745: the service reads the status back from the node. The route turns
+    // its two typed failures into their own codes so the UI can say which.
+    describe('read-back result (#5745)', () => {
+      let agent: Awaited<ReturnType<RouteTestHarness['loginAs']>>;
+
+      beforeEach(async () => {
+        await harness.grant(harness.limited.id, 'configuration', 'write', harness.sourceA);
+        agent = await harness.loginAs(harness.limited);
+      });
+
+      it('200s with the same body shape when the node confirms', async () => {
+        const res = await post(agent, harness.sourceA, 'Monitoring');
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ success: true, message: 'statusmessage configuration sent' });
+      });
+
+      it('502 STATUSMESSAGE_NOT_APPLIED when the node holds another value', async () => {
+        setGenericModuleConfig.mockRejectedValue(new ModuleConfigNotAppliedError('statusmessage', { nodeStatus: 'old' }));
+        const res = await post(agent, harness.sourceA, 'Monitoring');
+        expect(res.status).toBe(502);
+        expect(res.body).toMatchObject({ success: false, code: 'STATUSMESSAGE_NOT_APPLIED' });
+        expect(typeof res.body.error).toBe('string');
+      });
+
+      it('504 STATUSMESSAGE_UNVERIFIED when the node does not answer', async () => {
+        setGenericModuleConfig.mockRejectedValue(new ModuleConfigUnverifiedError('statusmessage'));
+        const res = await post(agent, harness.sourceA, 'Monitoring');
+        expect(res.status).toBe(504);
+        expect(res.body).toMatchObject({ success: false, code: 'STATUSMESSAGE_UNVERIFIED' });
+      });
+
+      it('still 500s MODULE_CONFIG_FAILED on any other error', async () => {
+        setGenericModuleConfig.mockRejectedValue(new Error('Not connected to Meshtastic node'));
+        const res = await post(agent, harness.sourceA, 'Monitoring');
+        expect(res.status).toBe(500);
+        expect(res.body.code).toBe('MODULE_CONFIG_FAILED');
+      });
+
+      it('asks for no read-back on another module', async () => {
+        const res = await agent.post('/module/serial').send({ sourceId: harness.sourceA, enabled: true });
+        expect(res.status).toBe(200);
+        expect(setGenericModuleConfig).toHaveBeenCalledWith('serial', { enabled: true });
       });
     });
   });

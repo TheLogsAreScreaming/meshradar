@@ -10,6 +10,9 @@ export interface MeshCoreContact {
   lastSeen?: number;
   rssi?: number;
   snr?: number;
+  /** Battery millivolts. Not on the wire contact record; views copy it in
+   *  from the node row so the map popup can show it (#6259). */
+  batteryMv?: number;
   advType?: number;
   latitude?: number;
   longitude?: number;
@@ -20,11 +23,25 @@ export interface MeshCoreContact {
    *  Not on the wire contact record; views copy it in from the node row. */
   positionSource?: string | null;
   lastAdvert?: number;
+  /** P7a #6254: latest checked advert signature. true verified, false failed, null/unset not checked. Copied from the node row. */
+  advertSignatureVerified?: boolean | null;
+  /** #6281: persisted clock offset in seconds (positive = node behind). Copied from the node row. */
+  clockOffsetSeconds?: number | null;
   /** #5363: the server moved latitude/longitude to the sign-flip corrected
    *  point; the reported pair rides along. Display only. */
   positionSignFlipCorrected?: boolean;
   reportedLatitude?: number;
   reportedLongitude?: number;
+  /** #5842: latitude/longitude are the user's location override, not the
+   *  advert fix. The server applies it; the override fields ride along. */
+  positionIsOverride?: boolean;
+  positionOverrideEnabled?: boolean;
+  positionOverrideIsPrivate?: boolean;
+  /** #6260: latitude/longitude are a computed estimate (neighbour and trace
+   *  links), not a fix. Set client-side from the estimated-positions read. */
+  positionIsEstimated?: boolean;
+  /** Radius of the estimate, km. Present with `positionIsEstimated`. */
+  estimatedUncertaintyKm?: number;
   /** Hop count of the cached forwarding route. `null` / undefined = unknown
    *  (next send floods). */
   pathLen?: number | null;
@@ -48,6 +65,9 @@ export interface MeshCoreContact {
    * query, or message it until it is added. `undefined` = unknown.
    */
   onDevice?: boolean;
+  /** ContactInfo.flags from the radio's contact table: 0x01 favourite,
+   *  0x02-0x08 telemetry permissions, 0x10 remote CLI (fw 1.18.0, #5867). */
+  flags?: number;
   /** #5508: server epoch ms of the last PATH_DISCOVERY_RESPONSE for this
    *  contact (in-memory on the server; may be absent after a device re-read). */
   pathDiscoveredAt?: number;
@@ -174,16 +194,14 @@ export function sha256PureJS(data: Uint8Array): Uint8Array {
 /**
  * Format a MeshCore channel name for display.
  *
- * Names are shown with a leading `# ` as a decorative convention. Hashtag
- * channels already store the `#` as part of the name (e.g. `#general`), so we
- * must NOT prepend another one or they render as `# #general`. Empty names fall
- * back to the supplied label (e.g. "Channel 0").
+ * Names are shown as stored. Hashtag channels keep their leading `#` because it
+ * is part of the name (e.g. `#general`); plain names are shown as-is (e.g.
+ * `Public`), with no decorative prefix (#6170). Empty names fall back to the
+ * supplied label (e.g. "Channel 0").
  */
 export function formatMeshCoreChannelName(name: string | null | undefined, fallback: string): string {
   const trimmed = (name ?? '').trim();
-  if (!trimmed) return `# ${fallback}`;
-  if (trimmed.startsWith('#')) return trimmed;
-  return `# ${trimmed}`;
+  return trimmed || fallback;
 }
 
 /**

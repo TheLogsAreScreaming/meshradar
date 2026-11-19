@@ -1,10 +1,11 @@
 import { useEffect } from 'react';
 import { useMap } from 'react-leaflet';
-import L from 'leaflet';
-import 'leaflet.heat';
+import type { Layer } from 'leaflet';
+import { HeatLayer } from 'leaflet.heat';
 import { useDashboardSources } from '../../../hooks/useDashboardData';
 import { useCoverageGrid, usePositions } from '../../../hooks/useMapAnalysisData';
 import { useMapAnalysisCtx } from '../MapAnalysisContext';
+import type { PositionRow } from '../../../services/analysisApi';
 
 const ZOOM_THRESHOLD = 13;
 
@@ -14,13 +15,7 @@ interface GridCell {
   count: number;
 }
 
-interface PositionRecord {
-  sourceId: string;
-  nodeNum: number;
-  latitude: number;
-  longitude: number;
-  timestamp: number;
-}
+type PositionRecord = PositionRow;
 
 /**
  * Heatmap of position density. At low zoom (< 13), uses the server-side
@@ -76,7 +71,7 @@ export default function CoverageHeatmapLayer() {
       points = cells.map((c) => [c.centerLat, c.centerLon, c.count / denom]);
     } else {
       // High-zoom equivalent of "unique nodes per cell": dedupe by (sourceId,
-      // nodeNum) at ~11m precision (4 decimal places). A stationary node that
+      // nodeKey) at ~11m precision (4 decimal places). A stationary node that
       // reports 200 times from the same spot contributes 1 dot, not 200.
       const seen = new Set<string>();
       const dedupedPoints: Array<[number, number, number]> = [];
@@ -84,7 +79,7 @@ export default function CoverageHeatmapLayer() {
         if (!inWindow(p.timestamp)) continue;
         const lat4 = Math.round(p.latitude * 1e4) / 1e4;
         const lon4 = Math.round(p.longitude * 1e4) / 1e4;
-        const key = `${p.sourceId}:${p.nodeNum}:${lat4}:${lon4}`;
+        const key = `${p.sourceId}:${p.nodeKey ?? `mt:${Number(p.nodeNum)}`}:${lat4}:${lon4}`;
         if (seen.has(key)) continue;
         seen.add(key);
         dedupedPoints.push([p.latitude, p.longitude, 1.0]);
@@ -104,24 +99,17 @@ export default function CoverageHeatmapLayer() {
       1.0: '#ef4444', // red
     };
 
-    const heat = (L as unknown as {
-      heatLayer: (
-        pts: Array<[number, number, number]>,
-        opts: {
-          radius: number;
-          blur: number;
-          maxZoom: number;
-          minOpacity?: number;
-          gradient?: Record<number, string>;
-        },
-      ) => L.Layer;
-    }).heatLayer(points, {
+    // leaflet.heat 1.x is an ES module exporting the HeatLayer class; it no
+    // longer registers L.heatLayer on import (#6296). Its bundled types extend
+    // Leaflet 2's generic Layer, which @types/leaflet 1.9 lacks, so view it as a
+    // plain 1.9 Layer (it is one at runtime).
+    const heat: Layer = new HeatLayer(points, {
       radius: 35,
       blur: 25,
       maxZoom: 17,
       minOpacity: 0.4,
       gradient,
-    });
+    }) as unknown as Layer;
     heat.addTo(map);
     return () => {
       map.removeLayer(heat);

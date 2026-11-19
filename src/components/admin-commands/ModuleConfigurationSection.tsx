@@ -1,5 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
+import { PasswordField } from '../shared/config/PasswordField';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
@@ -15,6 +16,16 @@ import {
   type BroadcastTarget,
 } from './useAdminCommandsState';
 import type { Channel } from '../../types/device';
+import BrokerPresetSelector from '../MQTT/BrokerPresetSelector';
+import { MqttRootFinder } from '../MQTT/MqttRootFinder';
+import { MqttRootFieldError } from '../MQTT/MqttRootFieldError';
+import { isChangedInvalidMqttRoot } from '../../utils/mqttRootTopic';
+import { defaultDeviceRegionRoot } from '../MQTT/mqttRootDefaults';
+import { useSource } from '../../contexts/SourceContext';
+import { applyPresetToDevice, devicePresetDraft, matchDevicePreset } from '../MQTT/brokerPresets';
+
+const MQTT_SAVE_NEEDS_LOAD =
+  'Load this node\u2019s MQTT configuration first. Saving without it would replace the node\u2019s MQTT settings with defaults.';
 
 interface ModuleConfigurationSectionProps {
   // CollapsibleSection component (passed from parent)
@@ -36,6 +47,16 @@ interface ModuleConfigurationSectionProps {
   mqttEncryptionEnabled: boolean;
   mqttJsonEnabled: boolean;
   mqttRoot: string;
+  mqttTlsEnabled: boolean;
+  mqttProxyToClientEnabled: boolean;
+  mqttMapReportingEnabled: boolean;
+  mqttMapPublishIntervalSecs: number;
+  mqttMapPositionPrecision: number;
+  mqttMapShouldReportLocation: boolean;
+  /** Save is blocked until this node's MQTT config is loaded (firmware replaces the struct). */
+  mqttLoadedForSelectedNode: boolean;
+  /** The root the node reported on load; a changed invalid root blocks Save (#6338). */
+  mqttSavedRoot?: string;
   onMQTTConfigChange: (field: string, value: any) => void;
   onSaveMQTTConfig: () => Promise<void>;
 
@@ -135,6 +156,14 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
   mqttEncryptionEnabled,
   mqttJsonEnabled,
   mqttRoot,
+  mqttTlsEnabled,
+  mqttProxyToClientEnabled,
+  mqttMapReportingEnabled,
+  mqttMapPublishIntervalSecs,
+  mqttMapPositionPrecision,
+  mqttMapShouldReportLocation,
+  mqttLoadedForSelectedNode,
+  mqttSavedRoot,
   onMQTTConfigChange,
   onSaveMQTTConfig,
   neighborInfoEnabled,
@@ -201,6 +230,9 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
   takHeaderActions,
 }) => {
   const { t } = useTranslation();
+  const { sourceId: rootFinderSourceId } = useSource();
+  // The server refuses a changed root that breaks the root rules (#6338).
+  const mqttRootBlocksSave = isChangedInvalidMqttRoot(mqttRoot, mqttSavedRoot);
 
   // nanopb caps `broadcast_message` at 100 bytes + NUL. One byte over and the
   // device drops the entire MeshBeacon config with no error and no log line, so
@@ -211,6 +243,7 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
 
   // #5649: one scope per independently-saved group. A blank or out-of-range
   // number field blocks only its own Save, so nothing invalid goes to the node.
+  const mqttNumbers = useNumberInputScope();
   const neighborInfoNumbers = useNumberInputScope();
   const telemetryNumbers = useNumberInputScope();
   const trafficManagementNumbers = useNumberInputScope();
@@ -222,6 +255,7 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
       title={t('admin_commands.module_configuration', 'Module Configuration')}
     >
       {/* MQTT Config Section */}
+      <NumberInputScope scope={mqttNumbers}>
       <CollapsibleSection
         id="admin-mqtt-config"
         title={t('admin_commands.mqtt_configuration')}
@@ -245,6 +279,37 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
         </div>
         {mqttEnabled && (
           <>
+            <BrokerPresetSelector
+              id="adminMqttBrokerPreset"
+              layout="settings"
+              disabled={isExecuting}
+              matchPreset={(candidates) => matchDevicePreset({ address: mqttAddress, tlsEnabled: mqttTlsEnabled }, candidates)}
+              getDraft={() => devicePresetDraft({
+                address: mqttAddress,
+                tlsEnabled: mqttTlsEnabled,
+                username: mqttUsername,
+                password: mqttPassword,
+                root: mqttRoot,
+              })}
+              onApplyPreset={(preset) => {
+                // #5689: edits the form only; the remote node hears nothing
+                // until the MQTT Save button below.
+                const { fields, kept } = applyPresetToDevice(preset, {
+                  address: mqttAddress,
+                  username: mqttUsername,
+                  password: mqttPassword,
+                  tlsEnabled: mqttTlsEnabled,
+                });
+                onMQTTConfigChange('address', fields.address);
+                onMQTTConfigChange('username', fields.username);
+                onMQTTConfigChange('password', fields.password);
+                onMQTTConfigChange('tlsEnabled', fields.tlsEnabled);
+                if (fields.root !== undefined) onMQTTConfigChange('root', fields.root);
+                // Remote admin is admin-only, and admins are shown every saved
+                // login, so `kept.serverFill` never happens here (#5794).
+                return kept;
+              }}
+            />
             <div className="setting-item">
               <label>
                 {t('admin_commands.server_address')}
@@ -279,8 +344,7 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
                 Password
                 <span className="setting-description">MQTT broker password</span>
               </label>
-              <input
-                type="password"
+              <PasswordField
                 value={mqttPassword}
                 onChange={(e) => onMQTTConfigChange('password', e.target.value)}
                 disabled={isExecuting}
@@ -302,6 +366,21 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
                 className="setting-input"
                 style={{ width: '100%', maxWidth: '600px' }}
               />
+              <MqttRootFieldError value={mqttRoot} />
+              <MqttRootFinder
+                context="remote_device"
+                sourceId={rootFinderSourceId}
+                nodeNum={selectedNodeNum}
+                disabled={isExecuting}
+                currentRoot={mqttRoot}
+                defaultRegionRoot={defaultDeviceRegionRoot(mqttRoot)}
+                getTarget={() => ({
+                  broker: { address: mqttAddress, tlsEnabled: mqttTlsEnabled },
+                  username: mqttUsername,
+                  password: mqttPassword,
+                })}
+                onPickRoot={(root) => onMQTTConfigChange('root', root)}
+              />
             </div>
             <div className="setting-item">
               <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
@@ -313,8 +392,23 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
                   style={{ width: 'auto', margin: 0, flexShrink: 0 }}
                 />
                 <div style={{ flex: 1 }}>
-                  <div>Encryption Enabled</div>
-                  <span className="setting-description">Use TLS encryption for MQTT connection</span>
+                  <div>{t('mqtt_config.encryption_enabled', 'Encryption Enabled')}</div>
+                  <span className="setting-description">{t('mqtt_config.encryption_description', 'Send encrypted packets to MQTT')}</span>
+                </div>
+              </label>
+            </div>
+            <div className="setting-item">
+              <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                <input
+                  type="checkbox"
+                  checked={mqttTlsEnabled}
+                  onChange={(e) => onMQTTConfigChange('tlsEnabled', e.target.checked)}
+                  disabled={isExecuting}
+                  style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div>{t('mqtt_config.tls_enabled', 'TLS Enabled')}</div>
+                  <span className="setting-description">{t('mqtt_config.tls_description', 'Enable TLS/SSL encryption for MQTT connection')}</span>
                 </div>
               </label>
             </div>
@@ -333,20 +427,121 @@ export const ModuleConfigurationSection: React.FC<ModuleConfigurationSectionProp
                 </div>
               </label>
             </div>
+            <div className="setting-item">
+              <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                <input
+                  type="checkbox"
+                  data-testid="admin-mqtt-proxy-to-client"
+                  checked={mqttProxyToClientEnabled}
+                  onChange={(e) => onMQTTConfigChange('proxyToClientEnabled', e.target.checked)}
+                  disabled={isExecuting}
+                  style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div>{t('mqtt_config.proxy_to_client')}</div>
+                  <span className="setting-description">{t('mqtt_config.proxy_to_client_description')}</span>
+                </div>
+              </label>
+            </div>
+            <div className="setting-item">
+              <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                <input
+                  type="checkbox"
+                  data-testid="admin-mqtt-map-reporting"
+                  checked={mqttMapReportingEnabled}
+                  onChange={(e) => onMQTTConfigChange('mapReportingEnabled', e.target.checked)}
+                  disabled={isExecuting}
+                  style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div>{t('mqtt_config.map_reporting')}</div>
+                  <span className="setting-description">{t('mqtt_config.map_reporting_description')}</span>
+                </div>
+              </label>
+            </div>
+            {mqttMapReportingEnabled && (
+              <div style={{
+                marginLeft: '1rem',
+                paddingLeft: '1rem',
+                borderLeft: '2px solid var(--color-surface-active)',
+                marginTop: '0.5rem',
+                marginBottom: '1rem'
+              }}>
+                <div className="setting-item">
+                  <label htmlFor="adminMqttMapPublishIntervalSecs">
+                    {t('mqtt_config.map_publish_interval')}
+                    <span className="setting-description">{t('mqtt_config.map_publish_interval_description')}</span>
+                  </label>
+                  <NumberInput
+                    id="adminMqttMapPublishIntervalSecs"
+                    min={0}
+                    max={4294967295}
+                    integer
+                    value={mqttMapPublishIntervalSecs}
+                    onChange={(v) => onMQTTConfigChange('mapPublishIntervalSecs', v)}
+                    disabled={isExecuting}
+                    className="setting-input"
+                    style={{ width: '150px' }}
+                  />
+                </div>
+                <div className="setting-item">
+                  <label htmlFor="adminMqttMapPositionPrecision">
+                    {t('mqtt_config.map_position_precision')}
+                    <span className="setting-description">{t('mqtt_config.map_position_precision_description')}</span>
+                  </label>
+                  <NumberInput
+                    id="adminMqttMapPositionPrecision"
+                    min={10}
+                    max={19}
+                    alsoValid={[0]}
+                    zeroHint={t('zero_hint.map_position_precision')}
+                    integer
+                    value={mqttMapPositionPrecision}
+                    onChange={(v) => onMQTTConfigChange('mapPositionPrecision', v)}
+                    disabled={isExecuting}
+                    className="setting-input"
+                    style={{ width: '100px' }}
+                  />
+                </div>
+                <div className="setting-item">
+                  <label style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                    <input
+                      type="checkbox"
+                      data-testid="admin-mqtt-map-report-location"
+                      checked={mqttMapShouldReportLocation}
+                      onChange={(e) => onMQTTConfigChange('mapShouldReportLocation', e.target.checked)}
+                      disabled={isExecuting}
+                      style={{ width: 'auto', margin: 0, flexShrink: 0 }}
+                    />
+                    <div style={{ flex: 1 }}>
+                      <div>{t('mqtt_config.map_report_location')}</div>
+                      <span className="setting-description">{t('mqtt_config.map_report_location_description')}</span>
+                    </div>
+                  </label>
+                </div>
+              </div>
+            )}
           </>
+        )}
+        {selectedNodeNum !== null && !mqttLoadedForSelectedNode && (
+          <div className="setting-description" style={{ marginBottom: '0.5rem', color: 'var(--color-warning)' }}>
+            {t('admin_commands.mqtt_save_needs_load', MQTT_SAVE_NEEDS_LOAD)}
+          </div>
         )}
         <button
           className="save-button"
-          onClick={onSaveMQTTConfig}
-          disabled={isExecuting || selectedNodeNum === null}
+          onClick={mqttNumbers.invalid || mqttRootBlocksSave || !mqttLoadedForSelectedNode ? undefined : onSaveMQTTConfig}
+          disabled={isExecuting || selectedNodeNum === null || mqttNumbers.invalid || mqttRootBlocksSave || !mqttLoadedForSelectedNode}
+          title={!mqttLoadedForSelectedNode ? t('admin_commands.mqtt_save_needs_load', MQTT_SAVE_NEEDS_LOAD) : undefined}
           style={{
-            opacity: (isExecuting || selectedNodeNum === null) ? 0.5 : 1,
-            cursor: (isExecuting || selectedNodeNum === null) ? 'not-allowed' : 'pointer'
+            opacity: (isExecuting || selectedNodeNum === null || mqttNumbers.invalid || mqttRootBlocksSave || !mqttLoadedForSelectedNode) ? 0.5 : 1,
+            cursor: (isExecuting || selectedNodeNum === null || mqttNumbers.invalid || mqttRootBlocksSave || !mqttLoadedForSelectedNode) ? 'not-allowed' : 'pointer'
           }}
         >
           {isExecuting ? t('common.saving') : t('admin_commands.save_mqtt_config')}
         </button>
       </CollapsibleSection>
+      </NumberInputScope>
 
       {/* Neighbor Info Config Section */}
       <NumberInputScope scope={neighborInfoNumbers}>

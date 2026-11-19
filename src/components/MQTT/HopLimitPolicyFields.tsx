@@ -11,11 +11,13 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
 import styles from './HopLimitPolicyFields.module.css';
+import { MQTT_AIRTIME_DOCS_URL } from '../../utils/mqttProxyLink';
 import {
   CLAMP_EXEMPTABLE_PORTNUMS,
   MAX_HOP_LIMIT,
   MAX_RAISE_TARGET,
   RAISEABLE_PORTNUMS,
+  PORTNUM_TEXT_MESSAGE,
   raiseSuppressedByClamp,
   type HopLimitPolicyForm,
 } from './hopLimitPolicyForm';
@@ -50,6 +52,9 @@ export function HopLimitPolicyFields({ value, onChange, legacyNotice }: HopLimit
           'Applies to packets this broker hands to a radio — both radios subscribed over MQTT and a device linked to this broker over TCP. Ingestion, the packet log, and upstream re-publishes always see the hop limit the packet arrived with.',
         )}
       </span>
+      <a className={styles.help} href={MQTT_AIRTIME_DOCS_URL} target="_blank" rel="noopener noreferrer">
+        {t('source.form.hop_policy_docs', 'How much airtime broker traffic costs, and which setting to pick')}
+      </a>
 
       {legacyNotice && (
         <div className={styles.notice}>
@@ -166,7 +171,7 @@ export function HopLimitPolicyFields({ value, onChange, legacyNotice }: HopLimit
             <span className={styles.help}>
               {t(
                 'source.form.hop_raise_help',
-                'Raises hop_limit to at least the target below. Never lowers it. Only the four packet types firmware hop scaling touches can be raised — text, direct messages and traceroutes are out of scope.',
+                'Raises hop_limit to at least the target below. Never lowers it. You choose which packet types to raise: the four firmware hop scaling touches, and text messages. Traceroutes are never raised.',
               )}
             </span>
           </span>
@@ -231,6 +236,15 @@ export function HopLimitPolicyFields({ value, onChange, legacyNotice }: HopLimit
                   </label>
                 ))}
               </div>
+              {value.raisePortnums.includes(PORTNUM_TEXT_MESSAGE) && (
+                <span className={styles.warning} role="note">
+                  <UiIcon name="alert" size={14} />
+                  {t(
+                    'source.form.hop_raise_text_warning',
+                    'Raising text is loud. Every text message and DM this broker delivers to a radio floods up to the target number of hops on your local mesh, and text packets are larger than position or telemetry. Watch channel utilisation and turn it off if it climbs.',
+                  )}
+                </span>
+              )}
               {value.raisePortnums.length === 0 && (
                 <span className={styles.warning}>
                   <UiIcon name="alert" size={14} />

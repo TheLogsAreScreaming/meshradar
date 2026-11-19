@@ -14,17 +14,32 @@ import { meshcoreLastHeardMs } from '../../utils/meshcoreAge';
 import { useSettings } from '../../contexts/SettingsContext';
 import { useSource } from '../../contexts/SourceContext';
 import { MeshCoreRemoteConsole } from './MeshCoreRemoteConsole';
+import { MeshCoreCompanionRemoteConsole } from './MeshCoreCompanionRemoteConsole';
+import companionCliStyles from './MeshCoreCompanionCli.module.css';
 import { MeshCoreNotOnDeviceNotice } from './MeshCoreNotOnDeviceNotice';
-import type { AddContactToDeviceResponse, DiscoverPathStart, MeshCoreActions, TracePathResult, TracePathTimeout, ZeroHopPingResult } from './hooks/useMeshCore';
+import type { AddContactToDeviceResponse, DiscoverPathStart, MeshCoreActions, MeshCorePositionOverrideInput, TracePathResult, TracePathTimeout, ZeroHopPingResult } from './hooks/useMeshCore';
+import { PositionOverrideModal } from '../PositionOverrideModal';
 import styles from './MeshCoreContactDetailPanel.module.css';
 import api from '../../services/api';
 import '../NodeDetailsBlock.css';
 import { UiIcon } from '../icons';
+import { shouldDiscardPosition } from '../../utils/nullIsland';
+import { getDiscardInvalidPositions } from '../../utils/positionDisplayConfig';
+import { isHiddenByPositionlessAdvert, readHidePositionlessAdverts } from '../../utils/meshcoreAdvertPosition';
 import { ShowCoverageLink } from '../Analysis/ShowCoverageLink';
+import { DirectRfSection } from '../DirectRfSection';
 import { SignFlipNotice } from '../SignFlipNotice';
 import { MeshCoreNeighboursFetchProgress } from './MeshCoreNeighboursFetchProgress';
+import { MeshCoreTracePathMap } from './MeshCoreTracePathMap';
+import { MeshCoreTraceSnrCard } from './MeshCoreTraceSnrCard';
+import { MeshCoreTraceSnrCharts } from './MeshCoreTraceSnrCharts';
 import { useMeshCoreNeighboursFetch } from './hooks/useMeshCoreNeighboursFetch';
 import type { MeshCoreNeighboursFetchActions } from './hooks/meshcoreNeighboursFetchApi';
+import NodeNameHistory from '../NodeNameHistory';
+import SignalTrendBadge from '../SignalTrendBadge';
+import SmartHopsGraphs from '../SmartHopsGraphs';
+import LinkQualityGraph from '../LinkQualityGraph';
+import { isClockNotSet, formatCompactSpan } from '../../utils/securityClock';
 
 /** Stand-in so the fetch hook can run unconditionally when no actions are wired. */
 const NO_NEIGHBOURS_FETCH_ACTIONS: MeshCoreNeighboursFetchActions = {
@@ -58,6 +73,8 @@ interface MeshCoreContactDetailPanelProps {
    *  repeater to its first-public-key-byte hop). Typically the full contact
    *  list; the panel filters to repeaters/room servers internally. */
   repeaters?: MeshCoreContact[];
+  /** This source's own node key, so trace SNR rows can say "This node" (#5722). */
+  selfPublicKey?: string | null;
   /** Send a trace-path diagnostic along the contact's cached path and
    *  return per-hop SNR data. Unset hides the Trace Path button. */
   onTracePath?: (publicKey: string, opts?: { autoReturn?: boolean }) => Promise<TracePathResult | TracePathTimeout | null>;
@@ -78,10 +95,23 @@ interface MeshCoreContactDetailPanelProps {
    *  (#3588), including its #4840 best-effort device-flag push, so the
    *  list, map, and this panel's star all agree. Unset hides the star. */
   onToggleFavorite?: (publicKey: string, isFavorite: boolean) => Promise<boolean>;
+  /** Set or clear this contact's location override (#5842). MeshRadar-only,
+   *  so it works on Companion and Repeater sources and while disconnected.
+   *  Unset hides the Override location button. */
+  onSetPositionOverride?: (publicKey: string, data: MeshCorePositionOverrideInput) => Promise<void>;
+  /** #5964: open the MeshCore Nodes map on this node and open its popup.
+   *  The button shows only when the map would draw the node. Unset hides it. */
+  onShowOnMap?: (publicKey: string) => void;
+  /** `nodes:write` on this source, the permission the Meshtastic override
+   *  route takes. Not tied to the connection, unlike `canWriteNodes`. */
+  canEditPositionOverride?: boolean;
   /** Whether the current user may invoke write actions on this source's
    *  `nodes` resource. Required to gate the Reset Path / Share / Edit
    *  buttons, and (issue #5507) the favorite star. */
   canWriteNodes?: boolean;
+  /** `traceroute:write` on this source (#5898). Gates the Trace Path button,
+   *  which sends a trace over the mesh. */
+  canTraceroute?: boolean;
   /** Is the source's device a Companion? Reset Path / Share Contact /
    *  manual edit are all companion-only. Defaults to `true` so callers
    *  that don't pass this still see the buttons when handlers are
@@ -119,7 +149,11 @@ interface MeshCoreContactDetailPanelProps {
     | 'getRemoteAdminCapability'
     | 'forgetRemoteCredential'
     | 'getRemoteStatus'
-  >;
+    | 'getRemoteAdminSession'
+    | 'logoutRemote'
+  > & Partial<Pick<MeshCoreActions, 'readRemoteSettings' | 'saveRemoteSettings'>>;
+  /** This source's radio, for the remote settings airtime estimate (#6256). */
+  localRadio?: { sf?: number; bw?: number; cr?: number } | null;
   /** Whether the current user may invoke write actions on this source's
    *  `remote_admin` resource. When false the console is hidden even if
    *  `remoteAdminActions` is supplied. */
@@ -132,7 +166,21 @@ interface MeshCoreContactDetailPanelProps {
   /** #5390: when this source first heard the node, epoch MILLISECONDS (the
    *  durable `meshcore_nodes.firstHeard`). Unset hides the row. */
   firstHeard?: number;
+  /** The connected radio runs fw 1.18.0+ (companion protocol 14), so it can
+   *  grant and send remote CLI to other companions (#5867). */
+  localNativeCli?: boolean;
+  /** Allow or stop this contact running CLI commands on the radio (#5867).
+   *  Resolves an error message, or null. Unset hides the toggle. */
+  onSetRemoteCli?: (publicKey: string, allowed: boolean) => Promise<string | null>;
+  /** `configuration:write` on this source; the toggle needs it. */
+  canWriteConfig?: boolean;
+  /** `traceroute:write` on this source: may clear trace SNR history (#5970).
+   *  Unlike `canTraceroute` it does not need a connected radio. */
+  canClearTraceSnr?: boolean;
 }
+
+/** ContactInfo.flags bit: this contact may run CLI commands on us (#5867). */
+const CONTACT_FLAG_REMOTE_CLI = 0x10;
 
 const COLLAPSED_KEY = 'meshcoreContactDetailsCollapsed';
 
@@ -161,10 +209,14 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
   publicKey,
   isFavorite = false,
   onToggleFavorite,
+  onSetPositionOverride,
+  onShowOnMap,
+  canEditPositionOverride = false,
   onResetPath,
   onShareContact,
   onSetOutPath,
   repeaters,
+  selfPublicKey,
   onTracePath,
   onPingZeroHop,
   onDiscoverPath,
@@ -174,14 +226,27 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
   onGetNeighbours,
   neighboursFetchActions,
   canWriteNodes = false,
+  canTraceroute = false,
   isCompanion = true,
   remoteAdminActions,
+  localRadio,
   canRemoteAdmin = false,
   receiveOnly = false,
   firstHeard,
+  localNativeCli = false,
+  onSetRemoteCli,
+  canWriteConfig = false,
+  canClearTraceSnr = false,
 }) => {
   const { t } = useTranslation();
-  const { timeFormat, dateFormat } = useSettings();
+  // Bumped when the trace SNR card clears the history, so the charts reload.
+  const [traceSnrReloadKey, setTraceSnrReloadKey] = useState(0);
+  const [remoteCliBusy, setRemoteCliBusy] = useState(false);
+  const [remoteCliError, setRemoteCliError] = useState<string | null>(null);
+  useEffect(() => { setRemoteCliError(null); }, [publicKey]);
+  const { timeFormat, dateFormat, telemetryVisualizationHours } = useSettings();
+  // Link history (#6262): lazy so the charts and their queries mount only when opened.
+  const [linkHistoryOpen, setLinkHistoryOpen] = useState(false);
   const { sourceId } = useSource();
   // Tracks the currently-selected contact synchronously (unlike the
   // `publicKey` prop, which an in-flight async closure captured at call
@@ -212,6 +277,8 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
   const [isCollapsed, setIsCollapsed] = useState<boolean>(() => {
     return localStorage.getItem(COLLAPSED_KEY) === 'true';
   });
+  // Location override modal (#5842).
+  const [overrideModalOpen, setOverrideModalOpen] = useState(false);
   // Favorite toggle state (#5507).
   const [favoriteBusy, setFavoriteBusy] = useState(false);
   const [favoriteError, setFavoriteError] = useState<string | null>(null);
@@ -373,12 +440,21 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
   const latitude = contact?.latitude;
   const longitude = contact?.longitude;
   const hasPosition = typeof latitude === 'number' && typeof longitude === 'number';
+  // #5964: Show on Map only for a node the MeshCore map draws. It drops
+  // invalid fixes (null island etc.) and, with the #5578 toggle on, a node
+  // whose latest advert had no position (an override or the local node stays).
+  const canShowOnMap = !!onShowOnMap
+    && hasPosition
+    && !shouldDiscardPosition(latitude!, longitude!, undefined, getDiscardInvalidPositions())
+    && (contact?.isLocal === true || !isHiddenByPositionlessAdvert(contact, readHidePositionlessAdverts()));
   const pathKnown = typeof pathLen === 'number' && pathLen !== null && pathLen >= 0;
   // Favorite is not companion-only (#3588 covers every role), so unlike the
   // other action buttons below this doesn't gate on `isCompanion` — the
   // device-flag push it triggers server-side is already best-effort and
   // companion-only on its own (meshcoreManager.pushFavoriteToDevice).
   const canShowFavoriteButton = !!onToggleFavorite && canWriteNodes;
+  // #5842: MeshRadar-only, so not companion-only and not tied to the link.
+  const canShowOverrideButton = !!onSetPositionOverride && canEditPositionOverride;
   const canShowResetButton =
     !!onResetPath && canWriteNodes && isCompanion;
   const canShowShareButton =
@@ -391,8 +467,12 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
     () => repeaterHopOptions(repeaters ?? [], editorHashBytes),
     [repeaters, editorHashBytes],
   );
+  // A direct neighbour (pathLen 0) is traced through its own hash (#5914),
+  // which only works when it forwards traces: a repeater or room server.
+  const targetForwardsTraces = advType === 2 || advType === 3;
   const canShowTraceButton =
-    !!onTracePath && canWriteNodes && isCompanion && pathKnown && pathLen! > 0;
+    !!onTracePath && canTraceroute && isCompanion && pathKnown &&
+    (pathLen! > 0 || targetForwardsTraces);
   // Ping needs no cached path (that is the point — it builds a synthetic
   // one-hop path from the contact's own key hash), so unlike Trace Path it is
   // offered whether or not an out_path is known.
@@ -1167,6 +1247,15 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
             </div>
           )}
 
+          {/* Trace Path map (#6260): live result, else the newest stored trace */}
+          <MeshCoreTracePathMap
+            sourceId={sourceId}
+            contact={contact}
+            contacts={repeaters ?? []}
+            traceResult={traceResult}
+            outPath={outPath}
+          />
+
           {/* Paged neighbour fetch progress (#5413) */}
           {(liveFetch || neighboursFetch.startError) && (
             <div className="node-detail-card node-detail-card-2col">
@@ -1281,6 +1370,34 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
             </div>
           )}
 
+          {/* Advert signature (P7a #6254): null = never checked, never "Failed" */}
+          <div className="node-detail-card" data-testid="meshcore-advert-signature">
+            <div className="node-detail-label">{t('meshcore.advert_signature', 'Advert signature')}</div>
+            <div className="node-detail-value">
+              {contact?.advertSignatureVerified === true
+                ? t('meshcore.advert_signature_verified', 'Verified')
+                : contact?.advertSignatureVerified === false
+                  ? t('meshcore.advert_signature_failed', 'Failed')
+                  : t('meshcore.advert_signature_unchecked', 'Not checked')}
+            </div>
+          </div>
+
+          {/* Clock offset (#6281): only while the security scan flags the node */}
+          {typeof contact?.clockOffsetSeconds === 'number' && (
+            <div className="node-detail-card" data-testid="meshcore-clock-offset">
+              <div className="node-detail-label">{t('meshcore.clock_offset', 'Clock offset')}</div>
+              <div className="node-detail-value">
+                {isClockNotSet(contact.clockOffsetSeconds)
+                  ? t('security.clock_not_set', 'Clock not set')
+                  : `${formatCompactSpan(contact.clockOffsetSeconds)} ${
+                      contact.clockOffsetSeconds >= 0
+                        ? t('meshcore.clock_offset_behind', 'behind')
+                        : t('meshcore.clock_offset_ahead', 'ahead')
+                    }`}
+              </div>
+            </div>
+          )}
+
           {/* Last Advert */}
           {typeof lastAdvert === 'number' && (
             <div className="node-detail-card">
@@ -1302,6 +1419,25 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
               <div className="node-detail-value">
                 {`${latitude!.toFixed(5)}, ${longitude!.toFixed(5)}`}
               </div>
+              {canShowOnMap && (
+                <button
+                  type="button"
+                  className={`${styles.overrideButton} ${styles.showOnMapButton}`}
+                  onClick={() => onShowOnMap!(publicKey)}
+                  title={t('messages.show_on_map_title', 'Show this node on the map')}
+                >
+                  <UiIcon name="map" size={14} />
+                  {t('messages.show_on_map', 'Show on Map')}
+                </button>
+              )}
+              {contact?.positionIsOverride && (
+                <div className={styles.overrideNote}>
+                  <UiIcon name="location" size={12} />
+                  {contact.positionOverrideIsPrivate
+                    ? t('meshcore.contact_details.position_override_private', 'Location override (private)')
+                    : t('meshcore.contact_details.position_override_active', 'Location override')}
+                </div>
+              )}
               {/* #5363: the coords above are the mirror of what the node sent. */}
               {contact?.positionSignFlipCorrected
                 && contact.reportedLatitude != null
@@ -1314,6 +1450,25 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
             </div>
           )}
 
+          {/* Location override (#5842) */}
+          {canShowOverrideButton && (
+            <div className="node-detail-card">
+              <div className="node-detail-label">
+                {t('meshcore.contact_details.location_override', 'Location Override')}
+              </div>
+              <div className="node-detail-value">
+                <button
+                  type="button"
+                  className={styles.overrideButton}
+                  onClick={() => setOverrideModalOpen(true)}
+                >
+                  <UiIcon name="location" size={14} />
+                  {t('meshcore.contact_details.override_location', 'Override location')}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Public Key */}
           <div className="node-detail-card node-detail-card-2col">
             <div className="node-detail-label">{t('meshcore.public_key', 'Public Key')}</div>
@@ -1323,6 +1478,14 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
           </div>
         </div>
       )}
+
+      {/* Name history (#5862) — renders nothing until the node is renamed. */}
+      <NodeNameHistory
+        nodeId={publicKey}
+        currentName={contact?.advName || contact?.name || null}
+        timeFormat={timeFormat}
+        dateFormat={dateFormat}
+      />
 
       {editorOpen && (
         <div
@@ -1511,6 +1674,108 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
         </div>
       )}
 
+      {/* #5722: per-link SNR from traces this source heard. Hidden without
+          traceroute:read or when there is no history. */}
+      <MeshCoreTraceSnrCard sourceId={sourceId} publicKey={publicKey} contacts={repeaters} localPublicKey={selfPublicKey}
+        canClear={canClearTraceSnr} onCleared={() => setTraceSnrReloadKey((n) => n + 1)} />
+      {/* #5765: the same data as full-size charts, one per link direction. */}
+      <MeshCoreTraceSnrCharts sourceId={sourceId} publicKey={publicKey} contacts={repeaters} localPublicKey={selfPublicKey}
+        reloadKey={traceSnrReloadKey} />
+
+      {/* Direct RF (#6210): signed zero-hop adverts this companion heard.
+          Renders nothing without a source or on an error. Sends nothing. */}
+      <DirectRfSection sourceId={sourceId} nodeKey={publicKey} timeFormat={timeFormat} dateFormat={dateFormat} />
+
+      {/* Link history (#6262): the shared Meshtastic graph components, fed by the
+          MeshCore read-side adapter in the same telemetry endpoints. */}
+      {sourceId && (
+        <div className={styles.linkHistory}>
+          <button
+            type="button"
+            className={styles.linkHistoryToggle}
+            aria-expanded={linkHistoryOpen}
+            onClick={() => setLinkHistoryOpen((o) => !o)}
+          >
+            <UiIcon name={linkHistoryOpen ? 'chevronUp' : 'chevronDown'} size={14} />
+            {' '}
+            {t('meshcore.contact.link_history', 'Link history')}
+          </button>
+          {linkHistoryOpen && (
+            <div className={styles.linkHistoryBody}>
+              <SignalTrendBadge nodeId={publicKey} sourceId={sourceId} />
+              <SmartHopsGraphs
+                nodeId={publicKey}
+                sourceId={sourceId}
+                allowFavorite={false}
+                telemetryHours={telemetryVisualizationHours ?? 24}
+              />
+              <LinkQualityGraph
+                nodeId={publicKey}
+                sourceId={sourceId}
+                allowFavorite={false}
+                telemetryHours={telemetryVisualizationHours ?? 24}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {onSetRemoteCli && canWriteConfig && isCompanion && advType === 1 && (() => {
+        const allowed = ((contact?.flags ?? 0) & CONTACT_FLAG_REMOTE_CLI) !== 0;
+        const notOnDevice = contact?.onDevice === false;
+        const unavailable = !localNativeCli || notOnDevice;
+        const title = !localNativeCli
+          ? t('meshcore.remote_cli.needs_firmware', 'Needs firmware 1.18.0 or later on this radio.')
+          : notOnDevice
+            ? t('meshcore.not_on_device.control_tooltip', "This node is not in the radio's contact list. Add it to the radio first.")
+            : undefined;
+        const toggle = async (next: boolean) => {
+          const stillCurrent = beginContactAction();
+          setRemoteCliBusy(true);
+          setRemoteCliError(null);
+          const err = await onSetRemoteCli(publicKey, next);
+          setRemoteCliBusy(false);
+          if (stillCurrent()) setRemoteCliError(err);
+        };
+        return (
+          <div className={companionCliStyles.permission} data-testid="remote-cli-permission">
+            <h4 className={companionCliStyles.permissionTitle}>
+              {t('meshcore.remote_cli.title', 'Remote CLI')}
+            </h4>
+            <label className={companionCliStyles.toggle} title={title}>
+              <input
+                type="checkbox"
+                checked={allowed}
+                disabled={unavailable || remoteCliBusy}
+                onChange={e => { void toggle(e.target.checked); }}
+              />
+              {t('meshcore.remote_cli.allow', 'Allow this contact to run CLI commands on this radio')}
+            </label>
+            <p className={companionCliStyles.warning}>
+              {t(
+                'meshcore.remote_cli.warning',
+                'This contact could run any command on this radio, including reboot and radio settings, and every command makes this radio reply over the air.',
+              )}
+            </p>
+            {remoteCliError && <p className={companionCliStyles.error} role="alert">{remoteCliError}</p>}
+          </div>
+        );
+      })()}
+
+      {remoteAdminActions
+        && canRemoteAdmin
+        && isCompanion
+        && localNativeCli
+        && advType === 1 && (
+        <MeshCoreCompanionRemoteConsole
+          publicKey={publicKey}
+          contactName={name}
+          actions={remoteAdminActions}
+          receiveOnly={receiveOnly}
+          notOnDevice={contact?.onDevice === false}
+        />
+      )}
+
       {remoteAdminActions
         && canRemoteAdmin
         && isCompanion
@@ -1521,6 +1786,20 @@ export const MeshCoreContactDetailPanel: React.FC<MeshCoreContactDetailPanelProp
           actions={remoteAdminActions}
           receiveOnly={receiveOnly}
           notOnDevice={contact?.onDevice === false}
+          isRepeater={advType === 2}
+          pathHops={pathKnown ? (pathLen as number) : null}
+          radio={localRadio ?? null}
+        />
+      )}
+
+      {canShowOverrideButton && (
+        <PositionOverrideModal
+          protocol="meshcore"
+          isOpen={overrideModalOpen}
+          selectedNode={{ nodeNum: 0, user: { id: publicKey, longName: name } }}
+          onClose={() => setOverrideModalOpen(false)}
+          onSave={(_nodeNum, data) => onSetPositionOverride!(publicKey, data)}
+          getNodeName={() => name}
         />
       )}
     </div>

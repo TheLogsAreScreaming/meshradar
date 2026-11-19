@@ -27,6 +27,7 @@
  * they don't need one.
  */
 import { compile, type WorkflowForm, type FormBlock } from '../compile';
+import { CLOCK_OUT_OF_SYNC_DEFAULT_SECONDS, CLOCK_OUT_OF_SYNC_MIN_SECONDS, CLOCK_OUT_OF_SYNC_MAX_SECONDS } from '../../../utils/clockOutOfSync';
 import type { AutomationTemplate, BuiltAutomation, ParamSpec } from './types';
 
 // ─── value coercion ──────────────────────────────────────────────────────────
@@ -73,7 +74,11 @@ const DEFAULTS = {
   highNoiseFloor: -90,   // dBm
   trendWindowHours: 6,   // h
   trendMinDropPercent: 15, // percentage points
+  clockDriftSeconds: CLOCK_OUT_OF_SYNC_DEFAULT_SECONDS, // s (MeshCore clock alert)
+  clockRateMax: 10,      // max clock alerts per hour per automation
   cooldownSeconds: 3600, // per-node throttle on the recurring telemetry alerts
+  neighborConfirmHours: 72, // h a new neighbour must stay listed before it alerts
+  neighborAlertsPerHour: 5, // per-automation cap on confirmed-neighbour alerts
 } as const;
 
 // ─── params ──────────────────────────────────────────────────────────────────
@@ -155,6 +160,27 @@ const PARAMS: ParamSpec[] = [
     placeholder: String(DEFAULTS.trendMinDropPercent), showIf: { field: 'batteryDeclining', truthy: true },
     help: 'Fire when the battery fell by at least this many points across the window.',
   },
+
+  // 11. Clock out of sync (MeshCore)
+  { name: 'clockOutOfSync', label: 'Alert when a node\'s clock is out of sync (MeshCore)', kind: 'checkbox' },
+  {
+    name: 'clockDriftThresholdSeconds', label: 'Clock off by more than (seconds)', kind: 'number',
+    placeholder: String(DEFAULTS.clockDriftSeconds), showIf: { field: 'clockOutOfSync', truthy: true },
+    help: `Measured passively from adverts. A repeater whose clock was never set reads 'Clock not set'. From ${CLOCK_OUT_OF_SYNC_MIN_SECONDS} to ${CLOCK_OUT_OF_SYNC_MAX_SECONDS} seconds.`,
+  },
+
+  // 12. Confirmed new neighbour (MeshCore)
+  { name: 'neighborConfirmed', label: 'Alert when a repeater gains a confirmed new neighbour (MeshCore)', kind: 'checkbox' },
+  {
+    name: 'neighborConfirmHours', label: 'Confirm after (hours)', kind: 'number',
+    placeholder: String(DEFAULTS.neighborConfirmHours), showIf: { field: 'neighborConfirmed', truthy: true },
+    help: 'A new neighbour must stay in the repeater’s neighbour table this long before it alerts (6 to 336 hours). Reads the table MeshRadar already polls; sends nothing to the mesh. Capped at 5 alerts per hour. Zero-hop repeaters only; a Companion source lists only its 10 strongest neighbours per poll.',
+  },
+  {
+    name: 'neighborMinSnr', label: 'Only if neighbour SNR is at least (dB)', kind: 'number',
+    placeholder: 'any', showIf: { field: 'neighborConfirmed', truthy: true },
+    help: 'Optional. Leave blank to alert for any neighbour.',
+  },
 ];
 
 // ─── shared assembly ─────────────────────────────────────────────────────────
@@ -188,11 +214,18 @@ interface AlertParts {
   /** The telemetry-threshold check, if this alert has one. */
   threshold?: FormBlock;
   notify: { title: string; body: string; type: string };
+  /** The subject is a MeshCore public key: skip the Meshtastic node-id filter. */
+  meshcoreOnly?: boolean;
+  /** Extra conditions after the common ones and the threshold. */
+  extraConditions?: FormBlock[];
 }
 
 function assemble(parts: AlertParts, common: Common): BuiltAutomation {
-  const conditions = commonConditions(common);
+  // `node.nodeId in !hex` never matches a MeshCore key, so a MeshCore-only alert
+  // keeps the source filter and drops the node-id filter (#6271 tracks the picker).
+  const conditions = commonConditions(parts.meshcoreOnly ? { ...common, nodeIds: [] } : common);
   if (parts.threshold) conditions.push(parts.threshold);
+  if (parts.extraConditions) conditions.push(...parts.extraConditions);
   const form: WorkflowForm = {
     trigger: parts.trigger,
     rules: [{ conditions, actions: [{ type: 'action.notify', params: parts.notify }] }],
@@ -387,6 +420,55 @@ const ALERTS: AlertSpec[] = [
       }, c);
     },
   },
+  {
+    key: 'clockOutOfSync',
+    build: (v, c) => {
+      const raw = numOr(v.clockDriftThresholdSeconds, DEFAULTS.clockDriftSeconds);
+      // Whole seconds inside the range the sampling can resolve; anything else falls back.
+      const t = Number.isInteger(raw) && raw >= CLOCK_OUT_OF_SYNC_MIN_SECONDS && raw <= CLOCK_OUT_OF_SYNC_MAX_SECONDS
+        ? raw
+        : DEFAULTS.clockDriftSeconds;
+      return assemble({
+        nameSuffix: 'Clock out of sync',
+        description: `Notify when a MeshCore node's clock is off by more than ${t} seconds. Measured from adverts; sends nothing.`,
+        trigger: {
+          type: 'trigger.clockOutOfSync',
+          // Capped at 10 alerts an hour per automation (maintainer decision, #6273).
+          params: { thresholdSeconds: t, rateLimit: { maxActions: DEFAULTS.clockRateMax, windowSeconds: 3600 } },
+        },
+        notify: {
+          title: 'Clock out of sync: {{ node.longName }}',
+          body: `{{ node.longName }} clock is {{ trigger.offsetText }} (threshold {{ trigger.thresholdSeconds }}s).`,
+          type: 'warning',
+        },
+      }, c);
+    },
+  },
+  {
+    key: 'neighborConfirmed',
+    build: (v, c) => {
+      const raw = numOr(v.neighborConfirmHours, DEFAULTS.neighborConfirmHours);
+      const hours = Math.min(336, Math.max(6, Math.round(raw)));
+      const hasSnr = v.neighborMinSnr !== '' && v.neighborMinSnr != null && Number.isFinite(Number(v.neighborMinSnr));
+      return assemble({
+        nameSuffix: 'New neighbour confirmed',
+        description: `Notify when a MeshCore repeater's neighbour table gains a node that is still listed after ${hours} hours. Reads the neighbour table MeshRadar already polls; nothing is sent to the mesh.`,
+        trigger: {
+          type: 'trigger.neighborAdded',
+          params: { confirmHours: hours, rateLimit: { maxActions: DEFAULTS.neighborAlertsPerHour, windowSeconds: 3600 } },
+        },
+        meshcoreOnly: true,
+        extraConditions: hasSnr
+          ? [{ type: 'condition.numeric', params: { field: 'snr', op: '>=', value: String(Number(v.neighborMinSnr)) } }]
+          : undefined,
+        notify: {
+          title: 'New neighbour: {{ trigger.reporterName }}',
+          body: `{{ trigger.reporterName }} ({{ trigger.reporterPublicKey }}) has a new neighbour, {{ node.longName }} ({{ trigger.neighborPublicKey }}), still listed after ${hours} hours (SNR {{ trigger.snr }}).`,
+          type: 'info',
+        },
+      }, c);
+    },
+  },
 ];
 
 // ─── build ───────────────────────────────────────────────────────────────────
@@ -409,9 +491,10 @@ function build(values: Record<string, unknown>): BuiltAutomation[] {
 export const deviceHealthTemplate: AutomationTemplate = {
   id: 'device-health',
   name: 'Device Health',
-  description: 'Get notified when a node’s health slips — low battery or voltage, high temperature or channel utilization, a lost heartbeat, a reboot, a power-source switch, a noisy RF floor, or a steadily draining battery. Installs one automation per alert you enable.',
+  description: 'Get notified when a node’s health slips — low battery or voltage, high temperature or channel utilization, a lost heartbeat, a reboot, a power-source switch, a noisy RF floor, a steadily draining battery, a MeshCore clock that drifts, or a MeshCore repeater with a confirmed new neighbour. Installs one automation per alert you enable.',
   icon: 'notifications',
   tags: ['Notifications', 'Health'],
   params: PARAMS,
+  multi: true,
   build,
 };

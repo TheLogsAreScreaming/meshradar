@@ -18,10 +18,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Test Suite
+  # Lint + type checks run once, on one Node version, in parallel with the test
+  # matrix. They used to run before the tests on every Node leg, which tripled
+  # their cost and delayed each leg's test start by several minutes; their
+  # result does not depend on the Node version.
+  static:
+    name: Lint & Type Check
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          submodules: recursive  # protobufs are part of the type-checked tree
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: '24.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Run lint ratchet
+        # BLOCKING: fails only on new violations above the checked-in baseline.
+        # Existing debt is frozen in eslint-baseline.json and burns down over time.
+        # Regenerate baseline: npm run lint:baseline. Tracking: #3962 Task 1.4.
+        run: npm run lint:ci
+
+      - name: Run type checking
+        run: npm run typecheck
+
+      # Test-file type check runs on ONE Node version (non-blocking; tracks
+      # toward a clean tsconfig.tests). Coverage generation + Codecov upload were
+      # removed (#4172): they ran on a single leg, produced no enforced signal
+      # (no token, no thresholds, no PR status check, no badge — Codecov was
+      # already fail_ci_if_error:false), and @vitest/coverage-v8 hung for 30+ min
+      # on Node 24, repeatedly blocking merges. `npm run test:coverage` remains
+      # available for ad-hoc local reports.
+      - name: Type-check tests (non-blocking)
+        run: npm run typecheck:tests
+        # NON-BLOCKING: ~283 pre-existing test-type errors (mock/signature drift).
+        # Flip to blocking (remove continue-on-error) once `npm run typecheck:tests` is clean (0 errors).
+        # Tracking: remediation epic #3962 Task 1.2.
+        continue-on-error: true
+
+  # The suite runs as 3 shards per Node version. Most of a run is per-file
+  # overhead (fork + module import across ~2,650 files), not test bodies, so it
+  # splits almost evenly across runners; one runner with more workers would not
+  # help, since 4 workers already saturate a standard runner.
+  #
+  # Required checks in the "protect main" ruleset name "Test Suite (<node>)".
+  # The shard jobs carry a different name; the `test-summary` job below keeps
+  # the old names and passes only when every shard passed.
+  test:
+    name: Test Shard (${{ matrix.node-version }}, ${{ matrix.shard }}/3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     services:
       postgres:
@@ -53,7 +108,10 @@ jobs:
           --health-retries 5
 
     strategy:
+      # Let the other shards finish so one failure shows the full picture.
+      fail-fast: false
       matrix:
+        shard: [1, 2, 3]
         # Node 20 dropped: nothing we ship runs it. The main image is Node 24,
         # the LXC template is NodeSource 24, and armv7 — the lowest target — is
         # Node 22 (Dockerfile.armv7 pins 22 because Node 24 has no ARMv7 build).
@@ -69,7 +127,7 @@ jobs:
           submodules: recursive  # Initialize protobufs submodule for tests
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -85,30 +143,6 @@ jobs:
 
       - name: Install dependencies
         run: npm install --legacy-peer-deps
-
-      - name: Run lint ratchet
-        # BLOCKING: fails only on new violations above the checked-in baseline.
-        # Existing debt is frozen in eslint-baseline.json and burns down over time.
-        # Regenerate baseline: npm run lint:baseline. Tracking: #3962 Task 1.4.
-        run: npm run lint:ci
-
-      - name: Run type checking
-        run: npm run typecheck
-
-      # Test-file type check runs on ONE Node version (non-blocking; tracks
-      # toward a clean tsconfig.tests). Coverage generation + Codecov upload were
-      # removed (#4172): they ran on a single leg, produced no enforced signal
-      # (no token, no thresholds, no PR status check, no badge — Codecov was
-      # already fail_ci_if_error:false), and @vitest/coverage-v8 hung for 30+ min
-      # on Node 24, repeatedly blocking merges. `npm run test:coverage` remains
-      # available for ad-hoc local reports.
-      - name: Type-check tests (non-blocking)
-        if: matrix.node-version == '24.x'
-        run: npm run typecheck:tests
-        # NON-BLOCKING: ~283 pre-existing test-type errors (mock/signature drift).
-        # Flip to blocking (remove continue-on-error) once `npm run typecheck:tests` is clean (0 errors).
-        # Tracking: remediation epic #3962 Task 1.2.
-        continue-on-error: true
 
       # `--disableConsoleIntercept` for the same reason as the release workflow's
       # coverage step: `onUserConsoleLog` is the RPC a worker uses to ship a
@@ -126,13 +160,31 @@ jobs:
       # stdout instead of via the interceptor) and failures report unchanged;
       # measured locally the log got SMALLER, 1.58M lines to ~750k.
       - name: Run tests
-        run: npm run test:run -- --disableConsoleIntercept
+        run: npm run test:run -- --disableConsoleIntercept --shard=${{ matrix.shard }}/3
+
+  # Keeps the "Test Suite (<node>)" check names that the ruleset and the
+  # Dependabot auto-merge regexp require. `needs.test.result` covers every
+  # shard of every Node version, so one failed shard fails all three.
+  test-summary:
+    name: Test Suite (${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: test
+    if: always()
+    strategy:
+      matrix:
+        node-version: [22.x, 24.x, 25.x]
+    steps:
+      - name: Check shard results
+        run: |
+          echo "Shard result: ${{ needs.test.result }}"
+          test "${{ needs.test.result }}" = "success"
 
   build:
     name: Build Check
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: test
+    needs: [test, static]
 
     steps:
       - name: Checkout code
@@ -141,7 +193,7 @@ jobs:
           submodules: recursive  # Initialize protobufs submodule
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: '24.x'
           cache: 'npm'
@@ -195,7 +247,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: '24.x'
           cache: 'npm'
@@ -210,7 +262,7 @@ jobs:
     name: Docker Build
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: test
+    needs: [test, static]
 
     steps:
       - name: Checkout code
@@ -295,7 +347,7 @@ jobs:
         run: trivy fs --scanners vuln --format sarif --output trivy-results.sarif --severity HIGH,CRITICAL .
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2  # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066  # v4
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
@@ -375,7 +427,7 @@ jobs:
           grep -v '^#' .github/clamav-ignore.ign2 | grep -v '^$'
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
           node-version: 22.x
           cache: 'npm'
@@ -408,7 +460,7 @@ jobs:
 
       - name: Upload scan results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: clamav-scan-results
           path: clamav.log
@@ -417,7 +469,7 @@ jobs:
     name: PR Comment
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [test, build, docker]
+    needs: [test, static, build, docker]
     if: github.event_name == 'pull_request'
 
     steps:

@@ -8,6 +8,14 @@
  * Meshtastic Encryption Spec:
  * - AES-128-CTR (16-byte key) or AES-256-CTR (32-byte key)
  * - Nonce: packetId (8 bytes, little-endian) + fromNode (4 bytes, little-endian) + extraNonce (4 bytes, usually 0)
+ *
+ * AEAD channels (firmware 2.8.1+, `ChannelSettings.use_aead`, #5248):
+ * - AES-CCM (RFC 3610), 12-byte tag, L=2. Payload = ciphertext ‖ tag.
+ * - Nonce: the CTR nonce cut to 13 bytes (extraNonce is always 0).
+ * - AAD: fromNode (4 bytes LE) ‖ toNode (4 bytes LE).
+ * - Channel hash: xorHash(name) ^ xorHash(psk) ^ 0xAE.
+ * - No CTR fallback: an AEAD row is only ever tried with CCM, as in firmware.
+ * See docs/internal/dev-notes/AEAD_CHANNELS_PLAN.md.
  */
 import { createDecipheriv } from 'crypto';
 import { getProtobufRoot } from '../protobufLoader.js';
@@ -52,8 +60,15 @@ interface CachedChannel {
   psk: Buffer;
   enforceNameValidation: boolean;
   expectedChannelHash?: number;
+  /** AES-CCM channel: tried only with CCM, never CTR. */
+  useAead: boolean;
   sortOrder: number;
 }
+
+/** AES-CCM auth tag length on AEAD channels (firmware `AEAD_TAG_SIZE`). */
+const AEAD_TAG_SIZE = 12;
+/** XORed into the finished channel hash of an AEAD channel (firmware `Channels.cpp`). */
+const AEAD_HASH_XOR = 0xae;
 
 /**
  * Compute XOR hash of bytes (Meshtastic channel hash algorithm)
@@ -76,9 +91,10 @@ function xorHash(bytes: Buffer): number {
  * @param psk Pre-shared key buffer
  * @returns 8-bit channel hash (0-255)
  */
-function computeChannelHash(name: string, psk: Buffer): number {
+function computeChannelHash(name: string, psk: Buffer, useAead: boolean = false): number {
   const nameBytes = Buffer.from(name, 'utf8');
-  return xorHash(nameBytes) ^ xorHash(psk);
+  const hash = xorHash(nameBytes) ^ xorHash(psk);
+  return useAead ? hash ^ AEAD_HASH_XOR : hash;
 }
 
 class ChannelDecryptionService {
@@ -170,7 +186,8 @@ class ChannelDecryptionService {
           // enforceNameValidation flag still independently controls whether a
           // hash *mismatch* is a hard skip (channel never attempted).
           const enforceNameValidation = channel.enforceNameValidation ?? false;
-          const expectedChannelHash = computeChannelHash(channel.name, pskBuffer);
+          const useAead = channel.useAead ?? false;
+          const expectedChannelHash = computeChannelHash(channel.name, pskBuffer, useAead);
 
           this.channelCache.set(channel.id, {
             id: channel.id,
@@ -178,6 +195,7 @@ class ChannelDecryptionService {
             psk: pskBuffer,
             enforceNameValidation,
             expectedChannelHash,
+            useAead,
             sortOrder: channel.sortOrder ?? 0,
           });
         } catch (err) {
@@ -244,6 +262,38 @@ class ChannelDecryptionService {
     nonce.writeUInt32LE(extraNonce >>> 0, 12);
 
     return nonce;
+  }
+
+  /**
+   * AES-CCM decrypt for an AEAD channel. Returns null when the tag does not
+   * verify (wrong key, wrong channel, or a tampered packet): a clean miss.
+   */
+  private tryDecryptCcm(
+    payload: Uint8Array,
+    ctrNonce: Buffer,
+    fromNode: number,
+    toNode: number,
+    psk: Buffer
+  ): Buffer | null {
+    if (payload.length <= AEAD_TAG_SIZE) return null;
+    try {
+      const algorithm = psk.length === 16 ? 'aes-128-ccm' : 'aes-256-ccm';
+      const ciphertext = payload.subarray(0, payload.length - AEAD_TAG_SIZE);
+      const tag = payload.subarray(payload.length - AEAD_TAG_SIZE);
+      const aad = Buffer.alloc(8);
+      aad.writeUInt32LE(fromNode >>> 0, 0);
+      aad.writeUInt32LE(toNode >>> 0, 4);
+      const decipher = createDecipheriv(algorithm, psk, ctrNonce.subarray(0, 13), {
+        authTagLength: AEAD_TAG_SIZE,
+      });
+      decipher.setAuthTag(tag);
+      decipher.setAAD(aad, { plaintextLength: ciphertext.length });
+      const plaintext = decipher.update(ciphertext);
+      decipher.final(); // throws when the tag does not verify
+      return plaintext;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -339,9 +389,18 @@ class ChannelDecryptionService {
   private attemptDecryptSingleChannel(
     encryptedPayload: Uint8Array,
     nonce: Buffer,
-    channel: CachedChannel
+    channel: CachedChannel,
+    fromNode: number,
+    toNode: number | undefined
   ): DecryptionResult {
-    const decrypted = this.tryDecryptWithKey(encryptedPayload, nonce, channel.psk);
+    let decrypted: Buffer | null;
+    if (channel.useAead) {
+      // The AAD binds the destination, so without it there is nothing to verify.
+      if (toNode === undefined) return { success: false, error: 'AEAD needs the packet destination' };
+      decrypted = this.tryDecryptCcm(encryptedPayload, nonce, fromNode, toNode, channel.psk);
+    } else {
+      decrypted = this.tryDecryptWithKey(encryptedPayload, nonce, channel.psk);
+    }
     if (!decrypted) {
       return { success: false, error: 'Decryption failed' };
     }
@@ -371,13 +430,16 @@ class ChannelDecryptionService {
    * @param packetId The packet's unique ID
    * @param fromNode The sender's node number
    * @param channelHash Optional 8-bit channel hash from packet (meshPacket.channel)
+   * @param toNode The packet's destination (`packet.to`). AEAD channels need it
+   *   (it is part of the authenticated data); without it they are skipped.
    * @returns DecryptionResult with success status and decoded data if successful
    */
   async tryDecrypt(
     encryptedPayload: Uint8Array,
     packetId: number,
     fromNode: number,
-    channelHash?: number
+    channelHash?: number,
+    toNode?: number
   ): Promise<DecryptionResult> {
     if (!this.enabled) {
       return { success: false, error: 'Server-side decryption is disabled' };
@@ -396,9 +458,102 @@ class ChannelDecryptionService {
 
     // Build the nonce once (same for all attempts)
     const nonce = this.buildNonce(packetId, fromNode);
+    const ordered = this.orderedCandidates(channelHash);
 
-    // Build the ordered list of channels to try. Channels are pre-sorted by
-    // sortOrder during cache refresh.
+    let attempts = 0;
+    for (const channel of ordered) {
+      if (attempts >= this.maxDecryptionAttempts) {
+        logger.warn(
+          `Decryption attempt limit reached (${this.maxDecryptionAttempts}) for packet ${packetId} — ` +
+          `${ordered.length - attempts} channels were not tried. ` +
+          `Consider increasing maxDecryptionAttempts or enabling name validation on channels.`
+        );
+        break;
+      }
+      attempts++;
+
+      const result = this.attemptDecryptSingleChannel(encryptedPayload, nonce, channel, fromNode, toNode);
+      if (!result.success) {
+        continue;
+      }
+
+      // Success! Update the channel's decrypted count
+      try {
+        await databaseService.channelDatabase.incrementDecryptedCountAsync(channel.id);
+      } catch (err) {
+        logger.warn(`Failed to update decrypted count for channel ${channel.id}:`, err);
+      }
+
+      logger.debug(
+        `Server-side decryption successful: packet ${packetId} decrypted with channel "${channel.name}" (portnum=${result.portnum})`
+      );
+
+      return result;
+    }
+
+    this.logAeadHint(channelHash);
+    return {
+      success: false,
+      error: `Failed to decrypt with any of ${attempts} channel(s)`,
+    };
+  }
+
+  /**
+   * Debug hint for a packet no key opened: if its hash is a known non-AEAD
+   * channel's hash `^ 0xAE`, that channel is probably AEAD upstream. Debug
+   * only: an AEAD packet otherwise looks exactly like a wrong key.
+   */
+  private logAeadHint(channelHash?: number): void {
+    if (channelHash === undefined) return;
+    for (const [, channel] of this.sortedChannels) {
+      if (
+        !channel.useAead &&
+        channel.expectedChannelHash !== undefined &&
+        (channel.expectedChannelHash ^ AEAD_HASH_XOR) === channelHash
+      ) {
+        logger.debug(
+          `Channel "${channel.name}" looks AEAD-enabled upstream (hash 0x${channelHash.toString(16)}); ` +
+            `enable AEAD on it in the Channel Database to decrypt`
+        );
+        return;
+      }
+    }
+  }
+
+  /**
+   * Read the portnum of an encrypted packet with the keys already cached,
+   * synchronously (#5791). For hot paths that cannot await, such as the MQTT
+   * broker's per-subscriber forward hook, which needs the portnum to decide a
+   * hop-limit raise.
+   *
+   * Never refreshes the cache, never counts a decryption against a channel,
+   * never logs: the ingest path calls {@link tryDecrypt} for the same packet,
+   * which does all three. An empty or stale cache returns null, which callers
+   * treat as "portnum unknown", the behaviour before this method existed.
+   */
+  peekPortnum(
+    encryptedPayload: Uint8Array,
+    packetId: number,
+    fromNode: number,
+    channelHash?: number,
+    toNode?: number
+  ): number | null {
+    if (!this.enabled || !encryptedPayload || encryptedPayload.length === 0) return null;
+    const nonce = this.buildNonce(packetId, fromNode);
+    const ordered = this.orderedCandidates(channelHash).slice(0, this.maxDecryptionAttempts);
+    for (const channel of ordered) {
+      const result = this.attemptDecryptSingleChannel(encryptedPayload, nonce, channel, fromNode, toNode);
+      if (result.success && typeof result.portnum === 'number') return result.portnum;
+    }
+    return null;
+  }
+
+  /**
+   * The cached channels to try for a packet, in order. Channels are pre-sorted
+   * by sortOrder during cache refresh.
+   */
+  private orderedCandidates(channelHash?: number): CachedChannel[] {
+    // Build the ordered list of channels to try.
     //
     // 1. Hard skip (name validation): when a channel enforces name validation
     //    and the packet carries a channel hash that doesn't match, the channel
@@ -425,49 +580,12 @@ class ChannelDecryptionService {
       candidates.push(channel);
     }
 
-    const ordered =
-      channelHash === undefined
-        ? candidates
-        : [
-            ...candidates.filter((c) => c.expectedChannelHash === channelHash),
-            ...candidates.filter((c) => c.expectedChannelHash !== channelHash),
-          ];
-
-    let attempts = 0;
-    for (const channel of ordered) {
-      if (attempts >= this.maxDecryptionAttempts) {
-        logger.warn(
-          `Decryption attempt limit reached (${this.maxDecryptionAttempts}) for packet ${packetId} — ` +
-          `${ordered.length - attempts} channels were not tried. ` +
-          `Consider increasing maxDecryptionAttempts or enabling name validation on channels.`
-        );
-        break;
-      }
-      attempts++;
-
-      const result = this.attemptDecryptSingleChannel(encryptedPayload, nonce, channel);
-      if (!result.success) {
-        continue;
-      }
-
-      // Success! Update the channel's decrypted count
-      try {
-        await databaseService.channelDatabase.incrementDecryptedCountAsync(channel.id);
-      } catch (err) {
-        logger.warn(`Failed to update decrypted count for channel ${channel.id}:`, err);
-      }
-
-      logger.debug(
-        `Server-side decryption successful: packet ${packetId} decrypted with channel "${channel.name}" (portnum=${result.portnum})`
-      );
-
-      return result;
-    }
-
-    return {
-      success: false,
-      error: `Failed to decrypt with any of ${attempts} channel(s)`,
-    };
+    return channelHash === undefined
+      ? candidates
+      : [
+          ...candidates.filter((c) => c.expectedChannelHash === channelHash),
+          ...candidates.filter((c) => c.expectedChannelHash !== channelHash),
+        ];
   }
 
   /**
@@ -478,7 +596,8 @@ class ChannelDecryptionService {
     encryptedPayload: Uint8Array,
     packetId: number,
     fromNode: number,
-    channelDatabaseId: number
+    channelDatabaseId: number,
+    toNode?: number
   ): Promise<DecryptionResult> {
     if (!this.enabled) {
       return { success: false, error: 'Server-side decryption is disabled' };
@@ -493,7 +612,7 @@ class ChannelDecryptionService {
     }
 
     const nonce = this.buildNonce(packetId, fromNode);
-    return this.attemptDecryptSingleChannel(encryptedPayload, nonce, channel);
+    return this.attemptDecryptSingleChannel(encryptedPayload, nonce, channel, fromNode, toNode);
   }
 
   /**
@@ -520,4 +639,4 @@ export const channelDecryptionService = new ChannelDecryptionService();
 export default channelDecryptionService;
 
 // Export hash functions for testing
-export { xorHash, computeChannelHash };
+export { xorHash, computeChannelHash, AEAD_TAG_SIZE };

@@ -15,6 +15,9 @@
 import crypto from 'crypto';
 import path from 'path';
 import { logger } from '../../utils/logger.js';
+import { getDataDir, getDefaultDatabasePath, getDefaultAccessLogPath } from './dataDir.js';
+import { parseVirtualNodeEnv } from './virtualNodeEnv.js';
+import { parseMeshCoreDefaultEnv, type MeshCoreDefaultEnv } from './meshcoreEnv.js';
 
 /**
  * Parse boolean environment variable
@@ -177,6 +180,38 @@ function parseEnum<T extends string>(
   return { value: defaultValue, wasProvided: false };
 }
 
+// ENABLE_VIRTUAL_NODE / VIRTUAL_NODE_PORT parsing lives in its own module so
+// the migrations can use it without importing (or mocking) this file.
+export {
+  DEFAULT_MESHTASTIC_VIRTUAL_NODE_PORT,
+  parseVirtualNodeEnv,
+  type VirtualNodeEnvConfig,
+} from './virtualNodeEnv.js';
+
+/** Shortest password MeshRadar accepts anywhere (see auth/localAuth.ts). */
+export const MIN_ADMIN_PASSWORD_LENGTH = 8;
+
+/**
+ * Parse ADMIN_PASSWORD (#5874): the first admin's password, used only when
+ * that admin is seeded. Empty or too-short values fall back to the default
+ * with a warning. The value is never logged.
+ */
+export function parseAdminPassword(
+  envValue: string | undefined,
+  warn: (msg: string) => void = () => {}
+): { value: string | undefined; wasProvided: boolean } {
+  if (envValue === undefined) return { value: undefined, wasProvided: false };
+  if (envValue.trim().length === 0) {
+    warn('⚠️  ADMIN_PASSWORD is set but empty. Ignoring it; the first admin gets the default password.');
+    return { value: undefined, wasProvided: false };
+  }
+  if (envValue.length < MIN_ADMIN_PASSWORD_LENGTH) {
+    warn(`⚠️  ADMIN_PASSWORD is shorter than ${MIN_ADMIN_PASSWORD_LENGTH} characters. Ignoring it; the first admin gets the default password.`);
+    return { value: undefined, wasProvided: false };
+  }
+  return { value: envValue, wasProvided: true };
+}
+
 /**
  * Environment configuration interface
  */
@@ -190,6 +225,7 @@ export interface EnvironmentConfig {
   // Server
   port: number;
   portProvided: boolean;
+  bindAddress: string | undefined;
   baseUrl: string;
   baseUrlProvided: boolean;
   allowedOrigins: string[];
@@ -238,6 +274,13 @@ export interface EnvironmentConfig {
   meshtasticReconnectMaxDelayMsProvided: boolean;
   meshtasticModuleConfigDelayMs: number;
   meshtasticModuleConfigDelayMsProvided: boolean;
+  // First-boot Virtual Node for the Default source (#5874)
+  virtualNodeEnabled: boolean;
+  virtualNodeEnabledProvided: boolean;
+  virtualNodePort: number;
+  virtualNodePortProvided: boolean;
+  /** First-boot MeshCore default source from MESHCORE_* (#5874). */
+  meshcoreDefault: MeshCoreDefaultEnv;
   timezone: string;
   timezoneProvided: boolean;
 
@@ -270,6 +313,16 @@ export interface EnvironmentConfig {
   disableAnonymousProvided: boolean;
   adminUsername: string;
   adminUsernameProvided: boolean;
+  /** First-admin password from ADMIN_PASSWORD (#5874). Never log this. */
+  adminPassword: string | undefined;
+  adminPasswordProvided: boolean;
+
+  // Passkeys / WebAuthn (#5841). Both optional: when unset the RP ID and
+  // origin come from each request (req.hostname / req.protocol).
+  webauthnRpId: string | undefined;
+  webauthnRpIdProvided: boolean;
+  webauthnOrigins: string[];
+  webauthnOriginsProvided: boolean;
 
   // Proxy Authentication
   proxyAuthEnabled: boolean;
@@ -334,6 +387,10 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
 
   // Server
   const port = parseInt32('PORT', process.env.PORT, 3001);
+  // BIND_ADDRESS: unset = every interface (unchanged default; Docker port mapping
+  // needs it). 127.0.0.1 keeps a bare-metal install behind its proxy only. Not
+  // named HOST: zsh and some containers export HOST as the hostname.
+  const bindAddress = process.env.BIND_ADDRESS?.trim() || undefined;
 
   // BASE_URL validation and normalization
   const baseUrlRaw = process.env.BASE_URL;
@@ -353,26 +410,18 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
     baseUrlProvided = false;
   }
 
-  // Remove trailing slashes
-  if (baseUrl.endsWith('/')) {
-    baseUrl = baseUrl.slice(0, -1);
-  }
+  // Remove all trailing slashes (`/foo//` -> `/foo`, `//` -> '')
+  baseUrl = baseUrl.replace(/\/+$/, '');
 
   // Validate URL path segments
   if (baseUrl) {
     const segments = baseUrl.split('/').filter(Boolean);
     const validSegment = /^[a-zA-Z0-9-_]+$/;
 
-    // Check each segment for path traversal or invalid characters
+    // Check each segment for invalid characters. A `..` segment cannot reach
+    // this point: baseUrl starts with '/' by now, so every `..` segment is
+    // preceded by '/' and the `/..` traversal check above already rejected it.
     for (const segment of segments) {
-      // Reject segments that are exactly '..'
-      if (segment === '..') {
-        logger.error(`Invalid BASE_URL: path traversal segment detected. Using default.`);
-        baseUrl = '';
-        baseUrlProvided = false;
-        break;
-      }
-
       if (!validSegment.test(segment)) {
         logger.warn(`BASE_URL contains invalid characters in segment: ${segment}. Only alphanumeric, hyphens, and underscores are allowed.`);
       }
@@ -465,7 +514,7 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
 
   // Database
   const databasePath = {
-    value: process.env.DATABASE_PATH || '/data/meshmonitor.db',
+    value: process.env.DATABASE_PATH || getDefaultDatabasePath(),
     wasProvided: process.env.DATABASE_PATH !== undefined
   };
 
@@ -550,6 +599,8 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
     process.env.MESHTASTIC_MODULE_CONFIG_DELAY_MS,
     1000 // 1 second default
   );
+  const virtualNodeEnv = parseVirtualNodeEnv(process.env, (msg) => logger.warn(msg));
+  const meshcoreDefault = parseMeshCoreDefaultEnv(process.env, (msg) => logger.warn(msg));
   const timezoneRaw = process.env.TZ || 'UTC';
   let timezone = { value: timezoneRaw, wasProvided: process.env.TZ !== undefined };
 
@@ -633,6 +684,30 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
     value: process.env.ADMIN_USERNAME || 'admin',
     wasProvided: process.env.ADMIN_USERNAME !== undefined
   };
+  const adminPassword = parseAdminPassword(process.env.ADMIN_PASSWORD, (msg) => logger.warn(msg));
+
+  // ============ PASSKEYS / WEBAUTHN (#5841) ============
+  // A passkey is bound to one hostname (the RP ID). Behind a reverse proxy the
+  // request-derived value is right only when TRUST_PROXY is right, so say so.
+  const webauthnRpIdRaw = process.env.WEBAUTHN_RP_ID?.trim();
+  const webauthnRpId = {
+    value: webauthnRpIdRaw ? webauthnRpIdRaw.toLowerCase() : undefined,
+    wasProvided: !!webauthnRpIdRaw,
+  };
+  const webauthnOriginList = (process.env.WEBAUTHN_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+  const webauthnOrigins = {
+    value: webauthnOriginList,
+    wasProvided: webauthnOriginList.length > 0,
+  };
+  if (!webauthnRpId.wasProvided || !webauthnOrigins.wasProvided) {
+    logger.warn(
+      '⚠️  WEBAUTHN_RP_ID / WEBAUTHN_ORIGINS not set: passkeys take the hostname and origin from each request. ' +
+      'Behind a reverse proxy, set TRUST_PROXY or these two variables.'
+    );
+  }
 
   // ============ PROXY AUTHENTICATION ============
   const proxyAuthEnabled = parseBoolean('PROXY_AUTH_ENABLED', process.env.PROXY_AUTH_ENABLED, false);
@@ -701,14 +776,14 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
   // Access Logging (for fail2ban)
   const accessLogEnabled = parseBoolean('ACCESS_LOG_ENABLED', process.env.ACCESS_LOG_ENABLED, false);
   const accessLogPath = {
-    value: process.env.ACCESS_LOG_PATH || '/data/logs/access.log',
+    value: process.env.ACCESS_LOG_PATH || getDefaultAccessLogPath(),
     wasProvided: process.env.ACCESS_LOG_PATH !== undefined
   };
 
   // Validate ACCESS_LOG_PATH for security
   if (accessLogPath.value.includes('../') || !path.isAbsolute(accessLogPath.value)) {
     logger.warn(`Invalid ACCESS_LOG_PATH: ${accessLogPath.value}. Must be absolute path without path traversal.`);
-    accessLogPath.value = '/data/logs/access.log';
+    accessLogPath.value = getDefaultAccessLogPath();
     accessLogPath.wasProvided = false;
   }
 
@@ -752,6 +827,7 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
   logger.info('📋 Environment configuration:');
   logger.info(`   NODE_ENV: ${nodeEnv.value} (${src(nodeEnv.wasProvided)})`);
   logger.info(`   PORT: ${port.value} (${src(port.wasProvided)})`);
+  logger.info(`   BIND_ADDRESS: ${bindAddress ?? 'all interfaces'} (${src(bindAddress !== undefined)})`);
   logger.info(`   BASE_URL: ${baseUrl || '/'} (${src(baseUrlProvided)})`);
   logger.info(`   LOG_LEVEL: ${logLevel.value} (${src(logLevel.wasProvided)})`);
   logger.info(`   TZ: ${timezone.value} (${src(timezone.wasProvided)})`);
@@ -767,6 +843,7 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
   logger.debug(`   COOKIE_SECURE: ${cookieSecure.value} (${src(cookieSecure.wasProvided)})`);
   logger.debug(`   COOKIE_SAMESITE: ${cookieSameSite.value} (${src(cookieSameSite.wasProvided)})`);
   logger.debug('   --- Database ---');
+  logger.info(`   DATA_DIR: ${getDataDir()} (${src(process.env.DATA_DIR !== undefined)})`);
   logger.info(`   DATABASE_TYPE: ${databaseType}`);
   if (databaseUrl.wasProvided) {
     logger.info(`   DATABASE_URL: ***provided*** (${databaseType})`);
@@ -782,6 +859,25 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
   logger.debug(`   MESHTASTIC_RECONNECT_INITIAL_DELAY_MS: ${meshtasticReconnectInitialDelayMs.value}ms (${src(meshtasticReconnectInitialDelayMs.wasProvided)})`);
   logger.debug(`   MESHTASTIC_RECONNECT_MAX_DELAY_MS: ${meshtasticReconnectMaxDelayMs.value}ms (${src(meshtasticReconnectMaxDelayMs.wasProvided)})`);
   logger.debug(`   MESHTASTIC_MODULE_CONFIG_DELAY_MS: ${meshtasticModuleConfigDelayMs.value}ms (${src(meshtasticModuleConfigDelayMs.wasProvided)})`);
+  if (virtualNodeEnv.enabledProvided || virtualNodeEnv.portProvided) {
+    logger.info(`   ENABLE_VIRTUAL_NODE: ${virtualNodeEnv.enabled} (${src(virtualNodeEnv.enabledProvided)}; first boot only)`);
+    logger.info(`   VIRTUAL_NODE_PORT: ${virtualNodeEnv.port} (${src(virtualNodeEnv.portProvided)}; first boot only)`);
+  }
+  if (meshcoreDefault.transport) {
+    logger.debug('   --- MeshCore default source (first boot only) ---');
+    if (meshcoreDefault.transport === 'tcp') {
+      logger.info(`   MESHCORE_TCP_HOST: ${meshcoreDefault.tcpHost} (env; first boot only)`);
+      logger.info(`   MESHCORE_TCP_PORT: ${meshcoreDefault.tcpPort} (${src(meshcoreDefault.tcpPortProvided)}; first boot only)`);
+    } else {
+      logger.info(`   MESHCORE_SERIAL_PORT: ${meshcoreDefault.serialPort} (env; first boot only)`);
+      logger.info(`   MESHCORE_BAUD_RATE: ${meshcoreDefault.baudRate} (${src(meshcoreDefault.baudRateProvided)}; first boot only)`);
+    }
+    logger.info(`   MESHCORE_DEVICE_TYPE: ${meshcoreDefault.deviceType} (${src(meshcoreDefault.deviceTypeProvided)}; first boot only)`);
+    if (meshcoreDefault.virtualNode.enabledProvided || meshcoreDefault.virtualNode.portProvided) {
+      logger.info(`   MESHCORE_ENABLE_VIRTUAL_NODE: ${meshcoreDefault.virtualNode.enabled} (${src(meshcoreDefault.virtualNode.enabledProvided)}; first boot only)`);
+      logger.info(`   MESHCORE_VIRTUAL_NODE_PORT: ${meshcoreDefault.virtualNode.port} (${src(meshcoreDefault.virtualNode.portProvided)}; first boot only)`);
+    }
+  }
   if (oidcEnabled) {
     logger.debug('   --- OIDC ---');
     logger.debug(`   OIDC_ISSUER: ${oidcIssuer.value ? '***provided***' : 'not set'}`);
@@ -796,6 +892,9 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
   logger.debug(`   DISABLE_LOCAL_AUTH: ${disableLocalAuth.value} (${src(disableLocalAuth.wasProvided)})`);
   if (adminUsername.wasProvided) {
     logger.debug(`   ADMIN_USERNAME: ${adminUsername.value} (env)`);
+  }
+  if (adminPassword.wasProvided) {
+    logger.debug('   ADMIN_PASSWORD: ***provided*** (first admin only)');
   }
   if (proxyAuthEnabled.value) {
     logger.debug('   --- Proxy Authentication ---');
@@ -841,6 +940,7 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
     // Server
     port: port.value,
     portProvided: port.wasProvided,
+    bindAddress,
     baseUrl,
     baseUrlProvided,
     allowedOrigins: allowedOrigins.value,
@@ -889,6 +989,11 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
     meshtasticReconnectMaxDelayMsProvided: meshtasticReconnectMaxDelayMs.wasProvided,
     meshtasticModuleConfigDelayMs: meshtasticModuleConfigDelayMs.value,
     meshtasticModuleConfigDelayMsProvided: meshtasticModuleConfigDelayMs.wasProvided,
+    virtualNodeEnabled: virtualNodeEnv.enabled,
+    virtualNodeEnabledProvided: virtualNodeEnv.enabledProvided,
+    virtualNodePort: virtualNodeEnv.port,
+    virtualNodePortProvided: virtualNodeEnv.portProvided,
+    meshcoreDefault,
     timezone: timezone.value,
     timezoneProvided: timezone.wasProvided,
 
@@ -920,6 +1025,14 @@ export function loadEnvironmentConfig(): EnvironmentConfig {
     disableAnonymousProvided: disableAnonymous.wasProvided,
     adminUsername: adminUsername.value,
     adminUsernameProvided: adminUsername.wasProvided,
+    adminPassword: adminPassword.value,
+    adminPasswordProvided: adminPassword.wasProvided,
+
+    // Passkeys / WebAuthn
+    webauthnRpId: webauthnRpId.value,
+    webauthnRpIdProvided: webauthnRpId.wasProvided,
+    webauthnOrigins: webauthnOrigins.value,
+    webauthnOriginsProvided: webauthnOrigins.wasProvided,
 
     // Proxy Authentication
     proxyAuthEnabled: proxyAuthEnabled.value,

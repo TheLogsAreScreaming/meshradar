@@ -496,7 +496,7 @@ A recipe is disabled when the region cannot use its bandwidth: when the band is 
 - **UA_433**: Ukraine (433MHz)
 - **UA_868**: Ukraine (868MHz)
 - **MY_433**: Malaysia (433MHz)
-- **MY_919**: Malaysia (919MHz
+- **MY_919**: Malaysia (919MHz)
 - **SG_923**: Singapore
 - **PH_433**: Philippines (433MHz)
 - **PH_868**: Philippines (868MHz)
@@ -506,6 +506,13 @@ A recipe is disabled when the region cannot use its bandwidth: when the band is 
 - **KZ_863**: Kazakhstan (863MHz)
 - **NP_865**: Nepal (865MHz)
 - **BR_902**: Brazil (902MHz)
+- **EU_866**, **EU_874**, **EU_917**: European Union SRD bands (866MHz, 874MHz, 917MHz)
+- **EU_N_868**: European Union 868MHz Narrow
+- **ITU1_2M**, **ITU2_2M**, **ITU3_2M**: Amateur 2m, ITU Regions 1 to 3
+- **ITU1_70CM**, **ITU2_70CM**, **ITU3_70CM**: Amateur 70cm, ITU Regions 1 to 3
+- **ITU2_125CM**: Amateur 1.25m, ITU Region 2
+
+The EU SRD, EU narrow and amateur regions come with firmware 2.8. The amateur bands need a licence; check local law before you pick one.
 
 **Side Effects**:
 - Incorrect region may violate local regulations
@@ -520,14 +527,14 @@ Always select the correct region for your location. Using incorrect frequency ba
 
 **Description**: Maximum number of times a message can be relayed through the mesh.
 
-**Range**: 0-7
+**Range**: 1-7. A node that reports 0 (zero hops: no other node relays its packets) shows 0, but a save sends 1, not 0.
 
 **Default**: 3
 
 **Effect**: Limits how far messages can propagate through the network. Each relay counts as one hop.
 
 **Side Effects**:
-- **Lower values (0-2)**: Reduced network range, less congestion, lower power usage
+- **Lower values (1-2)**: Reduced network range, less congestion, lower power usage
 - **Higher values (5-7)**: Extended range, increased network load, more battery drain across all nodes
 - Value of 7 allows messages to traverse large networks but may cause congestion
 
@@ -591,7 +598,7 @@ Always select the correct region for your location. Using incorrect frequency ba
 
 **Description**: How often to broadcast GPS position updates.
 
-**Range**: 1-4294967295 seconds
+**Range**: 32-4294967295 seconds, or 0 for the firmware default
 
 **Default**: 900 seconds (15 minutes) on older firmware; 3600 seconds (1 hour) on current firmware, 43200 seconds (12 hours) for router roles
 
@@ -637,6 +644,10 @@ Always select the correct region for your location. Using incorrect frequency ba
 - **Latitude**: Decimal degrees (-90 to 90)
 - **Longitude**: Decimal degrees (-180 to 180)
 - **Altitude**: Meters above sea level
+
+**Pick on map**: Below the fields is a map, like **Set fixed position** in the Meshtastic iOS app. Click the map to drop a pin, or drag the pin to move it, and the latitude and longitude fields update. **Use this device's location** puts the pin at the location your browser reports (the browser asks for permission first). Nothing is sent to the node until you press **Save**.
+
+![Fixed position map pin](/images/features/fixed-position-map-pin.png)
 
 **Side Effects**:
 - Position never updates even if device moves
@@ -1060,9 +1071,31 @@ Configure network settings including WiFi, NTP, and static IP addresses.
 - Remote monitoring and control
 - Integration with home automation systems
 
+### Broker Preset
+
+**Description**: A chooser above the address that fills in a known broker. It appears here, in Remote Admin's MQTT section, and in an MQTT bridge source's Settings.
+
+| Preset | Address | TLS | Username / Password |
+|---|---|---|---|
+| Meshtastic Official | `mqtt.meshtastic.org` (port 1883) | off | `meshdev` / `large4cats` |
+| Meshtastic Official (TLS) | `mqtt.meshtastic.org` (port 8883) | on | `meshdev` / `large4cats` |
+| Custom… | your own | your own | your own |
+
+**Effect**: Choosing a preset only edits the form. Nothing reaches the device until you press Save, and Save works as it always has (the device may reboot). A preset sets the address, TLS and login, and leaves root topic, encryption, JSON, client proxy, map reporting and channel uplink/downlink alone.
+
+**Login rule**: A preset fills the username and password only when they are empty. If you already have a login, it stays, and a note under the chooser tells you the public login so you can type it in.
+
+**Which one is selected**: The chooser shows the preset your saved settings already match. An empty address counts as the official broker, because that is what the firmware uses when no address is set. Anything else shows **Custom…**.
+
+**Finding a regional broker**: There is no list of community brokers. Local groups run and publish their own, so the chooser links to the [Meshtastic Local Groups](https://meshtastic.org/docs/community/local-groups/) list and the [MeshMonitor Site Gallery](https://meshmonitor.org/site-gallery.html). MeshMonitor does not read or copy either list.
+
+::: warning Public broker
+Every channel with **uplink** on publishes its traffic to the broker. On the public broker, anyone on the internet can read it. See Meshtastic's [public MQTT server](https://meshtastic.org/docs/software/integrations/mqtt/#public-mqtt-server) rules.
+:::
+
 ### MQTT Address
 
-**Description**: Hostname or IP address of the MQTT broker.
+**Description**: Hostname or IP address of the MQTT broker. Leave it empty to use the default public server (`mqtt.meshtastic.org`).
 
 **Format**: `hostname:port` or `ip:port`
 
@@ -1078,13 +1111,9 @@ Configure network settings including WiFi, NTP, and static IP addresses.
 
 ### MQTT Encryption
 
-**Description**: Enable TLS/SSL encryption for MQTT connections.
+**Description**: Send packets to MQTT still encrypted with the channel key, instead of decrypted.
 
-**Recommendation**: Always enable for public/internet MQTT brokers.
-
-**Effect**: Encrypts MQTT traffic between device and broker.
-
-**Side Effects**: Slightly higher power usage due to encryption overhead
+**Effect**: Only clients holding the channel key can read the packets on the broker. This is separate from TLS, which protects the connection itself.
 
 ### MQTT JSON
 
@@ -1134,7 +1163,7 @@ Configure network settings including WiFi, NTP, and static IP addresses.
 ::: tip MeshMonitor Integration
 With this option on, the node opens no broker connection of its own, so something must carry MQTT for it. Pick one:
 
-- **A linked MQTT source.** Pick an [embedded broker or MQTT bridge](/features/mqtt-broker) in **Quick configure from a MeshMonitor MQTT source** at the top of this section. MeshMonitor then carries the traffic itself.
+- **A linked MQTT source.** Pick an [embedded broker or MQTT bridge](/features/mqtt-broker) in **Quick configure from a MeshMonitor MQTT source** at the top of this section, then save: the save sends the node its MQTT settings and links the sources. MeshMonitor then carries the traffic itself.
 - **The [MQTT Client Proxy sidecar](/add-ons/mqtt-proxy)**, a separate container by [LN4CY](https://github.com/LN4CY/mqtt-proxy) attached to the source's Virtual Node.
 
 With neither, the node gets no MQTT traffic. MeshMonitor warns you here and on the source's dashboard card.
@@ -1196,9 +1225,9 @@ See [Why don't I see MQTT traffic?](/features/mqtt-broker#why-no-mqtt-traffic). 
 
 **Description**: How often to send neighbor information updates.
 
-**Range**: 1-4294967295 seconds
+**Range**: 14400-86400 seconds (4 to 24 hours)
 
-**Default**: 14400 seconds (4 hours)
+**Default**: 21600 seconds (6 hours) in firmware
 
 **Effect**: Controls frequency of neighbor information broadcasts.
 
@@ -1367,6 +1396,44 @@ Configure the store-and-forward module to cache and replay messages for nodes th
 
 - [Meshtastic Store and Forward Module](https://meshtastic.org/docs/configuration/module/store-and-forward/)
 
+## Status Message
+
+The **Status Message** section, and the quick-status pill in the header, set the short status text your node sends to the mesh (firmware 2.7.20+, up to 79 bytes). The node applies it without a reboot and sends it about every 12 hours.
+
+MeshMonitor confirms the node took the status: after each save it reads the status back from the node and shows an error if the node holds something else or does not answer. Other module settings are not read back.
+
+That check covers the node's running config only. A status that vanishes after a reboot is a node-side save failure (seen on nRF52 nodes with Bluetooth up), which MeshMonitor cannot detect. Set the status again after the reboot, or turn on the option below.
+
+### Re-apply after a reboot (opt-in)
+
+![Status Message section with the re-apply option](/images/features/5745-status-reapply-option.png)
+
+The root cause is in the node firmware: it can lose a Status Message on reboot without any error. **Re-apply after a reboot** works around it from MeshMonitor's side.
+
+- It is **off by default**, and you set it per source, under the Status Message section.
+- MeshMonitor remembers the last status the node confirmed. When the node connects (including after a MeshMonitor restart) with an **empty** status, MeshMonitor writes the remembered one once more and reads it back.
+- It acts only when the node's status is empty. If the node holds a different status, MeshMonitor leaves it alone and remembers that one instead.
+- It tries once per connection. If the node does not confirm, MeshMonitor logs a warning and does not retry until the next reconnect.
+- It uses local admin packets only. Nothing goes on air.
+- Caveat: a status you cleared from another app looks the same as a status lost in a reboot, so it would be restored too. Clear it in MeshMonitor, or turn the option off.
+
+### Quick-status pill
+
+The pill sits in the header of a Meshtastic source. Click it to pick one of ten presets (Available, Away, Busy and so on) or type your own text, with a byte counter. **Save** sends it, and **Clear** removes it.
+
+- It shows only while the node is connected, to a signed-in user with **configuration: write** on the source. It hides on firmware older than 2.7.20, and on MQTT, MeshCore and Reticulum sources.
+- A save goes to the local node over its own link. Nothing is sent over LoRa at that moment: other nodes see the change at the node's next status broadcast, up to 12 hours later.
+- Clearing the status is not sent to the mesh. Other nodes keep the last status they heard.
+
+## TAK Configuration
+
+The **TAK** section of Device Configuration sets the **Team** colour and **Role** the node reports to TAK clients. It needs firmware 2.8.0 or newer; on older firmware the section shows as unsupported, because that firmware drops the settings without saving them.
+
+- **Team**: Default (Cyan), White, Yellow, Orange, Magenta, Red, Maroon, Purple, Dark Blue, Blue, Cyan, Teal, Green, Dark Green or Brown.
+- **Role**: Default (Team Member), Team Member, Team Lead, HQ, Sniper, Medic, Forward Observer, RTO or K9.
+
+The node sends its team and role only when its device role is **TAK_TRACKER**. With any other role the values are stored but not used. Saving reboots the node. The same section is on the Admin Commands tab for remote nodes. See [ATAK / CoT Integration](/features/atak) for how MeshMonitor shows TAK traffic.
+
 ## Security Configuration
 
 The **Security** section of Device Configuration shows the local node's public key and its private key (masked). The public key is what other nodes use to send you PKI-encrypted direct messages.
@@ -1387,9 +1454,52 @@ Setting the private key lets you **restore a node's identity from a backup** or 
 Whoever holds a node's private key can impersonate it. Only paste a private key you own, on a trusted machine, and never share it.
 :::
 
+### Protection Level (packet authenticity)
+
+Firmware 2.8.0 added a packet signature policy. The **Protection Level** picker in the Security section sets how the node treats packets it cannot prove came from their sender.
+
+| Level | 2.8.0 and 2.8.1 | Firmware after 2.8.1 |
+|---|---|---|
+| **Compatible** (firmware default) | Accepts unsigned packets. A signature that can be checked and is wrong still drops the packet. Works with every firmware version. | Same, but the node does not sign its own packets at this level. |
+| **Balanced** | Signs the node's broadcasts. Drops an unsigned broadcast from a node that has sent a signed one before. | Signs the node's broadcasts. Accepts unsigned packets, but ignores an unsigned name or role change from a node that has sent a signed one before. |
+| **Strict** | Accepts only packets with a verified signature, and PKI-encrypted direct messages. | Same, and also accepts unsigned acks, traceroutes, key verification and AES-CCM channel packets. |
+
+- The picker is locked when the node runs firmware older than 2.8.0, when its firmware version is not known, or when its current level could not be read. Load the security config first.
+- Moving to Balanced or Strict asks you to confirm. Saving the security config reboots the node.
+- Firmware signs broadcasts only. A Strict node drops everything from nodes older than 2.8 except PKI direct messages, and from 2.8 nodes it drops packets sent to one node on a channel (traceroute replies, ACKs, legacy admin-channel messages) and broadcasts too large to carry a signature. A Strict router is likely to stop relaying that traffic for others too.
+- The same picker is on the Admin Commands tab. Strict on a remote node you reach through older peers can cut it off, and you may not be able to change it back from MeshMonitor.
+
+A Security save that leaves the picker alone keeps the node's level. MeshMonitor reads the security config from the node before it writes, and sends nothing if the node does not answer.
+
+When the node ignores an unsigned name or role change, MeshMonitor shows an **Unsigned update ignored** notice that names the sender and the node's level. Remove that sender from your node list to accept its unsigned updates.
+
+### Authenticated encryption (AEAD) channels
+
+A channel with the firmware's AES-CCM authenticated encryption turned on shows an **AEAD** badge in the Channels tab and in the channel list under Device Configuration. Only nodes with the same setting can read such a channel. MeshMonitor keeps the flag when you edit, import or export the channel.
+
+To turn it on, open the channel in Device Configuration and check **AEAD channel (AES-CCM, Experimental)**. Turning it on asks you to confirm, because **AEAD cuts this channel off from nodes that don't use it**. Nodes on older firmware, or with AEAD off, can no longer read or send on the channel, even with the same name and key. Turn it on for every node on the channel at the same time.
+
+- The checkbox needs firmware 2.8.1 or later on the node, and a non-empty key on the channel. Without them the box stays off and MeshMonitor sends nothing to the radio.
+- Turning it off always works and needs no confirmation, so you can switch back a channel that another app set.
+
+To read AEAD traffic that your node cannot open, add the key to the [Channel Database](/features/channel-database) with its AEAD box checked.
+
 ## Applying Changes
 
-All configuration changes require clicking the "Save" button in each section. Most changes also require a device reboot to take effect. MeshMonitor will notify you when a reboot is required.
+All configuration changes require clicking the "Save" button in each section. Most saves make the node reboot about 7 seconds later, and MeshMonitor expects that. A reboot window opens, waits for the node to come back, and reads the config again so the forms show what the node holds.
+
+- Position, Network, Security and most module saves always reboot the node.
+- Owner, Device, Power and Display saves may reboot it, depending on what changed. The window reads **Device May Restart**. If the node stays up, it closes with "Configuration saved. The node did not need to restart."
+- LoRa saves reboot the node on firmware older than 2.8 and apply live on 2.8 and later.
+- Status Message and MeshBeacon saves do not reboot the node.
+
+### Danger zone
+
+**Reboot** and **Purge Node Database** sit in a **Danger zone** section at the end of the page, after Firmware Updates. **Reload Config** and **Import/Export** are at the top. Both actions ask for confirmation in the app: Reboot with a confirm dialog, and Purge only after you type `PURGE`. The danger zone links to Admin Commands for shutdown, DFU and factory reset (admins only).
+
+Every section is read-only unless you hold **configuration: write** on the source. Import and the danger buttons are off too. Export and Reload stay on.
+
+You can clear a number field while you edit it. A blank or out-of-range field gets an outline and a message, and Save stays off until every number on the form is valid. A field that shows 0 where 0 has a special meaning says under it what 0 means and what a save sends.
 
 ## Troubleshooting
 
@@ -1424,37 +1534,43 @@ The backup export includes your complete device configuration:
 - **Position**: GPS settings, broadcast intervals, smart position, fixed position coordinates
 - **Power**: Battery management, sleep settings, shutdown behavior
 - **Network**: WiFi credentials, Bluetooth settings
-- **Security**: Device keys (encrypted)
+- **Security**: Admin and public keys. The node's **private key is not written** to new backups (a restore never used it). Older backup files may still contain it; delete them if that matters.
 - **MQTT**: Broker settings, encryption, topics, credentials
 - **Module Configuration**: All enabled modules (telemetry, neighbor info, canned messages, detection sensor, etc.)
 - **Channel Configuration**: All channels with encryption keys (encoded in channel URL)
 
 ### Backup Features
 
+#### Per-source backups
+
+Backups belong to one source. Each Meshtastic TCP source and each MeshCore Companion source has its own list, its own schedule and its own retention. A file made on one source never shows up on, downloads from, or restores onto another source: asking for another source's filename returns "not found".
+
+- **Download and Create Backup Now** need `configuration:write` on the source, because a file holds secrets (channel keys, the Bluetooth PIN, MQTT credentials). Listing files and reading the schedule need `configuration:read`.
+- **Restore** needs `configuration:write` on the source you restore to, and a connected radio.
+- **Source deletion** keeps the files. They become admin-only "orphans" you can still download or delete.
+- Files written before per-source backups ("legacy" files) go to the only Meshtastic source when there is exactly one, and are admin-only otherwise. An admin can restore a legacy file of the same device type onto a connected source after a second confirmation.
+- Files are saved with mode `0600` in a `0700` directory, and are not part of system backups. On first start after the upgrade, MeshMonitor tightens existing files to `0600`.
+
 #### Automated Backups
 
-MeshMonitor can automatically create backups on a daily schedule:
+MeshMonitor can automatically create backups on a daily schedule, per source:
 
-1. Navigate to **Settings** → **Backup**
-2. Enable **Automated Backups**
-3. Set your preferred backup time (UTC)
-4. Configure retention (how many backups to keep)
+1. Open **Device Configuration** → **Backup** (the **Device Backup Management** section) for the source
+2. Check **Enable Automatic Backups**
+3. Set the **Daily Backup Time** (server time zone)
+4. Set **Maximum Backups to Keep** (1-365)
+5. Click **Save Backup Settings**
 
-Automated backups are stored in the `/data/backups/` directory with filenames in the format:
+Saving never starts a backup. If you pick a time that has already passed today, the first run is tomorrow. A restart never triggers a catch-up backup: a missed slot is skipped. A source that is offline at its slot is skipped, and the section shows why on its "last automatic backup" line.
+
+The first time you upgrade, the old single schedule moves to your primary Meshtastic source. Every other source starts with automatic backups off (default 02:00, keep 7).
+
+Backups are stored in the `/data/backups/` directory with filenames in the format:
 ```
-{nodeId}-{timestamp}.yaml
+{mt|mc}-{nodeId}-{YYYY-MM-DD}-{HH-MM-SS}.yaml
 ```
 
-Example: `43588558-2025-10-28-12-34-18.yaml`
-
-#### Manual Backups
-
-To create an on-demand backup:
-
-1. Navigate to the **Device Configuration** tab
-2. Click the **Backup** button in the top-right corner
-3. Choose whether to save to disk or just download
-4. The backup file will be downloaded to your computer
+`mt` is a Meshtastic file and `mc` a MeshCore Companion file. The time is UTC. Example: `mt-43588558-2025-10-28-12-34-18.yaml`. Files made by older versions keep their old names.
 
 ### Backup File Format
 
@@ -1500,14 +1616,14 @@ owner_short: MNN
 
 ### Restoring Configuration from Device Backup Management
 
-*New in 4.15.2.* Every backup listed under **Device Configuration → Backups** carries a **Restore** button. Restore is a local, per-source, verbatim replay of the saved YAML back onto whichever device this source is currently connected to. MeshMonitor sends each config chunk in the same order it exported them (device, module, channels), then asks the device to reboot to apply the changes; a banner in the panel surfaces the reboot notice directly from the "did-reboot" flag on the response, so the UI never claims a reboot happened that the device didn't do.
+*New in 4.15.2.* Every backup listed under **Device Configuration → Backup → Show Saved Backups** carries a **Restore** button. Restore is a local, per-source, verbatim replay of the saved YAML back onto whichever device this source is currently connected to. MeshMonitor sends each config chunk in the same order it exported them (device, module, channels), then asks the device to reboot to apply the changes; a banner in the panel surfaces the reboot notice directly from the "did-reboot" flag on the response, so the UI never claims a reboot happened that the device didn't do.
 
 Behavior:
 
 - **Local device only** — restore targets the device on the current source, not another node on the mesh. Cross-node config transfers still need the Meshtastic CLI recipe below.
 - **Verbatim replay** — every field in the backup is sent, including the encryption keys, WiFi passwords, and channel URLs. Restore does not merge or diff.
 - **Bluetooth is handled separately** — Bluetooth configuration has its own setter path, so the panel offers a Bluetooth restore too.
-- **`settings:write` required** — the button is hidden without it.
+- **`configuration:write` on the source is required.** The server refuses a restore without it.
 
 ### Restoring Configuration with Meshtastic CLI
 
@@ -1686,11 +1802,11 @@ Create backup templates for different use cases:
 
 ## Firmware Updates
 
-**Device Configuration → Firmware Updates** is the last section, after Backup. It updates the node over Wi-Fi and is admin-only. It appears only when OTA is enabled, and not on MQTT sources. See [Firmware OTA Updates](/firmware-ota-prerequisites).
+**Device Configuration → Firmware Updates** is the last section, after Backup. It updates the node over Wi-Fi and is admin-only. It appears only when OTA is enabled, and not on MQTT sources. For hardware MeshMonitor cannot flash (a Linux `meshtasticd` node, a simulator, a node that reports no hardware model, or a board it has no firmware build for), a card explains why in place of the update controls. See [Firmware OTA Updates](/firmware-ota-prerequisites) and its list of [hardware that cannot be updated here](/firmware-ota-prerequisites#hardware-that-cannot-be-updated-here).
 
 ## Related Documentation
 
 - [Settings](/features/settings) - Learn about MeshMonitor settings and backup automation
-- [Automatic Responses](/features/automation) - Configure the standing automation behaviours
+- [Automation](/features/automation) - Automation Engine and built-in automations
 - [Meshtastic Official Documentation](https://meshtastic.org/docs/)
 - [Meshtastic CLI Documentation](https://meshtastic.org/docs/software/python/cli/)

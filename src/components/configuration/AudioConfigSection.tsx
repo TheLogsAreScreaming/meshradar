@@ -1,11 +1,13 @@
-import React, { useState, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
 import ModuleAvailabilityNotice from './ModuleAvailabilityNotice';
+import { ConfigSection } from '../shared/config/ConfigSection';
 
 // Audio bitrate options matching protobuf enum
 const AUDIO_BAUD_OPTIONS = [
@@ -21,6 +23,8 @@ const AUDIO_BAUD_OPTIONS = [
 ];
 
 interface AudioConfigSectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
   codec2Enabled: boolean;
   setCodec2Enabled: (value: boolean) => void;
   pttPin: number;
@@ -36,10 +40,12 @@ interface AudioConfigSectionProps {
   i2sSck: number;
   setI2sSck: (value: number) => void;
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
 }
 
 const AudioConfigSection: React.FC<AudioConfigSectionProps> = ({
+  canWrite = true,
   codec2Enabled,
   setCodec2Enabled,
   pttPin,
@@ -60,44 +66,27 @@ const AudioConfigSection: React.FC<AudioConfigSectionProps> = ({
   const { t } = useTranslation();
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // What the node holds; moves on a successful save (#5797)
+  const values = {
     codec2Enabled, pttPin, bitrate, i2sWs, i2sSd, i2sDin, i2sSck
-  });
-
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      codec2Enabled !== initial.codec2Enabled ||
-      pttPin !== initial.pttPin ||
-      bitrate !== initial.bitrate ||
-      i2sWs !== initial.i2sWs ||
-      i2sSd !== initial.i2sSd ||
-      i2sDin !== initial.i2sDin ||
-      i2sSck !== initial.i2sSck
-    );
-  }, [codec2Enabled, pttPin, bitrate, i2sWs, i2sSd, i2sDin, i2sSck]);
+  };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values);
 
   // Reset to initial values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setCodec2Enabled(initial.codec2Enabled);
-    setPttPin(initial.pttPin);
-    setBitrate(initial.bitrate);
-    setI2sWs(initial.i2sWs);
-    setI2sSd(initial.i2sSd);
-    setI2sDin(initial.i2sDin);
-    setI2sSck(initial.i2sSck);
-  }, [setCodec2Enabled, setPttPin, setBitrate, setI2sWs, setI2sSd, setI2sDin, setI2sSck]);
+    setCodec2Enabled(baseline.codec2Enabled);
+    setPttPin(baseline.pttPin);
+    setBitrate(baseline.bitrate);
+    setI2sWs(baseline.i2sWs);
+    setI2sSd(baseline.i2sSd);
+    setI2sDin(baseline.i2sDin);
+    setI2sSck(baseline.i2sSck);
+  }, [baseline, setCodec2Enabled, setPttPin, setBitrate, setI2sWs, setI2sSd, setI2sDin, setI2sSck]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      codec2Enabled, pttPin, bitrate, i2sWs, i2sSd, i2sDin, i2sSck
-    };
-  }, [onSave, codec2Enabled, pttPin, bitrate, i2sWs, i2sSd, i2sDin, i2sSck]);
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Register with SaveBar
   const numberScope = useNumberInputScope();
@@ -113,24 +102,7 @@ const AudioConfigSection: React.FC<AudioConfigSectionProps> = ({
 
   return (
     <NumberInputScope scope={numberScope}>
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('audio_config.title')}
-        <a
-          href="https://meshtastic.org/docs/configuration/module/audio/"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('audio_config.view_docs')}
-        >
-          ?
-        </a>
-      </h3>
-      <ModuleAvailabilityNotice />
+    <ConfigSection canWrite={canWrite} title={t('audio_config.title')} docsUrl="https://meshtastic.org/docs/configuration/module/audio/" notice={<ModuleAvailabilityNotice />}>
 
       {/* Enable Codec2 */}
       <div className="setting-item">
@@ -299,7 +271,7 @@ const AudioConfigSection: React.FC<AudioConfigSectionProps> = ({
           )}
         </>
       )}
-    </div>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

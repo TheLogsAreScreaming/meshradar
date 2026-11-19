@@ -13,6 +13,7 @@
 import { Router, Request, Response } from 'express';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
+import { meshcoreReceiptTimeMs } from '../../utils/meshcoreMessageTime.js';
 import { meshcoreMessageFilter } from '../services/meshcoreMessageFilter.js';
 import { requireAuth, optionalAuth, requirePermission } from '../auth/authMiddleware.js';
 import { meshcoreDeviceLimiter, messageLimiter } from '../middleware/rateLimiters.js';
@@ -21,11 +22,15 @@ import { failContactNotOnDevice, managerFor, VALIDATION, isValidPublicKey, isVal
   requireMeshcoreChannelAccess, canAccessMeshcoreChannel, requireMeshcoreTx, failIfTxDisabled,
   startTrackedLogin, respondLoginCancelled } from './meshcoreRouteShared.js';
 import type { MeshCoreLoginRetryOutcome } from '../meshcoreManager.js';
+import { meshcoreMessageByteCap, meshcoreChannelTextCap } from '../constants/meshcoreMessageLimits.js';
 import { extendRequestTimeout } from '../middleware/requestTimeout.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { resolveMeshcoreKeyAccess, filterKeyedMessages } from '../utils/meshcoreKeyAccess.js';
 import type { MeshCoreKeyAccessFilter } from '../../db/repositories/index.js';
 import { isMeshCoreResendError, MESHCORE_RESEND_ERROR_STATUS } from '../errors/meshcoreResendError.js';
+import { isMeshCoreSenderNameError, MESHCORE_SENDER_NAME_ERROR_STATUS } from '../errors/meshcoreSenderNameError.js';
+import { decideSenderName } from '../utils/meshcoreSenderNameRequest.js';
+import { isMeshCoreReactionError, MESHCORE_REACTION_ERROR_STATUS } from '../errors/meshcoreReactionError.js';
 
 // Room-server login retries over RF can legitimately run past the 30s
 // default socket timeout; extend it so the caller gets the real result
@@ -137,7 +142,7 @@ router.get('/messages/channel/:idx', optionalAuth(), requireMeshcoreChannelAcces
 const IGNORE_SCAN_PAGE = 50;
 async function latestExcludingIgnored(
   sourceId: string,
-  manager: { getChannelMessages(idx: number, limit: number, offset: number, keyAccess?: MeshCoreKeyAccessFilter): Promise<Array<{ timestamp: number; fromPublicKey: string; fromName?: string; text: string; messageType?: string; filtered?: 'ignore' | 'block' }>>; getLocalNode(): { publicKey?: string } | null },
+  manager: { getChannelMessages(idx: number, limit: number, offset: number, keyAccess?: MeshCoreKeyAccessFilter): Promise<Array<{ timestamp: number; receivedAt?: number; fromPublicKey: string; fromName?: string; text: string; messageType?: string; reactionEmoji?: string | null; filtered?: 'ignore' | 'block' }>>; getLocalNode(): { publicKey?: string } | null },
   latest: Record<number, number>,
   keyAccess?: MeshCoreKeyAccessFilter,
 ): Promise<Record<number, number>> {
@@ -149,7 +154,9 @@ async function latestExcludingIgnored(
     const page = meshcoreMessageFilter.annotate(sourceId, await manager.getChannelMessages(idx, IGNORE_SCAN_PAGE, 0, keyAccess), selfKey);
     let newest = 0;
     for (const m of page) {
-      if (!m.filtered && m.timestamp > newest) newest = m.timestamp;
+      // A reaction row never counts toward the unread dot (#5759).
+      const ts = meshcoreReceiptTimeMs(m);
+      if (!m.filtered && !m.reactionEmoji && ts > newest) newest = ts;
     }
     if (newest > 0) out[idx] = newest;
   }));
@@ -210,6 +217,124 @@ router.get('/messages/channel-counts', optionalAuth(), async (req: Request, res:
   } catch (error) {
     logger.error('[API] Error getting channel message counts:', error);
     res.status(500).json({ success: false, error: 'Failed to get channel message counts' });
+  }
+});
+
+/**
+ * GET /api/sources/:id/meshcore/messages/dm-peers
+ * DM threads that have stored history, with their latest DM time (#6186). The
+ * thread list is built from this server query rather than the shared
+ * 100-message window, so a thread never drops out under channel traffic.
+ * Registered before /messages/:messageId so the specific path wins.
+ */
+router.get('/messages/dm-peers', optionalAuth(), requirePermission('messages', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const peers = await managerFor(req, res).getDmPeers();
+    res.json({ success: true, data: peers });
+  } catch (error) {
+    logger.error('[API] Error getting MeshCore DM peers:', error);
+    res.status(500).json({ success: false, error: 'Failed to get DM peers' });
+  }
+});
+
+/**
+ * GET /api/sources/:id/meshcore/messages/room-stats
+ * Per-room post count + latest-post time (#6186), straight from the DB so the
+ * room list's counts/ordering don't depend on the shared 100-message window.
+ */
+router.get('/messages/room-stats', optionalAuth(), requirePermission('messages', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const stats = await managerFor(req, res).getRoomStats();
+    res.json({ success: true, data: stats });
+  } catch (error) {
+    logger.error('[API] Error getting MeshCore room stats:', error);
+    res.status(500).json({ success: false, error: 'Failed to get room stats' });
+  }
+});
+
+/**
+ * GET /api/sources/:id/meshcore/messages/dm/:publicKey
+ * Per-peer DM backlog (#6186). Unlike /messages (a global recent-tail shared by
+ * every channel and DM), this returns just this conversation's history, so a
+ * busy channel can't push a DM thread out of the visible window. `publicKey`
+ * may be a pubkey prefix or full 64-hex key; the match is prefix-aware both
+ * directions (inbound DMs store a sender prefix). Supports `offset` for
+ * load-older paging (#4460); `hasMore` says whether an older page exists.
+ * Registered before /messages/:messageId so the two-segment path wins.
+ */
+router.get('/messages/dm/:publicKey', optionalAuth(), requirePermission('messages', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const publicKey = String(req.params.publicKey || '').toLowerCase();
+    if (!/^[0-9a-f]{2,64}$/.test(publicKey)) {
+      return res.status(400).json({ success: false, error: 'publicKey must be a hex string' });
+    }
+    let limit = parseInt(req.query.limit as string || '100', 10);
+    if (isNaN(limit) || limit < 1) {
+      limit = 100;
+    } else if (limit > VALIDATION.MAX_MESSAGE_LIMIT) {
+      limit = VALIDATION.MAX_MESSAGE_LIMIT;
+    }
+    let offset = parseInt(req.query.offset as string || '0', 10);
+    if (isNaN(offset) || offset < 0) {
+      offset = 0;
+    } else if (offset > VALIDATION.MAX_MESSAGE_OFFSET) {
+      offset = VALIDATION.MAX_MESSAGE_OFFSET;
+    }
+    // The manager reverses the DB's newest-first rows to oldest-first, so the
+    // extra lookahead row (limit+1) is the oldest one — index 0 — drop it.
+    const manager = managerFor(req, res);
+    const keyAccess = await resolveMeshcoreKeyAccess(req.user);
+    const page = await manager.getConversationMessages(publicKey, limit + 1, offset, keyAccess);
+    const hasMore = page.length > limit;
+    const messages = meshcoreMessageFilter.annotate(
+      req.params.id,
+      hasMore ? page.slice(1) : page,
+      manager.getLocalNode?.()?.publicKey,
+    );
+    res.json({ success: true, data: messages, count: messages.length, hasMore });
+  } catch (error) {
+    logger.error('[API] Error getting MeshCore DM messages:', error);
+    res.status(500).json({ success: false, error: 'Failed to get DM messages' });
+  }
+});
+
+/**
+ * GET /api/sources/:id/meshcore/messages/room/:publicKey
+ * Per-room post backlog (#6186). Same shape as /messages/dm/:publicKey, but
+ * room posts keep SENDER-time order (#5973). `offset` pages further back.
+ * Registered before /messages/:messageId so the two-segment path wins.
+ */
+router.get('/messages/room/:publicKey', optionalAuth(), requirePermission('messages', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const publicKey = String(req.params.publicKey || '').toLowerCase();
+    if (!/^[0-9a-f]{2,64}$/.test(publicKey)) {
+      return res.status(400).json({ success: false, error: 'publicKey must be a hex string' });
+    }
+    let limit = parseInt(req.query.limit as string || '100', 10);
+    if (isNaN(limit) || limit < 1) {
+      limit = 100;
+    } else if (limit > VALIDATION.MAX_MESSAGE_LIMIT) {
+      limit = VALIDATION.MAX_MESSAGE_LIMIT;
+    }
+    let offset = parseInt(req.query.offset as string || '0', 10);
+    if (isNaN(offset) || offset < 0) {
+      offset = 0;
+    } else if (offset > VALIDATION.MAX_MESSAGE_OFFSET) {
+      offset = VALIDATION.MAX_MESSAGE_OFFSET;
+    }
+    const manager = managerFor(req, res);
+    const keyAccess = await resolveMeshcoreKeyAccess(req.user);
+    const page = await manager.getRoomMessages(publicKey, limit + 1, offset, keyAccess);
+    const hasMore = page.length > limit;
+    const messages = meshcoreMessageFilter.annotate(
+      req.params.id,
+      hasMore ? page.slice(1) : page,
+      manager.getLocalNode?.()?.publicKey,
+    );
+    res.json({ success: true, data: messages, count: messages.length, hasMore });
+  } catch (error) {
+    logger.error('[API] Error getting MeshCore room messages:', error);
+    res.status(500).json({ success: false, error: 'Failed to get room messages' });
   }
 });
 
@@ -317,20 +442,17 @@ router.delete('/messages/:messageId', requireAuth(), requirePermission('messages
  */
 router.post('/messages/send', messageLimiter, requireAuth(), requirePermission('messages', 'write', { sourceIdFrom: 'params.id' }), requireMeshcoreTx(), async (req: Request, res: Response) => {
   try {
-    const { text, toPublicKey, channelIdx, scope } = req.body;
+    const { text, toPublicKey, channelIdx, scope, senderName } = req.body;
 
-    // Determine per-context byte limit before validating the message.
-    // DM (toPublicKey present) → 150 bytes.
-    // Channel with scope → 120 bytes. Channel without scope → 130 bytes.
-    let msgMaxBytes: number;
-    if (toPublicKey !== undefined && toPublicKey !== null && toPublicKey !== '') {
-      msgMaxBytes = VALIDATION.MAX_MESSAGE_BYTES_DM;
-    } else {
-      const hasScope = typeof scope === 'string' && scope.trim().length > 0;
-      msgMaxBytes = hasScope
-        ? VALIDATION.MAX_MESSAGE_BYTES_CHANNEL_SCOPED
-        : VALIDATION.MAX_MESSAGE_BYTES_CHANNEL;
-    }
+    // Per-context byte limit. DM: 160. Channel: 160 minus the "<node name>: "
+    // prefix the firmware writes into the same buffer (#6303); scope does not
+    // use text room. Unknown name falls back to the worst case.
+    const isDm = toPublicKey !== undefined && toPublicKey !== null && toPublicKey !== '';
+    // With a senderName the byte cap is checked below against the raw cap.
+    const msgMaxBytes = meshcoreMessageByteCap({
+      isDm,
+      nodeName: isDm ? undefined : managerFor(req, res).getLocalNode()?.name,
+    });
 
     // Validate message text using the context-appropriate byte limit.
     const textValidation = isValidMessage(text, msgMaxBytes);
@@ -377,6 +499,53 @@ router.post('/messages/send', messageLimiter, requireAuth(), requirePermission('
         return res.status(400).json({ success: false, error: 'scope must be 63 characters or fewer' });
       }
       scopeOverride = scope;
+    }
+
+    // Optional sender-name override (#6282): needs today's grant (checked by the
+    // route guard) AND a name on this source's allowlist. Default is off.
+    const nameDecision = await decideSenderName({
+      sourceId: req.params.id,
+      raw: senderName,
+      isDm,
+      hasChannel: parsedChannelIdx !== undefined,
+      localNodeName: managerFor(req, res).getLocalNode()?.name,
+    });
+    if (nameDecision.kind === 'reject') {
+      if (nameDecision.denied) {
+        auditMeshcoreEvent(req, 'meshcore_message_sent_as_denied', 'messages', {
+          sourceId: req.params.id,
+          channelIdx: parsedChannelIdx,
+          code: nameDecision.code,
+          via: 'api',
+        });
+      }
+      return fail(res, nameDecision.status, nameDecision.code, nameDecision.message);
+    }
+    if (nameDecision.kind === 'override') {
+      const rawCap = meshcoreChannelTextCap(nameDecision.name, { raw: true });
+      if (Buffer.byteLength(text, 'utf8') > rawCap) {
+        return fail(res, 400, 'INVALID_INPUT', `Message exceeds ${rawCap} bytes for this sender name`);
+      }
+      try {
+        const result = await managerFor(req, res).sendChannelMessageAs(text, parsedChannelIdx as number, nameDecision.name, scopeOverride);
+        // No message text in the audit row, by design.
+        auditMeshcoreEvent(req, 'meshcore_message_sent_as', 'messages', {
+          sourceId: req.params.id,
+          channelIdx: parsedChannelIdx,
+          senderName: nameDecision.name,
+          scope: result.message?.scopeName ?? null,
+          textBytes: Buffer.byteLength(text, 'utf8'),
+          messageId: result.message?.id ?? null,
+          via: 'api',
+        });
+        return res.json({ success: true, message: 'Message sent' });
+      } catch (error) {
+        if (failIfTxDisabled(res, error)) return;
+        if (isMeshCoreSenderNameError(error)) {
+          return fail(res, MESHCORE_SENDER_NAME_ERROR_STATUS[error.code], error.code, error.message);
+        }
+        throw error;
+      }
     }
 
     const success = await managerFor(req, res).sendMessage(text, toPublicKey, parsedChannelIdx, scopeOverride);
@@ -426,6 +595,46 @@ router.post('/messages/:messageId/resend', messageLimiter, requireAuth(), requir
     }
     logger.error('[API] Error resending MeshCore message:', error);
     return fail(res, 500, 'INTERNAL_ERROR', 'Resend error');
+  }
+});
+
+/**
+ * POST /api/sources/:id/meshcore/messages/:messageId/reaction
+ * Send an emoji reaction to a stored message (#5762). Same gates as
+ * /messages/send; the manager decides every refusal and throws a typed error.
+ * The response never carries the internal mc1Hash.
+ */
+router.post('/messages/:messageId/reaction', messageLimiter, requireAuth(), requirePermission('messages', 'write', { sourceIdFrom: 'params.id' }), requireMeshcoreTx(), async (req: Request, res: Response) => {
+  const messageId = String(req.params.messageId || '');
+  if (!messageId || messageId.length > 128) {
+    return fail(res, 400, 'INVALID_INPUT', 'message id is required');
+  }
+  const emoji = req.body?.emoji;
+  if (typeof emoji !== 'string' || emoji.length === 0 || emoji.length > 64) {
+    return fail(res, 400, 'INVALID_INPUT', 'emoji is required (string, up to 64 characters)');
+  }
+  try {
+    const sent = await managerFor(req, res).sendReaction(messageId, emoji);
+    auditMeshcoreEvent(req, 'meshcore_reaction_sent', 'messages', {
+      sourceId: req.params.id,
+      messageId,
+      emoji,
+    });
+    const { mc1Hash: _mc1Hash, ...message } = sent as typeof sent & { mc1Hash?: unknown };
+    return ok(res, { message });
+  } catch (error) {
+    if (failIfTxDisabled(res, error)) return;
+    if (isMeshCoreReactionError(error)) {
+      return fail(
+        res,
+        MESHCORE_REACTION_ERROR_STATUS[error.code],
+        error.code,
+        error.message,
+        error.existingId ? { existingId: error.existingId } : undefined,
+      );
+    }
+    logger.error('[API] Error sending MeshCore reaction:', error);
+    return fail(res, 500, 'INTERNAL_ERROR', 'Reaction error');
   }
 });
 

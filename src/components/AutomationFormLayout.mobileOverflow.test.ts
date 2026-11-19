@@ -37,20 +37,23 @@ describe('automation forms wrap instead of overflowing on a phone', () => {
     expect(layoutCss).toMatch(/\.growField\s*\{[^}]*min-width:\s*min\(100%,/);
   });
 
-  it('Auto Responder add row and its text fields use the classes', () => {
-    const tsx = read('AutoResponderSection.tsx');
-    expect(tsx).toContain("import layout from './AutomationFormLayout.module.css'");
+  it('Auto Responder trigger editor row and its text fields use the classes', () => {
+    // #5808: the add row became the TriggerCard editor.
+    const tsx = read('auto-responder/TriggerEditor.tsx');
+    expect(tsx).toContain("import layout from '../AutomationFormLayout.module.css'");
     expect(tsx).toMatch(/className=\{`\$\{layout\.wrapRow\} \$\{layout\.patternRow\}`\}[^\n]*alignItems: 'flex-start'/);
     expect(tsx.match(/className=\{`?\$?\{?layout\.growField\}/g)?.length).toBe(2);
   });
 
-  it.each(['TimerTriggersSection.tsx', 'GeofenceTriggersSection.tsx'])(
+  it.each(['timer-triggers/TimerTriggerEditor.tsx', 'GeofenceTriggersSection.tsx'])(
     '%s channel row wraps',
     (file) => {
       const tsx = read(file);
-      // The Channel: label sits directly inside the wrapping row.
+      // The Channel(s) label sits directly inside the wrapping row. The timer
+      // editor is multi-channel (#6230) so its key is `channels_label`; the
+      // geofence editor is still single-channel (`channel`). Either wraps.
       expect(tsx).toMatch(
-        /className=\{layout\.wrapRow\}[^\n]*\n\s*<label[^\n]*\n\s*\{t\('automation\.(timer|geofence)_triggers\.channel',/,
+        /className=\{layout\.wrapRow\}[^\n]*\n\s*<label[^\n]*\n\s*\{t\('automation\.(timer|geofence)_triggers\.channels?(_label)?',/,
       );
     },
   );
@@ -73,9 +76,10 @@ describe('configuration page fits a phone', () => {
     }
   });
 
-  it('warning-box buttons wrap', () => {
-    expect(readCss('ConfigurationTab.module.css')).toMatch(/\.dangerActions\s*\{[^}]*flex-wrap:\s*wrap/);
-    expect(read('ConfigurationTab.tsx')).toContain('className={styles.dangerActions}');
+  it('danger-zone buttons wrap', () => {
+    // Reboot / purge moved to the shared DangerZone at the end (#5830).
+    expect(readCss('shared/config/DangerZone.module.css')).toMatch(/\.actions\s*\{[^}]*flex-wrap:\s*wrap/);
+    expect(read('ConfigurationTab.tsx')).toContain('<DangerZoneActions>');
   });
 
   it('private key row wraps', () => {

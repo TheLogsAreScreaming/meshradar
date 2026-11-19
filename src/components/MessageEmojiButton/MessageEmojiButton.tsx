@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useIsDesktop } from '../../hooks/useIsDesktop';
 import './MessageEmojiButton.css';
 import { UiIcon } from '../icons';
+import { insertIntoTextarea } from '../../utils/insertAtCaret';
 
 const EmojiPicker = React.lazy(() => import('emoji-picker-react'));
 
@@ -41,26 +42,8 @@ export const MessageEmojiButton: React.FC<MessageEmojiButtonProps> = ({
 
   const handleSelect = useCallback(
     (emoji: string) => {
-      const ta = textareaRef.current;
-      if (!ta) {
-        onChange(value + emoji);
-        setOpen(false);
-        return;
-      }
-      const start = ta.selectionStart ?? value.length;
-      const end = ta.selectionEnd ?? value.length;
-      const next = value.slice(0, start) + emoji + value.slice(end);
-      onChange(next);
+      insertIntoTextarea(textareaRef.current, () => value, onChange, emoji);
       setOpen(false);
-      requestAnimationFrame(() => {
-        ta.focus();
-        const pos = start + emoji.length;
-        try {
-          ta.setSelectionRange(pos, pos);
-        } catch {
-          /* setSelectionRange can throw on disabled inputs; ignore */
-        }
-      });
     },
     [textareaRef, value, onChange]
   );
@@ -108,6 +91,8 @@ export const MessageEmojiButton: React.FC<MessageEmojiButtonProps> = ({
             <EmojiPicker
               onEmojiClick={(e: { emoji: string }) => handleSelect(e.emoji)}
               theme={detectPickerTheme() as never}
+              // v5 defaults to native glyphs; keep v4's Apple images (#5887).
+              emojiStyle="apple"
             />
           </Suspense>
         </div>

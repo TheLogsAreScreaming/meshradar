@@ -1,0 +1,64 @@
+/*
+ * Per-node schedule tables in the MeshCore Automations view: Time Sync and
+ * Remote Telemetry (#6224). The global `data-table` class they used has no
+ * CSS, so the table rendered unstyled and, at 390px, ran 200px past its
+ * column with Save/Disable off-screen (#4173 review M9). The wrapper scrolls
+ * the table sideways on its own instead of the whole automations view.
+ */
+
+.scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0 0 1rem 1.75rem;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.table th,
+.table td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  vertical-align: middle;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.table th {
+  font-weight: 600;
+  color: var(--color-text-subtle);
+  white-space: nowrap;
+}
+
+.table .interval {
+  width: 6rem;
+}
+
+/* Flex lives on an inner div: `display: flex` on a <td> drops it out of the
+   table layout, so the cell lost its row height and border. */
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  white-space: nowrap;
+}
+
+/* #4173 review N11: the last column (Actions) is pinned to the right edge of
+   the scroll box, so Save / Disable stay on a 390px screen while the other
+   columns scroll beneath them. The cell needs an opaque background, the same
+   --color-bg the MeshCore page paints behind this section; the inset line marks
+   the edge the other columns slide under. */
+.table th:last-child,
+.table td:last-child {
+  position: sticky;
+  right: 0;
+  background: var(--color-bg);
+  box-shadow: inset 1px 0 0 var(--color-border-subtle);
+}
+
+@media (max-width: 768px) {
+  .scroll {
+    margin-left: 0;
+  }
+}

@@ -5,9 +5,12 @@
  * metadata only; the engine validates the resulting graph server-side. Field
  * `kind` maps to an input renderer in AutomationBuilder.
  */
+import { CLOCK_OUT_OF_SYNC_DEFAULT_SECONDS, CLOCK_OUT_OF_SYNC_MIN_SECONDS, CLOCK_OUT_OF_SYNC_MAX_SECONDS } from '../../utils/clockOutOfSync';
+import { MESHCORE_MAX_TEXT_BYTES } from '../../utils/meshcoreMessageLimits';
+import { MESHTASTIC_MAX_TEXT_BYTES, SPLIT_MAX_PARTS, SPLIT_PART_GAP_MS } from '../../utils/messageSplitLimits';
 import { HOP_COUNT_EMOJIS, HOP_EMOJI_MAX, MQTT_SOURCE_EMOJI } from '../../utils/hopEmoji';
 
-export type FieldKind = 'text' | 'number' | 'nodeNum' | 'textarea' | 'select' | 'checkbox' | 'variable' | 'emoji' | 'fieldselect' | 'sourceMulti' | 'sendSourceMulti' | 'channelMulti' | 'geofence' | 'scriptselect' | 'regionSelect' | 'nodeMulti' | 'automationSelect' | 'meshtasticSourceSelect' | 'forwardingSourceSelect' | 'resultTarget';
+export type FieldKind = 'text' | 'number' | 'nodeNum' | 'textarea' | 'select' | 'checkbox' | 'variable' | 'emoji' | 'fieldselect' | 'sourceMulti' | 'sendSourceMulti' | 'channelMulti' | 'geofence' | 'scriptselect' | 'regionSelect' | 'nodeMulti' | 'automationSelect' | 'meshtasticSourceSelect' | 'forwardingSourceSelect' | 'resultTarget' | 'tracePaths' | 'datetimeLocal' | 'timeZone';
 
 export interface FieldOpt { value: string; label: string; }
 export interface FieldGroup { label: string; options: FieldOpt[]; }
@@ -25,6 +28,12 @@ export interface FieldDef {
    * current WHEN trigger matches a key, that string wins over `placeholder`.
    */
   placeholderByTrigger?: Record<string, string>;
+  /**
+   * The placeholder is a complete, usable template, not an example (#5697):
+   * while the field is empty the builder offers "Use suggested template",
+   * which copies it in as the real value.
+   */
+  suggestTemplate?: boolean;
   help?: string;
   /**
    * `select` only: the option shown when the param is ABSENT (a block saved
@@ -96,6 +105,19 @@ export interface BlockDef {
 const COOLDOWN: FieldDef = {
   name: 'cooldownSeconds', label: 'Cooldown (seconds)', kind: 'number', advanced: true,
   placeholder: '0', help: 'Minimum seconds between firings — an anti-spam throttle. 0 = no limit.',
+};
+
+/**
+ * trigger.telemetry's cooldown. The engine raises any shorter cooldown to one
+ * hour per node (TELEMETRY_TRIGGER_MIN_COOLDOWN_SECONDS in
+ * src/types/automation.ts), so the field says so next to the input.
+ */
+export const TELEMETRY_COOLDOWN_NOTE = 'Telemetry triggers are limited to once per node per hour.';
+
+const TELEMETRY_COOLDOWN: FieldDef = {
+  ...COOLDOWN,
+  placeholder: '3600',
+  help: `Minimum seconds between firings. ${TELEMETRY_COOLDOWN_NOTE} A shorter value (or 0) is raised to 3600 seconds per node; a longer one is kept.`,
 };
 
 const COOLDOWN_SCOPE: FieldDef = {
@@ -170,10 +192,33 @@ export const TRIGGERS: BlockDef[] = [
         help: 'A regular expression matched against the message text. '
           + 'Case-sensitive, unlike "Text contains" above — prefix with (?i) to ignore case, e.g. (?i)^(test|ping).',
       },
+      // #6449: Meshtastic `is_automation` bit (Data.bitfield bit 2). 'human' MUST
+      // be first: defaultParams() seeds it, so a NEW rule ignores bot traffic by
+      // default (a bot-to-bot loop guard). A rule saved before this field existed
+      // has no param and the engine treats it as 'any' (absentValue).
+      {
+        name: 'senderKind', label: 'Sent by', kind: 'select',
+        options: [
+          { value: 'human', label: 'People only (skip automated messages)' },
+          { value: 'any', label: 'Anyone' },
+          { value: 'automation', label: 'Automations only' },
+        ],
+        absentValue: 'any',
+        warningByValue: {
+          any: 'A rule that replies to automated messages can answer another bot, which answers back. Set a cooldown.',
+          automation: 'A rule that replies to automated messages can answer another bot, which answers back. Set a cooldown.',
+        },
+        help: 'Meshtastic senders can flag a message as sent by a bot or script. The flag is self-reported; a message without it, and every MeshCore or Reticulum message, counts as sent by a person.',
+      },
       { name: 'channels', label: 'On channels', kind: 'channelMulti', advanced: true, help: 'Match messages that arrive on ANY of these channels (unified by name across your sources). An OR-list — leave none to match any channel. When set, this overrides the single-channel fields below.' },
       { name: 'channelName', label: 'On channel (name)', kind: 'text', placeholder: 'any', advanced: true, help: 'Match by channel name (case-insensitive) — portable across sources where the same channel sits in a different slot. Preferred over the channel # below. Ignored when "On channels" above is set.' },
       { name: 'channel', label: 'On channel #', kind: 'number', placeholder: 'any', advanced: true, help: 'Match by raw channel index. Note: the same channel can be a different index on different sources — use the name above for cross-source automations. Ignored when "On channels" above is set.' },
       { name: 'from', label: 'From node #', kind: 'number', placeholder: 'any', advanced: true, help: 'Only fire for messages from this node number.' },
+      {
+        name: 'includeMeshCoreReactions', label: 'Also fire on MeshCore reactions', kind: 'checkbox', advanced: true,
+        warning: 'A reaction is one tap for the sender. A rule that sends a message for each one can flood a channel; set a cooldown.',
+        help: 'Off: a MeshCore emoji reaction never fires this rule. On: it fires with the emoji as the text and trigger.isTapback = 1. Meshtastic tapbacks always fire; filter them with trigger.isTapback.',
+      },
       COOLDOWN,
       COOLDOWN_SCOPE,
       // `includeSelf` (bypasses the engine's #3914 self-origin guard, #4694) is
@@ -214,7 +259,7 @@ export const TRIGGERS: BlockDef[] = [
           { value: 'noiseFloor', label: 'Noise floor (dBm) — local node only' },
         ],
       },
-      COOLDOWN,
+      TELEMETRY_COOLDOWN,
       COOLDOWN_SCOPE,
     ],
   },
@@ -238,9 +283,16 @@ export const TRIGGERS: BlockDef[] = [
   {
     type: 'trigger.schedule',
     label: 'On a schedule',
-    description: 'Fires on a cron schedule (no mesh event).',
+    description: 'Fires on a cron schedule (no mesh event). Add a start and end to run it only during an event.',
     fields: [
-      { name: 'cron', label: 'Cron expression', kind: 'text', placeholder: '0 * * * *', help: 'Standard 5-field cron, e.g. "0 * * * *" = top of every hour.' },
+      {
+        name: 'cron', label: 'Cron expression', kind: 'text', placeholder: '0 * * * *',
+        // SCHEDULE_MIN_INTERVAL_MINUTES in src/types/scheduleWindow.ts; the server enforces it at save.
+        help: 'Standard 5-field cron, e.g. "0 * * * *" = top of every hour, "*/30 * * * *" = every 30 minutes. Fastest allowed: every 5 minutes. Each fire sends to every chosen channel on every chosen source, so a short interval uses a lot of airtime.',
+      },
+      { name: 'startAt', label: 'Start (optional)', kind: 'datetimeLocal', help: 'The rule does not fire before this. Leave blank to start now.' },
+      { name: 'endAt', label: 'End (optional)', kind: 'datetimeLocal', help: 'The rule does not fire at or after this, and turns itself off when it passes. Leave blank to run until you turn it off.' },
+      { name: 'timezone', label: 'Time zone', kind: 'timeZone', help: 'Zone the cron, start and end are read in, e.g. America/New_York. Blank = the server\'s zone (often UTC in Docker). Required with a start or end.' },
     ],
   },
   {
@@ -355,6 +407,16 @@ export const TRIGGERS: BlockDef[] = [
     ],
   },
   {
+    type: 'trigger.clockOutOfSync',
+    label: 'A MeshCore node’s clock is out of sync',
+    description: 'Fires when a MeshCore node’s clock is off by more than the threshold on two samples in a row, and again only after a sample in sync. MeshRadar measures this passively from adverts it already hears (and from the attached device’s own clock), so no packet is sent. A repeater whose clock was never set reads “Clock not set”. The firmware refuses to move a clock backwards, so only a clock that is behind can be fixed by a time sync. MQTT sources are not sampled. Meshtastic is not wired yet.',
+    fields: [
+      { name: 'thresholdSeconds', label: 'Off by more than (seconds)', kind: 'number', placeholder: String(CLOCK_OUT_OF_SYNC_DEFAULT_SECONDS), help: `Whole seconds, ${CLOCK_OUT_OF_SYNC_MIN_SECONDS} to ${CLOCK_OUT_OF_SYNC_MAX_SECONDS}. The floor covers relay delay and a repeater clock that reads to the minute.` },
+      COOLDOWN,
+      COOLDOWN_SCOPE,
+    ],
+  },
+  {
     type: 'trigger.batteryTrend',
     label: 'A node’s battery is steadily draining',
     description: 'Fires when a node’s battery level falls by at least the given amount across a lookback window — the “solar node losing charge / not charging” alert. Computed from the battery-level telemetry a node already reports; battery history is checked on a slow periodic tick (about every 15 minutes) against every Meshtastic node on every source, so narrow it with a “Source is one of…” condition. It fires once per decline and re-arms only after the battery recovers (net drop back under the threshold). Meshtastic only — MeshCore has no battery history. Heuristic note: the protocol carries no charge-state field, so a falling level is a proxy for “not charging”, not a certainty — it can false-alarm under heavy load and does not know day from night.',
@@ -365,11 +427,21 @@ export const TRIGGERS: BlockDef[] = [
       COOLDOWN_SCOPE,
     ],
   },
+  {
+    type: 'trigger.neighborAdded',
+    label: 'A repeater gains a confirmed new neighbour (MeshCore)',
+    description: 'Fires once when a repeater’s neighbour table lists a node it did not list before, and the node is still there after the confirmation time. It watches the neighbour table MeshRadar already polls, so it sends nothing to the mesh. The first poll of a repeater only records what is already listed, so turning this on does not alert on existing neighbours. A neighbour that drops out before the time is up never alerts. Zero-hop repeaters only (firmware table). Needs neighbour polling: always on for Repeater sources; opt-in per node for Companion sources (top 10 strongest per poll, so weak neighbours may never confirm). {{ node.* }} describes the new neighbour.',
+    fields: [
+      { name: 'confirmHours', label: 'Confirm after (hours)', kind: 'number', placeholder: '72', help: 'How long a new neighbour must stay in the table before it counts. Whole hours, 6 to 336. Default 72.' },
+      COOLDOWN,
+      COOLDOWN_SCOPE,
+    ],
+  },
 ];
 
 // ─── Comparison field registry (event / node / latest-telemetry) ─────────────
 
-const SUBJECT_NODE_TRIGGERS = ['trigger.message', 'trigger.nodeDiscovered', 'trigger.nodeUpdated', 'trigger.telemetry', 'trigger.geofence', 'trigger.becameMobile', 'trigger.leftHome', 'trigger.meshBeacon', 'trigger.nodeStale', 'trigger.nodeOnline', 'trigger.nodeRebooted', 'trigger.nodePowerChanged', 'trigger.batteryTrend', 'trigger.becameLikelyAircraft'];
+const SUBJECT_NODE_TRIGGERS = ['trigger.message', 'trigger.nodeDiscovered', 'trigger.nodeUpdated', 'trigger.telemetry', 'trigger.geofence', 'trigger.becameMobile', 'trigger.leftHome', 'trigger.meshBeacon', 'trigger.nodeStale', 'trigger.nodeOnline', 'trigger.nodeRebooted', 'trigger.nodePowerChanged', 'trigger.batteryTrend', 'trigger.becameLikelyAircraft', 'trigger.clockOutOfSync', 'trigger.neighborAdded'];
 const hasSubjectNode = (t: string) => SUBJECT_NODE_TRIGGERS.includes(t);
 
 // #5595: MeshCore contact facts on the node triggers. MeshCore has no node
@@ -390,19 +462,25 @@ const EVENT_NUMERIC: Record<string, FieldOpt[]> = {
     { value: 'channel', label: 'Channel #' }, { value: 'snr', label: 'SNR' }, { value: 'rssi', label: 'RSSI' },
     // #4340 Phase 3: booleans compared as 1/0 (the engine's asNumber() coerces
     // them). Needed to express Auto-Acknowledge's {Channel,Direct} ×
-    // {ZeroHop,MultiHop} matrix, where ZeroHop means hops == 0 AND NOT viaMqtt.
+    // {ZeroHop,MultiHop,Ip} matrix, where ZeroHop means hops == 0 AND NOT viaIp.
     { value: 'isDM', label: 'Is a direct message (1 = yes, 0 = channel)' },
+    { value: 'isTapback', label: 'Is a tapback / reaction (1 = yes, 0 = no)' },
     { value: 'viaMqtt', label: 'Arrived via MQTT (1 = yes, 0 = RF)' },
     // #4340 Phase 4: derived, total (never NaN) form of the ZeroHop half of the
     // matrix above — computed via Auto-Acknowledge's own autoAckIsZeroHop() on
     // its own floored hop count, so a hopless packet (no hopStart) reads 1, not
     // NaN. See triggerContext.ts buildMessageContext for the derivation.
-    { value: 'zeroHop', label: 'Direct RF, 0 hops (1 = yes; 0 = relayed or via MQTT)' },
+    { value: 'zeroHop', label: 'Direct RF, 0 hops (1 = yes; 0 = relayed, or via MQTT / UDP)' },
+    // #5796: the matrix's IP row — 1 when the packet reached the node over MQTT
+    // or multicast UDP. Same autoAckIsIp() the matrix uses; total, never NaN.
+    { value: 'viaIp', label: 'Arrived over IP: MQTT or UDP (1 = yes, 0 = RF)' },
     // #4594: the TRANSPORT the message reached MeshRadar by — whether its
     // source is an MQTT Bridge / MQTT Broker rather than a radio. Distinct from
     // `viaMqtt` above, which is the packet's own upstream relay flag and is
     // routinely 1 on messages our radio did receive over RF.
     { value: 'viaMqttSource', label: 'Came in via an MQTT source (1 = yes, 0 = over RF)' },
+    // #6449: the sender's Meshtastic is_automation bit.
+    { value: 'isAutomation', label: 'Sent by an automation (1 = yes, 0 = person or unknown)' },
   ],
   'trigger.telemetry': [{ value: 'value', label: 'Reading value' }, { value: 'nodeNum', label: 'Node #' }],
   'trigger.meshBeacon': [
@@ -428,6 +506,10 @@ const EVENT_NUMERIC: Record<string, FieldOpt[]> = {
     { value: 'previousUptimeSeconds', label: 'Uptime before reset (s)' },
     { value: 'uptimeSeconds', label: 'Uptime after reset (s)' },
   ],
+  'trigger.clockOutOfSync': [
+    { value: 'offsetSeconds', label: 'Clock offset (s, positive = node is behind)' },
+    { value: 'thresholdSeconds', label: 'Threshold (s)' },
+  ],
   'trigger.nodePowerChanged': [
     { value: 'nodeNum', label: 'Node #' },
     { value: 'batteryLevel', label: 'Battery level (%, >100 = powered)' },
@@ -441,6 +523,11 @@ const EVENT_NUMERIC: Record<string, FieldOpt[]> = {
     { value: 'minDropPercent', label: 'Drop threshold (points)' },
     { value: 'startLevel', label: 'Battery at window start (%)' },
     { value: 'latestLevel', label: 'Latest battery (%)' },
+  ],
+  'trigger.neighborAdded': [
+    { value: 'snr', label: 'Neighbour SNR (dB)' },
+    { value: 'confirmedAfterHours', label: 'Hours since first seen' },
+    { value: 'sightings', label: 'Times seen' },
   ],
   'trigger.becameMobile': [{ value: 'nodeNum', label: 'Node #' }, { value: 'mobile', label: 'Mobile flag (1)' }, { value: 'previousMobile', label: 'Previous mobile flag' }],
   'trigger.becameLikelyAircraft': [
@@ -464,10 +551,21 @@ const EVENT_STRING: Record<string, FieldOpt[]> = {
   'trigger.message': [
     { value: 'text', label: 'Message text' }, { value: 'fromId', label: 'Sender node id' }, { value: 'toId', label: 'Recipient node id' },
     { value: 'scopeName', label: 'MeshCore scope/region' },
+    { value: 'reactionTargetText', label: 'MeshCore: text of the message reacted to' },
+    { value: 'reactionTargetSender', label: 'MeshCore: sender of the message reacted to' },
   ],
   'trigger.telemetry': [{ value: 'telemetryType', label: 'Metric name' }],
+  'trigger.clockOutOfSync': [
+    { value: 'direction', label: 'Direction (behind / ahead / notSet)' },
+    { value: 'sampleSource', label: 'Sample source (advert / device)' },
+  ],
   'trigger.nodeUpdated': MESHCORE_NODE_EVENT_STRING_FIELDS,
   'trigger.nodeDiscovered': MESHCORE_NODE_EVENT_STRING_FIELDS,
+  'trigger.neighborAdded': [
+    { value: 'reporterName', label: 'Repeater name' },
+    { value: 'reporterPublicKey', label: 'Repeater public key' },
+    { value: 'neighborPublicKey', label: 'Neighbour public key' },
+  ],
   'trigger.meshBeacon': [
     { value: 'message', label: 'Beacon text' },
     { value: 'offerChannelName', label: 'Offered channel name' },
@@ -692,7 +790,7 @@ export const ACTIONS: BlockDef[] = [
         help: `Hop count reacts with ${HOP_COUNT_EMOJIS[0]} for a direct (0-hop) message and ${HOP_COUNT_EMOJIS[1]}–${HOP_COUNT_EMOJIS[HOP_EMOJI_MAX]} above, clamping at ${HOP_COUNT_EMOJIS[HOP_EMOJI_MAX]} — the same table Auto-Acknowledge uses. A message that came in through an MQTT source (bridge or broker) reacts with ${MQTT_SOURCE_EMOJI} instead, whatever its hop count, because it never crossed this radio's RF link. Triggers with no hop information (Schedule, System) record a skipped no-op.`,
       },
       { name: 'emoji', label: 'Emoji', kind: 'emoji', placeholder: '👍', showIf: { field: 'emojiMode', notEquals: 'hopCount' } },
-      { name: 'sourceIds', label: 'Send via sources', kind: 'sendSourceMulti', help: 'Which radios send the reaction (MeshCore sources are skipped — tapbacks are Meshtastic-only). Leave none to use the source that triggered the automation — but a source IS required for source-less triggers like System events and Schedules.' },
+      { name: 'sourceIds', label: 'Send via sources', kind: 'sendSourceMulti', help: 'Which radios send the reaction (a MeshCore source reacts only to a MeshCore message it received itself; hop limit does not apply there). Leave none to use the source that triggered the automation — but a source IS required for source-less triggers like System events and Schedules.' },
       HOP_LIMIT_FIELD,
     ],
   },
@@ -705,12 +803,13 @@ export const ACTIONS: BlockDef[] = [
         name: 'text', label: 'Message', kind: 'textarea', tokens: true,
         placeholder: 'Hello {{ trigger.senderLabel }}!',
         placeholderByTrigger: MOVEMENT_MESSAGE_HINTS,
+        suggestTemplate: true,
         help: 'Use {{ trigger.field }}, {{ node.longName }}, or {{ var.name }} to insert values. On Became mobile / Left home, prefer {{ node.longName }} (or {{ node.nodeId }}) — those triggers have no senderLabel.',
       },
       { name: 'sourceIds', label: 'Send via sources', kind: 'sendSourceMulti', help: 'Which radios to send through (MQTT sources are receive-only and excluded). Leave none to use the source that triggered the automation — but a source IS required for source-less triggers like System events and Schedules.' },
       { name: 'channels', label: 'On channels', kind: 'channelMulti', help: 'Channels to post to, unified by name + key across your sources (the correct local slot is resolved per source). Leave none to use the triggering channel.' },
       { name: 'to', label: 'DM to node #', kind: 'text', tokens: true, placeholder: 'blank = channel; {{ trigger.from }} replies to sender', advanced: true },
-      { name: 'replyToTrigger', label: 'Reply to the triggering message', kind: 'checkbox', advanced: true, help: 'Meshtastic: threads the reply as a tapback. MeshCore has no tapback, so instead it auto-prepends the @[sender]: mention (using {{ trigger.senderLabel }} — sender name, else channel name, else id) to your text, so you don’t have to write it yourself. An existing @[…] mention in your text = no change.' },
+      { name: 'replyToTrigger', label: 'Reply to the triggering message', kind: 'checkbox', advanced: true, help: 'Meshtastic: threads the reply as a tapback. MeshCore sends no threaded reply, so instead it auto-prepends the @[sender]: mention (using {{ trigger.senderLabel }} — sender name, else channel name, else id) to your text, so you don’t have to write it yourself. An existing @[…] mention in your text = no change.' },
       {
         name: 'maxAttempts', label: 'DM resend attempts', kind: 'number', advanced: true,
         placeholder: '1', // 1–3; mirrors SEND_MAX_ATTEMPTS_* in src/types/automation.ts.
@@ -718,6 +817,10 @@ export const ACTIONS: BlockDef[] = [
         // sends. Reuses Phase 2's showIf.truthy so an unset/blank/0 `to` hides it.
         showIf: { field: 'to', truthy: true },
         help: 'Resend this DM (1–3) until the recipient ACKs it — the same retry Auto-Acknowledge uses. Leave blank for a single send. Setting it routes the DM through the source’s outgoing queue, which also spaces sends 30 seconds apart. Meshtastic DMs only: ignored for channel messages and MeshCore, and ignored when Hop limit is 0.',
+      },
+      {
+        name: 'splitLongMessages', label: 'Split long messages', kind: 'checkbox', advanced: true,
+        help: `Meshtastic and MeshCore. A Meshtastic message holds ${MESHTASTIC_MAX_TEXT_BYTES} bytes. A MeshCore message holds ${MESHCORE_MAX_TEXT_BYTES} bytes in a DM, less on a channel (${MESHCORE_MAX_TEXT_BYTES} minus your node name and 2). A longer message is cut to fit unless you split it. Split messages go out as up to ${SPLIT_MAX_PARTS} messages, ${SPLIT_PART_GAP_MS / 1000} seconds apart, each marked like "(1/${SPLIT_MAX_PARTS})", and every repeater or router in range repeats each one. Each source and channel sends its own set, so airtime grows with both.`,
       },
       HOP_LIMIT_FIELD,
       {
@@ -734,6 +837,21 @@ export const ACTIONS: BlockDef[] = [
         name: 'scopeName', label: 'Region', kind: 'regionSelect', advanced: true, tokens: true,
         placeholder: 'e.g. paris', help: 'Used when MeshCore scope is "A specific region".',
       },
+    ],
+  },
+  {
+    type: 'action.tracePathSchedule',
+    label: 'Trace MeshCore paths on a schedule',
+    description: 'Trace to one or more MeshCore contacts, each on its own interval, and keep the per-hop SNR.',
+    fields: [
+      {
+        name: 'paths', label: 'Paths', kind: 'tracePaths',
+        // Limits mirror src/types/tracePathSchedule.ts (enforced server-side).
+        help: 'Each path runs on its own interval, at least every 10 minutes. This step only traces the paths that are due, so run the automation from a Schedule trigger that fires every minute (cron: * * * * *). Results appear under Trace SNR history in each contact\u2019s Node Details.',
+        warning: 'Each trace is a packet relayed hop by hop (and back again with the return leg on). One source sends at most 12 scheduled traces an hour; paths past that wait for the next hour.',
+      },
+      { name: 'sourceIds', label: 'Via MeshCore sources', kind: 'sendSourceMulti', protocolFilter: 'meshcore', help: 'Which MeshCore companion sends the traces. A Schedule trigger has no source of its own, so pick one.' },
+      { name: 'autoReturn', label: 'Trace the return leg too', kind: 'checkbox', help: 'Brings the trace back along the same route, so both directions of each hop are measured. Doubles the airtime of each trace.' },
     ],
   },
   {
@@ -899,11 +1017,12 @@ export const ACTIONS: BlockDef[] = [
     label: 'Send a notification',
     description: 'Send an external notification (Apprise).',
     fields: [
-      { name: 'title', label: 'Title', kind: 'text', tokens: true, placeholder: 'MeshRadar alert' },
+      { name: 'title', label: 'Title', kind: 'text', tokens: true, placeholder: 'MeshRadar alert', suggestTemplate: true },
       {
         name: 'body', label: 'Body', kind: 'textarea', tokens: true,
         placeholder: 'Node {{ trigger.fromId }} said {{ trigger.text }}',
         placeholderByTrigger: MOVEMENT_MESSAGE_HINTS,
+        suggestTemplate: true,
       },
       {
         name: 'type', label: 'Severity', kind: 'select', advanced: true,

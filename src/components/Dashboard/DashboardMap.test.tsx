@@ -3,7 +3,7 @@
  */
 import { useEffect, useRef } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, within } from '@testing-library/react';
 import DashboardMap from './DashboardMap';
 import { darkOverlayColors } from '../../config/overlayColors';
 // D3's most-permissive cross-source rule (#4412 Phase 3): DashboardMap itself
@@ -18,6 +18,8 @@ import { NODE_DISPLAY_NUMERIC_DEFAULTS } from '../../constants/nodeDisplayDefaul
 // can assert fitBounds behavior and toggle the Default Map Center (issue #4125).
 const mocks = vi.hoisted(() => ({
   fitBounds: vi.fn(),
+  // Counts Marker renders, for the marker memoization test.
+  markerRenders: 0,
   settings: {
     mapPinStyle: 'official' as string,
     overlayColors: undefined as unknown,
@@ -46,11 +48,17 @@ const mocks = vi.hoisted(() => ({
     // #5364/#5365 Phase 3 flight trails.
     aircraftDisplayMode: 'mark' as string,
     showAircraftTrails: false,
+    colorNodesByGateway: false,
     // #5561 cross-source "heard here" edges.
     showCrossSourceLinks: false,
     // #5580 traceroute-confirmed sub-toggle (default on in the real context).
     showTracerouteConfirmedLinks: true,
+    // #5734 ducting overlay toggle.
+    showDucting: false,
   },
+  // #5734: the admin's ductingOverlayEnabled switch, as the hook reads it.
+  ductingEnabled: false,
+  setShowDucting: vi.fn(),
   setShowCrossSourceLinks: vi.fn(),
   setShowTracerouteConfirmedLinks: vi.fn(),
   // #5580: props the map hands the confirmed-links layer (null = not mounted).
@@ -138,6 +146,7 @@ vi.mock('react-leaflet', () => ({
     // function component can't accept `ref` for real, so invoke it manually
     // on mount/unmount with a minimal fake marker — mirrors the pattern in
     // src/components/map/layers/NodeMarkersLayer.test.tsx.
+    mocks.markerRenders++;
     const instRef = useRef<any>(null);
     if (!instRef.current) instRef.current = { openPopup: vi.fn(), off: vi.fn() };
     useEffect(() => {
@@ -189,17 +198,25 @@ vi.mock('../../contexts/MapContext', () => ({
     setShowNeighborInfo: vi.fn(),
     showWaypoints: false,
     setShowWaypoints: vi.fn(),
+    showLocalMarkers: false,
+    setShowLocalMarkers: vi.fn(),
     showPolarGrid: false,
     setShowPolarGrid: vi.fn(),
     showCrossSourceLinks: mocks.mapContext.showCrossSourceLinks,
     setShowCrossSourceLinks: mocks.setShowCrossSourceLinks,
     showTracerouteConfirmedLinks: mocks.mapContext.showTracerouteConfirmedLinks,
     setShowTracerouteConfirmedLinks: mocks.setShowTracerouteConfirmedLinks,
+    showDucting: mocks.mapContext.showDucting,
+    setShowDucting: mocks.setShowDucting,
+    ductingHoursAhead: 0,
+    setDuctingHoursAhead: vi.fn(),
     showAgedOutAircraft: mocks.mapContext.showAgedOutAircraft,
     setShowAgedOutAircraft: vi.fn(),
     aircraftDisplayMode: mocks.mapContext.aircraftDisplayMode,
     setAircraftDisplayMode: vi.fn(),
     showAircraftTrails: mocks.mapContext.showAircraftTrails,
+    colorNodesByGateway: mocks.mapContext.colorNodesByGateway,
+    setColorNodesByGateway: vi.fn(),
     setShowAircraftTrails: vi.fn(),
     aircraftTrailHours: 6,
     setAircraftTrailHours: vi.fn(),
@@ -228,6 +245,17 @@ vi.mock('../map/layers/TracerouteConfirmedLinksLayer', () => ({
     mocks.confirmedLayerProps = p;
     return <div data-testid="traceroute-confirmed-links" />;
   },
+}));
+// #5734: the ducting hooks run queries (no QueryClient here). The real
+// control renders against these; the layer is a marker div.
+vi.mock('../../hooks/useDuctingForecast', () => ({
+  DUCTING_MAX_HOURS_AHEAD: 72,
+  DUCTING_STEP_HOURS: 3,
+  useDuctingEnabled: () => mocks.ductingEnabled,
+  useDuctingForecast: () => ({ data: undefined, error: null, isFetching: false, isPlaceholderData: false }),
+}));
+vi.mock('../map/layers/DuctingLayer', () => ({
+  default: () => <div data-testid="ducting-layer" />,
 }));
 vi.mock('../map/layers/AircraftTrailsLayer', () => ({
   default: (p: { trails: Array<{ key: string; label: string; times: number[] }> }) => {
@@ -488,9 +516,12 @@ describe('DashboardMap', () => {
       showAgedOutAircraft: false,
       aircraftDisplayMode: 'mark',
       showAircraftTrails: false,
+      colorNodesByGateway: false,
       showCrossSourceLinks: false,
       showTracerouteConfirmedLinks: true,
+      showDucting: false,
     };
+    mocks.ductingEnabled = false;
     mocks.crossSourceLayerProps = null;
     mocks.confirmedLayerProps = null;
     mocks.aircraftTrails = [];
@@ -565,6 +596,31 @@ describe('DashboardMap', () => {
     render(<DashboardMap {...defaultProps} sourceId="src-1" />);
     expect(screen.getByTestId('cross-source-links')).toBeInTheDocument();
     expect(mocks.crossSourceLayerProps).toMatchObject({ enabled: true, sourceIds: ['src-1'] });
+  });
+
+  describe('#5734: ducting overlay toggle', () => {
+    it('is hidden, and no layer mounts, while the admin switch is off', () => {
+      mocks.mapContext.showDucting = true;
+      render(<DashboardMap {...defaultProps} />);
+      expect(screen.queryByTestId('ducting-control')).not.toBeInTheDocument();
+      expect(screen.queryByRole('checkbox', { name: /map\.ducting\.toggle|Ducting/ })).not.toBeInTheDocument();
+    });
+
+    it('shows the toggle once the admin switch is on, and mounts the layer while ticked', () => {
+      mocks.ductingEnabled = true;
+      const { unmount } = render(<DashboardMap {...defaultProps} />);
+      const toggle = screen.getByRole('checkbox', { name: /map\.ducting\.toggle|Ducting/ });
+      expect(toggle).not.toBeChecked();
+      expect(screen.queryByTestId('ducting-layer')).not.toBeInTheDocument();
+      fireEvent.click(toggle);
+      expect(mocks.setShowDucting).toHaveBeenCalledWith(true);
+      unmount();
+
+      mocks.mapContext.showDucting = true;
+      render(<DashboardMap {...defaultProps} />);
+      expect(screen.getByTestId('ducting-layer')).toBeInTheDocument();
+      expect(screen.getByRole('slider', { name: /map\.ducting\.scrubber_label|Forecast time/ })).toBeInTheDocument();
+    });
   });
 
   describe('#5580: traceroute-confirmed links sub-toggle', () => {
@@ -727,6 +783,19 @@ describe('DashboardMap', () => {
     );
     expect(createNodeIconMock).toHaveBeenCalledWith(
       expect.objectContaining({ pinStyle: 'official' }),
+    );
+  });
+
+  it('marks CLIENT_BASE as infrastructure and passes TRACKER its badge category (#6008)', () => {
+    const clientBase = { ...nodeWithPosition, user: { id: 'node-base', shortName: 'BS', longName: 'Base' }, role: 12 };
+    const tracker = { ...nodeWithPosition, user: { id: 'node-trk', shortName: 'TR', longName: 'Tracker' }, role: 5, position: { latitude: 35.1, longitude: -80.1 } };
+    createNodeIconMock.mockClear();
+    render(<DashboardMap {...defaultProps} nodes={[clientBase, tracker]} />);
+    expect(createNodeIconMock).toHaveBeenCalledWith(
+      expect.objectContaining({ shortName: 'BS', isRouter: true, roleCategory: 'mtClientBase' }),
+    );
+    expect(createNodeIconMock).toHaveBeenCalledWith(
+      expect.objectContaining({ shortName: 'TR', isRouter: false, roleCategory: 'mtTracker' }),
     );
   });
 
@@ -1197,7 +1266,7 @@ describe('DashboardMap', () => {
     updatedAt: 0,
   };
 
-  it('forwards the active map style JSON into the vector tile layer', () => {
+  it('forwards the active map style JSON into the vector tile layer', async () => {
     const styleJson = { version: 8, sources: {}, layers: [] };
     mocks.settings.activeStyleJson = styleJson;
     render(
@@ -1207,10 +1276,10 @@ describe('DashboardMap', () => {
         customTilesets={[vectorCustomTileset]}
       />,
     );
-    expect(screen.getByTestId('vector-tile-layer').dataset.styleJson).toBe(JSON.stringify(styleJson));
+    expect((await screen.findByTestId('vector-tile-layer')).dataset.styleJson).toBe(JSON.stringify(styleJson));
   });
 
-  it('renders the vector tile layer without a style when no map style is active', () => {
+  it('renders the vector tile layer without a style when no map style is active', async () => {
     render(
       <DashboardMap
         {...defaultProps}
@@ -1218,7 +1287,7 @@ describe('DashboardMap', () => {
         customTilesets={[vectorCustomTileset]}
       />,
     );
-    expect(screen.getByTestId('vector-tile-layer').dataset.styleJson).toBe('');
+    expect((await screen.findByTestId('vector-tile-layer')).dataset.styleJson).toBe('');
   });
 
   // --- 2D/3D toggle (#4704) ---------------------------------------------------
@@ -1280,6 +1349,7 @@ describe('DashboardMap', () => {
       'Measure Distance',
       'Show Accuracy Regions',
       'Show Waypoints',
+      'Show Local Markers',
       'Show ATAK Contacts',
       'Show Polar Grid',
       'Show Legend',
@@ -1321,6 +1391,32 @@ describe('DashboardMap', () => {
     rerender(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[nodeWithPosition]} />);
     expect(screen.queryByTestId('map-3d-view')).not.toBeInTheDocument();
     expect(screen.getByTestId('map-container')).toBeInTheDocument();
+  });
+  describe('marker memoization (dashboard perf)', () => {
+    it('re-renders only the markers whose node changed', () => {
+      const other = {
+        ...nodeWithPosition,
+        user: { id: 'node-memo', shortName: 'NM', longName: 'Node Memo' },
+        position: { latitude: 35.5, longitude: -80.5 },
+      };
+      const { rerender } = render(<DashboardMap {...defaultProps} nodes={[nodeWithPosition, other]} />);
+      expect(screen.getAllByTestId('map-marker')).toHaveLength(2);
+      const afterMount = mocks.markerRenders;
+
+      // Unrelated prop change, same nodes array: no marker renders.
+      rerender(<DashboardMap {...defaultProps} nodes={[nodeWithPosition, other]} isLoading />);
+      expect(mocks.markerRenders).toBe(afterMount);
+
+      // A new array holding the same node objects (a poll that changed
+      // nothing for these nodes): still no marker renders.
+      rerender(<DashboardMap {...defaultProps} nodes={[nodeWithPosition, other]} />);
+      expect(mocks.markerRenders).toBe(afterMount);
+
+      // One node moved: only its marker renders.
+      const moved = { ...other, position: { latitude: 35.6, longitude: -80.5 } };
+      rerender(<DashboardMap {...defaultProps} nodes={[nodeWithPosition, moved]} />);
+      expect(mocks.markerRenders).toBe(afterMount + 1);
+    });
   });
 });
 
@@ -1501,5 +1597,27 @@ describe('DashboardMap — Map age filter names the Settings window (#5344)', ()
     render(<DashboardMap {...defaultProps} maxNodeAgeHours={0} />);
     const slider = screen.getByRole('slider', { name: 'map.ageFilter' });
     expect(slider).toHaveAttribute('aria-valuetext', 'map.ageAllUnlimited');
+  });
+
+  // #6386: the gateway legend shows a known name, keeping the raw id in parens
+  // and in the tooltip; an unknown gateway falls back to its raw id.
+  it('#6386: gateway legend shows the gateway name with its id, or the raw id when unknown', () => {
+    mocks.mapContext.colorNodesByGateway = true;
+    const gateways = [
+      { sourceId: 'mqtt', gatewayId: '!04e36b84', gatewayNodeNum: 0x04e36b84, receptionCount: 1, lastHeard: recent },
+      { sourceId: 'mqtt', gatewayId: '!0000beef', gatewayNodeNum: null, receptionCount: 1, lastHeard: recent },
+    ];
+    const relayed = { ...nodeWithPosition, nodeNum: 1, gateways };
+    const gatewayNode = {
+      nodeNum: 0x04e36b84,
+      user: { id: '!04e36b84', shortName: 'GW1', longName: 'Hilltop Gateway' },
+      position: null,
+      lastHeard: recent,
+    };
+    render(<DashboardMap {...defaultProps} sourceId="__unified__" nodes={[relayed, gatewayNode]} />);
+    const legend = screen.getByRole('note', { name: 'Node gateway colours' });
+    const named = within(legend).getByText('Hilltop Gateway (!04e36b84)');
+    expect(named).toHaveAttribute('title', '!04e36b84');
+    expect(within(legend).getByText('!0000beef')).toBeInTheDocument();
   });
 });

@@ -1,3 +1,4 @@
+import { HOP_COUNT_EMOJIS, HOP_EMOJI_SETTING_MAX_LENGTH } from '../utils/hopEmoji';
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { COOLDOWN_SECONDS_MAX } from './automationInputLimits';
 import { useTranslation } from 'react-i18next';
@@ -17,6 +18,9 @@ import {
 } from '../utils/autoAckMatrix';
 import { hasRE2IncompatibleConstructs } from '../utils/autoAckRegex';
 import { UiIcon } from './icons';
+import { ConfigSection } from './shared/config/ConfigSection';
+import { AutomationEngineNote } from './shared/config/AutomationEngineNote';
+import { ConfigGroup } from './shared/config/ConfigGroup';
 import AutoAckConvertDialog from './autoack/AutoAckConvertDialog';
 import { HopLimitOverrideSelect } from './HopLimitOverrideSelect';
 import { NumberInput } from './common/NumberInput';
@@ -27,6 +31,16 @@ import {
 } from '../utils/autoAckMaxResponses';
 import { NumberInputScope } from './common/NumberInputScope';
 import { useNumberInputScope } from './common/numberInputScopeContext';
+
+/**
+ * Display order for the response matrix grid: two columns (Channel | Direct),
+ * one row per path (0 hops, multi-hop, then IP — #5796).
+ */
+const MATRIX_DISPLAY_CELLS = (['zeroHop', 'multiHop', 'ip'] as const).flatMap((hop) =>
+  (['channel', 'direct'] as const).map(
+    (type) => AUTOACK_CELLS.find((c) => c.hop === hop && c.type === type)!,
+  ),
+);
 
 interface AutoAcknowledgeSectionProps {
   enabled: boolean;
@@ -45,6 +59,9 @@ interface AutoAcknowledgeSectionProps {
   onMessageDirectChange: (message: string) => void;
   onChannelsChange: (channels: number[]) => void;
   onSkipIncompleteNodesChange: (enabled: boolean) => void;
+  /** #6449: also answer messages the sender flagged as automated. Default false (skip them). */
+  respondToAutomation?: boolean;
+  onRespondToAutomationChange?: (enabled: boolean) => void;
   onIgnoredNodesChange: (ignoredNodes: string) => void;
   onMatrixChange: (m: AutoAckMatrix) => void;
   cooldownSeconds: number;
@@ -59,8 +76,18 @@ interface AutoAcknowledgeSectionProps {
   /** Response cap for channel acks: 0 = no cap, default 2, max 10. */
   maxResponses?: number;
   onMaxResponsesChange?: (value: number) => void;
+  /** Tapback glyph for a 0-hop message (#5890): '' = built-in *️⃣. */
+  hopEmojiZeroHop?: string;
+  onHopEmojiZeroHopChange?: (value: string) => void;
+  /** Tapback glyph for a message that came over MQTT (#5890): '' = hop glyph. */
+  hopEmojiMqtt?: string;
+  onHopEmojiMqttChange?: (value: string) => void;
   testMessages: string;
   onTestMessagesChange: (messages: string) => void;
+  /** False disables every control (no automation write permission). Default true. */
+  canWrite?: boolean;
+  /** True when the source cannot transmit; shows the paused note. */
+  receiveOnly?: boolean;
 }
 
 const DEFAULT_MESSAGE = '🤖 Copy, {NUMBER_HOPS} hops at {TIME}';
@@ -83,6 +110,8 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
   onMessageDirectChange,
   onChannelsChange,
   onSkipIncompleteNodesChange,
+  respondToAutomation = false,
+  onRespondToAutomationChange,
   onIgnoredNodesChange,
   onMatrixChange,
   cooldownSeconds,
@@ -95,8 +124,14 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
   onHopLimitChange,
   maxResponses = AUTO_ACK_MAX_RESPONSES_DEFAULT,
   onMaxResponsesChange,
+  hopEmojiZeroHop = '',
+  onHopEmojiZeroHopChange,
+  hopEmojiMqtt = '',
+  onHopEmojiMqttChange,
   testMessages: testMessagesProp,
   onTestMessagesChange,
+  canWrite = true,
+  receiveOnly = false,
 }) => {
   const { t } = useTranslation();
   const { timeFormat, dateFormat } = useSettings();
@@ -110,6 +145,7 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
   const [localMessageDirect, setLocalMessageDirect] = useState(messageDirect || DEFAULT_MESSAGE_DIRECT);
   const [localEnabledChannels, setLocalEnabledChannels] = useState<number[]>(enabledChannels);
   const [localSkipIncompleteNodes, setLocalSkipIncompleteNodes] = useState(skipIncompleteNodes);
+  const [localRespondToAutomation, setLocalRespondToAutomation] = useState(respondToAutomation);
   const [localIgnoredNodes, setLocalIgnoredNodes] = useState(ignoredNodes || '');
   const [localMatrix, setLocalMatrix] = useState<AutoAckMatrix>(matrix);
   const [localCooldownSeconds, setLocalCooldownSeconds] = useState(cooldownSeconds);
@@ -117,6 +153,8 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
   const [localMaxAttempts, setLocalMaxAttempts] = useState(maxAttempts);
   const [localHopLimit, setLocalHopLimit] = useState(hopLimit);
   const [localMaxResponses, setLocalMaxResponses] = useState(maxResponses);
+  const [localHopEmojiZeroHop, setLocalHopEmojiZeroHop] = useState(hopEmojiZeroHop);
+  const [localHopEmojiMqtt, setLocalHopEmojiMqtt] = useState(hopEmojiMqtt);
   const [hasChanges, setHasChanges] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [testMessages, setTestMessages] = useState(testMessagesProp || 'test\nTest message\nping\nPING\nHello world\nTESTING 123');
@@ -132,6 +170,7 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
     setLocalMessageDirect(messageDirect || DEFAULT_MESSAGE_DIRECT);
     setLocalEnabledChannels(enabledChannels);
     setLocalSkipIncompleteNodes(skipIncompleteNodes);
+    setLocalRespondToAutomation(respondToAutomation);
     setLocalIgnoredNodes(ignoredNodes || '');
     setLocalMatrix(matrix);
     setLocalCooldownSeconds(cooldownSeconds);
@@ -139,10 +178,12 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
     setLocalMaxAttempts(maxAttempts);
     setLocalHopLimit(hopLimit);
     setLocalMaxResponses(maxResponses);
+    setLocalHopEmojiZeroHop(hopEmojiZeroHop);
+    setLocalHopEmojiMqtt(hopEmojiMqtt);
     if (testMessagesProp) {
       setTestMessages(testMessagesProp);
     }
-  }, [enabled, regex, message, messageDirect, enabledChannels, skipIncompleteNodes, ignoredNodes, matrix, cooldownSeconds, preSendDelaySeconds, maxAttempts, hopLimit, maxResponses, testMessagesProp]);
+  }, [enabled, regex, message, messageDirect, enabledChannels, skipIncompleteNodes, respondToAutomation, ignoredNodes, matrix, cooldownSeconds, preSendDelaySeconds, maxAttempts, hopLimit, maxResponses, hopEmojiZeroHop, hopEmojiMqtt, testMessagesProp]);
 
   // Check if any settings have changed.
   // Compare each local value against the SAME normalized baseline the local
@@ -160,9 +201,9 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
     const maxAttemptsChanged = localMaxAttempts !== maxAttempts;
     const hopLimitChanged = localHopLimit !== hopLimit;
     const matrixChanged = JSON.stringify(localMatrix) !== JSON.stringify(matrix);
-    const changed = localEnabled !== enabled || localRegex !== (regex || '^(test|ping)') || localMessage !== (message || DEFAULT_MESSAGE) || localMessageDirect !== (messageDirect || DEFAULT_MESSAGE_DIRECT) || channelsChanged || localSkipIncompleteNodes !== skipIncompleteNodes || localIgnoredNodes !== (ignoredNodes || '') || matrixChanged || cooldownChanged || preSendDelayChanged || maxAttemptsChanged || hopLimitChanged || localMaxResponses !== maxResponses || testMessages !== (testMessagesProp || 'test\nTest message\nping\nPING\nHello world\nTESTING 123');
+    const changed = localEnabled !== enabled || localRegex !== (regex || '^(test|ping)') || localMessage !== (message || DEFAULT_MESSAGE) || localMessageDirect !== (messageDirect || DEFAULT_MESSAGE_DIRECT) || channelsChanged || localSkipIncompleteNodes !== skipIncompleteNodes || localRespondToAutomation !== respondToAutomation || localIgnoredNodes !== (ignoredNodes || '') || matrixChanged || cooldownChanged || preSendDelayChanged || maxAttemptsChanged || hopLimitChanged || localMaxResponses !== maxResponses || localHopEmojiZeroHop !== hopEmojiZeroHop || localHopEmojiMqtt !== hopEmojiMqtt || testMessages !== (testMessagesProp || 'test\nTest message\nping\nPING\nHello world\nTESTING 123');
     setHasChanges(changed);
-  }, [localEnabled, localRegex, localMessage, localMessageDirect, localEnabledChannels, localSkipIncompleteNodes, localIgnoredNodes, localMatrix, localCooldownSeconds, localPreSendDelaySeconds, localMaxAttempts, localHopLimit, localMaxResponses, testMessages, enabled, regex, message, messageDirect, enabledChannels, skipIncompleteNodes, ignoredNodes, matrix, cooldownSeconds, preSendDelaySeconds, maxAttempts, hopLimit, maxResponses, testMessagesProp]);
+  }, [localEnabled, localRegex, localMessage, localMessageDirect, localEnabledChannels, localSkipIncompleteNodes, localRespondToAutomation, localIgnoredNodes, localMatrix, localCooldownSeconds, localPreSendDelaySeconds, localMaxAttempts, localHopLimit, localMaxResponses, localHopEmojiZeroHop, localHopEmojiMqtt, testMessages, enabled, regex, message, messageDirect, enabledChannels, skipIncompleteNodes, respondToAutomation, ignoredNodes, matrix, cooldownSeconds, preSendDelaySeconds, maxAttempts, hopLimit, maxResponses, hopEmojiZeroHop, hopEmojiMqtt, testMessagesProp]);
 
   // Reset local state to props (used by SaveBar dismiss)
   const resetChanges = useCallback(() => {
@@ -172,6 +213,7 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
     setLocalMessageDirect(messageDirect || DEFAULT_MESSAGE_DIRECT);
     setLocalEnabledChannels(enabledChannels);
     setLocalSkipIncompleteNodes(skipIncompleteNodes);
+    setLocalRespondToAutomation(respondToAutomation);
     setLocalIgnoredNodes(ignoredNodes || '');
     setLocalMatrix(matrix);
     setLocalCooldownSeconds(cooldownSeconds);
@@ -179,8 +221,10 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
     setLocalMaxAttempts(maxAttempts);
     setLocalHopLimit(hopLimit);
     setLocalMaxResponses(maxResponses);
+    setLocalHopEmojiZeroHop(hopEmojiZeroHop);
+    setLocalHopEmojiMqtt(hopEmojiMqtt);
     setTestMessages(testMessagesProp || 'test\nTest message\nping\nPING\nHello world\nTESTING 123');
-  }, [enabled, regex, message, messageDirect, enabledChannels, skipIncompleteNodes, ignoredNodes, matrix, cooldownSeconds, preSendDelaySeconds, maxAttempts, hopLimit, maxResponses, testMessagesProp]);
+  }, [enabled, regex, message, messageDirect, enabledChannels, skipIncompleteNodes, respondToAutomation, ignoredNodes, matrix, cooldownSeconds, preSendDelaySeconds, maxAttempts, hopLimit, maxResponses, hopEmojiZeroHop, hopEmojiMqtt, testMessagesProp]);
 
   // Validate regex pattern for safety
   const validateRegex = (pattern: string): { valid: boolean; error?: string } => {
@@ -301,6 +345,7 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
           autoAckMessageDirect: localMessageDirect,
           autoAckChannels: localEnabledChannels.join(','),
           autoAckSkipIncompleteNodes: String(localSkipIncompleteNodes),
+          autoAckRespondToAutomation: String(localRespondToAutomation),
           autoAckIgnoredNodes: localIgnoredNodes,
           ...matrixToSettings(localMatrix),
           autoAckCooldownSeconds: String(localCooldownSeconds),
@@ -308,6 +353,8 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
           autoAckMaxAttempts: String(localMaxAttempts),
           autoAckHopLimit: localHopLimit,
           autoAckMaxResponses: String(localMaxResponses),
+          hopEmojiZeroHop: localHopEmojiZeroHop.trim(),
+          hopEmojiMqtt: localHopEmojiMqtt.trim(),
           autoAckTestMessages: testMessages
         })
       });
@@ -338,6 +385,7 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
       onMessageDirectChange(localMessageDirect);
       onChannelsChange(localEnabledChannels);
       onSkipIncompleteNodesChange(localSkipIncompleteNodes);
+      onRespondToAutomationChange?.(localRespondToAutomation);
       onIgnoredNodesChange(localIgnoredNodes);
       onMatrixChange(localMatrix);
       onCooldownSecondsChange(localCooldownSeconds);
@@ -345,6 +393,8 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
       onMaxAttemptsChange(localMaxAttempts);
       onHopLimitChange?.(localHopLimit);
       onMaxResponsesChange?.(localMaxResponses);
+      onHopEmojiZeroHopChange?.(localHopEmojiZeroHop.trim());
+      onHopEmojiMqttChange?.(localHopEmojiMqtt.trim());
       onTestMessagesChange(testMessages);
 
       setHasChanges(false);
@@ -355,7 +405,7 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
     } finally {
       setIsSaving(false);
     }
-  }, [localRegex, localEnabled, localMessage, localMessageDirect, localEnabledChannels, localSkipIncompleteNodes, localIgnoredNodes, localMatrix, localCooldownSeconds, localPreSendDelaySeconds, localMaxAttempts, localHopLimit, localMaxResponses, testMessages, baseUrl, csrfFetch, sourceQuery, showToast, t, onEnabledChange, onRegexChange, onMessageChange, onMessageDirectChange, onChannelsChange, onSkipIncompleteNodesChange, onIgnoredNodesChange, onMatrixChange, onCooldownSecondsChange, onPreSendDelaySecondsChange, onMaxAttemptsChange, onHopLimitChange, onMaxResponsesChange, onTestMessagesChange]);
+  }, [localRegex, localEnabled, localMessage, localMessageDirect, localEnabledChannels, localSkipIncompleteNodes, localRespondToAutomation, localIgnoredNodes, localMatrix, localCooldownSeconds, localPreSendDelaySeconds, localMaxAttempts, localHopLimit, localMaxResponses, localHopEmojiZeroHop, localHopEmojiMqtt, testMessages, baseUrl, csrfFetch, sourceQuery, showToast, t, onEnabledChange, onRegexChange, onMessageChange, onMessageDirectChange, onChannelsChange, onSkipIncompleteNodesChange, onRespondToAutomationChange, onIgnoredNodesChange, onMatrixChange, onCooldownSecondsChange, onPreSendDelaySecondsChange, onMaxAttemptsChange, onHopLimitChange, onMaxResponsesChange, onHopEmojiZeroHopChange, onHopEmojiMqttChange, onTestMessagesChange]);
 
   // Register with SaveBar
   const numberScope = useNumberInputScope();
@@ -374,9 +424,11 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
   // intentionally falls through to "not MeshCore" so the button stays enabled
   // there, matching pre-#4420 behavior for those views.
   const isMeshCoreSource = sourceType === 'meshcore';
-  const isConvertDisabled = hasChanges || isMeshCoreSource;
+  const isConvertDisabled = hasChanges || isMeshCoreSource || !canWrite;
   const convertDisabledReason = isMeshCoreSource
     ? t('automation.auto_ack.convert_meshtastic_only', 'Convert to an Automation is only available for Meshtastic sources.')
+    : !canWrite
+    ? t('automation.auto_ack.convert_no_permission', 'You need write permission for automations on this source to convert.')
     : hasChanges
       ? 'Save your changes first — converting now would use the last saved configuration, not your unsaved edits.'
       : undefined;
@@ -384,39 +436,22 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
   return (
     <NumberInputScope scope={numberScope}>
     <>
-      <div className="automation-section-header" style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        marginBottom: '1.5rem',
-        padding: '1rem 1.25rem',
-        background: 'var(--color-surface-hover)',
-        border: '1px solid var(--color-surface-active)',
-        borderRadius: '8px'
-      }}>
-        <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <input
-            type="checkbox"
-            checked={localEnabled}
-            onChange={(e) => setLocalEnabled(e.target.checked)}
-            style={{ width: 'auto', margin: 0, cursor: 'pointer' }}
-          />
-          {t('automation.auto_ack.title')}
-          <a
-            href="https://meshmonitor.org/features/automation#auto-acknowledge"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              fontSize: '1.2rem',
-              color: '#89b4fa',
-              textDecoration: 'none',
-              marginLeft: '0.5rem'
-            }}
-            title={t('automation.view_docs')}
-          >
-            <UiIcon name="help" />
-          </a>
-        </h2>
+      <ConfigSection
+        title={t('automation.auto_ack.title')}
+        notice={<AutomationEngineNote />}
+        enabled={localEnabled}
+        onEnabledChange={setLocalEnabled}
+        enableLabel={t('automation.auto_ack.title')}
+        docsUrl="https://meshmonitor.org/features/automation#auto-acknowledge"
+        canWrite={canWrite}
+        receiveOnly={receiveOnly}
+        description={
+          <>
+            {t('automation.auto_ack.description')}
+            {' '}{t('automation.auto_ack.tokens_info')}
+          </>
+        }
+        headerActions={<>
         {/* #4340 Phase 4 WP4 — one-way door into the Automation Engine. Disabled while
             there are unsaved edits: converting now would convert the *saved* config,
             not what's on screen, and silently discard the user's in-progress changes.
@@ -446,22 +481,10 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
           <UiIcon name="bot" size={16} />
           Convert to an Automation…
         </button>
-      </div>
-
-      <AutoAckConvertDialog
-        isOpen={isConvertDialogOpen}
-        onClose={() => setIsConvertDialogOpen(false)}
-        baseUrl={baseUrl}
-        onEnabledChange={onEnabledChange}
-      />
-
-      <div className="settings-section" style={{ opacity: localEnabled ? 1 : 0.5, transition: 'opacity 0.2s' }}>
-        <p style={{ marginBottom: '1rem', color: '#666', lineHeight: '1.5', marginLeft: '1.75rem' }}>
-          {t('automation.auto_ack.description')}
-          {' '}{t('automation.auto_ack.tokens_info')}
-        </p>
-
-        <div className="setting-item" style={{ marginTop: '1rem' }}>
+        </>}
+      >
+        <ConfigGroup name="trigger" title={t('automation.group.trigger', 'Trigger')}>
+        <div className="setting-item">
           <label htmlFor="autoAckRegex">
             {t('automation.auto_ack.regex_label')}
             <span className="setting-description">
@@ -480,8 +503,10 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
             style={{ fontFamily: 'monospace' }}
           />
         </div>
+        </ConfigGroup>
 
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <ConfigGroup name="where" title={t('automation.group.where', 'Where')}>
+        <div className="setting-item">
           <label>
             {t('automation.auto_ack.active_channels')}
             <span className="setting-description">
@@ -512,15 +537,15 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
             ))}
           </div>
         </div>
+        </ConfigGroup>
 
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
-          <label>
-            {t('automation.auto_ack.security')}
-            <span className="setting-description">
-              {t('automation.auto_ack.security_description')}
-            </span>
-          </label>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
+        <ConfigGroup
+          name="who"
+          title={t('automation.group.who', 'Who')}
+          hint={t('automation.auto_ack.security_description')}
+        >
+        <div className="setting-item">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <input
               type="checkbox"
               id="autoAckSkipIncomplete"
@@ -536,6 +561,27 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
           <div style={{ marginTop: '0.5rem', marginLeft: '1.75rem', fontSize: '0.9rem', color: 'var(--color-text-subtle)' }}>
             {t('automation.auto_ack.skip_incomplete_description')}
           </div>
+
+          {!isMeshCoreSource && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '1rem' }}>
+                <input
+                  type="checkbox"
+                  id="autoAckRespondToAutomation"
+                  checked={localRespondToAutomation}
+                  onChange={(e) => setLocalRespondToAutomation(e.target.checked)}
+                  disabled={!localEnabled}
+                  style={{ width: 'auto', margin: 0, cursor: localEnabled ? 'pointer' : 'not-allowed' }}
+                />
+                <label htmlFor="autoAckRespondToAutomation" style={{ margin: 0, cursor: localEnabled ? 'pointer' : 'not-allowed', fontWeight: 'bold' }}>
+                  {t('automation.respond_to_automation')}
+                </label>
+              </div>
+              <div style={{ marginTop: '0.5rem', marginLeft: '1.75rem', fontSize: '0.9rem', color: 'var(--color-text-subtle)' }}>
+                {t('automation.respond_to_automation_description')}
+              </div>
+            </>
+          )}
 
           <div style={{ marginTop: '1rem' }}>
             <label htmlFor="autoAckIgnoredNodes" style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 'bold' }}>
@@ -559,8 +605,12 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
               }}
             />
           </div>
+        </div>
+        </ConfigGroup>
 
-          <div style={{ marginTop: '1rem' }}>
+        <ConfigGroup name="timing" title={t('automation.group.timing', 'Timing')}>
+        <div className="setting-item">
+          <div>
             <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 'bold' }}>
               {t('automation.auto_ack.cooldown_label')}
             </label>
@@ -613,7 +663,7 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
               {t('automation.auto_ack.max_responses_label', 'Maximum number of responses')}
             </label>
             <div id="autoAckMaxResponsesHelp" style={{ marginBottom: '0.5rem', fontSize: '0.85rem', color: 'var(--color-text-subtle)' }}>
-              {t('automation.auto_ack.max_responses_description', 'Before it answers a channel message, MeshRadar waits 5 to 30 seconds (about 17 on average), so the acknowledgement does not appear at once. If this many other nodes have already replied or sent a tapback to that message by then, it stays quiet. This keeps a channel from filling with acknowledgements that add nothing after the first few. A node that sends both a reply and a tapback counts once. Direct messages are answered straight away.')}
+              {t('automation.auto_ack.max_responses_description', 'Before it answers a channel message, MeshRadar waits 5 to 30 seconds (about 17 on average), so the acknowledgement does not appear at once. A message that took more hops to reach this node waits longer: 3 seconds more per hop, so nearer nodes answer first. If this many other nodes have already replied or sent a tapback to that message by then, it stays quiet. This keeps a channel from filling with acknowledgements that add nothing after the first few. A node that sends both a reply and a tapback counts once. Direct messages are answered straight away.')}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
               <NumberInput
@@ -660,6 +710,11 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
             </div>
           </div>
 
+        </div>
+        </ConfigGroup>
+
+        <ConfigGroup name="delivery" title={t('automation.group.delivery', 'Delivery')}>
+        <div className="setting-item">
           {/* Hop-limit override (#5121) for replies and tapbacks. */}
           <HopLimitOverrideSelect
             id="autoAckHopLimit"
@@ -672,9 +727,11 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
             )}
           />
         </div>
+        </ConfigGroup>
 
-        {/* Response matrix: {Channel | Direct} × {0 hops | Multi-hop} */}
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <ConfigGroup name="message" title={t('automation.group.message', 'Message')}>
+        {/* Response matrix: columns {Channel | Direct}, rows {0 hops | Multi-hop | IP} */}
+        <div className="setting-item">
           <label>
             {t('automation.auto_ack.response_matrix')}
             <span className="setting-description">
@@ -690,10 +747,12 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
               opacity: localEnabled ? 1 : 0.5,
             }}
           >
-            {AUTOACK_CELLS.map((cell) => {
+            {MATRIX_DISPLAY_CELLS.map((cell) => {
               const config = localMatrix[cell.id];
               const isDirect = cell.type === 'direct';
-              const borderColor = cell.hop === 'zeroHop' ? 'var(--color-success)' : 'var(--color-accent)';
+              const borderColor = cell.hop === 'zeroHop'
+                ? 'var(--color-success)'
+                : cell.hop === 'ip' ? 'var(--color-info)' : 'var(--color-accent)';
               // Direct replies are inherently DMs: show the "Respond via DM" checkbox
               // checked + disabled. Channel cells gate it on the cell's reply toggle.
               const replyDmChecked = isDirect ? true : config.replyDm;
@@ -763,6 +822,55 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
               );
             })}
           </div>
+          <p
+            className="setting-description"
+            data-testid="autoAck-ip-row-note"
+            style={{ display: 'block', marginTop: '0.75rem' }}
+          >
+            {t(
+              'automation.auto_ack.ip_row_note',
+              'The IP row covers messages your node got over MQTT or UDP. The 0-hop and multi-hop rows used to answer these. Turn on the IP row to keep answering them.',
+            )}
+          </p>
+        </div>
+
+        {/* Tapback glyphs (#5890). Blank keeps the built-in glyph. */}
+        <div className="setting-item" style={{ opacity: localEnabled ? 1 : 0.5 }}>
+          <label htmlFor="hopEmojiZeroHop">
+            {t('automation.auto_ack.zero_hop_emoji', '0-hop tapback')}
+            <span className="setting-description">
+              {t('automation.auto_ack.zero_hop_emoji_description', 'The tapback for a message heard directly. Leave blank for *️⃣; some meshes use 0️⃣. Hop-count tapbacks in automations use it too.')}
+            </span>
+          </label>
+          <input
+            id="hopEmojiZeroHop"
+            type="text"
+            className="setting-input"
+            value={localHopEmojiZeroHop}
+            placeholder={HOP_COUNT_EMOJIS[0]}
+            maxLength={HOP_EMOJI_SETTING_MAX_LENGTH}
+            onChange={(e) => setLocalHopEmojiZeroHop(e.target.value)}
+            disabled={!localEnabled}
+            style={{ width: '6rem' }}
+          />
+        </div>
+        <div className="setting-item" style={{ opacity: localEnabled ? 1 : 0.5 }}>
+          <label htmlFor="hopEmojiMqtt">
+            {t('automation.auto_ack.mqtt_emoji', 'MQTT tapback')}
+            <span className="setting-description">
+              {t('automation.auto_ack.mqtt_emoji_description', 'The tapback for a message that came over MQTT or UDP (the IP row). Leave blank to use its hop-count glyph. Automations use it for messages from an MQTT source, in place of #️⃣.')}
+            </span>
+          </label>
+          <input
+            id="hopEmojiMqtt"
+            type="text"
+            className="setting-input"
+            value={localHopEmojiMqtt}
+            maxLength={HOP_EMOJI_SETTING_MAX_LENGTH}
+            onChange={(e) => setLocalHopEmojiMqtt(e.target.value)}
+            disabled={!localEnabled}
+            style={{ width: '6rem' }}
+          />
         </div>
 
         {/* Multi-hop reply template */}
@@ -846,8 +954,10 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
             </div>
           </div>
         </div>
+        </ConfigGroup>
 
-        <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+        <ConfigGroup name="test" title={t('automation.group.test', 'Test')}>
+        <div className="setting-item">
           <label htmlFor="testMessages">
             {t('automation.auto_ack.pattern_testing')}
             <span className="setting-description">
@@ -911,7 +1021,15 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
             </div>
           </div>
         </div>
-      </div>
+        </ConfigGroup>
+      </ConfigSection>
+
+      <AutoAckConvertDialog
+        isOpen={isConvertDialogOpen}
+        onClose={() => setIsConvertDialogOpen(false)}
+        baseUrl={baseUrl}
+        onEnabledChange={onEnabledChange}
+      />
     </>
     </NumberInputScope>
   );

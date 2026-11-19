@@ -13,7 +13,7 @@
  * - Better separation of concerns
  */
 
-import React, { useMemo, useCallback } from 'react';
+import React, { useMemo, useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { useSortable } from '@dnd-kit/sortable';
@@ -28,7 +28,8 @@ import { useWidgetMode } from '../hooks/useWidgetMode';
 import { useWidgetRange } from '../hooks/useWidgetRange';
 import { useSource } from '../contexts/SourceContext';
 import { getLatestValue } from '../utils/telemetry';
-import { telemetryDisplayScale } from '../utils/telemetryFormat';
+import { telemetryDotProp } from '../utils/telemetryChartDensity';
+import { telemetryDisplayScale, formatTelemetryNumber } from '../utils/telemetryFormat';
 import { buildTelemetryFilename, telemetrySeriesToCsv } from '../utils/telemetryChartCsv';
 import { downloadTextFile } from '../utils/nodeExport';
 import TelemetryGauge from './TelemetryGauge';
@@ -36,6 +37,9 @@ import TelemetryNumericLabel from './TelemetryNumericLabel';
 import { UiIcon } from './icons';
 import DeviceCounterNote from './DeviceCounterNote';
 import { isDeviceCounterType } from '../utils/deviceCounters';
+import { chartYDomain, hasFixedYBound, type ChartYRange } from '../utils/chartYRange';
+import ChartYRangeEditor from './ChartYRangeEditor/ChartYRangeEditor';
+import yRangeStyles from './ChartYRangeEditor/ChartYRangeEditor.module.css';
 
 interface FavoriteChart {
   nodeId: string;
@@ -57,6 +61,10 @@ interface TelemetryChartProps {
   showSolar?: boolean;
   onToggleSolar?: (nodeId: string, telemetryType: string, show: boolean) => void;
   solarMonitoringEnabled?: boolean;
+  /** Fixed Y-axis bounds in the series' stored unit (#6348); absent = auto. */
+  yRange?: ChartYRange | null;
+  /** Save a new Y range (stored unit), or null for auto. Absent: no editor. */
+  onYRangeChange?: (nodeId: string, telemetryType: string, range: ChartYRange | null) => void;
 }
 
 // Translation keys for telemetry types
@@ -431,6 +439,8 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
     showSolar = true,
     onToggleSolar,
     solarMonitoringEnabled = false,
+    yRange = null,
+    onYRangeChange,
   }) => {
     const { t } = useTranslation();
     const { timeFormat } = useSettings();
@@ -487,6 +497,8 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
       onRemove(favorite.nodeId, favorite.telemetryType);
     }, [favorite.nodeId, favorite.telemetryType, onRemove]);
 
+    const [yRangeEditorOpen, setYRangeEditorOpen] = useState(false);
+
     const handleSolarToggle = useCallback(() => {
       if (onToggleSolar) {
         onToggleSolar(favorite.nodeId, favorite.telemetryType, !showSolar);
@@ -507,6 +519,58 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
     // Widget mode and range (per-widget persistence in localStorage)
     const [mode, setMode] = useWidgetMode(favorite.nodeId, favorite.telemetryType, baseUrl);
     const [range, setRange] = useWidgetRange(favorite.nodeId, favorite.telemetryType, baseUrl);
+
+    // Humanize uptime and auto-scale current/power (#3261). Shared with the
+    // per-node graphs (TelemetryGraphs) so the two surfaces cannot drift.
+    // Temperature keeps its own C/F handling below.
+    const display = useMemo(
+      () => telemetryDisplayScale(
+        favorite.telemetryType,
+        telemetryData.map(d => d.value),
+        telemetryData[0]?.unit || ''
+      ),
+      [favorite.telemetryType, telemetryData]
+    );
+    const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : display.unit;
+
+    // Built once per data change rather than on every render (this walks and
+    // labels every point). Declared above the early returns so the hook order
+    // stays fixed.
+    const scaledChartData = useMemo(() => {
+      if (telemetryData.length === 0) return [];
+      const chartData = prepareChartData(telemetryData, isTemperature, temperatureUnit, solarEstimates, globalMinTime, timeFormat);
+
+      // For combined paxcounter chart, merge BLE data
+      if (isPaxcounterCombined) {
+        const bleByTimestamp = new Map<number, number>();
+        paxBleData.forEach(item => bleByTimestamp.set(item.timestamp, item.value));
+        chartData.forEach(point => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const p = point as any;
+          p.paxWifi = point.value;
+          p.paxBle = bleByTimestamp.get(point.timestamp) ?? null;
+          bleByTimestamp.delete(point.timestamp);
+        });
+        bleByTimestamp.forEach((value, timestamp) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const point: any = {
+            timestamp,
+            value: null,
+            time: formatTime(new Date(timestamp), timeFormat),
+            paxWifi: null,
+            paxBle: value,
+          };
+          chartData.push(point);
+        });
+        chartData.sort((a, b) => a.timestamp - b.timestamp);
+      }
+
+      // Apply the chart's display scale to the plotted series. The solar overlay
+      // lives on its own axis (watt-hours) and is left untouched.
+      return !isTemperature && display.factor !== 1
+        ? chartData.map((d) => ({ ...d, value: d.value == null ? d.value : d.value * display.factor }))
+        : chartData;
+    }, [telemetryData, isTemperature, temperatureUnit, solarEstimates, globalMinTime, timeFormat, isPaxcounterCombined, paxBleData, display.factor]);
 
     // Loading state
     if (isLoading) {
@@ -577,50 +641,7 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
       );
     }
 
-    // Prepare chart data
-    const chartData = prepareChartData(telemetryData, isTemperature, temperatureUnit, solarEstimates, globalMinTime, timeFormat);
-    // Humanize uptime and auto-scale current/power (#3261). Shared with the
-    // per-node graphs (TelemetryGraphs) so the two surfaces cannot drift.
-    // Temperature keeps its own C/F handling below.
-    const display = telemetryDisplayScale(
-      favorite.telemetryType,
-      telemetryData.map(d => d.value),
-      telemetryData[0]?.unit || ''
-    );
-    const unit = isTemperature ? getTemperatureUnit(temperatureUnit) : display.unit;
-
-    // For combined paxcounter chart, merge BLE data
-    if (isPaxcounterCombined) {
-      const bleByTimestamp = new Map<number, number>();
-      paxBleData.forEach(item => bleByTimestamp.set(item.timestamp, item.value));
-      chartData.forEach(point => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const p = point as any;
-        p.paxWifi = point.value;
-        p.paxBle = bleByTimestamp.get(point.timestamp) ?? null;
-        bleByTimestamp.delete(point.timestamp);
-      });
-      bleByTimestamp.forEach((value, timestamp) => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const point: any = {
-          timestamp,
-          value: null,
-          time: formatTime(new Date(timestamp), timeFormat),
-          paxWifi: null,
-          paxBle: value,
-        };
-        chartData.push(point);
-      });
-      chartData.sort((a, b) => a.timestamp - b.timestamp);
-    }
-
     const latest = getLatestValue(telemetryData);
-
-    // Apply the chart's display scale to the plotted series. The solar overlay
-    // lives on its own axis (watt-hours) and is left untouched.
-    const scaledChartData = !isTemperature && display.factor !== 1
-      ? chartData.map((d) => ({ ...d, value: d.value == null ? d.value : d.value * display.factor }))
-      : chartData;
 
     const canExportCsv = scaledChartData.length > 0;
     const handleExportCsv = () => {
@@ -659,6 +680,27 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
       isTemperature ? formatTemperature(v, temperatureUnit, 'C') : v / display.factor;
     const handleRangeChange = (r: { min: number; max: number }) =>
       setRange({ min: toStored(r.min), max: toStored(r.max) });
+
+    // Fixed Y-axis bounds (#6348) persist in the stored unit like the gauge
+    // range; the editor and the axis work in the displayed unit.
+    const yRangeFixed = hasFixedYBound(yRange);
+    const yDomain = chartYDomain(yRange, toDisplay);
+    const yRangeDisplay: ChartYRange | null = yRangeFixed
+      ? {
+          ...(yRange?.min !== undefined ? { min: toDisplay(yRange.min) } : {}),
+          ...(yRange?.max !== undefined ? { max: toDisplay(yRange.max) } : {}),
+        }
+      : null;
+    const handleYRangeApply = (r: ChartYRange | null) => {
+      if (!onYRangeChange) return;
+      const stored: ChartYRange | null = r
+        ? {
+            ...(r.min !== undefined ? { min: toStored(r.min) } : {}),
+            ...(r.max !== undefined ? { max: toStored(r.max) } : {}),
+          }
+        : null;
+      onYRangeChange(favorite.nodeId, favorite.telemetryType, stored);
+    };
 
     // Display formatter for uptime metrics: humanize seconds in the gauge,
     // the numeric label, the Y-axis ticks and the tooltip (#3261).
@@ -710,6 +752,17 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
                 <UiIcon name={showSolar ? 'sun' : 'visibilityOff'} size={15} />
               </button>
             )}
+            {onYRangeChange && mode === 'chart' && (
+              <button
+                className={`telemetry-export-btn ${yRangeFixed ? yRangeStyles.toggleActive : ''}`}
+                onClick={() => setYRangeEditorOpen(v => !v)}
+                aria-expanded={yRangeEditorOpen}
+                aria-label={t('chart_y_range.title')}
+                title={t('chart_y_range.title')}
+              >
+                <UiIcon name="ruler" size={15} />
+              </button>
+            )}
             <button
               className="telemetry-export-btn"
               onClick={handleExportCsv}
@@ -727,6 +780,14 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
               <UiIcon name="close" size={15} />            </button>
           </div>
         </div>
+
+        {yRangeEditorOpen && onYRangeChange && mode === 'chart' && (
+          <ChartYRangeEditor
+            value={yRangeDisplay}
+            onApply={handleYRangeApply}
+            onClose={() => setYRangeEditorOpen(false)}
+          />
+        )}
 
         {isDeviceCounterType(favorite.telemetryType) && (
           <DeviceCounterNote text={t('telemetry.device_counter_note')} />
@@ -774,7 +835,8 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
               <YAxis
                 yAxisId="left"
                 tick={{ fontSize: 12 }}
-                domain={['auto', 'auto']}
+                domain={yDomain}
+                allowDataOverflow={yRangeFixed}
                 tickFormatter={uptimeFormatter}
               />
               <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 12 }} domain={['auto', 'auto']} hide={true} />
@@ -786,14 +848,12 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
                   color: '#cdd6f4',
                 }}
                 labelStyle={{ color: '#cdd6f4' }}
-                formatter={
-                  uptimeFormatter
-                    ? (value, name) =>
-                        // Leave the solar overlay (watt-hours) untouched.
-                        name === 'solarEstimate' || typeof value !== 'number'
-                          ? value
-                          : uptimeFormatter(value)
-                    : undefined
+                formatter={(value, name) =>
+                  // Leave the solar overlay (watt-hours) untouched; round the
+                  // rest (bucket averages are long floats, #4173 review L20).
+                  name === 'solarEstimate' || typeof value !== 'number'
+                    ? value
+                    : (uptimeFormatter ?? formatTelemetryNumber)(value)
                 }
                 labelFormatter={value => {
                   const date = new Date(value);
@@ -829,9 +889,10 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
                     name="WiFi"
                     stroke={getColor('paxcounterWifi')}
                     strokeWidth={2}
-                    dot={{ fill: getColor('paxcounterWifi'), r: 3 }}
+                    dot={telemetryDotProp(scaledChartData.length, 0, getColor('paxcounterWifi'))}
                     activeDot={{ r: 5 }}
                     connectNulls={true}
+                    isAnimationActive={false}
                   />
                   <Line
                     yAxisId="left"
@@ -840,9 +901,10 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
                     name="BLE"
                     stroke={getColor('paxcounterBle')}
                     strokeWidth={2}
-                    dot={{ fill: getColor('paxcounterBle'), r: 3 }}
+                    dot={telemetryDotProp(scaledChartData.length, 0, getColor('paxcounterBle'))}
                     activeDot={{ r: 5 }}
                     connectNulls={true}
+                    isAnimationActive={false}
                   />
                 </>
               ) : (
@@ -852,9 +914,10 @@ const TelemetryChart: React.FC<TelemetryChartProps> = React.memo(
                   dataKey="value"
                   stroke={color}
                   strokeWidth={2}
-                  dot={{ fill: color, r: 3 }}
+                  dot={telemetryDotProp(scaledChartData.length, 0, color)}
                   activeDot={{ r: 5 }}
                   connectNulls={true}
+                  isAnimationActive={false}
                 />
               )}
             </ComposedChart>

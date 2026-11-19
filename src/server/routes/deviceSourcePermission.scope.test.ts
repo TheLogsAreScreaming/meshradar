@@ -33,7 +33,10 @@ vi.mock('../services/backupFileService.js', () => ({
     saveBackup: vi.fn().mockResolvedValue('saved.yaml'),
     listBackups: vi.fn().mockResolvedValue([]),
     deleteBackup: vi.fn().mockResolvedValue(undefined),
+    findBackup: vi.fn().mockResolvedValue({ row: { filename: 'backup-1.yaml', protocol: 'meshtastic' }, legacy: false }),
+    readRow: vi.fn().mockReturnValue('owner: x\n'),
   },
+  BackupNotFoundError: class BackupNotFoundError extends Error {},
 }));
 
 import configRoutes from './configRoutes.js';
@@ -44,6 +47,9 @@ import databaseService from '../../services/database.js';
 import { deviceBackupService } from '../services/deviceBackupService.js';
 import { deviceRestoreService } from '../services/deviceRestoreService.js';
 import { createRouteTestApp, type RouteTestHarness } from '../test-helpers/routeTestApp.js';
+// Registers the real `fallbackManager` that resolveSourceManager() returns
+// when no primary source is registered (the server loads it at startup).
+import '../meshtasticManager.js';
 import { sourceManagerRegistry, type ISourceManager } from '../sourceManagerRegistry.js';
 import { getPermissionGate } from '../auth/authMiddleware.js';
 import { getDeviceSourceGate } from '../utils/deviceSourcePermission.js';
@@ -106,7 +112,7 @@ function fakeManager(sourceId: string, sourceType = 'meshtastic_tcp'): FakeManag
 interface RouteCase {
   /** Router this route is registered on, and the path it is mounted under. */
   router: 'config' | 'device' | 'channels' | 'backup';
-  method: 'get' | 'post';
+  method: 'get' | 'post' | 'delete';
   /** Path as registered on the router (the guard matches on it). */
   route: string;
   /** Path to request, when the registered one has a parameter. */
@@ -121,6 +127,8 @@ interface RouteCase {
   device?: (typeof DEVICE_METHODS)[number];
   /** Routes that 400 without an explicit sourceId (requireSourceId). */
   explicitOnly?: boolean;
+  /** Gate built with a non-default `accept` mode. */
+  accept?: 'config-capable' | 'stored';
   /** Extra proof the handler ran against `sourceId`. */
   reached?: (sourceId: string, manager: FakeManager) => void;
 }
@@ -149,7 +157,7 @@ const CASES: RouteCase[] = [
   { router: 'config', method: 'post', route: '/request', action: 'write', from: 'body', payload: { configType: 1 }, allowed: 200, device: 'requestConfig' },
   { router: 'device', method: 'get', route: '/device-config', action: 'read', from: 'query', allowed: 200, device: 'getDeviceConfig' },
   {
-    router: 'device', method: 'get', route: '/device/backup', action: 'read', from: 'query', allowed: 200,
+    router: 'device', method: 'get', route: '/device/backup', action: 'write', from: 'query', allowed: 200, accept: 'config-capable',
     reached: (_sourceId, manager) => expect(deviceBackupService.generateBackup).toHaveBeenCalledWith(manager),
   },
   { router: 'device', method: 'post', route: '/device/reboot', action: 'write', from: 'body', payload: { seconds: 5 }, allowed: 200, device: 'rebootDevice' },
@@ -159,12 +167,24 @@ const CASES: RouteCase[] = [
   },
   // These two stop at their own validation (a 400 the gate did not send), so
   // the allowed path proves the gate passed without starting a device write.
-  { router: 'channels', method: 'post', route: '/encode-url', action: 'read', from: 'body', payload: { channelIds: 'not-an-array' }, allowed: 400, explicitOnly: true },
-  { router: 'channels', method: 'post', route: '/import-config', action: 'write', from: 'body', payload: {}, allowed: 400, explicitOnly: true },
+  // encode-url embeds full AES PSKs in the returned URL, so it is gated on
+  // `configuration:write`, not `:read` (MISC-02 / #6058). With action:'write'
+  // the shared cases below also assert a configuration:read-only caller is 403'd.
+  { router: 'channels', method: 'post', route: '/encode-url', action: 'write', from: 'body', payload: { channelIds: 'not-an-array' }, allowed: 400, explicitOnly: true, accept: 'config-capable' },
+  { router: 'channels', method: 'post', route: '/import-config', action: 'write', from: 'body', payload: {}, allowed: 400, explicitOnly: true, accept: 'config-capable' },
   {
-    router: 'backup', method: 'post', route: '/restore/:filename', path: '/restore/backup-1.yaml', action: 'write', from: 'body', allowed: 200,
+    router: 'backup', method: 'post', route: '/restore/:filename', path: '/restore/backup-1.yaml', action: 'write', from: 'body', allowed: 200, accept: 'config-capable',
     reached: (_sourceId, manager) => expect(deviceRestoreService.restoreBackup).toHaveBeenCalledWith(manager, expect.any(String)),
   },
+  // The stored-file routes act on one source's files and need no live device
+  // (`accept: 'stored'`). The handlers hit the mocked backupFileService.
+  { router: 'backup', method: 'get', route: '/settings', action: 'read', from: 'query', allowed: 200, accept: 'stored' },
+  { router: 'backup', method: 'post', route: '/settings', action: 'write', from: 'body', payload: { enabled: false, maxBackups: 7, backupTime: '02:00' }, allowed: 200, accept: 'stored' },
+  { router: 'backup', method: 'get', route: '/list', action: 'read', from: 'query', allowed: 200, accept: 'stored' },
+  { router: 'backup', method: 'get', route: '/summary/:filename', path: '/summary/backup-1.yaml', action: 'read', from: 'query', allowed: 200, accept: 'stored' },
+  // Download hands out PSKs and PINs, so it needs configuration:write (#6285).
+  { router: 'backup', method: 'get', route: '/download/:filename', path: '/download/backup-1.yaml', action: 'write', from: 'query', allowed: 200, accept: 'stored' },
+  { router: 'backup', method: 'delete', route: '/delete/:filename', path: '/delete/backup-1.yaml', action: 'write', from: 'query', allowed: 200, accept: 'stored' },
 ];
 
 const label = (c: RouteCase): string => `${c.method.toUpperCase()} ${MOUNT[c.router]}${c.route}`;
@@ -206,6 +226,9 @@ describe('device-config routes: permission is checked on the target source', () 
     const url = `${MOUNT[c.router]}${c.path ?? c.route}`;
     if (c.method === 'get') {
       return agent.get(url).query(sourceId ? { sourceId } : {});
+    }
+    if (c.method === 'delete') {
+      return agent.delete(url).query(sourceId ? { sourceId } : {});
     }
     const body = { ...(c.payload ?? {}), ...(sourceId ? { sourceId } : {}) };
     return agent.post(url).send(body);
@@ -402,6 +425,48 @@ describe('device-config routes: permission is checked on the target source', () 
       expectUntouched();
     });
 
+    describe('accept: stored (no manager bound)', () => {
+      const listCase = CASES.find((c) => c.route === '/list')!;
+      const MC_SOURCE = 'rt-source-meshcore-stored';
+      afterEach(async () => {
+        await databaseService.sources.deleteSource(MC_SOURCE).catch(() => {});
+        await databaseService.sources.deleteSource(MQTT_SOURCE).catch(() => {});
+      });
+
+      it('lets a permitted caller reach a Meshtastic source whose device is offline', async () => {
+        await sourceManagerRegistry.removeManager(harness.sourceB);
+        await harness.grant(harness.limited.id, 'configuration', 'read', harness.sourceB);
+        const agent = await harness.loginAs(harness.limited);
+        const res = await send(agent, listCase, harness.sourceB);
+        expect(res.status).toBe(200);
+      });
+
+      it('lets a permitted caller reach a MeshCore source with no registered manager', async () => {
+        await databaseService.sources.createSource({ id: MC_SOURCE, name: 'mc', type: 'meshcore', config: {}, enabled: true });
+        await harness.grant(harness.limited.id, 'configuration', 'read', MC_SOURCE);
+        const agent = await harness.loginAs(harness.limited);
+        const res = await send(agent, listCase, MC_SOURCE);
+        expect(res.status).toBe(200);
+      });
+
+      it('400s SOURCE_NOT_BACKUP_CAPABLE for an MQTT source, but only after the permission check', async () => {
+        await databaseService.sources.createSource({ id: MQTT_SOURCE, name: 'mqtt', type: 'mqtt_broker', config: {}, enabled: true });
+        const agent = await harness.loginAs(harness.limited);
+        expect((await send(agent, listCase, MQTT_SOURCE)).status).toBe(403);
+        await harness.grant(harness.limited.id, 'configuration', 'read', MQTT_SOURCE);
+        const res = await send(await harness.loginAs(harness.limited), listCase, MQTT_SOURCE);
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('SOURCE_NOT_BACKUP_CAPABLE');
+      });
+
+      it('404s for a sourceId that names no source row (admin)', async () => {
+        const agent = await harness.loginAs(harness.admin);
+        const res = await send(agent, listCase, 'no-such-source');
+        expect(res.status).toBe(404);
+        expect(res.body.code).toBe('SOURCE_NOT_FOUND');
+      });
+    });
+
     it('with no Meshtastic source registered, a request with no sourceId 403s for a non-admin', async () => {
       await sourceManagerRegistry.removeManager(harness.sourceA);
       await sourceManagerRegistry.removeManager(harness.sourceB);
@@ -490,7 +555,9 @@ describe('guard: device-config routes are registered with a source-scoped gate',
       const route = registeredRoutes(routers[c.router]).find((r) => key(r.method, r.path) === key(c.method, c.route));
       expect(route, label(c)).toBeDefined();
       const gate = route!.handlers.map((h) => getDeviceSourceGate(h)).find((g) => g !== undefined);
-      expect(gate, label(c)).toEqual({ resource: 'configuration', action: c.action, from: c.from });
+      expect(gate, label(c)).toEqual({
+        resource: 'configuration', action: c.action, from: c.from, ...(c.accept ? { accept: c.accept } : {}),
+      });
     }
   });
 
@@ -504,14 +571,9 @@ describe('guard: device-config routes are registered with a source-scoped gate',
 
     // decode-url parses a URL the caller supplies. It touches no source.
     expect(unscoped(channelRoutes)).toEqual(['POST /decode-url']);
-    // The saved-backup store on disk and its schedule are not per-source.
-    expect(unscoped(backupRouter)).toEqual([
-      'DELETE /delete/:filename',
-      'GET /download/:filename',
-      'GET /list',
-      'GET /settings',
-      'POST /settings',
-    ]);
+    // Every backup route is source-scoped: files since #6073, the schedule
+    // settings since #6285.
+    expect(unscoped(backupRouter)).toEqual([]);
   });
 
   it('requirePermission records whether its check is tied to a source', async () => {

@@ -1,4 +1,5 @@
-import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
 import { ROLE_OPTIONS, TIMEZONE_PRESETS, REBROADCAST_MODE_OPTIONS, BUZZER_MODE_OPTIONS } from './constants';
@@ -6,8 +7,11 @@ import { useSaveBar } from '../../hooks/useSaveBar';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
+import { ConfigSection } from '../shared/config/ConfigSection';
 
 interface DeviceConfigSectionProps {
+  /** False disables every control: no configuration:write on this source (#5830). */
+  canWrite?: boolean;
   role: number;
   nodeInfoBroadcastSecs: number;
   tzdef: string;
@@ -29,10 +33,15 @@ interface DeviceConfigSectionProps {
   setButtonGpio: (value: number) => void;
   setBuzzerGpio: (value: number) => void;
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /** Resolves true when the node accepted the save. */
+  onSave: () => Promise<boolean>;
+  /** Bumped when the page reloads config from the node (#5797). */
+  configVersion?: number;
 }
 
 const DeviceConfigSection: React.FC<DeviceConfigSectionProps> = ({
+  canWrite = true,
+  configVersion,
   role,
   nodeInfoBroadcastSecs,
   tzdef,
@@ -62,58 +71,36 @@ const DeviceConfigSection: React.FC<DeviceConfigSectionProps> = ({
   const [timezoneFilter, setTimezoneFilter] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // What the node holds; moves on a successful save or a reload (#5797).
+  // It used to follow the page-wide isSaving flag, so saving any other
+  // section (or a failed save here) made unsaved Device edits the baseline.
+  const values = {
     role, nodeInfoBroadcastSecs, tzdef, rebroadcastMode,
     doubleTapAsButtonPress, disableTripleClick, ledHeartbeatDisabled,
     buzzerMode, buttonGpio, buzzerGpio
-  });
+  };
+  const { baseline, hasChanges, commit } = useSectionBaseline(values, { reseedKey: configVersion });
 
-  // Update initial values after successful save
-  useEffect(() => {
-    if (!isSaving) {
-      initialValuesRef.current = {
-        role, nodeInfoBroadcastSecs, tzdef, rebroadcastMode,
-        doubleTapAsButtonPress, disableTripleClick, ledHeartbeatDisabled,
-        buzzerMode, buttonGpio, buzzerGpio
-      };
-    }
-  }, [isSaving]);
-
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      role !== initial.role ||
-      nodeInfoBroadcastSecs !== initial.nodeInfoBroadcastSecs ||
-      tzdef !== initial.tzdef ||
-      rebroadcastMode !== initial.rebroadcastMode ||
-      doubleTapAsButtonPress !== initial.doubleTapAsButtonPress ||
-      disableTripleClick !== initial.disableTripleClick ||
-      ledHeartbeatDisabled !== initial.ledHeartbeatDisabled ||
-      buzzerMode !== initial.buzzerMode ||
-      buttonGpio !== initial.buttonGpio ||
-      buzzerGpio !== initial.buzzerGpio
-    );
-  }, [role, nodeInfoBroadcastSecs, tzdef, rebroadcastMode, doubleTapAsButtonPress,
-      disableTripleClick, ledHeartbeatDisabled, buzzerMode, buttonGpio, buzzerGpio]);
-
-  // Reset to initial values (for SaveBar dismiss)
+  // Reset to saved values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setRole(initial.role);
-    setNodeInfoBroadcastSecs(initial.nodeInfoBroadcastSecs);
-    setTzdef(initial.tzdef);
-    setRebroadcastMode(initial.rebroadcastMode);
-    setDoubleTapAsButtonPress(initial.doubleTapAsButtonPress);
-    setDisableTripleClick(initial.disableTripleClick);
-    setLedHeartbeatDisabled(initial.ledHeartbeatDisabled);
-    setBuzzerMode(initial.buzzerMode);
-    setButtonGpio(initial.buttonGpio);
-    setBuzzerGpio(initial.buzzerGpio);
-  }, [setRole, setNodeInfoBroadcastSecs, setTzdef, setRebroadcastMode,
+    setRole(baseline.role);
+    setNodeInfoBroadcastSecs(baseline.nodeInfoBroadcastSecs);
+    setTzdef(baseline.tzdef);
+    setRebroadcastMode(baseline.rebroadcastMode);
+    setDoubleTapAsButtonPress(baseline.doubleTapAsButtonPress);
+    setDisableTripleClick(baseline.disableTripleClick);
+    setLedHeartbeatDisabled(baseline.ledHeartbeatDisabled);
+    setBuzzerMode(baseline.buzzerMode);
+    setButtonGpio(baseline.buttonGpio);
+    setBuzzerGpio(baseline.buzzerGpio);
+  }, [baseline, setRole, setNodeInfoBroadcastSecs, setTzdef, setRebroadcastMode,
       setDoubleTapAsButtonPress, setDisableTripleClick, setLedHeartbeatDisabled,
       setBuzzerMode, setButtonGpio, setBuzzerGpio]);
+
+  // Move the baseline only when the node took the save
+  const handleSave = async () => {
+    if (await onSave()) commit(values);
+  };
 
   // Register with SaveBar
   const numberScope = useNumberInputScope();
@@ -122,7 +109,7 @@ const DeviceConfigSection: React.FC<DeviceConfigSectionProps> = ({
     sectionName: t('device_config.title'),
     hasChanges,
     isSaving,
-    onSave: onSave,
+    onSave: handleSave,
     onDismiss: resetChanges,
     numberScope
   });
@@ -179,23 +166,7 @@ const DeviceConfigSection: React.FC<DeviceConfigSectionProps> = ({
 
   return (
     <NumberInputScope scope={numberScope}>
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('device_config.title')}
-        <a
-          href="https://meshmonitor.org/features/device#device-configuration"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('device_config.view_docs')}
-        >
-          <UiIcon name="help" />
-        </a>
-      </h3>
+    <ConfigSection canWrite={canWrite} title={t('device_config.title')} docsUrl="https://meshmonitor.org/features/device#device-configuration">
       <div className="setting-item">
         <label htmlFor="role">
           {t('device_config.device_role')}
@@ -674,7 +645,7 @@ const DeviceConfigSection: React.FC<DeviceConfigSectionProps> = ({
           </div>
         </div>
       )}
-    </div>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

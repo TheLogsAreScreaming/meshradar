@@ -17,16 +17,23 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useCsrfFetch } from '../../hooks/useCsrfFetch';
+import { parseJsonResponse } from '../../utils/parseJsonResponse';
+import { readRequiredRepeaters, type RequiredRepeaterMode } from '../../utils/meshcoreHeardBy';
 import { MeshCoreMessage, MeshCoreActions, ConnectionStatus } from './hooks/useMeshCore';
 import { MeshCoreContact, formatMeshCoreChannelName } from '../../utils/meshcoreHelpers';
+import { MeshCoreChannelMarker } from './MeshCoreChannelMarker';
 import { MeshCoreMessageStream } from './MeshCoreMessageStream';
 import { useAuth } from '../../contexts/AuthContext';
-import { useOptionalChannelMuteSettings } from '../../contexts/SettingsContext';
-import { loadChannelLastRead, markChannelRead as persistChannelRead } from './meshcoreUnreadStore';
+import { useContactTokenImport } from './hooks/useContactTokenImport';
+import { useOptionalChannelMuteSettings, useSettingsOptional } from '../../contexts/SettingsContext';
+import { loadChannelLastRead, markChannelRead as persistChannelRead, markManyRead } from './meshcoreUnreadStore';
 import { slotMoveMap, subscribeChannelsReordered } from './meshcoreChannelReorderEvents';
 import { subscribeFiltersChanged } from './meshcoreFilterEvents';
 import { compareMeshCoreMessages } from './messageOrder';
+import { mergeMeshCoreHeardBy } from '../../utils/meshcoreHeardBy';
 import { UiIcon } from '../icons';
+import { MuteMenu, MutedIndicator } from '../notifications/MuteMenu';
+import { MarkAllReadButton } from '../messages/MarkAllReadButton';
 import { MeshCoreChannelReorderList } from './MeshCoreChannelReorderList';
 import {
   type ChannelSortMode,
@@ -38,13 +45,14 @@ import {
 } from './meshcoreChannelOrder';
 import { formatRelativeTime } from '../../utils/datetime';
 import styles from './MeshCoreChannelsView.module.css';
-
-const MOBILE_BREAKPOINT = 768;
-const isMobileViewport = (): boolean =>
-  typeof window !== 'undefined' && window.innerWidth <= MOBILE_BREAKPOINT;
+import { meshcoreChannelMaxBytes } from '../../utils/meshcoreMessageLimits';
+import { meshcoreReceiptTimeMs } from '../../utils/meshcoreMessageTime';
+import { isMobileLayoutViewport } from '../../utils/sidebarWidth';
 
 interface MeshCoreChannelsViewProps {
   messages: MeshCoreMessage[];
+  /** Reaction id → target id for late-resolved reactions (#5759). */
+  reactionResolutions?: Record<string, string>;
   contacts: MeshCoreContact[];
   status: ConnectionStatus | null;
   actions: MeshCoreActions;
@@ -56,6 +64,8 @@ interface MeshCoreChannelsViewProps {
    *  disabled + tooltip, and the region-discovery mount effect's silent
    *  skip). */
   receiveOnly?: boolean;
+  /** Open on this channel (notification click-through, #6253). */
+  initialChannelIdx?: number | null;
 }
 
 interface ChannelRow {
@@ -63,9 +73,16 @@ interface ChannelRow {
   name: string;
   /** Persisted per-channel region/scope (#3667). null/'' = no channel scope. */
   scope: string | null;
+  /** Channel secret (base64) when the list carries it; feeds the public /
+   *  private marker (#4173 review L18). */
+  psk?: string | null;
   /** A keyed channel (#5551): decrypted with another source's key, so this
    *  source has no slot to send on. View only. */
   readOnly?: boolean;
+  /** A MeshCore virtual channel (#5552/#6159): decrypted with a key held only
+   *  in the Channel Database, not on the radio. Shown with a `(Virtual)` marker
+   *  and no send bar — the key is not on the device, so it is receive-only. */
+  virtual?: boolean;
 }
 
 /** Synthesised pseudo-pubkey used to scope channel messages. Must match the
@@ -113,6 +130,7 @@ const SORT_UNREAD_FIRST_KEY = 'meshmonitor-meshcore-channel-sort-unread-first';
 
 export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   messages,
+  reactionResolutions,
   contacts,
   status,
   actions,
@@ -120,21 +138,35 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   sourceId,
   onNodeNameClick,
   receiveOnly = false,
+  initialChannelIdx = null,
 }) => {
   const { t } = useTranslation();
   const csrfFetch = useCsrfFetch();
   const { hasPermission, authStatus } = useAuth();
   const canSend = hasPermission('messages', 'write');
+  // Contact-share tokens (#6370): import from messages; share in the composer.
+  const contactTokenImport = useContactTokenImport(status, actions.importContactToken);
+  const contactShare = useMemo(() => ({ selfNode: status?.localNode ?? null }), [status?.localNode]);
+
   // Channel mute (#5487): a per-user preference on this source's notification
-  // row, keyed by MeshCore channel index. Indicator-only for MeshCore — it
-  // hides the unread dot/badge; MeshCore channel traffic sends no push today.
+  // row, keyed by MeshCore channel index. For MeshCore it hides the
+  // unread dot/badge and also suppresses push for that channel (P11).
   const muteSettings = useOptionalChannelMuteSettings();
+  const tapbackEmojis = useSettingsOptional()?.tapbackEmojis;
   const isChannelMutedFn = muteSettings?.isChannelMuted;
   const canMute = !!muteSettings && authStatus?.authenticated === true;
-  const [showMuteMenu, setShowMuteMenu] = useState(false);
+    // #6178 → #6193: per-source Required Repeaters list + ANY/ALL mode. Gates the
+  // resend ↻ button so it stays until the gate is satisfied.
+  const [requiredRepeaterKeys, setRequiredRepeaterKeys] = useState<string[]>([]);
+  const [requiredRepeaterMode, setRequiredRepeaterMode] = useState<RequiredRepeaterMode>('any');
 
   const [channels, setChannels] = useState<ChannelRow[]>([]);
-  const [selectedIdx, setSelectedIdx] = useState<number>(0);
+  // No channel is selected when the view opens (#6049) — the operator must pick
+  // one. `null` means "nothing selected"; the main pane shows the landing area.
+  const [selectedIdx, setSelectedIdx] = useState<number | null>(initialChannelIdx ?? null);
+  useEffect(() => {
+    if (typeof initialChannelIdx === 'number') setSelectedIdx(initialChannelIdx);
+  }, [initialChannelIdx]);
   const [loadingChannels, setLoadingChannels] = useState(false);
   // Bumped when the device's channel slots are reordered (#5379) so the
   // slot-keyed list and counts reload.
@@ -148,6 +180,12 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // of the global recent-tail). Live updates still arrive via `messages` and
   // are merged in below.
   const [history, setHistory] = useState<MeshCoreMessage[]>([]);
+  // Which `${sourceId}:${channelIdx}` the fetched `history` belongs to. The
+  // fetch is async, so for a while after a channel switch `history` still holds
+  // the PREVIOUS channel's rows. Until this matches the active channel the
+  // backlog is treated as loading: its rows are not drawn, the stream's
+  // one-shot entry scroll waits, and the channel is not marked read.
+  const [historyFor, setHistoryFor] = useState<string | null>(null);
   // Infinite-scroll pagination for the active channel's history (#4460): does
   // an older page exist beyond `history`, and is one currently being fetched.
   // Reset alongside `history` on every channel switch/reconnect.
@@ -212,7 +250,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
 
   useEffect(() => {
     const onResize = () => {
-      if (!isMobileViewport()) setMobileShowContent(false);
+      if (!isMobileLayoutViewport()) setMobileShowContent(false);
     };
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
@@ -231,6 +269,30 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     localStorage.setItem(SORT_UNREAD_FIRST_KEY, String(sortUnreadFirst));
   }, [sortUnreadFirst]);
 
+  // #6178 → #6193: read this source's Required Repeaters list + mode. The shared
+  // reader prefers the new list keys but falls back to the legacy single key, so
+  // existing #6178 setups keep working with no migration. Re-read on source
+  // change (per-source); switching to the Settings tab and back remounts this
+  // view, so a change made there is picked up on return.
+  useEffect(() => {
+    if (!sourceId) { setRequiredRepeaterKeys([]); setRequiredRepeaterMode('any'); return; }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await csrfFetch(`${baseUrl}/api/settings?sourceId=${encodeURIComponent(sourceId)}`);
+        if (!res.ok) return;
+        const settings = await parseJsonResponse(res);
+        if (cancelled || !settings) return;
+        const { keys, mode } = readRequiredRepeaters(settings);
+        setRequiredRepeaterKeys(keys);
+        setRequiredRepeaterMode(mode);
+      } catch {
+        // Keep the default (none); the resend button behaves as before.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [baseUrl, sourceId, csrfFetch]);
+
   // Mark a channel read up to `ts`, persisting to localStorage. Never moves the
   // marker backwards. `ts` defaults to now so opening an empty/quiet channel
   // still clears any stale unread state.
@@ -246,8 +308,16 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   }, [sourceId]);
 
   const handleSelectChannel = useCallback((idx: number) => {
-    setSelectedIdx(idx);
-    if (isMobileViewport()) setMobileShowContent(true);
+    if (isMobileLayoutViewport()) {
+      // Mobile: the list IS the landing view and Back leaves `selectedIdx` set,
+      // so a tap on the same row must REOPEN the channel, never de-select it.
+      setSelectedIdx(idx);
+      setMobileShowContent(true);
+      return;
+    }
+    // Desktop (#6049): clicking the already-selected channel de-selects it and
+    // returns to the landing pane.
+    setSelectedIdx(prev => (prev === idx ? null : idx));
   }, []);
 
   // Reply to a channel message (#3851): the stream prefills the `@[Sender]:`
@@ -274,7 +344,9 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     return subscribeChannelsReordered((detail) => {
       if (detail.sourceId !== sourceId) return;
       const map = slotMoveMap(detail.moves);
-      setSelectedIdx(prev => map.get(prev) ?? prev);
+      // Keep "nothing selected" as nothing selected (#6049); otherwise follow
+      // the open channel to its new slot.
+      setSelectedIdx(prev => (prev === null ? null : map.get(prev) ?? prev));
       // useMeshCore already rewrote the saved Custom order (#5392); pick it
       // up, and drop any display-order draft built on the old slots.
       setCustomOrder(loadChannelCustomOrder(sourceId));
@@ -311,7 +383,9 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
                 id: c.id as number,
                 name: String(c.name ?? ''),
                 scope: typeof c?.scope === 'string' && c.scope ? c.scope : null,
+                psk: typeof c?.psk === 'string' ? c.psk : null,
                 readOnly: c?.readOnly === true,
+                virtual: c?.virtual === true,
               }))
               .sort((a, b) => a.id - b.id)
           : [];
@@ -339,11 +413,14 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     return [{ id: 0, name: t('meshcore.channels.public_fallback', 'Public'), scope: null }];
   }, [channels, t]);
 
-  // Keep `selectedIdx` valid if channels change underneath us.
+  // Keep `selectedIdx` valid if channels change underneath us. Never FORCE a
+  // selection (#6049): if the selected slot disappears, fall back to `null`
+  // (the landing pane), not to the first channel.
   useEffect(() => {
+    if (selectedIdx === null) return;
     if (displayChannels.length === 0) return;
     if (!displayChannels.some(c => c.id === selectedIdx)) {
-      setSelectedIdx(displayChannels[0].id);
+      setSelectedIdx(null);
     }
   }, [displayChannels, selectedIdx]);
 
@@ -385,13 +462,20 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     return () => { cancelled = true; };
   }, [baseUrl, sourceId, channelIdsKey, csrfFetch, status?.connected, reorderTick, filtersTick]);
 
-  const active = displayChannels.find(c => c.id === selectedIdx) ?? displayChannels[0];
-  const activeFilter = useMemo(() => buildChannelFilter(active.id), [active.id]);
+  // `null` when nothing is selected (#6049) — the main pane then shows the
+  // landing area and the fetch / mark-read / mute / send paths below all guard
+  // for it.
+  const active: ChannelRow | null =
+    selectedIdx === null ? null : displayChannels.find(c => c.id === selectedIdx) ?? null;
+  const activeFilter = useMemo(
+    () => (active ? buildChannelFilter(active.id) : () => false),
+    [active],
+  );
 
   // The scope a *normal* send on the active channel would assert: the channel's
   // own scope, else the source default, else unscoped. Used as the override
   // field's default/placeholder so the operator overrides from a known baseline.
-  const resolvedScope = (active.scope && active.scope.trim()) || defaultScope.trim() || '';
+  const resolvedScope = (active?.scope && active.scope.trim()) || defaultScope.trim() || '';
 
   // Load the source default scope when (re)connected so the override control can
   // show the baseline. This is a cheap local DB read (no radio traffic), so it's
@@ -483,13 +567,14 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   useEffect(() => {
     setOverrideScope(null);
     setShowScopeOverride(false);
-  }, [active.id]);
+  }, [active?.id]);
 
   // Fetch the active channel's backlog from the per-channel endpoint. Re-runs on
   // channel switch and on (re)connect. The shared `messages` pool only carries a
   // global recent-tail, so this is what makes each channel's full history show.
   useEffect(() => {
-    if (!sourceId) return;
+    // Nothing selected (#6049): do NOT fetch a backlog while on the landing pane.
+    if (!sourceId || !active) return;
     let cancelled = false;
     const idx = active.id;
     activeChannelIdxRef.current = idx;
@@ -509,18 +594,20 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
         const data = await response.json();
         if (!cancelled) {
           setHistory(data?.success && Array.isArray(data.data) ? (data.data as MeshCoreMessage[]) : []);
+          setHistoryFor(`${sourceId}:${idx}`);
           setHasMoreHistory(Boolean(data?.hasMore));
         }
       } catch (err) {
         if (!cancelled) {
           console.error('Failed to fetch MeshCore channel messages:', err);
           setHistory([]);
+          setHistoryFor(`${sourceId}:${idx}`);
           setHasMoreHistory(false);
         }
       }
     })();
     return () => { cancelled = true; };
-  }, [baseUrl, sourceId, active.id, csrfFetch, status?.connected, filtersTick]);
+  }, [baseUrl, sourceId, active, csrfFetch, status?.connected, filtersTick]);
 
   // Load an older page of the active channel's history (#4460 infinite scroll).
   // Offset is the current backlog length (oldest-first fetch order means the
@@ -528,7 +615,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // Idempotent against overlapping calls: bails if a load is already in
   // flight or the channel has no older page.
   const loadOlderHistory = useCallback(() => {
-    if (!sourceId || loadingOlderHistory || !hasMoreHistory) return;
+    if (!sourceId || !active || loadingOlderHistory || !hasMoreHistory) return;
     const idx = active.id;
     const offset = historyRef.current.length;
     setLoadingOlderHistory(true);
@@ -559,24 +646,34 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
         if (activeChannelIdxRef.current === idx) setLoadingOlderHistory(false);
       }
     })();
-  }, [sourceId, baseUrl, csrfFetch, active.id, hasMoreHistory, loadingOlderHistory]);
+  }, [sourceId, baseUrl, csrfFetch, active, hasMoreHistory, loadingOlderHistory]);
 
   // Merge the fetched backlog with any live messages for this channel (socket
   // pushes land in `messages`). Dedupe by id, letting the live copy win so
   // delivery-status updates (sent → delivered/failed) are reflected, then sort
   // oldest-first for the stream.
+  //
+  // While the active channel's backlog is still loading, `history` is the
+  // previous channel's: leave it out, or the stream draws (and entry-scrolls
+  // to) another channel's rows and unread divider.
+  const historyReady = !sourceId || !active || historyFor === `${sourceId}:${active.id}`;
   const filtered = useMemo(() => {
     const byId = new Map<string, MeshCoreMessage>();
-    for (const m of history) byId.set(m.id, m);
+    if (historyReady) {
+      for (const m of history) byId.set(m.id, m);
+    }
     for (const m of messages) {
-      if (activeFilter(m)) byId.set(m.id, m);
+      if (activeFilter(m)) {
+        const heardBy = mergeMeshCoreHeardBy(byId.get(m.id)?.heardBy, m.heardBy);
+        byId.set(m.id, heardBy?.length ? { ...m, heardBy } : m);
+      }
     }
     // NOT a raw `timestamp` sort: received messages carry the remote's
     // whole-second `sender_timestamp` while our own sends are ms-precision
     // Date.now(), so a same-second auto-reply sorted BEFORE its own trigger.
     // See ./messageOrder.ts.
     return Array.from(byId.values()).sort(compareMeshCoreMessages);
-  }, [history, messages, activeFilter]);
+  }, [history, historyReady, messages, activeFilter]);
 
   // Unread-divider anchor (#4607): the last-read marker frozen at the moment
   // this channel was opened. The effect below marks the channel read within a
@@ -589,10 +686,15 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // its backlog arrives.
   const [entryLastRead, setEntryLastRead] = useState<number | null>(null);
   useEffect(() => {
+    // Nothing selected (#6049): no divider to pin.
+    if (!active) {
+      setEntryLastRead(null);
+      return;
+    }
     // Read through the ref, not `lastRead`: depending on the state value would
     // re-pin on every mark-read and erase the line while you are reading it.
     setEntryLastRead(lastReadRef.current[active.id] ?? 0);
-  }, [active.id, sourceId]);
+  }, [active, sourceId]);
 
   // Mark the active channel read up to its newest visible message. Runs whenever
   // the active channel's content changes (channel switch, backlog load, or a
@@ -600,11 +702,16 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // unread. Falls back to "now" for an empty channel so opening it still clears
   // any stale marker. On mobile the channel isn't actually being viewed until
   // the operator drills in, so defer marking until the content pane is shown.
-  const newestVisibleTs = filtered.length > 0 ? filtered[filtered.length - 1].timestamp : 0;
+  const newestVisibleTs = filtered.length > 0 ? meshcoreReceiptTimeMs(filtered[filtered.length - 1]) : 0;
   useEffect(() => {
-    if (isMobileViewport() && !mobileShowContent) return;
+    // Nothing selected (#6049): never mark a channel read from the landing pane.
+    if (!active) return;
+    if (isMobileLayoutViewport() && !mobileShowContent) return;
+    // Wait for this channel's backlog: until then `filtered` holds only the
+    // live tail, so "newest visible" would be a guess.
+    if (!historyReady) return;
     markChannelRead(active.id, newestVisibleTs || Date.now());
-  }, [active.id, newestVisibleTs, mobileShowContent, markChannelRead]);
+  }, [active, newestVisibleTs, mobileShowContent, markChannelRead, historyReady]);
 
   // Effective latest timestamp per channel: the persisted max from the
   // counts/latest endpoint, bumped by any newer live message in the shared pool
@@ -614,9 +721,10 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     for (const c of displayChannels) {
       const liveMatch = messages.filter(buildChannelFilter(c.id));
       for (const m of liveMatch) {
-        // Ignored messages never count as unread (#5408).
-        if (m.filtered) continue;
-        if (m.timestamp > (map[c.id] ?? 0)) map[c.id] = m.timestamp;
+        // Ignored messages never count as unread (#5408), nor do reactions (#5759).
+        if (m.filtered || m.reactionEmoji) continue;
+        const ts = meshcoreReceiptTimeMs(m);
+        if (ts > (map[c.id] ?? 0)) map[c.id] = ts;
       }
     }
     return map;
@@ -633,11 +741,29 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
    *  the header total and the "unread first" sort. */
   const isChannelUnread = useCallback((idx: number): boolean => {
     if (isChannelMuted(idx)) return false;
-    if (idx === active.id && (!isMobileViewport() || mobileShowContent)) return false;
+    // No selection (#6049) = no active channel, so every channel can be unread.
+    if (active && idx === active.id && (!isMobileLayoutViewport() || mobileShowContent)) return false;
     const latest = effectiveLatest[idx];
     if (!latest) return false;
     return latest > (lastRead[idx] ?? 0);
-  }, [isChannelMuted, active.id, mobileShowContent, effectiveLatest, lastRead]);
+  }, [isChannelMuted, active, mobileShowContent, effectiveLatest, lastRead]);
+
+  // Mark-all-read (#6261): every channel whose newest message is past its
+  // marker, muted ones included (muting hides the dot, not the backlog).
+  const unreadChannelEntries = useMemo(() => {
+    const out: Array<{ kind: 'meshcore_channel'; key: string; ts: number }> = [];
+    for (const [idxStr, latest] of Object.entries(effectiveLatest)) {
+      const idx = Number(idxStr);
+      if (latest && latest > (lastRead[idx] ?? 0)) out.push({ kind: 'meshcore_channel', key: String(idx), ts: latest });
+    }
+    return out;
+  }, [effectiveLatest, lastRead]);
+
+  const handleMarkAllChannelsRead = useCallback(() => {
+    if (!sourceId) return;
+    markManyRead(sourceId, unreadChannelEntries);
+    setLastRead(loadChannelLastRead(sourceId));
+  }, [sourceId, unreadChannelEntries]);
 
   const channelLabel = useCallback(
     (c: { id: number; name: string }) => formatMeshCoreChannelName(
@@ -651,14 +777,17 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // count from the counts endpoint, and for the active channel the merged
   // stream length when larger, so a just-arrived live message counts before
   // the next refetch. The Message count sort (#5503) uses the same numbers.
+  const filteredMessageCount = useMemo(() => filtered.filter(m => !m.reactionEmoji).length, [filtered]);
   const channelCounts = useMemo(() => {
     const map: Record<number, number> = {};
     for (const c of displayChannels) {
-      const persisted = counts[c.id] ?? messages.filter(buildChannelFilter(c.id)).length;
-      map[c.id] = c.id === active.id ? Math.max(persisted, filtered.length) : persisted;
+      // Reactions are not messages (#5759); the server count skips them too.
+      const persisted = counts[c.id]
+        ?? messages.filter(buildChannelFilter(c.id)).filter(m => !m.reactionEmoji).length;
+      map[c.id] = active && c.id === active.id ? Math.max(persisted, filteredMessageCount) : persisted;
     }
     return map;
-  }, [displayChannels, counts, messages, active.id, filtered.length]);
+  }, [displayChannels, counts, messages, active, filteredMessageCount]);
 
   // Base order from the sort dropdown (#5385): device slot order, name, last
   // message, message count (#5503), or the saved custom order (#5379).
@@ -703,6 +832,8 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
 
   const selfKey = status?.localNode?.publicKey;
   const connected = status?.connected ?? false;
+  // Outbound reactions (#5762): needs the per-source switch, a live non-receive-only link, and a sendable channel.
+  const canReact = canSend && connected && !receiveOnly && status?.reactionsOutboundEnabled === true && active?.readOnly !== true;
 
   // Per-message delete + whole-channel clear (#3981). Both confirm first.
   //
@@ -736,6 +867,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     return state;
   }, [actions]);
   const handleClearChannel = useCallback(async () => {
+    if (!active) return;
     if (!window.confirm(t(
       'meshcore.confirm_clear_channel',
       'Clear all messages on this channel? This cannot be undone.',
@@ -763,6 +895,14 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
               >
                 {unreadChannelCount}
               </span>
+            )}
+            {unreadChannelEntries.length > 0 && (
+              <MarkAllReadButton
+                onMarkAll={handleMarkAllChannelsRead}
+                label={t('channels.mark_all_read_button', 'Mark all as Read')}
+                title={t('meshcore.channels.mark_all_read_title', 'Mark every channel as read')}
+                unreadCount={unreadChannelEntries.length}
+              />
             )}
             <button
               type="button"
@@ -797,16 +937,16 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
               className={`${styles.reorderButton} ${reordering ? styles.active : ''}`}
               onClick={() => setReorderingFor(prev => (prev === channelIdsKey ? null : channelIdsKey))}
               aria-pressed={reordering}
-              title={t('meshcore.channels.order.reorder_title', 'Set a custom channel order (MeshRadar display only)')}
+              title={t('meshcore.channels.order.reorder_title', 'Sort the channel list in your own order (MeshRadar display only)')}
             >
-              <UiIcon name="dragHandle" size={14} /> {t('meshcore.channels.order.reorder', 'Reorder')}
+              <UiIcon name="dragHandle" size={14} /> {t('meshcore.channels.order.reorder', 'Sort')}
             </button>
           )}
         </div>
         <div className="meshcore-list-pane-body">
           {reordering ? (
             <MeshCoreChannelReorderList
-              channels={baseOrderedChannels.map(c => ({ id: c.id, label: channelLabel(c) }))}
+              channels={baseOrderedChannels.map(c => ({ id: c.id, label: channelLabel(c), marker: <MeshCoreChannelMarker id={c.id} name={c.name} psk={c.psk} /> }))}
               onSave={handleSaveCustomOrder}
               onCancel={() => setReorderingFor(null)}
             />
@@ -827,7 +967,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
             return (
               <button
                 key={c.id}
-                className={`mc-channel-row ${active.id === c.id ? 'selected' : ''} ${unread ? 'unread' : ''}`}
+                className={`mc-channel-row ${active && active.id === c.id ? 'selected' : ''} ${unread ? 'unread' : ''}`}
                 onClick={() => handleSelectChannel(c.id)}
               >
                 {unread && (
@@ -838,16 +978,14 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
                   />
                 )}
                 <div className="mc-channel-row-name">
+                  <MeshCoreChannelMarker id={c.id} name={c.name} psk={c.psk} />
                   {channelLabel(c)}
-                  {isChannelMuted(c.id) && (
-                    <span
-                      className={styles.mutedIcon}
-                      title={t('notifications.muted', 'Notifications muted')}
-                      aria-label={t('notifications.muted', 'Notifications muted')}
-                    >
-                      <UiIcon name="muted" size={13} />
-                    </span>
+                  {c.virtual && (
+                    <sup className={styles.virtualTag} title={t('meshcore.channels.virtual_title', 'Decrypted with a Channel Database key; not set on this radio (receive-only)')}>
+                      {t('meshcore.channels.virtual_tag', '(Virtual)')}
+                    </sup>
                   )}
+                  {isChannelMuted(c.id) && <MutedIndicator />}
                 </div>
                 <div className="mc-channel-row-meta">
                   {count} {t('meshcore.messages', 'messages')}
@@ -864,6 +1002,16 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
         </div>
       </div>
       <div className="meshcore-main-pane">
+        {active === null ? (
+          // Landing pane (#6049): no channel is selected yet, so the main pane
+          // is blank except for a prompt. Kept as a SEPARATE element so richer
+          // content can be dropped in here later.
+          <div className={styles.landingPane}>
+            <span className={styles.landingText}>
+              {t('meshcore.channels.select_prompt', 'Select a channel')}
+            </span>
+          </div>
+        ) : (<>
         {mobileShowContent && (
           <div className="meshcore-mobile-back-header">
             <button
@@ -874,9 +1022,15 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
               <UiIcon name="back" size={16} /> {t('common.back', 'Back')}
             </button>
             <span className="meshcore-mobile-back-title">
+              <MeshCoreChannelMarker id={active.id} name={active.name} psk={active.psk} />
               {formatMeshCoreChannelName(
                 active.name,
                 t('meshcore.channels.unnamed', 'Channel {{idx}}', { idx: active.id }),
+              )}
+              {active.virtual && (
+                <sup className={styles.virtualTag} title={t('meshcore.channels.virtual_title', 'Decrypted with a Channel Database key; not set on this radio (receive-only)')}>
+                  {t('meshcore.channels.virtual_tag', '(Virtual)')}
+                </sup>
               )}
             </span>
           </div>
@@ -884,7 +1038,9 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
         {/* `|| canMute`: a signed-in reader without send rights still gets the row, for the mute bell alone. */}
         {((canSend && (connected || filtered.length > 0)) || canMute) && (
         <div className="meshcore-toolbar-row">
-        {canSend && connected && (
+        {/* No send scope on a virtual channel (#6159): its key is not on the
+            radio, so there is nothing to send and the control would mislead. */}
+        {canSend && connected && !active.virtual && (
           <div className="mc-scope-override">
             {showScopeOverride ? (
               <div className="mc-scope-override-row">
@@ -944,64 +1100,11 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
           </div>
         )}
         {canMute && muteSettings && (
-          <div className={styles.muteWrap}>
-            <button
-              type="button"
-              className={`${styles.muteButton} ${isChannelMuted(active.id) ? styles.active : ''}`}
-              onClick={() => setShowMuteMenu(v => !v)}
-              aria-haspopup="menu"
-              aria-expanded={showMuteMenu}
-              title={isChannelMuted(active.id)
-                ? t('notifications.mute_channel_active', 'Muted — click to change')
-                : t('notifications.mute_channel', 'Mute notifications')}
-              aria-label={isChannelMuted(active.id)
-                ? t('notifications.mute_channel_active', 'Muted — click to change')
-                : t('notifications.mute_channel', 'Mute notifications')}
-            >
-              <UiIcon name={isChannelMuted(active.id) ? 'muted' : 'notifications'} size={15} />
-            </button>
-            {showMuteMenu && (
-              <>
-                <div className={styles.muteBackdrop} onClick={() => setShowMuteMenu(false)} />
-                <div className={styles.muteMenu} role="menu">
-                  {isChannelMuted(active.id) && (
-                    <button
-                      type="button"
-                      role="menuitem"
-                      className={styles.muteMenuItem}
-                      onClick={() => { setShowMuteMenu(false); void muteSettings.unmuteChannel(active.id); }}
-                    >
-                      <UiIcon name="unmute" size={14} /> {t('notifications.unmute', 'Unmute')}
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className={styles.muteMenuItem}
-                    onClick={() => { setShowMuteMenu(false); void muteSettings.muteChannel(active.id, null); }}
-                  >
-                    <UiIcon name="muted" size={14} /> {t('notifications.mute_indefinite', 'Mute indefinitely')}
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className={styles.muteMenuItem}
-                    onClick={() => { setShowMuteMenu(false); void muteSettings.muteChannel(active.id, Date.now() + 60 * 60 * 1000); }}
-                  >
-                    <UiIcon name="time" size={14} /> {t('notifications.mute_1h', 'Mute for 1 hour')}
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className={styles.muteMenuItem}
-                    onClick={() => { setShowMuteMenu(false); void muteSettings.muteChannel(active.id, Date.now() + 7 * 24 * 60 * 60 * 1000); }}
-                  >
-                    <UiIcon name="calendar" size={14} /> {t('notifications.mute_1w', 'Mute for 1 week')}
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
+          <MuteMenu
+            muted={isChannelMuted(active.id)}
+            onMute={(until) => muteSettings.muteChannel(active.id, until)}
+            onUnmute={() => muteSettings.unmuteChannel(active.id)}
+          />
         )}
         {canSend && filtered.length > 0 && (
           <div className="meshcore-conversation-toolbar">
@@ -1019,9 +1122,17 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
         )}
         <MeshCoreMessageStream
           messages={filtered}
+          contactTokenImport={contactTokenImport}
+          contactShare={contactShare}
+          reactionResolutions={reactionResolutions}
           contacts={contacts}
           sourceId={sourceId}
           selfPublicKey={selfKey}
+          requiredRepeaterKeys={requiredRepeaterKeys}
+          requiredRepeaterMode={requiredRepeaterMode}
+          // #6159: a virtual channel's key is not on the radio — hide the send
+          // bar entirely (receive-only), rather than just disabling it.
+          hideComposer={active?.virtual === true}
           disabled={!connected || !canSend || receiveOnly || active?.readOnly === true}
           disabledReason={receiveOnly
             ? t('meshcore.receive_only.control_tooltip', 'Receive-only mode is on for this MeshCore source. Turn it off in MeshCore Settings to use this.')
@@ -1031,6 +1142,8 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
           emptyText={t('meshcore.no_messages', 'No messages on this channel yet')}
           onDeleteMessage={canSend ? handleDeleteMessage : undefined}
           onResendMessage={canSend ? handleResendMessage : undefined}
+          onReact={canReact ? (m, e) => actions.sendReaction(m, e) : undefined}
+          reactionEmojis={tapbackEmojis}
           onSend={async text => {
             // Pass the one-off scope override only when the operator has opened
             // the control AND typed a value (incl. '' to mean unscoped). When
@@ -1045,17 +1158,13 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
           onReply={handleReply}
           conversationKey={`channel-${active.id}`}
           unreadAnchorMs={entryLastRead}
+          backlogLoading={!historyReady}
           onLoadOlder={loadOlderHistory}
-          hasMoreOlder={hasMoreHistory}
+          hasMoreOlder={historyReady && hasMoreHistory}
           loadingOlder={loadingOlderHistory}
-          maxBytes={
-            showScopeOverride && overrideScope !== null && overrideScope !== ''
-              ? 120
-              : resolvedScope
-              ? 120
-              : 130
-          }
+          maxBytes={meshcoreChannelMaxBytes(status?.localNode?.name)}
         />
+        </>)}
       </div>
     </div>
   );

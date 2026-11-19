@@ -19,6 +19,7 @@
  * `send-key-warning` is gated on `messages:write` (it sends a DM).
  */
 import express from 'express';
+import { loadMqttConsentHiddenSet, dropRowsNamingHiddenNodes } from '../utils/mqttConsentVisibility.js';
 import databaseService from '../../services/database.js';
 import { ALL_SOURCES } from '../../db/repositories/index.js';
 import { fallbackManager } from '../meshtasticManager.js';
@@ -34,8 +35,9 @@ import {
   getSourcePairTarget,
   listPermittedSourceIds,
 } from '../utils/sourceScopedAccess.js';
-import { isMeshCoreManager, getPrimaryMeshtasticManager } from '../sourceManagerTypes.js';
+import { isMeshCoreManager, isMeshCoreMqttManager, getPrimaryMeshtasticManager } from '../sourceManagerTypes.js';
 import { loadNodeViewAccess, enhanceNodeForClient, checkNodeChannelAccess, resolveNodePositionScope, attachUptimeToNodes } from '../utils/nodeEnhancer.js';
+import { applyMeshCorePositionOverrides, loadMeshCorePositionOverrides } from '../utils/meshcorePositionOverride.js';
 import { createSignFlipResolver, applySignFlipCorrection, rowSourceId } from '../services/signFlipCorrection.js';
 import { pivotPositionHistory } from '../utils/positionHistoryPivot.js';
 import { requireSourceId } from '../utils/requireSourceId.js';
@@ -47,7 +49,9 @@ import { calculateDistance } from '../../utils/distance.js';
 import {
   DEFAULT_SINGLE_ANCHOR_KM,
   MAX_STORED_ANCHORS_PER_NODE,
+  countUniqueAnchorPositions,
 } from '../services/positionEstimationService.js';
+import { loadPositionEstimateAccess } from '../utils/positionEstimateAccess.js';
 import {
   encodeSharedContactUrl,
   decodeSharedContactUrl,
@@ -110,7 +114,7 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
       const allNodes = await mgr.getAllNodesAsync(nodesSourceId);
       filteredNodes = access.isAdmin
         ? allNodes
-        : allNodes.filter((node) => access.canViewNode(nodesSourceId, (node as { channel?: number }).channel));
+        : allNodes.filter((node) => access.canViewNode(nodesSourceId, (node as { channel?: number }).channel, node.nodeNum));
       canViewPrivate = access.canViewPrivate(nodesSourceId);
       uptimeSources = nodesSourceId;
     } else {
@@ -122,7 +126,7 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
         access.sources === 'all' ? ALL_SOURCES : access.sources,
         (row) => {
           const rowSource = rowSourceId(row);
-          if (!rowSource || !access.canViewNode(rowSource, row.channel)) return null;
+          if (!rowSource || !access.canViewNode(rowSource, row.channel, row.nodeNum)) return null;
           seen.add(rowSource);
           if (row.positionOverrideIsPrivate && !access.canViewPrivate(rowSource)) {
             return {
@@ -159,8 +163,14 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
     // render them alongside Meshtastic nodes. MeshCore stores lastSeen in ms;
     // dashboard age-cutoff expects seconds, so we down-convert here.
     const allMeshcoreManagers = sourceManagerRegistry.getAllManagers().filter(isMeshCoreManager);
+    // #6307: a request scoped to ONE source also lists that source's MQTT ingest
+    // nodes, so the notification monitored-node picker is not empty for a region
+    // feed. The unscoped aggregate stays device-only: region nodes must not flood
+    // the dashboard map. The nodes:read / viewOnMap gates below are unchanged.
     const meshcoreManagers = nodesSourceId
-      ? allMeshcoreManagers.filter(m => m.sourceId === nodesSourceId)
+      ? sourceManagerRegistry.getAllManagers().filter(
+          m => m.sourceId === nodesSourceId && (isMeshCoreManager(m) || isMeshCoreMqttManager(m)),
+        ) as typeof allMeshcoreManagers
       : allMeshcoreManagers;
     // By default MeshCore nodes are only appended when they have a position
     // (the aggregate dashboard map use-case). Consumers that need the full node
@@ -180,7 +190,11 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
       const canViewOnMap = access.permissions.can('nodes', 'viewOnMap', mgr.sourceId);
       if (!canRead && !canViewOnMap) continue;
       const mcSignFlipCtx = await signFlipFor(mgr.sourceId); // #5363
-      for (const n of await mgr.getAllNodes()) {
+      // #5842: an enabled location override wins over the advert position.
+      const mcOverrides = canViewOnMap ? await loadMeshCorePositionOverrides(mgr.sourceId) : new Map();
+      const mcRows = applyMeshCorePositionOverrides(await mgr.getAllNodes(), mcOverrides, access.canViewPrivate(mgr.sourceId));
+      const mcLocalKey = mgr.getLocalNode?.()?.publicKey;
+      for (const n of mcRows) {
         const hasPosition = canViewOnMap
           && n.latitude != null && n.longitude != null && !(n.latitude === 0 && n.longitude === 0);
         // A row with no position to show needs `nodes:read` AND the caller's
@@ -206,14 +220,19 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
                 latitude: n.latitude,
                 longitude: n.longitude,
                 position: { latitude: n.latitude, longitude: n.longitude },
+                ...(n.positionIsOverride ? { positionIsOverride: true } : {}),
               }
             : {}),
           lastHeard,
-          hopsAway: 0,
+          // #6220: the stored hop count, not a blanket 0 — every MeshCore
+          // node read as a direct neighbour. Unknown stays undefined, which
+          // the dashboard map draws as "unknown". The local radio is 0.
+          hopsAway: n.publicKey === mcLocalKey ? 0 : n.pathLen,
           role: 0,
           // #5578: latest-advert position flag for the map's hide toggle.
-          // Position data too, so it follows the same `viewOnMap` gate.
-          lastAdvertHadPosition: canViewOnMap ? n.lastAdvertHadPosition ?? null : null,
+          // Position data too, so it follows the same `viewOnMap` gate. An
+          // override (#5842) is a known location, so it reads as "has one".
+          lastAdvertHadPosition: canViewOnMap && !n.positionIsOverride ? n.lastAdvertHadPosition ?? null : null,
           positionSource: canViewOnMap ? n.positionSource ?? null : null,
         }, mcSignFlipCtx));
       }
@@ -242,7 +261,7 @@ router.get('/nodes/active', optionalAuth(), async (req, res) => {
     const allDbNodes = await databaseService.nodes.getActiveNodes(days, activeScope);
     const dbNodes = access.isAdmin
       ? allDbNodes
-      : allDbNodes.filter((node) => access.canViewNode(rowSourceId(node), node.channel));
+      : allDbNodes.filter((node) => access.canViewNode(rowSourceId(node), node.channel, node.nodeNum));
 
     const assets = await databaseService.getAssetNodesMapAsync();
 
@@ -303,6 +322,13 @@ router.get(
     try {
       const sourceId = req.query.sourceId as string;
       const report = await detectIdentityChanges(sourceId);
+      // #5156: an anonymous caller loses detections naming a consent-hidden node.
+      const hidden = await loadMqttConsentHiddenSet(req.user, [sourceId]);
+      if (hidden.active) {
+        report.detections = report.detections.filter(
+          (d) => !hidden.hides(sourceId, d.successor.nodeNum) && !hidden.hides(sourceId, d.predecessor.nodeNum),
+        );
+      }
       return ok(res, report);
     } catch (error) {
       logger.error('Error detecting node identity changes:', error);
@@ -436,7 +462,13 @@ router.get(
   async (req, res) => {
     try {
       const sourceId = req.query.sourceId as string;
-      const merges = await listNodeIdentityMerges(sourceId);
+      // #5156: an anonymous caller loses merges naming a consent-hidden node.
+      const merges = dropRowsNamingHiddenNodes(
+        await listNodeIdentityMerges(sourceId),
+        await loadMqttConsentHiddenSet(req.user, [sourceId]),
+        () => sourceId,
+        (m) => [m.fromNodeNum, m.toNodeNum],
+      );
       return ok(res, { merges });
     } catch (error) {
       return handleMergeError(res, error, 'Failed to list node identity merges');
@@ -610,9 +642,12 @@ router.get('/nodes/:nodeNum/sources', requireSourcePermission('nodes', 'read', {
       databaseService.nodes.getSourcesForNode(nodeNum),
       databaseService.sources.getAllSources(),
     ]);
-    const nodeRows = sourceIds === 'all'
+    // #5156: an anonymous caller does not learn which sources hold a node they hide.
+    const hidden = await loadMqttConsentHiddenSet(req.user, sourceIds === 'all' ? undefined : sourceIds);
+    const nodeRows = (sourceIds === 'all'
       ? allNodeRows
-      : allNodeRows.filter((r) => sourceIds.includes(r.sourceId));
+      : allNodeRows.filter((r) => sourceIds.includes(r.sourceId)))
+      .filter((r) => !hidden.hides(r.sourceId, nodeNum));
 
     const sourceNameById = new Map(sources.map((s) => [s.id, s.name] as const));
 
@@ -658,10 +693,14 @@ router.get('/nodes/:nodeNum/copy-candidates', requireSourcePermission('nodes', '
       getNodeInfoSnapshot(nodeNum, sourceId),
       listPermittedSourceIds(req.user, 'nodes', 'read'),
     ]);
-    const candidates = readable === 'all'
+    // #5156: an anonymous caller sees no copy of a node a source hides from them.
+    const hidden = await loadMqttConsentHiddenSet(req.user);
+    const candidates = (readable === 'all'
       ? allCandidates
-      : allCandidates.filter((c) => readable.includes(c.sourceId));
-    res.json({ success: true, data: { candidates, target } });
+      : allCandidates.filter((c) => readable.includes(c.sourceId)))
+      .filter((c) => !hidden.hides(c.sourceId, nodeNum));
+    const visibleTarget = hidden.hides(sourceId, nodeNum) ? null : target;
+    res.json({ success: true, data: { candidates, target: visibleTarget } });
   } catch (error) {
     logger.error('Error getting copy candidates:', error);
     fail(res, 500, 'INTERNAL_ERROR', 'Failed to retrieve copy candidates');
@@ -682,7 +721,9 @@ router.get('/nodes/:nodeNum/copy-candidates', requireSourcePermission('nodes', '
  *
  * GLOBAL — no `sourceId`. Estimates pool observations from every Meshtastic
  * source into one row per physical nodeNum (#3271), so there is nothing to
- * scope. The `nodes:read` gate still applies.
+ * scope. The `nodes:read` gate still applies, and because the anchors come from
+ * every source, a non-admin sees only anchors whose position they could already
+ * see on a source they read (#5900, `positionEstimateAccess.ts`).
  *
  * Anchors are capped at storage time (MAX_STORED_ANCHORS_PER_NODE); `anchors`
  * carries what was kept and `observationCount` the true total, so a consumer
@@ -695,24 +736,40 @@ router.get('/nodes/:nodeNum/position-estimate', requirePermission('nodes', 'read
       return fail(res, 400, 'INVALID_NODE_NUM', 'nodeNum must be a decimal node number or a !hex node id');
     }
 
-    const estimate = await databaseService.getEstimatedPositionByNodeNumAsync(nodeNum);
-    if (!estimate) {
+    const [estimate, access] = await Promise.all([
+      databaseService.getEstimatedPositionByNodeNumAsync(nodeNum),
+      loadPositionEstimateAccess(req.user, nodeNum),
+    ]);
+    // A node the caller cannot read on any source answers exactly like a node
+    // with no estimate, so the reply does not confirm the node exists (#5900).
+    if (!estimate || !access.canSeeTarget) {
       return fail(res, 404, 'NO_ESTIMATED_POSITION', 'This node has no estimated position');
     }
 
     const stored = await databaseService.getEstimatedPositionAnchorsAsync(nodeNum);
-    const anchors = stored.map((a) => ({
-      anchorNodeNum: a.anchorNodeNum,
-      anchorNodeId: a.anchorNodeId,
-      anchorLat: a.anchorLat,
-      anchorLon: a.anchorLon,
-      kind: a.kind,
-      snrDb: a.snrDb,
-      observedAt: a.observedAt,
-      weight: a.weight,
-      // Derived, not stored: how far this anchor sits from the solved point.
-      distanceKm: calculateDistance(estimate.latitude, estimate.longitude, a.anchorLat, a.anchorLon),
-    }));
+    // Counted over every stored row, before the visibility filter: like
+    // observationCount and nEff, it describes the global estimate itself.
+    const uniqueAnchors = countUniqueAnchorPositions(stored);
+    const anchors = stored.flatMap((a) => {
+      // Only positions the caller could already see (#5900). See
+      // positionEstimateAccess.ts for the rule.
+      const label = access.anchorLabel(a.anchorNodeNum, a.anchorLat, a.anchorLon);
+      if (!label) return [];
+      return [{
+        anchorNodeNum: a.anchorNodeNum,
+        anchorNodeId: a.anchorNodeId,
+        anchorLongName: label.longName,
+        anchorShortName: label.shortName,
+        anchorLat: a.anchorLat,
+        anchorLon: a.anchorLon,
+        kind: a.kind,
+        snrDb: a.snrDb,
+        observedAt: a.observedAt,
+        weight: a.weight,
+        // Derived, not stored: how far this anchor sits from the solved point.
+        distanceKm: calculateDistance(estimate.latitude, estimate.longitude, a.anchorLat, a.anchorLon),
+      }];
+    });
 
     return ok(res, {
       nodeNum: estimate.nodeNum,
@@ -727,6 +784,12 @@ router.get('/nodes/:nodeNum/position-estimate', requirePermission('nodes', 'read
       // rather than guess a method.
       nEff: estimate.nEff,
       radiusMethod: estimate.radiusMethod,
+      // Distinct anchor positions (#5900). The estimator stores one row per
+      // position before it stores repeats, so this is exact unless every stored
+      // slot holds a different position and some observations were dropped.
+      uniqueAnchors,
+      uniqueAnchorsIsLowerBound:
+        estimate.observationCount > stored.length && uniqueAnchors >= MAX_STORED_ANCHORS_PER_NODE,
       singleAnchorDefaultKm: DEFAULT_SINGLE_ANCHOR_KM,
       anchors,
       anchorsStored: anchors.length,
@@ -1122,7 +1185,10 @@ router.get('/auto-favorite/status', requireSourcePermission('nodes', 'read', { w
     // Read the per-source tracking list (manager writes via setSourceSetting on
     // the same key — global getSetting would return stale/empty data here).
     const autoFavoriteNodesJson = await databaseService.settings.getSettingForSource(afManager.sourceId, 'autoFavoriteNodes') || '[]';
-    const autoFavoriteNodeNums: number[] = JSON.parse(autoFavoriteNodesJson);
+    // #5156: an anonymous caller loses consent-hidden nodes from the list.
+    const afHidden = await loadMqttConsentHiddenSet(req.user, [afManager.sourceId]);
+    const autoFavoriteNodeNums: number[] = (JSON.parse(autoFavoriteNodesJson) as number[])
+      .filter((n) => !afHidden.hides(afManager.sourceId, n));
 
     // Get node details for each auto-favorited node (scoped to this source)
     const autoFavoriteNodes = (await Promise.all(autoFavoriteNodeNums
@@ -1665,6 +1731,49 @@ router.post('/nodes/:nodeId/notes', requirePermission('nodes', 'write', { source
       details: error instanceof Error ? error.message : 'Unknown error occurred',
     };
     res.status(500).json(errorResponse);
+  }
+});
+
+// Set or clear a node's channel by hand, and lock or unlock it (#5923).
+// MeshRadar-local only — never sent to the mesh. `channel: null` clears it.
+// While `locked` is true, traffic does not change the stored channel. The
+// channel decides which channel-scoped viewers can see the node, so this needs
+// nodes:write on that source.
+router.post('/nodes/:nodeId/channel', requirePermission('nodes', 'write', { sourceIdFrom: 'body' }), async (req, res) => {
+  try {
+    const { nodeId } = req.params;
+    const { channel, locked, sourceId } = req.body ?? {};
+
+    if (typeof sourceId !== 'string' || sourceId.length === 0) {
+      fail(res, 400, 'MISSING_SOURCE_ID', 'Request body must include a sourceId string');
+      return;
+    }
+    if (channel !== null && !(Number.isInteger(channel) && channel >= 0 && channel <= 0x7fffffff)) {
+      fail(res, 400, 'INVALID_PARAMETER', 'channel must be a non-negative integer or null');
+      return;
+    }
+    if (typeof locked !== 'boolean') {
+      fail(res, 400, 'INVALID_PARAMETER_TYPE', 'locked must be a boolean');
+      return;
+    }
+
+    const nodeNumStr = nodeId.replace('!', '');
+    if (!/^[0-9a-fA-F]{8}$/.test(nodeNumStr)) {
+      fail(res, 400, 'INVALID_NODE_ID', 'nodeId must be in format !XXXXXXXX (8 hex characters)');
+      return;
+    }
+    const nodeNum = parseInt(nodeNumStr, 16);
+
+    const updated = await databaseService.setNodeChannelAsync(nodeNum, sourceId, channel, locked);
+    if (!updated) {
+      fail(res, 404, 'NODE_NOT_FOUND', 'Node not found on this source');
+      return;
+    }
+
+    ok(res, { nodeNum, channel, locked });
+  } catch (error) {
+    logger.error('Error setting node channel:', error);
+    fail(res, 500, 'INTERNAL_ERROR', 'Failed to set node channel');
   }
 });
 

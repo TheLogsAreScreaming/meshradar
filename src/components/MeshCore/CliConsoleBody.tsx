@@ -32,6 +32,7 @@ import {
 } from 'react';
 import { useTranslation } from 'react-i18next';
 import './MeshCoreRemoteConsole.css';
+import { CliHistoryPanel, type CliHistoryTarget } from './CliHistoryPanel';
 
 export interface ActionCommand {
   key: string;
@@ -52,7 +53,7 @@ export interface ActionCommand {
  *  meshcoreRoutes.ts:DANGER_COMMAND_PATTERN; keep in sync. The trailing
  *  `(?!\.)` excludes danger words used as the prefix of a dotted config
  *  key (e.g. `get reboot.interval`), which are not the standalone verb. */
-export const DANGER_COMMAND_PATTERN = /\b(reboot|erase|clkreboot|factory)\b(?!\.)/i;
+export const DANGER_COMMAND_PATTERN = /\b(reboot|erase|clkreboot|factory|poweroff|shutdown)\b(?!\.)|\bset\s+prv\.key\b/i;
 
 export type CliRunResult =
   | { ok: true; reply: string; elapsedMs?: number }
@@ -99,6 +100,18 @@ interface CliConsoleBodyProps {
   emptyTextDisabled?: string;
   /** Empty-transcript text when enabled. */
   emptyTextEnabled?: string;
+  /** Extra info line appended after a CLI_TIMEOUT error. The remote console
+   *  sets it while running on a resumed session (#5785), where silence may
+   *  mean the node dropped the session. */
+  timeoutHint?: string;
+  /** When set, a collapsible panel under the input shows the server-side
+   *  history of commands sent to this target (#5892). */
+  history?: CliHistoryTarget;
+  /** Override the destructive-command pattern that opens the typed-name
+   *  confirmation modal. Defaults to the MeshCore {@link DANGER_COMMAND_PATTERN};
+   *  the Meshtastic console passes its own (shared with its server guard) so the
+   *  two agree on what is destructive (#6154). */
+  dangerPattern?: RegExp;
 }
 
 const nextId = (() => {
@@ -117,6 +130,9 @@ export const CliConsoleBody = forwardRef<CliConsoleBodyHandle, CliConsoleBodyPro
     placeholder,
     emptyTextDisabled,
     emptyTextEnabled,
+    timeoutHint,
+    history,
+    dangerPattern = DANGER_COMMAND_PATTERN,
   },
   ref,
 ) {
@@ -241,8 +257,11 @@ export const CliConsoleBody = forwardRef<CliConsoleBodyHandle, CliConsoleBodyPro
             )
           : '';
       appendTranscript({ kind: 'error', text: `${result.error}${hint}` });
+      if (result.code === 'CLI_TIMEOUT' && timeoutHint) {
+        appendTranscript({ kind: 'info', text: timeoutHint });
+      }
     }
-  }, [appendTranscript, runCommand, sending, t]);
+  }, [appendTranscript, runCommand, sending, t, timeoutHint]);
 
   // Once a send completes and the input re-enables, return keyboard focus to
   // the command line (#3752). The flag keeps this from grabbing focus on mount
@@ -270,12 +289,12 @@ export const CliConsoleBody = forwardRef<CliConsoleBodyHandle, CliConsoleBodyPro
   const handleSend = useCallback(async () => {
     const trimmed = command.trim();
     if (!trimmed || sending) return;
-    if (DANGER_COMMAND_PATTERN.test(trimmed)) {
+    if (dangerPattern.test(trimmed)) {
       setDangerConfirm({ command: trimmed, typedName: '' });
       return;
     }
     await runAndLog(trimmed);
-  }, [command, runAndLog, sending]);
+  }, [command, dangerPattern, runAndLog, sending]);
 
   const handleActionClick = useCallback((action: ActionCommand) => {
     if (action.danger) {
@@ -409,6 +428,8 @@ export const CliConsoleBody = forwardRef<CliConsoleBodyHandle, CliConsoleBodyPro
             : t('meshcore.remoteConsole.send', 'Send')}
         </button>
       </form>
+
+      {history && <CliHistoryPanel sourceId={history.sourceId} target={history.target} />}
 
       {dangerConfirm && (
         <div

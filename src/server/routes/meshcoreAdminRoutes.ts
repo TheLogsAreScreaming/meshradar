@@ -13,6 +13,7 @@
 
 import { Router, Request, Response } from 'express';
 import { logger } from '../../utils/logger.js';
+import databaseService from '../../services/database.js';
 import { requireAuth, requirePermission } from '../auth/authMiddleware.js';
 import { meshcoreDeviceLimiter } from '../middleware/rateLimiters.js';
 import { getMeshCoreCredentialStore } from '../services/meshcoreCredentialStore.js';
@@ -36,6 +37,27 @@ import { ok, fail } from '../utils/apiResponse.js';
 import { MeshCoreContactNotOnDeviceError } from '../meshcoreDeviceContactErrors.js';
 import { isTransmittingLocalCliVerb } from '../constants/meshcoreTx.js';
 import { extendRequestTimeout } from '../middleware/requestTimeout.js';
+import { recordMeshcoreCliHistory, cliRequester, cliErrorOutcome } from '../services/meshcoreCliHistoryService.js';
+import type { MeshCoreManager } from '../meshcoreManager.js';
+
+/** Contact name for a history row; best effort, never throws. */
+function contactNameOf(manager: MeshCoreManager | undefined, publicKey: string): string | null {
+  try {
+    const contact = manager?.getContact(publicKey);
+    return contact?.advName ?? contact?.name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Local node name for a history row; best effort, never throws. */
+function localNameOf(manager: MeshCoreManager | undefined): string | null {
+  try {
+    return manager?.getLocalNode()?.name ?? null;
+  } catch {
+    return null;
+  }
+}
 
 // Radio round trips on these routes legitimately run past the 30s default
 // socket timeout; extend it per-route so the caller gets the real result
@@ -100,15 +122,20 @@ router.post('/admin/login', extendRequestTimeout(LOGIN_TIMEOUT_MS), meshcoreDevi
 
     const tracked = startTrackedLogin(req, res);
     if (!tracked) return;
+    const manager = managerFor(req, res);
     let finalOutcome: MeshCoreLoginRetryOutcome = 'no_reply';
     let loginResult;
     try {
-      loginResult = await managerFor(req, res).loginToNodeWithRetry(publicKey, password, tracked.opts);
+      loginResult = await manager.loginToNodeWithRetry(publicKey, password, tracked.opts);
       finalOutcome = loginResult.outcome;
     } finally {
       tracked.finish(finalOutcome);
     }
     const { result: success, outcome, attempts } = loginResult;
+    // Remember the session so the console can resume it later (#5785); a
+    // refusal means any remembered one is no good either.
+    if (success) await manager.recordAdminSession(publicKey, success, { guest: password === '' });
+    else if (outcome === 'rejected') await manager.clearAdminSession(publicKey);
     if (outcome === 'cancelled') {
       auditMeshcoreEvent(req, 'meshcore_remote_login_cancelled', 'remote_admin', { sourceId, publicKey, attempts });
       return respondLoginCancelled(res);
@@ -203,6 +230,17 @@ router.post('/admin/cli', extendRequestTimeout(REMOTE_CLI_TIMEOUT_MS), meshcoreD
         command,
         reason: 'DANGER_CONFIRM_REQUIRED',
       });
+      void recordMeshcoreCliHistory({
+        sourceId: req.params.id!,
+        targetKind: 'remote',
+        targetPublicKey: publicKey,
+        targetName: contactNameOf(res.locals.meshcoreManager as MeshCoreManager | undefined, publicKey),
+        origin: 'user',
+        ...cliRequester(req),
+        command,
+        outcome: 'blocked',
+        error: 'DANGER_CONFIRM_REQUIRED',
+      });
       return res.status(400).json({
         success: false,
         error: 'Destructive command requires confirm:true in the request body',
@@ -227,8 +265,34 @@ router.post('/admin/cli', extendRequestTimeout(REMOTE_CLI_TIMEOUT_MS), meshcoreD
         replyChars: result.reply?.length ?? 0,
         elapsedMs: result.elapsedMs,
       });
+      void recordMeshcoreCliHistory({
+        sourceId: req.params.id!,
+        targetKind: 'remote',
+        targetPublicKey: publicKey,
+        targetName: contactNameOf(manager, publicKey),
+        origin: 'user',
+        ...cliRequester(req),
+        command,
+        outcome: 'ok',
+        reply: result.reply ?? null,
+        elapsedMs: result.elapsedMs ?? null,
+      });
       res.json({ success: true, data: result });
     } catch (err) {
+      const errMsg = err instanceof MeshCoreContactNotOnDeviceError
+        ? 'CONTACT_NOT_ON_DEVICE'
+        : err instanceof Error ? err.message : String(err);
+      void recordMeshcoreCliHistory({
+        sourceId: req.params.id!,
+        targetKind: 'remote',
+        targetPublicKey: publicKey,
+        targetName: contactNameOf(res.locals.meshcoreManager as MeshCoreManager | undefined, publicKey),
+        origin: 'user',
+        ...cliRequester(req),
+        command,
+        outcome: cliErrorOutcome(errMsg),
+        error: errMsg,
+      });
       if (failIfTxDisabled(res, err)) return;
       if (err instanceof MeshCoreContactNotOnDeviceError) {
         auditMeshcoreEvent(req, 'meshcore_remote_cli_failed', 'remote_admin', {
@@ -274,9 +338,11 @@ router.post('/admin/cli', extendRequestTimeout(REMOTE_CLI_TIMEOUT_MS), meshcoreD
  * `MeshCoreManager.sendLocalCliCommand`):
  *   - Repeater / Room Server: forwarded to the device's native text CLI
  *     over serial.
- *   - Companion: handled by a small synthetic-CLI interpreter that
- *     covers ver / stats / clock / advert / help. Unknown commands
- *     return a usage hint.
+ *   - Companion fw 1.18.0+: the firmware's own text CLI (#5866), with
+ *     stats / clock / advert / help still answered by the shim.
+ *   - Older Companion: a small synthetic-CLI interpreter that covers
+ *     ver / stats / clock / advert / help. Unknown commands return a
+ *     usage hint.
  *
  * Reuses the same `DANGER_COMMAND_PATTERN` guard as the remote /admin/cli
  * route — destructive verbs (reboot / erase / clkreboot / factory)
@@ -305,6 +371,16 @@ router.post('/cli', extendRequestTimeout(LOCAL_CLI_TIMEOUT_MS), meshcoreDeviceLi
         command,
         reason: 'DANGER_CONFIRM_REQUIRED',
       });
+      void recordMeshcoreCliHistory({
+        sourceId: req.params.id!,
+        targetKind: 'local',
+        targetName: localNameOf(res.locals.meshcoreManager as MeshCoreManager | undefined),
+        origin: 'user',
+        ...cliRequester(req),
+        command,
+        outcome: 'blocked',
+        error: 'DANGER_CONFIRM_REQUIRED',
+      });
       return res.status(400).json({
         success: false,
         error: 'Destructive command requires confirm:true in the request body',
@@ -315,6 +391,16 @@ router.post('/cli', extendRequestTimeout(LOCAL_CLI_TIMEOUT_MS), meshcoreDeviceLi
     // purely local/serial verbs (ver, stats, clock, help, get/set config).
     // Gate only the transmitting ones so the console stays usable.
     if (isTransmittingLocalCliVerb(command) && rejectIfReceiveOnly(req, res)) {
+      void recordMeshcoreCliHistory({
+        sourceId: req.params.id!,
+        targetKind: 'local',
+        targetName: localNameOf(res.locals.meshcoreManager as MeshCoreManager | undefined),
+        origin: 'user',
+        ...cliRequester(req),
+        command,
+        outcome: 'blocked',
+        error: 'TX_DISABLED',
+      });
       return;
     }
     const effectiveTimeout = await resolveCliTimeoutMs(timeoutMs);
@@ -334,10 +420,32 @@ router.post('/cli', extendRequestTimeout(LOCAL_CLI_TIMEOUT_MS), meshcoreDeviceLi
         replyChars: result.reply?.length ?? 0,
         elapsedMs: result.elapsedMs,
       });
+      void recordMeshcoreCliHistory({
+        sourceId: req.params.id!,
+        targetKind: 'local',
+        targetName: localNameOf(manager),
+        origin: 'user',
+        ...cliRequester(req),
+        command,
+        outcome: 'ok',
+        reply: result.reply ?? null,
+        elapsedMs: result.elapsedMs ?? null,
+      });
       res.json({ success: true, data: result });
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      void recordMeshcoreCliHistory({
+        sourceId: req.params.id!,
+        targetKind: 'local',
+        targetName: localNameOf(res.locals.meshcoreManager as MeshCoreManager | undefined),
+        origin: 'user',
+        ...cliRequester(req),
+        command,
+        outcome: cliErrorOutcome(errMsg),
+        error: errMsg,
+      });
       if (failIfTxDisabled(res, err)) return;
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = errMsg;
       auditMeshcoreEvent(req, 'meshcore_local_cli_failed', 'configuration', {
         sourceId: req.params.id,
         command,
@@ -454,15 +562,19 @@ router.post('/admin/login-with-saved', extendRequestTimeout(LOGIN_TIMEOUT_MS), m
     // log it, do not echo it, do not include it in any response field.
     const tracked = startTrackedLogin(req, res);
     if (!tracked) return;
+    const manager = managerFor(req, res);
     let finalOutcome: MeshCoreLoginRetryOutcome = 'no_reply';
     let loginResult;
     try {
-      loginResult = await managerFor(req, res).loginToNodeWithRetry(publicKey, result.password, tracked.opts);
+      loginResult = await manager.loginToNodeWithRetry(publicKey, result.password, tracked.opts);
       finalOutcome = loginResult.outcome;
     } finally {
       tracked.finish(finalOutcome);
     }
     const { result: loggedIn, outcome, attempts } = loginResult;
+    // Remember / forget the session (#5785), as in /admin/login.
+    if (loggedIn) await manager.recordAdminSession(publicKey, loggedIn);
+    else if (outcome === 'rejected') await manager.clearAdminSession(publicKey);
     if (outcome === 'cancelled') {
       auditMeshcoreEvent(req, 'meshcore_remote_login_saved_cancelled', 'remote_admin', { sourceId, publicKey, attempts });
       return respondLoginCancelled(res);
@@ -560,6 +672,9 @@ router.delete('/admin/credentials/:publicKey', requireAuth(), requirePermission(
       return res.status(400).json({ success: false, error: 'Invalid public key format (expected 64-character hex string)' });
     }
     await getMeshCoreCredentialStore().clear(sourceId, publicKey);
+    // Forgetting the password also forgets the remembered session (#5785):
+    // the user is saying "stop acting as admin on this node".
+    await managerFor(req, res).clearAdminSession(publicKey);
     auditMeshcoreEvent(req, 'meshcore_credential_forget', 'remote_admin', {
       sourceId, publicKey,
     });
@@ -567,6 +682,50 @@ router.delete('/admin/credentials/:publicKey', requireAuth(), requirePermission(
   } catch (error) {
     logger.error('[API] Error clearing credential:', error);
     res.status(500).json({ success: false, error: 'Clear failed' });
+  }
+});
+
+/**
+ * GET /api/sources/:id/meshcore/admin/session/:publicKey
+ * Is there a remembered login to this node that the console can resume
+ * (#5785)? Database only — NO radio traffic, so the console calls it on
+ * every mount. `active` is true only while the connected companion still
+ * has the key the login was made with; `reason` says why not otherwise
+ * (`none` | `other_radio` | `not_connected`).
+ */
+router.get('/admin/session/:publicKey', requireAuth(), requirePermission('remote_admin', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const { publicKey } = req.params;
+    if (!isValidPublicKey(publicKey)) {
+      return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key format (expected 64-character hex string)');
+    }
+    return ok(res, await managerFor(req, res).getAdminSession(publicKey));
+  } catch (error) {
+    logger.error('[API] Error reading admin session:', error);
+    return fail(res, 500, 'ADMIN_SESSION_LOOKUP_FAILED', 'Session lookup failed');
+  }
+});
+
+/**
+ * DELETE /api/sources/:id/meshcore/admin/session/:publicKey
+ * "Log out" (#5785): forget the remembered session. Sends nothing to the
+ * node — the firmware has no logout verb, and our key stays in its ACL until
+ * it is evicted or removed with `setperm`. The next use logs in again. The
+ * saved password, if any, is kept.
+ */
+router.delete('/admin/session/:publicKey', requireAuth(), requirePermission('remote_admin', 'write', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
+  try {
+    const { publicKey } = req.params;
+    if (!isValidPublicKey(publicKey)) {
+      return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key format (expected 64-character hex string)');
+    }
+    // Straight to the repository so a DB failure reaches the user.
+    await databaseService.meshcoreAdminSessions.clear(req.params.id!, publicKey);
+    auditMeshcoreEvent(req, 'meshcore_remote_logout', 'remote_admin', { sourceId: req.params.id, publicKey });
+    return ok(res);
+  } catch (error) {
+    logger.error('[API] Error clearing admin session:', error);
+    return fail(res, 500, 'ADMIN_SESSION_CLEAR_FAILED', 'Log out failed');
   }
 });
 

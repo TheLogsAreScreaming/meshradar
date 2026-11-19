@@ -52,7 +52,14 @@ vi.mock('../meshtasticManager.js', () => ({
 }));
 
 vi.mock('../sourceManagerRegistry.js', () => ({ sourceManagerRegistry: {} }));
+vi.mock('../utils/localNodeNameForSource.js', () => ({
+  resolveLocalNodeNameForSource: vi.fn(async () => 'LocalNode'),
+}));
 vi.mock('../sourceManagerTypes.js', () => ({ getPrimaryMeshtasticManager: () => undefined }));
+// SSRF guard on the Apprise egress (SSRF-03, #6078) resolves the host via DNS.
+// Stub the resolver to a public IP so these functional tests (which mock fetch)
+// reach the mocked fetch instead of a real/failed DNS lookup.
+vi.mock('node:dns/promises', () => ({ lookup: vi.fn().mockResolvedValue([{ address: '93.184.216.34', family: 4 }]) }));
 
 vi.mock('../utils/notificationFiltering.js', () => ({
   getUserNotificationPreferencesAsync: h.getUserNotificationPreferencesAsyncMock,
@@ -60,6 +67,7 @@ vi.mock('../utils/notificationFiltering.js', () => ({
   shouldFilterNotificationAsync: h.shouldFilterNotificationAsyncMock,
   applyNodeNamePrefixAsync: h.applyNodeNamePrefixAsyncMock,
   resolveAppriseTargetAsync: h.resolveAppriseTargetAsyncMock,
+  userReadsAnySourceAsync: vi.fn(async () => false),
 }));
 
 const fetchMock = vi.fn();

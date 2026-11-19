@@ -16,6 +16,7 @@ import { notifyAccessChange } from '../../db/accessChanges.js';
 import { automationTraceBus } from './automation/automationTraceBus.js';
 import { getSocketIO } from './webSocketService.js';
 import { CHANNEL_DB_OFFSET } from '../constants/meshtastic.js';
+import databaseService from '../../services/database.js';
 
 const NODE_NUM = 0x10203040;
 const NODE_ID = '!10203040';
@@ -31,10 +32,13 @@ const PAYLOADS: Record<DataEventType, (marker: string) => unknown> = {
   'meshcore:node:changed': (marker) => ({ publicKey: 'ab'.repeat(32), name: marker, changed: ['name'] }),
   'node:mobility': (marker) => ({ nodeNum: NODE_NUM, previous: 0, current: 1, marker }),
   'node:rebooted': (marker) => ({ nodeNum: NODE_NUM, previousUptimeSeconds: 9, uptimeSeconds: 1, marker }),
+  'node:clockOffset': (marker) => ({ publicKey: 'ab'.repeat(32), offsetSeconds: 600, previousOffsets: [], sampleSource: 'advert', marker }),
   'node:powerChanged': (marker) => ({ nodeNum: NODE_NUM, previousPowered: false, powered: true, batteryLevel: 101, marker }),
+  'neighbor:sighting': (marker) => ({ reporterPublicKey: 'cd'.repeat(32), neighborPublicKey: 'ab'.repeat(32), firstSeenAt: 1, prevLastHeardAt: 2, lastHeardAt: 3, snr: 1, sightings: 2, marker }),
   'node:aircraft': (marker) => ({ nodeNum: NODE_NUM, previous: null, current: true, basis: 'agl', marker }),
   'channel:updated': (marker) => ({ id: 0, name: marker, psk: 'AQ==', role: 1 }),
   'telemetry:batch': (marker) => ({ [NODE_NUM]: [{ nodeId: NODE_ID, nodeNum: NODE_NUM, telemetryType: 'batteryLevel', value: 80, unit: marker }] }),
+  'node:batch': (marker) => ({ [NODE_NUM]: { longName: marker, lastHeard: 1, latitude: 30.1, longitude: -90.1 } }),
   'connection:status': (marker) => ({ connected: false, nodeId: marker, reason: `reset ${marker} at 192.0.2.7:4403` }),
   'client-notification': (marker) => ({ level: 30, message: marker }),
   'traceroute:complete': (marker) => ({
@@ -47,6 +51,7 @@ const PAYLOADS: Record<DataEventType, (marker: string) => unknown> = {
   'waypoint:deleted': (marker) => ({ sourceId: marker, waypointId: 5 }),
   'waypoint:expired': (marker) => ({ sourceId: marker, waypointId: 5 }),
   'meshcore:message': (marker) => ({ id: marker, fromPublicKey: 'cd'.repeat(32), toPublicKey: 'channel-1', text: marker, timestamp: Date.now() }),
+  'meshcore:reaction:resolved': (marker) => ({ id: marker, reactionTargetId: 'target', fromPublicKey: 'cd'.repeat(32), toPublicKey: 'channel-1' }),
   'meshcore:messages:deleted': (marker) => ({ ids: [marker] }),
   'meshcore:message:updated': (marker) => ({ id: marker, deliveryStatus: 'delivered' }),
   'meshcore:contact:updated': (marker) => ({ sourceId: marker, contact: { publicKey: 'ef'.repeat(32), advName: marker, latitude: 30.5, longitude: -90.5 } }),
@@ -57,6 +62,7 @@ const PAYLOADS: Record<DataEventType, (marker: string) => unknown> = {
   'meshcore:channels:reordered': (marker) => ({ sourceId: marker, moves: [{ from: 1, to: 2 }] }),
   'meshcore:filters:changed': (marker) => ({ sourceId: marker }),
   'meshcore:ota-packet': (marker) => ({ timestamp: Date.now(), payloadType: 2, rawHex: marker }),
+  'packet:flight': (marker) => ({ sourceId: 'x', protocol: 'meshtastic', receivedAt: Date.now(), from: NODE_NUM, to: 1, relay: null, hopsUsed: 0, kind: marker }),
   'meshbeacon:received': (marker) => ({ nodeNum: NODE_NUM, message: marker, offerChannelPsk: 'c2VjcmV0' }),
   'reticulum:message': (marker) => ({ id: marker, fromHash: 'aa', content: marker }),
   'reticulum:delivery-state:updated': (marker) => ({ sourceId: marker, id: marker, hash: 'aa', state: 'delivered' }),
@@ -64,10 +70,20 @@ const PAYLOADS: Record<DataEventType, (marker: string) => unknown> = {
 };
 
 const ALL_TYPES = Object.keys(PAYLOADS) as DataEventType[];
+/**
+ * Types a socket gets only after asking for them on the source, admins
+ * included (#4835 live packet flights: `packet-flights:subscribe`).
+ */
+const SUBSCRIPTION_ONLY: DataEventType[] = ['packet:flight'];
+const ROUTINE_TYPES = ALL_TYPES.filter((type) => !SUBSCRIPTION_ONLY.includes(type));
+
+/** Ask for live packet flights on these sources, as a map with the layer on does. */
+const watchFlights = (client: SocketTestClient, sourceIds: string[]): Promise<unknown> =>
+  new Promise((resolve) => client.socket.emit('packet-flights:subscribe', sourceIds, resolve));
 /** Types a viewer who is not an admin can never receive. */
 const ADMIN_ONLY: DataEventType[] = [
-  'node:discovered', 'meshcore:node:changed', 'node:mobility', 'node:rebooted', 'node:powerChanged',
-  'node:aircraft', 'meshbeacon:received', 'auto-ping:update', 'firmware:status',
+  'node:discovered', 'meshcore:node:changed', 'node:mobility', 'node:rebooted', 'node:clockOffset', 'node:powerChanged',
+  'node:aircraft', 'neighbor:sighting', 'meshbeacon:received', 'auto-ping:update', 'firmware:status',
 ];
 
 function emit(type: DataEventType, sourceId: string | undefined, marker: string, data: unknown = PAYLOADS[type](marker)): void {
@@ -163,6 +179,9 @@ describe('WebSocket event gates', () => {
       await harness.grantEverythingOn(harness.limited.id, A);
       const user = await harness.connectAs(harness.limited, { join: 'all' });
       const admin = await harness.connectAs(harness.admin, { join: 'all' });
+      // Both ask for live packet flights everywhere; the user is held to A.
+      await watchFlights(user, [A, B]);
+      await watchFlights(admin, [A, B]);
 
       emitEveryType(B, 'MARK-B');
       emitEveryType(A, 'MARK-A');
@@ -209,7 +228,8 @@ describe('WebSocket event gates', () => {
       await user.settle();
       await admin.settle();
       expect(typesWith(user, 'MARK-A')).toEqual([]);
-      expect(typesWith(admin, 'MARK-A')).toEqual([...ALL_TYPES].sort());
+      // Live packet flights still need their own subscription.
+      expect(typesWith(admin, 'MARK-A')).toEqual([...ROUTINE_TYPES].sort());
     });
 
     it('a socket joined to A gets A and not another source it could read', async () => {
@@ -287,6 +307,21 @@ describe('WebSocket event gates', () => {
       expect(has(user, 'CH2')).toBe(true);
       expect(has(user, 'CH1')).toBe(false);
       expect(has(user, 'DM')).toBe(false);
+    });
+
+    it('carries the hop-display badge flags, so a live row matches the poll (#6449)', async () => {
+      await harness.grantRow(harness.limited.id, 'channel_0', { read: true }, A);
+      const user = await harness.connectAs(harness.limited, { join: A });
+      emit('message:new', A, '', { ...message('FLAGGED', 0), isAutomation: true, xeddsaSigned: true, viaMqtt: true });
+      emit('message:new', A, '', message('PLAIN', 0));
+      await user.settle();
+      const rows = user.payloads('message:new') as Array<Record<string, unknown>>;
+      const flagged = rows.find((r) => r.id === 'FLAGGED');
+      const plain = rows.find((r) => r.id === 'PLAIN');
+      expect(flagged).toMatchObject({ isAutomation: true, xeddsaSigned: true, viaMqtt: true });
+      expect(plain?.isAutomation).toBeUndefined();
+      expect(plain?.xeddsaSigned).toBeUndefined();
+      expect(plain?.viaMqtt).toBe(false);
     });
 
     it('channel_N:read without channel_0:read reads no channel message (the poll rule)', async () => {
@@ -387,6 +422,33 @@ describe('WebSocket event gates', () => {
       expect(user.payloads('node:updated')[1]).toEqual(update);
     });
 
+    it('node:batch keeps only the nodes the viewer may see, on the joined source only', async () => {
+      await harness.db.nodes.upsertNode({ nodeNum: 77, nodeId: '!0000004d', channel: 3 }, A);
+      await harness.grantRow(harness.limited.id, 'channel_0', { viewOnMap: true }, A);
+      const user = await harness.connectAs(harness.limited, { join: A });
+      const admin = await harness.connectAs(harness.admin, { join: A });
+      const batch = { [NODE_NUM]: { lastHeard: 5, longName: 'SEEN' }, 77: { lastHeard: 6, longName: 'HIDDEN' }, 4242: { lastHeard: 7 } };
+      emit('node:batch', A, '', batch);
+      // Another source's batch never reaches a socket that joined A.
+      emit('node:batch', B, '', { [NODE_NUM]: { lastHeard: 8, longName: 'OTHER-SOURCE' } });
+      await user.settle();
+      await admin.settle();
+      expect(user.payloads('node:batch')).toEqual([{ [NODE_NUM]: { lastHeard: 5, longName: 'SEEN' } }]);
+      expect(admin.payloads('node:batch')).toEqual([batch]);
+    });
+
+    it('node:batch removes a private position override without nodes_private:read', async () => {
+      await harness.db.nodes.upsertNode({
+        nodeNum: NODE_NUM, nodeId: NODE_ID, channel: 0,
+        positionOverrideEnabled: true, positionOverrideIsPrivate: true, latitudeOverride: 11.5, longitudeOverride: 22.5,
+      }, A);
+      await harness.grantRow(harness.limited.id, 'channel_0', { viewOnMap: true }, A);
+      const user = await harness.connectAs(harness.limited, { join: A });
+      emit('node:batch', A, '', { [NODE_NUM]: { lastHeard: 5, latitudeOverride: 11.5, longitudeOverride: 22.5 } });
+      await user.settle();
+      expect(user.payloads('node:batch')).toEqual([{ [NODE_NUM]: { lastHeard: 5 } }]);
+    });
+
     it('telemetry:batch keeps only the nodes the viewer may see, and needs info or dashboard read', async () => {
       await harness.db.nodes.upsertNode({ nodeNum: 77, nodeId: '!0000004d', channel: 3 }, A);
       await harness.grantRow(harness.limited.id, 'channel_0', { viewOnMap: true }, A);
@@ -470,6 +532,22 @@ describe('WebSocket event gates', () => {
       expect(has(user, 'DEL-CH2')).toBe(false);
     });
 
+    it('a resolved reaction follows the message rules: its channel, and its key', async () => {
+      await harness.grantRow(harness.limited.id, 'channel_1', { read: true }, A);
+      const user = await harness.connectAs(harness.limited, { join: A });
+      const reaction = (marker: string, toPublicKey: string, extra: object = {}) =>
+        ({ id: marker, reactionTargetId: 'target', fromPublicKey: 'cd'.repeat(32), toPublicKey, ...extra });
+      emit('meshcore:reaction:resolved', A, '', reaction('RX-CH1', 'channel-1'));
+      emit('meshcore:reaction:resolved', A, '', reaction('RX-CH2', 'channel-2'));
+      emit('meshcore:reaction:resolved', A, '', reaction('RX-DM', 'ee'.repeat(32)));
+      emit('meshcore:reaction:resolved', A, '', reaction('RX-KEYED', 'channel-1', { keyFingerprint: 'feedface' }));
+      await user.settle();
+      expect(has(user, 'RX-CH1')).toBe(true);
+      expect(has(user, 'RX-CH2')).toBe(false);
+      expect(has(user, 'RX-DM')).toBe(false);
+      expect(has(user, 'RX-KEYED')).toBe(false);
+    });
+
     it('a repeater-decrypted message also needs access to its key', async () => {
       await harness.grantRow(harness.limited.id, 'messages', { read: true }, A);
       const user = await harness.connectAs(harness.limited, { join: A });
@@ -492,6 +570,36 @@ describe('WebSocket event gates', () => {
       expect(user.payloads('meshcore:contact:updated')).toEqual([
         { sourceId: 'CONTACT-A', contact: { publicKey: 'ef'.repeat(32), advName: 'CONTACT-A' } },
       ]);
+    });
+
+    it('a contact update carries the location override; a private one only with nodes_private:read (#5842)', async () => {
+      const key = 'ef'.repeat(32);
+      await databaseService.meshcore.setNodePositionOverride(A, key, { enabled: true, latitude: 28.5, longitude: -81.4, isPrivate: true });
+      try {
+        await harness.grantRow(harness.limited.id, 'nodes', { read: true, viewOnMap: true }, A);
+        const user = await harness.connectAs(harness.limited, { join: A });
+        const admin = await harness.connectAs(harness.admin, { join: A });
+        emit('meshcore:contact:updated', A, 'PIN-1');
+        await user.settle();
+        await admin.settle();
+        // No nodes_private:read: the advert position, no override fields.
+        expect(user.payloads('meshcore:contact:updated')).toEqual([
+          { sourceId: 'PIN-1', contact: { publicKey: key, advName: 'PIN-1', latitude: 30.5, longitude: -90.5 } },
+        ]);
+        expect(admin.payloads('meshcore:contact:updated')).toEqual([
+          { sourceId: 'PIN-1', contact: expect.objectContaining({ latitude: 28.5, longitude: -81.4, positionIsOverride: true, positionOverrideIsPrivate: true }) },
+        ]);
+
+        // A public override reaches a viewOnMap holder too.
+        await databaseService.meshcore.setNodePositionOverride(A, key, { enabled: true, latitude: 28.5, longitude: -81.4, isPrivate: false });
+        emit('meshcore:contact:updated', A, 'PIN-2');
+        await user.settle();
+        expect(user.payloads('meshcore:contact:updated')[1]).toEqual(
+          { sourceId: 'PIN-2', contact: expect.objectContaining({ latitude: 28.5, longitude: -81.4, positionIsOverride: true }) },
+        );
+      } finally {
+        await databaseService.meshcore.clearNodePositionOverride(A, key);
+      }
     });
 
     it('parses the channel slot from either end of a message', () => {

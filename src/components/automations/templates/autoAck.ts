@@ -56,7 +56,7 @@ const PARAMS: ParamSpec[] = [
       { value: 'fixed', label: 'Tapback: thumbs up' },
       { value: 'text', label: 'Reply message' },
     ],
-    help: 'The hop-count and thumbs-up tapbacks react to the triggering message (Meshtastic only — MeshCore has no tapback). '
+    help: 'The hop-count and thumbs-up tapbacks react to the triggering message (on MeshCore they react to the triggering message too). '
       + 'Reply message sends a short reply and works on both protocols.',
   },
 ];
@@ -94,6 +94,9 @@ function build(values: Record<string, unknown>): BuiltAutomation {
     // Flood guard: caps this automation at 30 fires/minute regardless of subject —
     // see RATE_LIMIT_MAX_ACTIONS_MIN/MAX in src/types/automation.ts.
     rateLimit: { maxActions: 30, windowSeconds: 60 },
+    // #6449: never ack a message whose sender flagged it as automated, so two
+    // auto-ack bots cannot answer each other forever.
+    senderKind: 'human',
   };
   if (channelFilter.length > 0) triggerParams.channels = channelFilter;
 
@@ -101,8 +104,8 @@ function build(values: Record<string, unknown>): BuiltAutomation {
   // Mirrors autoAckConverter.ts's own S1 ordering (source filter first).
   if (sourceIds.length > 0) conditions.push({ type: 'condition.sourceFilter', params: { sourceIds } });
   // zeroHop (#4340 Phase 4): the derived, TOTAL (never NaN) "direct RF, 0 hops"
-  // field — 1 when the message arrived direct over RF, 0 when relayed or via
-  // MQTT. Verified present in EVENT_NUMERIC['trigger.message'] (catalog.ts)
+  // field — 1 when the message arrived direct over RF, 0 when relayed or over
+  // IP (MQTT or UDP, #5796). Verified present in EVENT_NUMERIC['trigger.message'] (catalog.ts)
   // and computed in buildMessageContext (triggerContext.ts).
   conditions.push({ type: 'condition.numeric', params: { field: 'zeroHop', op: '==', value: '1' } });
 

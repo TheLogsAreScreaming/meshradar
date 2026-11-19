@@ -103,6 +103,7 @@ export class MessagesRepository extends BaseRepository {
       viaMqtt: messageData.viaMqtt ?? null,
       viaStoreForward: messageData.viaStoreForward ?? null,
       xeddsaSigned: messageData.xeddsaSigned ?? null,
+      isAutomation: messageData.isAutomation ?? null,
       ackProofStatus: messageData.ackProofStatus ?? null,
       rxSnr: messageData.rxSnr ?? null,
       rxRssi: messageData.rxRssi ?? null,
@@ -253,6 +254,36 @@ export class MessagesRepository extends BaseRepository {
     const { messages } = this.tables;
     const conditions: (SQL | undefined)[] = [
       eq(messages.channel, channel),
+      this.withSourceScope(messages, sourceId),
+    ];
+    if (before !== undefined) {
+      conditions.push(sql`${messages.createdAt} < ${before}`);
+    }
+    const result = await this.db
+      .select()
+      .from(messages)
+      .where(and(...conditions))
+      .orderBy(desc(messages.createdAt))
+      .limit(limit);
+    return this.normalizeBigInts(result) as DbMessage[];
+  }
+
+  /**
+   * One page of channel messages across several channels of a source, newest
+   * first by server arrival time (#5361, the unified "All Channels" view).
+   * `channels` is the caller's readable set, so a DM (`channel = -1`) or a
+   * channel the reader may not open never loads. An empty set returns nothing.
+   */
+  async getMessagesBeforeInChannels(
+    channels: number[],
+    before: number | undefined,
+    limit: number = 100,
+    sourceId?: SourceScope
+  ): Promise<DbMessage[]> {
+    if (channels.length === 0) return [];
+    const { messages } = this.tables;
+    const conditions: (SQL | undefined)[] = [
+      inArray(messages.channel, channels),
       this.withSourceScope(messages, sourceId),
     ];
     if (before !== undefined) {
@@ -576,6 +607,7 @@ export class MessagesRepository extends BaseRepository {
       viaMqtt: messageData.viaMqtt ?? null,
       viaStoreForward: (messageData as any).viaStoreForward ?? null,
       xeddsaSigned: messageData.xeddsaSigned ?? null,
+      isAutomation: messageData.isAutomation ?? null,
       ackProofStatus: messageData.ackProofStatus ?? null,
       rxSnr: messageData.rxSnr ?? null,
       rxRssi: messageData.rxRssi ?? null,

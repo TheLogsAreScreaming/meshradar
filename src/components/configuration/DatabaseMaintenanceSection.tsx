@@ -13,6 +13,8 @@ interface MaintenanceStats {
   traceroutesDeleted: number;
   routeSegmentsDeleted: number;
   neighborInfoDeleted: number;
+  auditLogDeleted?: number;
+  meshcoreCliHistoryDeleted?: number;
   sizeBefore: number;
   sizeAfter: number;
   duration: number;
@@ -33,8 +35,19 @@ interface MaintenanceStatus {
     tracerouteRetentionDays: number;
     routeSegmentRetentionDays: number;
     neighborInfoRetentionDays: number;
+    auditLogRetentionDays: number;
+    meshcoreCliHistoryRetentionDays?: number;
   };
 }
+
+/** Matches DEFAULT_AUDIT_LOG_RETENTION_DAYS on the server (#5870). */
+const DEFAULT_AUDIT_LOG_RETENTION_DAYS = 90;
+/** Matches DEFAULT_MESHCORE_CLI_HISTORY_RETENTION_DAYS on the server (#5892). */
+const DEFAULT_CLI_HISTORY_RETENTION_DAYS = 90;
+
+const totalDeletedOf = (s: MaintenanceStats): number =>
+  s.messagesDeleted + s.traceroutesDeleted + s.routeSegmentsDeleted + s.neighborInfoDeleted + (s.auditLogDeleted ?? 0) +
+  (s.meshcoreCliHistoryDeleted ?? 0);
 
 const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0 B';
@@ -55,13 +68,14 @@ const DatabaseMaintenanceSection: React.FC = () => {
   const [tracerouteRetentionDays, setTracerouteRetentionDays] = useState(30);
   const [routeSegmentRetentionDays, setRouteSegmentRetentionDays] = useState(30);
   const [neighborInfoRetentionDays, setNeighborInfoRetentionDays] = useState(30);
+  const [auditLogRetentionDays, setAuditLogRetentionDays] = useState(DEFAULT_AUDIT_LOG_RETENTION_DAYS);
+  const [cliHistoryRetentionDays, setCliHistoryRetentionDays] = useState(DEFAULT_CLI_HISTORY_RETENTION_DAYS);
 
   // Status state
   const [status, setStatus] = useState<MaintenanceStatus | null>(null);
   const [databaseSize, setDatabaseSize] = useState<number | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
-  const [databaseType, setDatabaseType] = useState<'sqlite' | 'postgres' | 'mysql' | null>(null);
   const [saveCounter, setSaveCounter] = useState(0); // Triggers hasChanges recalculation
 
   // Track initial values loaded from API for change detection
@@ -71,7 +85,9 @@ const DatabaseMaintenanceSection: React.FC = () => {
     messageRetentionDays: 30,
     tracerouteRetentionDays: 30,
     routeSegmentRetentionDays: 30,
-    neighborInfoRetentionDays: 30
+    neighborInfoRetentionDays: 30,
+    auditLogRetentionDays: DEFAULT_AUDIT_LOG_RETENTION_DAYS,
+    cliHistoryRetentionDays: DEFAULT_CLI_HISTORY_RETENTION_DAYS,
   });
 
   // Calculate if there are unsaved changes
@@ -84,9 +100,11 @@ const DatabaseMaintenanceSection: React.FC = () => {
       messageRetentionDays !== initial.messageRetentionDays ||
       tracerouteRetentionDays !== initial.tracerouteRetentionDays ||
       routeSegmentRetentionDays !== initial.routeSegmentRetentionDays ||
-      neighborInfoRetentionDays !== initial.neighborInfoRetentionDays
+      neighborInfoRetentionDays !== initial.neighborInfoRetentionDays ||
+      auditLogRetentionDays !== initial.auditLogRetentionDays ||
+      cliHistoryRetentionDays !== initial.cliHistoryRetentionDays
     );
-  }, [enabled, maintenanceTime, messageRetentionDays, tracerouteRetentionDays, routeSegmentRetentionDays, neighborInfoRetentionDays, saveCounter]);
+  }, [enabled, maintenanceTime, messageRetentionDays, tracerouteRetentionDays, routeSegmentRetentionDays, neighborInfoRetentionDays, auditLogRetentionDays, cliHistoryRetentionDays, saveCounter]);
 
   // Reset to initial values (for SaveBar dismiss)
   const resetChanges = useCallback(() => {
@@ -97,34 +115,16 @@ const DatabaseMaintenanceSection: React.FC = () => {
     setTracerouteRetentionDays(initial.tracerouteRetentionDays);
     setRouteSegmentRetentionDays(initial.routeSegmentRetentionDays);
     setNeighborInfoRetentionDays(initial.neighborInfoRetentionDays);
+    setAuditLogRetentionDays(initial.auditLogRetentionDays);
+    setCliHistoryRetentionDays(initial.cliHistoryRetentionDays);
   }, []);
 
-  // Fetch database type from health endpoint (public, no auth required)
+  // Maintenance runs on every backend (#5870); it used to be hidden on
+  // PostgreSQL/MySQL, so those installs could never switch it on.
   useEffect(() => {
-    const fetchDatabaseType = async () => {
-      try {
-        const data = await apiService.get<{ databaseType?: 'sqlite' | 'postgres' | 'mysql' }>('/api/health');
-        if (data.databaseType) {
-          setDatabaseType(data.databaseType);
-        }
-      } catch (error) {
-        // Preserve the prior silent-ignore on a non-ok HTTP response; only a
-        // genuine network/transport failure gets logged (same split as the
-        // old `if (response.ok) {...}` with no else branch).
-        if (error instanceof ApiError) return;
-        logger.error('Error fetching database type:', error);
-      }
-    };
-    void fetchDatabaseType();
+    void loadStatus();
+    void loadDatabaseSize();
   }, []);
-
-  // Load status and settings on mount (only if SQLite)
-  useEffect(() => {
-    if (databaseType === 'sqlite') {
-      void loadStatus();
-      void loadDatabaseSize();
-    }
-  }, [databaseType]);
 
   const loadStatus = async () => {
     try {
@@ -136,6 +136,8 @@ const DatabaseMaintenanceSection: React.FC = () => {
       setTracerouteRetentionDays(data.settings.tracerouteRetentionDays);
       setRouteSegmentRetentionDays(data.settings.routeSegmentRetentionDays);
       setNeighborInfoRetentionDays(data.settings.neighborInfoRetentionDays);
+      setAuditLogRetentionDays(data.settings.auditLogRetentionDays ?? DEFAULT_AUDIT_LOG_RETENTION_DAYS);
+      setCliHistoryRetentionDays(data.settings.meshcoreCliHistoryRetentionDays ?? DEFAULT_CLI_HISTORY_RETENTION_DAYS);
       // Update initial values to match loaded settings
       initialValuesRef.current = {
         enabled: data.enabled,
@@ -143,7 +145,9 @@ const DatabaseMaintenanceSection: React.FC = () => {
         messageRetentionDays: data.settings.messageRetentionDays,
         tracerouteRetentionDays: data.settings.tracerouteRetentionDays,
         routeSegmentRetentionDays: data.settings.routeSegmentRetentionDays,
-        neighborInfoRetentionDays: data.settings.neighborInfoRetentionDays
+        neighborInfoRetentionDays: data.settings.neighborInfoRetentionDays,
+        auditLogRetentionDays: data.settings.auditLogRetentionDays ?? DEFAULT_AUDIT_LOG_RETENTION_DAYS,
+        cliHistoryRetentionDays: data.settings.meshcoreCliHistoryRetentionDays ?? DEFAULT_CLI_HISTORY_RETENTION_DAYS,
       };
     } catch (error) {
       // Preserve the prior silent-ignore on a non-ok HTTP response; only a
@@ -174,7 +178,9 @@ const DatabaseMaintenanceSection: React.FC = () => {
         messageRetentionDays: String(messageRetentionDays),
         tracerouteRetentionDays: String(tracerouteRetentionDays),
         routeSegmentRetentionDays: String(routeSegmentRetentionDays),
-        neighborInfoRetentionDays: String(neighborInfoRetentionDays)
+        neighborInfoRetentionDays: String(neighborInfoRetentionDays),
+        auditLogRetentionDays: String(auditLogRetentionDays),
+        meshcoreCliHistoryRetentionDays: String(cliHistoryRetentionDays),
       });
 
       // Update initial values to match saved settings
@@ -184,7 +190,9 @@ const DatabaseMaintenanceSection: React.FC = () => {
         messageRetentionDays,
         tracerouteRetentionDays,
         routeSegmentRetentionDays,
-        neighborInfoRetentionDays
+        neighborInfoRetentionDays,
+        auditLogRetentionDays,
+        cliHistoryRetentionDays,
       };
       // Trigger hasChanges recalculation
       setSaveCounter(c => c + 1);
@@ -218,8 +226,7 @@ const DatabaseMaintenanceSection: React.FC = () => {
 
       const result = await apiService.post<{ stats: MaintenanceStats }>('/api/maintenance/run');
       const stats = result.stats;
-      const totalDeleted = stats.messagesDeleted + stats.traceroutesDeleted +
-                          stats.routeSegmentsDeleted + stats.neighborInfoDeleted;
+      const totalDeleted = totalDeletedOf(stats);
       const spaceSaved = stats.sizeBefore - stats.sizeAfter;
 
       showToast(
@@ -255,12 +262,6 @@ const DatabaseMaintenanceSection: React.FC = () => {
     return new Date(status.nextScheduledRun).toLocaleString();
   };
 
-  // Hide the entire section for PostgreSQL/MySQL - maintenance features are SQLite-specific
-  // Also hide if we can't determine the database type yet
-  if (databaseType !== 'sqlite') {
-    return null;
-  }
-
   return (
     <NumberInputScope scope={numberScope}>
     <div id="settings-maintenance" className="settings-section" style={{ marginTop: '2rem' }}>
@@ -287,12 +288,7 @@ const DatabaseMaintenanceSection: React.FC = () => {
         {status?.lastRunStats && (
           <p style={{ color: 'var(--color-text-subtle)', fontSize: '0.85rem', marginTop: '0.5rem' }}>
             {t('maintenance.last_run')}: {formatLastRun()}
-            {status.lastRunStats && ` (${t('maintenance.deleted_records', { count:
-              status.lastRunStats.messagesDeleted +
-              status.lastRunStats.traceroutesDeleted +
-              status.lastRunStats.routeSegmentsDeleted +
-              status.lastRunStats.neighborInfoDeleted
-            })})`}
+            {status.lastRunStats && ` (${t('maintenance.deleted_records', { count: totalDeletedOf(status.lastRunStats) })})`}
           </p>
         )}
       </div>
@@ -437,6 +433,52 @@ const DatabaseMaintenanceSection: React.FC = () => {
                   <NumberInput
                     value={neighborInfoRetentionDays}
                     onChange={setNeighborInfoRetentionDays}
+                    min={7}
+                    max={365}
+                    integer
+                    style={{
+                      padding: '0.5rem',
+                      borderRadius: '4px',
+                      border: '1px solid var(--color-surface-active)',
+                      backgroundColor: 'var(--color-surface)',
+                      color: 'var(--color-text)',
+                      fontSize: '1rem',
+                      width: '100px'
+                    }}
+                  />
+                  <span style={{ marginLeft: '0.5rem', color: 'var(--color-text-subtle)' }}>{t('common.days')}</span>
+                </div>
+
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 500 }}>
+                    {t('maintenance.auditlog_retention', 'Audit Log Retention')}
+                  </label>
+                  <NumberInput
+                    value={auditLogRetentionDays}
+                    onChange={setAuditLogRetentionDays}
+                    min={7}
+                    max={365}
+                    integer
+                    style={{
+                      padding: '0.5rem',
+                      borderRadius: '4px',
+                      border: '1px solid var(--color-surface-active)',
+                      backgroundColor: 'var(--color-surface)',
+                      color: 'var(--color-text)',
+                      fontSize: '1rem',
+                      width: '100px'
+                    }}
+                  />
+                  <span style={{ marginLeft: '0.5rem', color: 'var(--color-text-subtle)' }}>{t('common.days')}</span>
+                </div>
+
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 500 }}>
+                    {t('maintenance.meshcore_cli_history_retention', 'MeshCore CLI History Retention')}
+                  </label>
+                  <NumberInput
+                    value={cliHistoryRetentionDays}
+                    onChange={setCliHistoryRetentionDays}
                     min={7}
                     max={365}
                     integer

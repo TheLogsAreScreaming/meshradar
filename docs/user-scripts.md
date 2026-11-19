@@ -96,10 +96,11 @@ Scripts must output JSON to stdout:
 4. **Make it executable**: `chmod +x ./scripts/YourScript.py`
 5. **Configure in MeshMonitor**:
    - Navigate to **Settings → Automation → Auto Responder**
-   - Click **"Add Trigger"**
+   - Click **"Add Trigger"** to open a new trigger card
    - Set the trigger pattern (see script's example trigger)
    - Select **"Script"** as response type
-   - Enter the script path: `/data/scripts/YourScript.py`
+   - Pick the script: `/data/scripts/YourScript.py`
+   - Click **"Done"**, then **"Save"**
 6. **Test your trigger** by sending a message matching the pattern
 
 ## Installing Dependencies
@@ -136,6 +137,11 @@ All scripts receive these environment variables:
 - `TRIGGER`: The trigger pattern that matched
 - `PARAM_*`: Extracted parameters from trigger pattern (e.g., `PARAM_name`, `PARAM_location`)
 - `TZ`: Server timezone (IANA timezone name)
+- Every [Script Secret](/developers/auto-responder-scripting#script-secrets), under its own name
+
+### API keys
+
+Scripts do **not** see container variables whose names look like secrets (`*API_KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`), so an uploaded script can't read MeshMonitor's own keys. To give scripts an API key, an admin adds it in **Settings › Scripts › Script Secrets** (this needs `SESSION_SECRET` set in your environment). Each secret reaches **every** script as an environment variable of the same name, so read it with `os.environ["PIRATE_WEATHER_API_KEY"]` (Python) or `process.env.PIRATE_WEATHER_API_KEY` (Node.js). Only upload scripts you trust: any script can read every secret. See [Script Secrets](/developers/auto-responder-scripting#script-secrets).
 
 ## Source Code Location
 
@@ -173,7 +179,7 @@ External scripts are fetched from the external repository's raw GitHub URL. The 
 For detailed information on creating Auto Responder scripts, see:
 
 - [Auto Responder Scripting Guide](/developers/auto-responder-scripting) - Complete developer documentation
-- [Automatic Responses](/features/automation) - User-facing Auto Responder documentation
+- [Auto Responder](/features/automation-messages#auto-responder) - User-facing Auto Responder documentation
 - [Example Scripts README](https://github.com/yeraze/meshmonitor/blob/main/examples/auto-responder-scripts/README.md) - Detailed examples and patterns
 
 ## Join the Community

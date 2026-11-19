@@ -20,6 +20,8 @@ export const backupHistorySqlite = sqliteTable('backup_history', {
   backupType: text('backupType').notNull(), // 'auto' or 'manual'
   timestamp: integer('timestamp').notNull(),
   createdAt: integer('createdAt').notNull(),
+  sourceId: text('sourceId'), // NULL = legacy / unowned (admin-only)
+  protocol: text('protocol').notNull().default('meshtastic'),
 });
 
 export const backupHistoryPostgres = pgTable('backup_history', {
@@ -32,6 +34,8 @@ export const backupHistoryPostgres = pgTable('backup_history', {
   backupType: pgText('backupType').notNull(),
   timestamp: pgBigint('timestamp', { mode: 'number' }).notNull(),
   createdAt: pgBigint('createdAt', { mode: 'number' }).notNull(),
+  sourceId: pgText('sourceId'),
+  protocol: pgText('protocol').notNull().default('meshtastic'),
 });
 
 // ============ SYSTEM BACKUP HISTORY ============
@@ -126,6 +130,10 @@ export const userMapPreferencesSqlite = sqliteTable('user_map_preferences', {
   // Default true = today's decluttering behaviour; false pins every node at
   // exactly the position it reported.
   spreadNodes: integer('spread_nodes', { mode: 'boolean' }).default(true),
+  // Per-source coloured ring around node markers on Unified maps (#6125).
+  // Default false = opt-in; the ring reuses getSourceColor so it matches the
+  // colour that source already uses elsewhere.
+  colorNodesBySource: integer('color_nodes_by_source', { mode: 'boolean' }).default(false),
   // Likely-aircraft map display choice (#5364/#5365, migration 176):
   // 'show' | 'mark' | 'hide'. NULL reads as 'mark'.
   aircraftDisplayMode: text('aircraft_display_mode'),
@@ -138,6 +146,9 @@ export const userMapPreferencesSqlite = sqliteTable('user_map_preferences', {
   mapMaxAgeHours: integer('map_max_age_hours'),
   // Position history "points only" toggle (#3492): omit the connecting line.
   positionHistoryPointsOnly: integer('position_history_points_only', { mode: 'boolean' }).default(false),
+  // Per-source "Show MQTT/Bridge Messages" (#5824, migration 205): JSON
+  // object { [sourceId]: boolean }. NULL = never set on any source.
+  showMqttMessagesBySource: text('show_mqtt_messages_by_source'),
   createdAt: integer('createdAt'),
   updatedAt: integer('updatedAt'),
 });
@@ -167,12 +178,14 @@ export const userMapPreferencesPostgres = pgTable('user_map_preferences', {
   showAtakContacts: pgBoolean('show_atak_contacts').default(false),
   unreadIndicatorEnabled: pgBoolean('unread_indicator_enabled').default(true),
   spreadNodes: pgBoolean('spread_nodes').default(true),
+  colorNodesBySource: pgBoolean('color_nodes_by_source').default(false),
   aircraftDisplayMode: pgText('aircraft_display_mode'),
   showAircraftTrails: pgBoolean('show_aircraft_trails').default(false),
   aircraftTrailHours: pgInteger('aircraft_trail_hours').default(6),
   positionHistoryHours: pgInteger('position_history_hours'),
   mapMaxAgeHours: pgInteger('map_max_age_hours'),
   positionHistoryPointsOnly: pgBoolean('position_history_points_only').default(false),
+  showMqttMessagesBySource: pgText('show_mqtt_messages_by_source'),
   createdAt: pgBigint('createdAt', { mode: 'number' }),
   updatedAt: pgBigint('updatedAt', { mode: 'number' }),
 });
@@ -374,6 +387,8 @@ export const backupHistoryMysql = mysqlTable('backup_history', {
   backupType: myVarchar('backupType', { length: 32 }).notNull(),
   timestamp: myBigint('timestamp', { mode: 'number' }).notNull(),
   createdAt: myBigint('createdAt', { mode: 'number' }).notNull(),
+  sourceId: myVarchar('sourceId', { length: 36 }),
+  protocol: myVarchar('protocol', { length: 16 }).notNull().default('meshtastic'),
 });
 
 export const systemBackupHistoryMysql = mysqlTable('system_backup_history', {
@@ -426,12 +441,14 @@ export const userMapPreferencesMysql = mysqlTable('user_map_preferences', {
   showAtakContacts: myBoolean('show_atak_contacts').default(false),
   unreadIndicatorEnabled: myBoolean('unread_indicator_enabled').default(true),
   spreadNodes: myBoolean('spread_nodes').default(true),
+  colorNodesBySource: myBoolean('color_nodes_by_source').default(false),
   aircraftDisplayMode: myVarchar('aircraft_display_mode', { length: 8 }),
   showAircraftTrails: myBoolean('show_aircraft_trails').default(false),
   aircraftTrailHours: myInt('aircraft_trail_hours').default(6),
   positionHistoryHours: myInt('position_history_hours'),
   mapMaxAgeHours: myInt('map_max_age_hours'),
   positionHistoryPointsOnly: myBoolean('position_history_points_only').default(false),
+  showMqttMessagesBySource: myText('show_mqtt_messages_by_source'),
   createdAt: myBigint('createdAt', { mode: 'number' }),
   updatedAt: myBigint('updatedAt', { mode: 'number' }),
 });

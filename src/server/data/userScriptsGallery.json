@@ -65,11 +65,6 @@
     "githubPath": "Yoss101/MM-Weather/index.js"
   },
   {
-    "filename": "solar-forecast.py",
-    "name": "MeshManager Solar Forecast",
-    "githubPath": "Yeraze/meshmanager/main/examples/auto-responder-scripts/solar-forecast.py"
-  },
-  {
     "filename": "mm_radio_id_qth.py",
     "name": "Radio Identity + QTH",
     "githubPath": "maxhayim/meshmonitor-radio-id-qth/mm_radio_id_qth.py"
@@ -88,6 +83,11 @@
     "filename": "sky_and_sea_alert.py",
     "name": "Sky and Sea Alert",
     "githubPath": "maxhayim/meshmonitor-skyandsea-alert/sky_and_sea_alert.py"
+  },
+  {
+    "filename": "orbit_and_launch_alert.py",
+    "name": "Orbit and Launch Alert",
+    "githubPath": "maxhayim/meshmonitor-orbitandlaunch-alert/orbit_and_launch_alert.py"
   },
   {
     "filename": "remote-admin.py",

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useReducer, useRef, useMemo, u
 import { QueryClientContext } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from './icons';
+import { PasswordField } from './shared/config/PasswordField';
 import '../styles/settings.css';
 import { useSaveBar } from '../hooks/useSaveBar';
 import { NumberInput } from './common/NumberInput';
@@ -17,7 +18,7 @@ import { useCsrfFetch } from '../hooks/useCsrfFetch';
 import { getAllTilesets, type TilesetId } from '../config/tilesets';
 import { type NodeListStyle } from '../utils/nodeColor';
 import PacketMonitorSettings from './PacketMonitorSettings';
-import ChannelSoundPicker from './ChannelSoundPicker';
+import AudioNotificationSettings from './AudioNotificationSettings';
 import PkiDmGlobalToggle from './settings/PkiDmGlobalToggle';
 import PrivacyDocumentsSection from './settings/PrivacyDocumentsSection';
 import settingsStyles from './SettingsTab.module.css';
@@ -25,12 +26,23 @@ import SystemBackupSection from './configuration/SystemBackupSection';
 import DatabaseMaintenanceSection from './configuration/DatabaseMaintenanceSection';
 import ScriptsSection from './settings/ScriptsSection';
 import CoverageMqttRecordingSection from './settings/CoverageMqttRecordingSection';
+import MqttNativeSendSection from './settings/MqttNativeSendSection';
+import AnonMqttConsentSection from './settings/AnonMqttConsentSection';
+import { isMqttConsentFilterSourceType } from '../utils/mqttConsentFilter';
 import FirmwareUpdateSection from './configuration/FirmwareUpdateSection';
 import PkiDmDecryptionSection from './configuration/PkiDmDecryptionSection';
+import ReliablePkiSection from './settings/ReliablePkiSection';
+import NodeNameSanitizerSection from './settings/NodeNameSanitizerSection';
 import MqttBridgeConfigurationView from './MQTT/MqttBridgeConfigurationView';
 import ReticulumRetentionSection from './settings/ReticulumRetentionSection';
+import DefaultMeshtasticSourceSection from './settings/DefaultMeshtasticSourceSection';
 import { MovedSettingNote } from './common/MovedSettingNote';
+import SystemRestartSection from './settings/SystemRestartSection';
 import SignFlipCorrectionSettings from './settings/SignFlipCorrectionSettings';
+import NodeDimmingSettings from './settings/NodeDimmingSettings';
+import HideIncompleteNodesSetting from './settings/HideIncompleteNodesSetting';
+import TelemetryRetentionSettings from './settings/TelemetryRetentionSettings';
+import TelemetryDataActions from './settings/TelemetryDataActions';
 import { parseSignFlipSettings, clampSignFlipRangeKm, SIGN_FLIP_DEFAULT_RANGE_KM } from '../utils/signFlipPosition';
 import ChannelDatabaseSection from './configuration/ChannelDatabaseSection';
 import { CustomThemeManagement } from './CustomThemeManagement';
@@ -48,6 +60,9 @@ import { getEffectiveTileset, type Theme, type AppearanceMode, type NodeHopsCalc
 import { type SortOption as DashboardSortOption } from './Dashboard/types';
 import { LanguageSelector } from './LanguageSelector';
 import SectionNav from './SectionNav';
+import sectionNavLayout from './SectionNav.module.css';
+import { GlobalSettingsLink } from './nav/GlobalSettingsLink';
+import { GLOBAL_SETTINGS_PATH } from './nav/sourceNavEntries';
 import {
   GLOBAL_SETTINGS_SECTIONS,
   SOURCE_SETTINGS_SECTIONS,
@@ -56,6 +71,7 @@ import {
 } from './search/configSections';
 import PositionEstimationSection from './PositionEstimationSection';
 import AutoEnrichmentSection from './AutoEnrichmentSection';
+import MeshWarsSection from './MeshWarsSection';
 import MeshIssuesSection from './MeshIssuesSection';
 import TapbackEmojiSettings from './TapbackEmojiSettings';
 import EmbedSettings from './settings/EmbedSettings';
@@ -67,10 +83,9 @@ import { useDashboardSources } from '../hooks/useDashboardData';
 import { DEFAULT_TERRARIUM_URL } from '../types/elevation';
 import { ADSB_FEEDS, ADSB_FEED_IDS, DEFAULT_ADSB_FEED, isAdsbFeed } from '../utils/adsbFeeds';
 import { clampCoverageRetentionDays, COVERAGE_RETENTION_DEFAULT_DAYS, isCoverageMqttSourceType } from '../utils/coverage';
+import { clampDirectRfRetentionDays, DIRECT_RF_RETENTION_DEFAULT_DAYS, DIRECT_RF_RETENTION_MAX_DAYS, DIRECT_RF_RETENTION_MIN_DAYS } from '../utils/directRfContacts';
 import { useSourceQuery } from '../hooks/useSourceQuery';
 import { useSource } from '../contexts/SourceContext';
-import TelemetryOutlierDialog from './TelemetryOutlierDialog/TelemetryOutlierDialog';
-import { getTelemetryLabel } from './TelemetryChart';
 import {
   SETTINGS_TAB_PER_SOURCE_KEYS,
   NODE_DISPLAY_NUMERIC_DEFAULTS,
@@ -176,6 +191,8 @@ interface SettingsDraft {
   aircraftMslThresholdMeters: number;
   // Aircraft age-out (#5364/#5365 Phase 2) — same per-source routing.
   aircraftAgeOutEnabled: boolean;
+  /** #5704: ask a newly flagged aircraft for its position (opt-in, transmits). */
+  aircraftPositionRequestsEnabled: boolean;
   aircraftAgeOutHours: number;
   aircraftAgeOutAction: AircraftAgeOutAction;
   // Sign-flipped position correction (#5363) — per-source Node Display keys
@@ -201,10 +218,16 @@ interface SettingsDraft {
   // server-only — same Category C pattern as localStatsIntervalMinutes.
   txTargetMaxAgeHoursWhenUnlimited: number;
   meshcoreCliTimeoutSeconds: number;
+  // #5909: global opt-in, default off. Server-only (Category C): read by the
+  // hop-candidates route, never via SettingsContext.
+  meshcoreCrossSourceHopResolution: boolean;
   adminRetryAttempts: number;
   // Coverage Report retention window, in days (#5277 P1 WP2). Global, no
   // SettingsContext prop home — same Category C pattern as the two above.
   coverageRetentionDays: number;
+  // Direct RF Contacts retention window, in days (#6210). Global, same
+  // Category C pattern as coverageRetentionDays.
+  directRfRetentionDays: number;
   analyticsProvider: string;
   analyticsConfig: Record<string, string>;
   appriseApiServerUrl: string;
@@ -219,9 +242,15 @@ interface SettingsDraft {
   // ADS-B flight matching (#5374). Global outbound service, same admin-field
   // pattern as the elevation pair. `adsbApiToken` maps to the server-only
   // `adsb_api_token` key (admins receive it unmasked).
+  // Tropospheric ducting overlay (#5734). Global, admin-only, off by default.
+  ductingOverlayEnabled: boolean;
+  mqttRootDirectoryRefreshEnabled: boolean;
   adsbMatchEnabled: boolean;
   adsbFeed: string;
   adsbApiToken: string;
+  // OpenSky Network credentials (#5877): server-only `adsb_opensky_client_*`.
+  adsbOpenSkyClientId: string;
+  adsbOpenSkyClientSecret: string;
   // Deployment-wide Carto basemap API key (#4934). Global, admin-set, publicly
   // readable (NOT a secret) — publishable, domain-restricted token appended to
   // Carto tile URLs. Mirrors the elevationSourceUrl admin-field pattern.
@@ -230,6 +259,17 @@ interface SettingsDraft {
   // server, not per-source — mirrors the elevation fields above.
   cotFeedEnabled: boolean;
   cotFeedPort: number;
+  // Public-instance mode (#5156). Global; master default OFF, sub-toggles default ON.
+  publicInstanceModeEnabled: boolean;
+  publicInstanceHideLongNames: boolean;
+  publicInstanceHidePublicKeys: boolean;
+  publicInstanceRoundTimestamps: boolean;
+  publicInstanceHideMessageText: boolean;
+  // Virtual Node message replay (#6160). Global, opt-in (default off). Same
+  // Category C pattern as the fields above — no SettingsContext home; read
+  // server-side by VirtualNodeServer. Exclude list is a CSV of IPs.
+  virtualNodeReplayEnabled: boolean;
+  virtualNodeReplayExcludeIps: string;
   // Translation settings (global)
   translationEnabled: boolean;
   translationProvider: TranslationProvider;
@@ -490,8 +530,6 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // section/nav item to MQTT-shaped sources — see isCoverageMqttSourceType
   // below.
   const { sourceId: purgeSourceId, sourceType } = useSource();
-  // #5333: outlier purge dialog (Danger Zone → Clean telemetry outliers).
-  const [outlierDialogOpen, setOutlierDialogOpen] = useState(false);
 
   // Single draft reducer replacing the 49 `local*` mirrors (Task 5.3). Lazy-initialized once from
   // the current context/props values; category-C fields (no context/prop home) start at their
@@ -541,6 +579,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     aircraftAglThresholdMeters: DEFAULT_AIRCRAFT_AGL_THRESHOLD_M,
     aircraftMslThresholdMeters: DEFAULT_AIRCRAFT_MSL_THRESHOLD_M,
     aircraftAgeOutEnabled: false,
+    aircraftPositionRequestsEnabled: false,
     aircraftAgeOutHours: AIRCRAFT_AGE_OUT_HOURS_DEFAULT,
     aircraftAgeOutAction: DEFAULT_AIRCRAFT_AGE_OUT_ACTION,
     signFlipCorrectionEnabled: false,
@@ -559,8 +598,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     localStatsIntervalMinutes: NODE_DISPLAY_NUMERIC_DEFAULTS.localStatsIntervalMinutes,
     txTargetMaxAgeHoursWhenUnlimited: TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_DEFAULT,
     meshcoreCliTimeoutSeconds: 15,
+    meshcoreCrossSourceHopResolution: false,
     adminRetryAttempts: 1,
     coverageRetentionDays: COVERAGE_RETENTION_DEFAULT_DAYS,
+    directRfRetentionDays: DIRECT_RF_RETENTION_DEFAULT_DAYS,
     analyticsProvider: 'none',
     analyticsConfig: {},
     appriseApiServerUrl: '',
@@ -570,12 +611,23 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     externalUrl: '',
     elevationEnabled: false,
     elevationSourceUrl: '',
+    ductingOverlayEnabled: false,
+    mqttRootDirectoryRefreshEnabled: false,
     adsbMatchEnabled: false,
     adsbFeed: DEFAULT_ADSB_FEED,
     adsbApiToken: '',
+    adsbOpenSkyClientId: '',
+    adsbOpenSkyClientSecret: '',
     cartoApiKey: '',
     cotFeedEnabled: false,
     cotFeedPort: 8088,
+    publicInstanceModeEnabled: false,
+    publicInstanceHideLongNames: true,
+    publicInstanceHidePublicKeys: true,
+    publicInstanceRoundTimestamps: true,
+    publicInstanceHideMessageText: true,
+    virtualNodeReplayEnabled: false,
+    virtualNodeReplayExcludeIps: '',
     translationEnabled: false,
     translationProvider: DEFAULT_TRANSLATION_PROVIDER,
     ...emptyTranslationProviderFieldValues(),
@@ -599,9 +651,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // MeshCore CLI console reply-timeout (seconds), issue #4027. Local-only server-backed setting
   // (no SettingsContext prop), mirroring localStats above.
   const [initialMeshcoreCliTimeoutSeconds, setInitialMeshcoreCliTimeoutSeconds] = useState(15);
+  const [initialMeshcoreCrossSourceHopResolution, setInitialMeshcoreCrossSourceHopResolution] = useState(false);
   const [initialAdminRetryAttempts, setInitialAdminRetryAttempts] = useState(1);
   // Coverage Report retention window (#5277 P1 WP2). Same Category C pattern.
   const [initialCoverageRetentionDays, setInitialCoverageRetentionDays] = useState(COVERAGE_RETENTION_DEFAULT_DAYS);
+  // Direct RF Contacts retention window (#6210). Same Category C pattern.
+  const [initialDirectRfRetentionDays, setInitialDirectRfRetentionDays] = useState(DIRECT_RF_RETENTION_DEFAULT_DAYS);
   const [initialAnalyticsProvider, setInitialAnalyticsProvider] = useState<string>('none');
   const [initialAnalyticsConfig, setInitialAnalyticsConfig] = useState<string>('{}');
   const [initialAppriseApiServerUrl, setInitialAppriseApiServerUrl] = useState<string>('');
@@ -616,10 +671,15 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // `elevationSourceUrl` (stripSecretSettings returns the full map to admins).
   const [initialElevationEnabled, setInitialElevationEnabled] = useState(false);
   const [initialElevationSourceUrl, setInitialElevationSourceUrl] = useState('');
+  // Ducting overlay (#5734): same Category C pattern as elevation.
+  const [initialDuctingOverlayEnabled, setInitialDuctingOverlayEnabled] = useState(false);
+  const [initialMqttRootDirectoryRefreshEnabled, setInitialMqttRootDirectoryRefreshEnabled] = useState(false);
   // ADS-B flight matching (#5374): same Category C pattern as elevation.
   const [initialAdsbMatchEnabled, setInitialAdsbMatchEnabled] = useState(false);
   const [initialAdsbFeed, setInitialAdsbFeed] = useState<string>(DEFAULT_ADSB_FEED);
   const [initialAdsbApiToken, setInitialAdsbApiToken] = useState('');
+  const [initialAdsbOpenSkyClientId, setInitialAdsbOpenSkyClientId] = useState('');
+  const [initialAdsbOpenSkyClientSecret, setInitialAdsbOpenSkyClientSecret] = useState('');
   // Likely-aircraft detection (#5364/#5365 Phase 1 WP5). Per-source, unseeded
   // Node Display keys (AIRCRAFT_NODE_DISPLAY_KEYS) — same Category C pattern
   // as the elevation pair above: no SettingsContext prop home, dirty-tracked
@@ -630,6 +690,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // Aircraft age-out (#5364/#5365 Phase 2): same Category C pattern. The
   // last-run pair is server-written and read-only here (not in the draft).
   const [initialAircraftAgeOutEnabled, setInitialAircraftAgeOutEnabled] = useState(false);
+  const [initialAircraftPositionRequestsEnabled, setInitialAircraftPositionRequestsEnabled] = useState(false);
   const [initialAircraftAgeOutHours, setInitialAircraftAgeOutHours] = useState(AIRCRAFT_AGE_OUT_HOURS_DEFAULT);
   const [initialAircraftAgeOutAction, setInitialAircraftAgeOutAction] = useState<AircraftAgeOutAction>(DEFAULT_AIRCRAFT_AGE_OUT_ACTION);
   // Sign-flip correction (#5363): Category C, one snapshot for the four keys.
@@ -650,6 +711,15 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // global singleton, no context/prop home, default OFF / port 8088.
   const [initialCotFeedEnabled, setInitialCotFeedEnabled] = useState(false);
   const [initialCotFeedPort, setInitialCotFeedPort] = useState(8088);
+  // Public-instance mode (#5156): master default OFF, sub-toggles default ON.
+  const [initialPublicInstanceModeEnabled, setInitialPublicInstanceModeEnabled] = useState(false);
+  const [initialPublicInstanceHideLongNames, setInitialPublicInstanceHideLongNames] = useState(true);
+  const [initialPublicInstanceHidePublicKeys, setInitialPublicInstanceHidePublicKeys] = useState(true);
+  const [initialPublicInstanceRoundTimestamps, setInitialPublicInstanceRoundTimestamps] = useState(true);
+  const [initialPublicInstanceHideMessageText, setInitialPublicInstanceHideMessageText] = useState(true);
+  // Virtual Node message replay (#6160). Same Category C pattern as cotFeed above.
+  const [initialVirtualNodeReplayEnabled, setInitialVirtualNodeReplayEnabled] = useState(false);
+  const [initialVirtualNodeReplayExcludeIps, setInitialVirtualNodeReplayExcludeIps] = useState('');
   // Translation settings (global)
   const [initialTranslationEnabled, setInitialTranslationEnabled] = useState(false);
   const [initialTranslationProvider, setInitialTranslationProvider] = useState<TranslationProvider>(DEFAULT_TRANSLATION_PROVIDER);
@@ -664,8 +734,6 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // 5.3 spec).
   const [isFetchingSolarEstimates, setIsFetchingSolarEstimates] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [isDocker, setIsDocker] = useState<boolean | null>(null);
-  const [isRestarting, setIsRestarting] = useState(false);
   const [databaseType, setDatabaseType] = useState<'sqlite' | 'postgres' | 'mysql' | null>(null);
   const [firmwareOtaEnabled, setFirmwareOtaEnabled] = useState(false);
   const [isTestingApprise, setIsTestingApprise] = useState<boolean>(false);
@@ -674,18 +742,6 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   const [elevationTesting, setElevationTesting] = useState(false);
   const { showToast } = useToast();
 
-  // Fetch system status to determine if running in Docker
-  useEffect(() => {
-    const fetchSystemStatus = async () => {
-      try {
-        const data = await apiService.get<{ isDocker?: boolean }>('/api/system/status');
-        setIsDocker(!!data.isDocker);
-      } catch (error) {
-        logger.error('Failed to fetch system status:', error);
-      }
-    };
-    void fetchSystemStatus();
-  }, [baseUrl]);
 
   // Fetch database type from health endpoint (public, no auth required)
   useEffect(() => {
@@ -764,6 +820,11 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           updateField('meshcoreCliTimeoutSeconds', cliTimeout);
           setInitialMeshcoreCliTimeoutSeconds(cliTimeout);
 
+          // #5909: cross-source hop resolution. Off unless explicitly on.
+          const crossSourceHopsOn = settings.meshcoreCrossSourceHopResolution === '1' || settings.meshcoreCrossSourceHopResolution === 'true';
+          updateField('meshcoreCrossSourceHopResolution', crossSourceHopsOn);
+          setInitialMeshcoreCrossSourceHopResolution(crossSourceHopsOn);
+
           // Load remote-admin retry attempts (#4487). Absent/invalid => 1, i.e.
           // a single attempt, matching the server's own fallback exactly.
           const retryParsed = parseInt(settings.adminRetryAttempts || '1', 10);
@@ -776,6 +837,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           const coverageRetention = clampCoverageRetentionDays(settings.coverage_retention_days);
           updateField('coverageRetentionDays', coverageRetention);
           setInitialCoverageRetentionDays(coverageRetention);
+          // Direct RF Contacts retention (#6210): default 30, clamped 1-365.
+          const directRfRetention = clampDirectRfRetentionDays(settings.direct_rf_contacts_retention_days);
+          updateField('directRfRetentionDays', directRfRetention);
+          setInitialDirectRfRetentionDays(directRfRetention);
 
           // Load node dimming initial values from server (#4412 Phase 3 WP4(c):
           // the trio now lands on the draft via updateField, like every other
@@ -835,6 +900,16 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           updateField('elevationSourceUrl', elevationSourceUrl);
           setInitialElevationSourceUrl(elevationSourceUrl);
 
+          // Ducting overlay (#5734). Off unless stored 'true'.
+          const ductingOn = settings.ductingOverlayEnabled === 'true';
+          updateField('ductingOverlayEnabled', ductingOn);
+          setInitialDuctingOverlayEnabled(ductingOn);
+
+          // MQTT root directory refresh (#6337). Off unless stored 'true'.
+          const rootDirOn = settings.mqttRootDirectoryRefreshEnabled === 'true';
+          updateField('mqttRootDirectoryRefreshEnabled', rootDirOn);
+          setInitialMqttRootDirectoryRefreshEnabled(rootDirOn);
+
           // ADS-B flight matching (#5374). Off unless stored 'true'; an
           // unknown feed reads as the default.
           const adsbOn = settings.adsbMatchEnabled === 'true';
@@ -846,6 +921,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           const adsbToken = typeof settings.adsb_api_token === 'string' ? settings.adsb_api_token : '';
           updateField('adsbApiToken', adsbToken);
           setInitialAdsbApiToken(adsbToken);
+          const openSkyId = typeof settings.adsb_opensky_client_id === 'string' ? settings.adsb_opensky_client_id : '';
+          updateField('adsbOpenSkyClientId', openSkyId);
+          setInitialAdsbOpenSkyClientId(openSkyId);
+          const openSkySecret = typeof settings.adsb_opensky_client_secret === 'string' ? settings.adsb_opensky_client_secret : '';
+          updateField('adsbOpenSkyClientSecret', openSkySecret);
+          setInitialAdsbOpenSkyClientSecret(openSkySecret);
 
           // Load likely-aircraft detection settings (#5364/#5365 Phase 1
           // WP5). Per-source, routed through NODE_DISPLAY_SETTING_KEYS; an
@@ -879,6 +960,11 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           updateField('aircraftAgeOutAction', ageOut.action);
           setInitialAircraftAgeOutAction(ageOut.action);
 
+          // #5704: off unless explicitly 'true'.
+          const positionRequests = settings.aircraftPositionRequestsEnabled === 'true';
+          updateField('aircraftPositionRequestsEnabled', positionRequests);
+          setInitialAircraftPositionRequestsEnabled(positionRequests);
+
           // Sign-flip correction (#5363). Off / 500 km / own node when unset.
           // The typed reference strings are kept as stored so a half-entered
           // point shows up for fixing rather than silently vanishing.
@@ -909,6 +995,23 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           updateField('cartoApiKey', cartoApiKey);
           setInitialCartoApiKey(cartoApiKey);
 
+          // Public-instance mode (#5156). Master opts in; sub-toggles opt out.
+          const publicInstanceMasterOn = settings.publicInstanceModeEnabled === '1' || settings.publicInstanceModeEnabled === 'true';
+          updateField('publicInstanceModeEnabled', publicInstanceMasterOn);
+          setInitialPublicInstanceModeEnabled(publicInstanceMasterOn);
+          const publicInstanceHideLongNamesOn = !(settings.publicInstanceHideLongNames === '0' || settings.publicInstanceHideLongNames === 'false');
+          updateField('publicInstanceHideLongNames', publicInstanceHideLongNamesOn);
+          setInitialPublicInstanceHideLongNames(publicInstanceHideLongNamesOn);
+          const publicInstanceHidePublicKeysOn = !(settings.publicInstanceHidePublicKeys === '0' || settings.publicInstanceHidePublicKeys === 'false');
+          updateField('publicInstanceHidePublicKeys', publicInstanceHidePublicKeysOn);
+          setInitialPublicInstanceHidePublicKeys(publicInstanceHidePublicKeysOn);
+          const publicInstanceRoundTimestampsOn = !(settings.publicInstanceRoundTimestamps === '0' || settings.publicInstanceRoundTimestamps === 'false');
+          updateField('publicInstanceRoundTimestamps', publicInstanceRoundTimestampsOn);
+          setInitialPublicInstanceRoundTimestamps(publicInstanceRoundTimestampsOn);
+          const publicInstanceHideMessageTextOn = !(settings.publicInstanceHideMessageText === '0' || settings.publicInstanceHideMessageText === 'false');
+          updateField('publicInstanceHideMessageText', publicInstanceHideMessageTextOn);
+          setInitialPublicInstanceHideMessageText(publicInstanceHideMessageTextOn);
+
           // Load ATAK/CoT feed settings (#3691 Phase 3). Default OFF; absent
           // port key => 8088.
           const cotFeedEnabledOn = settings.cotFeedEnabled === '1' || settings.cotFeedEnabled === 'true';
@@ -918,6 +1021,14 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           const cotFeedPort = Number.isFinite(cotFeedPortParsed) && cotFeedPortParsed > 0 ? cotFeedPortParsed : 8088;
           updateField('cotFeedPort', cotFeedPort);
           setInitialCotFeedPort(cotFeedPort);
+
+          // Load Virtual Node message replay settings (#6160). Default OFF.
+          const vnReplayOn = settings.virtualNodeReplayEnabled === '1' || settings.virtualNodeReplayEnabled === 'true';
+          updateField('virtualNodeReplayEnabled', vnReplayOn);
+          setInitialVirtualNodeReplayEnabled(vnReplayOn);
+          const vnReplayExcludeIps = typeof settings.virtualNodeReplayExcludeIps === 'string' ? settings.virtualNodeReplayExcludeIps : '';
+          updateField('virtualNodeReplayExcludeIps', vnReplayExcludeIps);
+          setInitialVirtualNodeReplayExcludeIps(vnReplayExcludeIps);
 
           // Load Translation settings
           const translationOn = settings.translationEnabled === 'true' || settings.translationEnabled === '1';
@@ -1020,6 +1131,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       aircraftAglThresholdMeters: initialAircraftAglThresholdMeters,
       aircraftMslThresholdMeters: initialAircraftMslThresholdMeters,
       aircraftAgeOutEnabled: initialAircraftAgeOutEnabled,
+      aircraftPositionRequestsEnabled: initialAircraftPositionRequestsEnabled,
       aircraftAgeOutHours: initialAircraftAgeOutHours,
       aircraftAgeOutAction: initialAircraftAgeOutAction,
       signFlipCorrectionEnabled: initialSignFlip.enabled,
@@ -1038,8 +1150,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       localStatsIntervalMinutes: initialLocalStatsIntervalMinutes,
       txTargetMaxAgeHoursWhenUnlimited: initialTxTargetMaxAgeHoursWhenUnlimited,
       meshcoreCliTimeoutSeconds: initialMeshcoreCliTimeoutSeconds,
+      meshcoreCrossSourceHopResolution: initialMeshcoreCrossSourceHopResolution,
       adminRetryAttempts: initialAdminRetryAttempts,
       coverageRetentionDays: initialCoverageRetentionDays,
+      directRfRetentionDays: initialDirectRfRetentionDays,
       analyticsProvider: initialAnalyticsProvider,
       analyticsConfig: parsedAnalyticsConfig,
       appriseApiServerUrl: initialAppriseApiServerUrl,
@@ -1049,12 +1163,23 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       externalUrl: initialExternalUrl,
       elevationEnabled: initialElevationEnabled,
       elevationSourceUrl: initialElevationSourceUrl,
+      ductingOverlayEnabled: initialDuctingOverlayEnabled,
+      mqttRootDirectoryRefreshEnabled: initialMqttRootDirectoryRefreshEnabled,
       adsbMatchEnabled: initialAdsbMatchEnabled,
       adsbFeed: initialAdsbFeed,
       adsbApiToken: initialAdsbApiToken,
+      adsbOpenSkyClientId: initialAdsbOpenSkyClientId,
+      adsbOpenSkyClientSecret: initialAdsbOpenSkyClientSecret,
       cartoApiKey: initialCartoApiKey,
       cotFeedEnabled: initialCotFeedEnabled,
       cotFeedPort: initialCotFeedPort,
+      publicInstanceModeEnabled: initialPublicInstanceModeEnabled,
+      publicInstanceHideLongNames: initialPublicInstanceHideLongNames,
+      publicInstanceHidePublicKeys: initialPublicInstanceHidePublicKeys,
+      publicInstanceRoundTimestamps: initialPublicInstanceRoundTimestamps,
+      publicInstanceHideMessageText: initialPublicInstanceHideMessageText,
+      virtualNodeReplayEnabled: initialVirtualNodeReplayEnabled,
+      virtualNodeReplayExcludeIps: initialVirtualNodeReplayExcludeIps,
       translationEnabled: initialTranslationEnabled,
       translationProvider: initialTranslationProvider,
       ...initialTranslationFields,
@@ -1069,16 +1194,20 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       linkPreviewsEnabled, discardInvalidPositions, noIndexEnabled, meshcoreChannelRetryEnabled, showIncompleteNodes,
       nodeDimmingEnabled, nodeDimmingStartHours, nodeDimmingMinOpacity,
       initialAircraftDetectionEnabled, initialAircraftAglThresholdMeters, initialAircraftMslThresholdMeters,
-      initialAircraftAgeOutEnabled, initialAircraftAgeOutHours, initialAircraftAgeOutAction,
+      initialAircraftAgeOutEnabled, initialAircraftAgeOutHours, initialAircraftAgeOutAction, initialAircraftPositionRequestsEnabled,
       initialSignFlip,
       solarMonitoringEnabled, solarMonitoringLatitude, solarMonitoringLongitude, solarMonitoringAzimuth, solarMonitoringDeclination,
       initialPacketMonitorSettings, initialHomoglyphEnabled, initialLocalStatsIntervalMinutes, initialTxTargetMaxAgeHoursWhenUnlimited,
-      initialMeshcoreCliTimeoutSeconds, initialAdminRetryAttempts,
-      initialCoverageRetentionDays,
+      initialMeshcoreCliTimeoutSeconds, initialMeshcoreCrossSourceHopResolution, initialAdminRetryAttempts,
+      initialCoverageRetentionDays, initialDirectRfRetentionDays,
       initialAnalyticsProvider, initialAnalyticsConfig, initialAppriseApiServerUrl, initialExternalUrl, initialElevationEnabled, initialElevationSourceUrl,
       initialPrivacyPolicyUrl, initialTermsOfServiceUrl, initialContactUrl,
       initialCartoApiKey, initialCotFeedEnabled, initialCotFeedPort,
+      initialPublicInstanceModeEnabled, initialPublicInstanceHideLongNames, initialPublicInstanceHidePublicKeys, initialPublicInstanceRoundTimestamps, initialPublicInstanceHideMessageText,
+      initialVirtualNodeReplayEnabled, initialVirtualNodeReplayExcludeIps,
+      initialDuctingOverlayEnabled, initialMqttRootDirectoryRefreshEnabled,
       initialAdsbMatchEnabled, initialAdsbFeed, initialAdsbApiToken,
+      initialAdsbOpenSkyClientId, initialAdsbOpenSkyClientSecret,
       initialTranslationEnabled, initialTranslationProvider, initialTranslationFields, initialTranslationDefaultLanguage, initialTranslationDefaultOutgoingLanguage]);
 
   // Re-seed the draft's category-A/B fields whenever the upstream props/context values change.
@@ -1172,6 +1301,8 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // nodeDimmingChanged tracker is gone now that the trio is an ordinary draft field (#4412 Phase 3
   // WP4c) covered by settingsDraftEqual like every other field.
   const hasChanges = useMemo(() => !settingsDraftEqual(draft, baseline), [draft, baseline]);
+  // OpenSky has no anonymous mode (#5877); the server refuses the feed without both.
+  const openSkyCredsSet = draft.adsbOpenSkyClientId.trim() !== '' && draft.adsbOpenSkyClientSecret.trim() !== '';
 
   // Reset local state to current saved values (for SaveBar dismiss). Replaces the old ~35-dep
   // resetChanges useCallback — re-seeding the draft from `baseline` covers every draft field
@@ -1257,6 +1388,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     setInitialAircraftAglThresholdMeters(d.aircraftAglThresholdMeters);
     setInitialAircraftMslThresholdMeters(d.aircraftMslThresholdMeters);
     setInitialAircraftAgeOutEnabled(d.aircraftAgeOutEnabled);
+    setInitialAircraftPositionRequestsEnabled(d.aircraftPositionRequestsEnabled);
     setInitialAircraftAgeOutHours(d.aircraftAgeOutHours);
     setInitialAircraftAgeOutAction(d.aircraftAgeOutAction);
     setInitialSignFlip({
@@ -1270,8 +1402,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     setInitialLocalStatsIntervalMinutes(d.localStatsIntervalMinutes);
     setInitialTxTargetMaxAgeHoursWhenUnlimited(d.txTargetMaxAgeHoursWhenUnlimited);
     setInitialMeshcoreCliTimeoutSeconds(d.meshcoreCliTimeoutSeconds);
+    setInitialMeshcoreCrossSourceHopResolution(d.meshcoreCrossSourceHopResolution);
     setInitialAdminRetryAttempts(d.adminRetryAttempts);
     setInitialCoverageRetentionDays(d.coverageRetentionDays);
+    setInitialDirectRfRetentionDays(d.directRfRetentionDays);
     setInitialAnalyticsProvider(d.analyticsProvider);
     setInitialAnalyticsConfig(JSON.stringify(d.analyticsConfig));
     setInitialAppriseApiServerUrl(d.appriseApiServerUrl.trim());
@@ -1281,12 +1415,23 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     setInitialExternalUrl(d.externalUrl.trim());
     setInitialElevationEnabled(d.elevationEnabled);
     setInitialElevationSourceUrl(d.elevationSourceUrl.trim());
+    setInitialDuctingOverlayEnabled(d.ductingOverlayEnabled);
+    setInitialMqttRootDirectoryRefreshEnabled(d.mqttRootDirectoryRefreshEnabled);
     setInitialAdsbMatchEnabled(d.adsbMatchEnabled);
     setInitialAdsbFeed(d.adsbFeed);
     setInitialAdsbApiToken(d.adsbApiToken.trim());
+    setInitialAdsbOpenSkyClientId(d.adsbOpenSkyClientId.trim());
+    setInitialAdsbOpenSkyClientSecret(d.adsbOpenSkyClientSecret.trim());
     setInitialCartoApiKey(d.cartoApiKey.trim());
     setInitialCotFeedEnabled(d.cotFeedEnabled);
     setInitialCotFeedPort(d.cotFeedPort);
+    setInitialPublicInstanceModeEnabled(d.publicInstanceModeEnabled);
+    setInitialPublicInstanceHideLongNames(d.publicInstanceHideLongNames);
+    setInitialPublicInstanceHidePublicKeys(d.publicInstanceHidePublicKeys);
+    setInitialPublicInstanceRoundTimestamps(d.publicInstanceRoundTimestamps);
+    setInitialPublicInstanceHideMessageText(d.publicInstanceHideMessageText);
+    setInitialVirtualNodeReplayEnabled(d.virtualNodeReplayEnabled);
+    setInitialVirtualNodeReplayExcludeIps(d.virtualNodeReplayExcludeIps.trim());
     setInitialTranslationEnabled(d.translationEnabled);
     setInitialTranslationProvider(d.translationProvider);
     const savedTranslationFields = emptyTranslationProviderFieldValues();
@@ -1358,8 +1503,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         localStatsIntervalMinutes: draft.localStatsIntervalMinutes.toString(),
         txTargetMaxAgeHoursWhenUnlimited: draft.txTargetMaxAgeHoursWhenUnlimited.toString(),
         meshcoreCliTimeoutSeconds: draft.meshcoreCliTimeoutSeconds.toString(),
+        meshcoreCrossSourceHopResolution: draft.meshcoreCrossSourceHopResolution ? '1' : '0',
         adminRetryAttempts: draft.adminRetryAttempts.toString(),
         coverage_retention_days: String(clampCoverageRetentionDays(draft.coverageRetentionDays)),
+        direct_rf_contacts_retention_days: String(clampDirectRfRetentionDays(draft.directRfRetentionDays)),
         nodeHopsCalculation: draft.nodeHopsCalculation,
         nodeDimmingEnabled: draft.nodeDimmingEnabled ? '1' : '0',
         nodeDimmingStartHours: draft.nodeDimmingStartHours.toString(),
@@ -1376,6 +1523,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         // Aircraft age-out (#5364/#5365 Phase 2). The server-written
         // aircraftAgeOutLastRunAt/LastResult are never posted.
         aircraftAgeOutEnabled: draft.aircraftAgeOutEnabled ? 'true' : 'false',
+        aircraftPositionRequestsEnabled: draft.aircraftPositionRequestsEnabled ? 'true' : 'false',
         aircraftAgeOutHours: String(draft.aircraftAgeOutHours),
         aircraftAgeOutAction: draft.aircraftAgeOutAction,
         // Sign-flip correction (#5363), per-source via NODE_DISPLAY_SETTING_KEYS.
@@ -1392,12 +1540,24 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         externalUrl: draft.externalUrl.trim(),
         elevationEnabled: draft.elevationEnabled ? 'true' : 'false',
         elevationSourceUrl: draft.elevationSourceUrl.trim(),
+        ductingOverlayEnabled: draft.ductingOverlayEnabled ? 'true' : 'false',
+        mqttRootDirectoryRefreshEnabled: draft.mqttRootDirectoryRefreshEnabled ? 'true' : 'false',
         adsbMatchEnabled: draft.adsbMatchEnabled ? 'true' : 'false',
         adsbFeed: draft.adsbFeed,
         adsb_api_token: draft.adsbApiToken.trim(),
+        adsb_opensky_client_id: draft.adsbOpenSkyClientId.trim(),
+        adsb_opensky_client_secret: draft.adsbOpenSkyClientSecret.trim(),
         cartoApiKey: draft.cartoApiKey.trim(),
         cotFeedEnabled: draft.cotFeedEnabled ? '1' : '0',
         cotFeedPort: String(draft.cotFeedPort),
+        publicInstanceModeEnabled: draft.publicInstanceModeEnabled ? '1' : '0',
+        publicInstanceHideLongNames: draft.publicInstanceHideLongNames ? '1' : '0',
+        publicInstanceHidePublicKeys: draft.publicInstanceHidePublicKeys ? '1' : '0',
+        publicInstanceRoundTimestamps: draft.publicInstanceRoundTimestamps ? '1' : '0',
+        publicInstanceHideMessageText: draft.publicInstanceHideMessageText ? '1' : '0',
+        // Virtual Node message replay (#6160). Opt-in; exclude list trimmed.
+        virtualNodeReplayEnabled: draft.virtualNodeReplayEnabled ? '1' : '0',
+        virtualNodeReplayExcludeIps: draft.virtualNodeReplayExcludeIps.trim(),
         translationEnabled: draft.translationEnabled ? 'true' : 'false',
         translationProvider: draft.translationProvider,
         // Provider fields (#5518). Hand-written: the persistence test reads
@@ -1663,6 +1823,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       updateField('discardInvalidPositions', true);
       updateField('meshcoreChannelRetryEnabled', false);
       updateField('coverageRetentionDays', COVERAGE_RETENTION_DEFAULT_DAYS);
+      updateField('directRfRetentionDays', DIRECT_RF_RETENTION_DEFAULT_DAYS);
 
       // Update parent component with defaults
       onMaxNodeAgeChange(NODE_DISPLAY_NUMERIC_DEFAULTS.maxNodeAgeHours);
@@ -1696,6 +1857,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       // Update initial packet monitor settings
       setInitialPacketMonitorSettings({ enabled: false, maxCount: 1000, maxAgeHours: 24 });
       setInitialCoverageRetentionDays(COVERAGE_RETENTION_DEFAULT_DAYS);
+      setInitialDirectRfRetentionDays(DIRECT_RF_RETENTION_DEFAULT_DAYS);
 
       showToast(t('settings.reset_success'), 'success');
     } catch (error) {
@@ -1707,10 +1869,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   };
   const handlePurgeNodes = async () => {
     const confirmed = window.confirm(
-      t('settings.confirm_purge_nodes_title') + '\n\n' +
+      t(purgeSourceId ? 'settings.confirm_purge_nodes_title_source' : 'settings.confirm_purge_nodes_title') + '\n\n' +
       t('settings.confirm_purge_nodes_impact') + '\n' +
-      '• ' + t('settings.confirm_purge_nodes_item1') + '\n' +
-      '• ' + t('settings.confirm_purge_nodes_item2') + '\n' +
+      '• ' + t(purgeSourceId ? 'settings.confirm_purge_nodes_item1_source' : 'settings.confirm_purge_nodes_item1') + '\n' +
+      '• ' + t(purgeSourceId ? 'settings.confirm_purge_nodes_item2_source' : 'settings.confirm_purge_nodes_item2') + '\n' +
       '• ' + t('settings.confirm_purge_nodes_item3') + '\n' +
       // #4629: the purge now also clears the Auto-Traceroute / Auto-Time-Sync
       // node allowlists. That is a curated selection the user built by hand, so
@@ -1722,35 +1884,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     if (!confirmed) return;
 
     try {
-      await apiService.purgeNodes(0);
+      await apiService.purgeNodes(0, purgeSourceId ?? undefined);
       showToast(t('toast.nodes_purged'), 'success');
       setTimeout(() => window.location.reload(), 1500);
     } catch (error) {
       logger.error('Error purging nodes:', error);
       showToast(t('toast.node_purge_failed'), 'error');
-    }
-  };
-
-  const handlePurgeTelemetry = async () => {
-    const confirmed = window.confirm(
-      t('settings.confirm_purge_telemetry_title') + '\n\n' +
-      t('settings.confirm_purge_nodes_impact') + '\n' +
-      '• ' + t('settings.confirm_purge_telemetry_item1') + '\n' +
-      '• ' + t('settings.confirm_purge_telemetry_item2') + '\n' +
-      '• ' + t('settings.confirm_purge_telemetry_item3') + '\n' +
-      '• ' + t('settings.confirm_purge_telemetry_item4') + '\n\n' +
-      t('settings.confirm_cannot_undo')
-    );
-
-    if (!confirmed) return;
-
-    try {
-      await apiService.purgeTelemetry(0);
-      showToast(t('toast.telemetry_purged'), 'success');
-      setTimeout(() => window.location.reload(), 1500);
-    } catch (error) {
-      logger.error('Error purging telemetry:', error);
-      showToast(t('toast.telemetry_purge_failed'), 'error');
     }
   };
 
@@ -1796,35 +1935,6 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     } catch (error) {
       logger.error('Error purging traceroutes:', error);
       showToast(t('toast.traceroutes_purge_failed'), 'error');
-    }
-  };
-
-  const handleRestartContainer = async () => {
-    const action = isDocker ? t('settings.restart_action') : t('settings.shutdown_action');
-    const confirmed = window.confirm(
-      t('settings.confirm_restart_title', { action }) + '\n\n' +
-      (isDocker
-        ? t('settings.confirm_restart_docker')
-        : t('settings.confirm_restart_manual'))
-    );
-
-    if (!confirmed) return;
-
-    setIsRestarting(true);
-    try {
-      const result = await apiService.restartContainer();
-      showToast(result.message, 'success');
-
-      if (isDocker) {
-        // Wait a few seconds, then reload the page
-        setTimeout(() => {
-          window.location.reload();
-        }, 5000);
-      }
-    } catch (error) {
-      logger.error(`Error ${action}ing:`, error);
-      showToast(t('settings.restart_failed', { action }), 'error');
-      setIsRestarting(false);
     }
   };
 
@@ -1921,6 +2031,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         >
           <UiIcon name="heart" /> {t('settings.support')}</a>
       </div>
+      {mode === 'source' && <GlobalSettingsLink variant="banner" />}
+      {/* Picker + form share one flex row on a landscape phone (#6211): the
+          picker becomes a left rail so the form keeps the full usable height. */}
+      <div className={sectionNavLayout.shell}>
       <SectionNav
         searchable
         searchPlaceholder={t('config_search.filter_settings', 'Search settings...')}
@@ -1937,7 +2051,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           canReadConfiguration,
         })}
       />
-      <div className="settings-content settings-multi-column">
+      <div className={`settings-content settings-multi-column ${sectionNavLayout.body}`}>
         {/* MQTT bridge setup (#5683 follow-up): MeshRadar's own connection and
             filter settings for the bridge. First, because on a bridge it is the
             setup the rest depends on. It loads and saves through
@@ -2253,7 +2367,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-link-previews') && <div id="settings-link-previews" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.linkPreviewsEnabled}
@@ -2270,7 +2384,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-privacy') && <div id="settings-privacy" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.noIndexEnabled}
@@ -2355,9 +2469,85 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           <PrivacyDocumentsSection canEdit={canWriteSettings} />
         </div>}
 
+        {show('settings-public-instance') && <div id="settings-public-instance" className="settings-section">
+          <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            <label className={settingsStyles.checkboxRow}>
+              <input
+                id="publicInstanceModeEnabled"
+                type="checkbox"
+                checked={draft.publicInstanceModeEnabled}
+                onChange={(e) => updateField('publicInstanceModeEnabled', e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.public_instance_enabled', 'Public-instance mode')}</span>
+            </label>
+          </h3>
+          <p className="setting-description">
+            {t('settings.public_instance_description', 'Limits what signed-out visitors and embed maps can see. Signed-in users are not affected. Positions are always shown only to about 1.5 km. Raw packet data and file exports are blocked for signed-out visitors.')}
+          </p>
+          <div className="setting-item">
+            <label className={settingsStyles.checkboxRow}>
+              <input
+                id="publicInstanceHideLongNames"
+                type="checkbox"
+                checked={draft.publicInstanceHideLongNames}
+                onChange={(e) => updateField('publicInstanceHideLongNames', e.target.checked)}
+                disabled={!draft.publicInstanceModeEnabled}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.public_instance_hide_long_names', 'Hide long names (short name and node ID stay)')}</span>
+            </label>
+          </div>
+          <div className="setting-item">
+            <label className={settingsStyles.checkboxRow}>
+              <input
+                id="publicInstanceHidePublicKeys"
+                type="checkbox"
+                checked={draft.publicInstanceHidePublicKeys}
+                onChange={(e) => updateField('publicInstanceHidePublicKeys', e.target.checked)}
+                disabled={!draft.publicInstanceModeEnabled}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.public_instance_hide_public_keys', 'Hide public keys')}</span>
+            </label>
+          </div>
+          <div className="setting-item">
+            <label className={settingsStyles.checkboxRow}>
+              <input
+                id="publicInstanceRoundTimestamps"
+                type="checkbox"
+                checked={draft.publicInstanceRoundTimestamps}
+                onChange={(e) => updateField('publicInstanceRoundTimestamps', e.target.checked)}
+                disabled={!draft.publicInstanceModeEnabled}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.public_instance_round_timestamps', 'Round times down to the hour')}</span>
+            </label>
+          </div>
+          <div className="setting-item">
+            <label className={settingsStyles.checkboxRow}>
+              <input
+                id="publicInstanceHideMessageText"
+                type="checkbox"
+                checked={draft.publicInstanceHideMessageText}
+                onChange={(e) => updateField('publicInstanceHideMessageText', e.target.checked)}
+                disabled={!draft.publicInstanceModeEnabled}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.public_instance_hide_message_text', 'Hide message text')}</span>
+            </label>
+          </div>
+          {draft.publicInstanceModeEnabled && draft.cotFeedEnabled && (
+            <p className={settingsStyles.txWarning} data-testid="public-instance-cot-warning">
+              <UiIcon name="alert" />
+              {t('settings.public_instance_cot_warning')}
+            </p>
+          )}
+        </div>}
+
         {show('settings-meshcore-messaging') && <div id="settings-meshcore-messaging" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.meshcoreChannelRetryEnabled}
@@ -2387,6 +2577,21 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               className="setting-input"
             />
           </div>
+          <div className="setting-item">
+            <label htmlFor="meshcoreCrossSourceHopResolution" className={settingsStyles.checkboxRow}>
+              <input
+                id="meshcoreCrossSourceHopResolution"
+                type="checkbox"
+                checked={draft.meshcoreCrossSourceHopResolution}
+                onChange={(e) => updateField('meshcoreCrossSourceHopResolution', e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.meshcore_cross_source_hops_label', 'Use other sources to resolve unknown hops')}</span>
+            </label>
+            <p className="setting-description">
+              {t('settings.meshcore_cross_source_hops_description', 'When a relay hash in a MeshCore message route matches none of this source\'s contacts, look it up in the other MeshCore sources you can read, including MQTT feeds (MQTT nodes count only once a signed advert from them has checked out). Those names are marked "via <source>", and a hash that several nodes share is shown as a guess with a question mark. Display only: nothing is sent. Off by default.')}
+            </p>
+          </div>
         </div>}
 
         {show('settings-reticulum') && mode === 'global' && <ReticulumRetentionSection />}
@@ -2394,7 +2599,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         {show('settings-map') && <div id="settings-map" className="settings-section">
           <h3>{t('settings.map')}</h3>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.discardInvalidPositions}
@@ -2704,68 +2909,18 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               <option value="messages">{t('settings.node_hops_messages')}</option>
             </select>
           </div>
-          <div className="setting-item" style={{ marginTop: '1rem' }}>
-            <label>
-              <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={draft.hideIncompleteNodes}
-                  onChange={(e) => updateField('hideIncompleteNodes', e.target.checked)}
-                  style={{ cursor: 'pointer' }}
-                />
-                {t('settings.hide_incomplete_nodes')}
-              </span>
-              <span className="setting-description">{t('settings.hide_incomplete_description')}</span>
-            </label>
-          </div>
-          <div className="setting-item" style={{ marginTop: '1rem' }}>
-            <label>
-              <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={draft.nodeDimmingEnabled}
-                  onChange={(e) => updateField('nodeDimmingEnabled', e.target.checked)}
-                  style={{ cursor: 'pointer' }}
-                />
-                {t('settings.node_dimming_enabled')}
-              </span>
-              <span className="setting-description">{t('settings.node_dimming_description')}</span>
-            </label>
-          </div>
-          {draft.nodeDimmingEnabled && (
-            <>
-              <div className="setting-item">
-                <label htmlFor="nodeDimmingStartHours">
-                  {t('settings.node_dimming_start_hours')}
-                  <span className="setting-description">{t('settings.node_dimming_start_hours_description')}</span>
-                </label>
-                <NumberInput
-                  id="nodeDimmingStartHours"
-                  min={0.5}
-                  max={24}
-                  step={0.5}
-                  value={draft.nodeDimmingStartHours}
-                  onChange={(n) => updateField('nodeDimmingStartHours', n)}
-                  className="setting-input"
-                />
-              </div>
-              <div className="setting-item">
-                <label htmlFor="nodeDimmingMinOpacity">
-                  {t('settings.node_dimming_min_opacity')}
-                  <span className="setting-description">{t('settings.node_dimming_min_opacity_description')}</span>
-                </label>
-                <NumberInput
-                  id="nodeDimmingMinOpacity"
-                  min={0.1}
-                  max={0.9}
-                  step={0.1}
-                  value={draft.nodeDimmingMinOpacity}
-                  onChange={(n) => updateField('nodeDimmingMinOpacity', n)}
-                  className="setting-input"
-                />
-              </div>
-            </>
-          )}
+          <HideIncompleteNodesSetting
+            checked={draft.hideIncompleteNodes}
+            onChange={(v) => updateField('hideIncompleteNodes', v)}
+          />
+          <NodeDimmingSettings
+            enabled={draft.nodeDimmingEnabled}
+            startHours={draft.nodeDimmingStartHours}
+            minOpacity={draft.nodeDimmingMinOpacity}
+            onEnabledChange={(v) => updateField('nodeDimmingEnabled', v)}
+            onStartHoursChange={(n) => updateField('nodeDimmingStartHours', n)}
+            onMinOpacityChange={(n) => updateField('nodeDimmingMinOpacity', n)}
+          />
 
           {/* Likely-aircraft detection (#5364/#5365 Phase 1 WP5, spec §5.10).
               Meshtastic-only (D2/D18) — do NOT add to
@@ -2833,6 +2988,27 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
             <p className="setting-description">
               {t('settings.aircraft.help_effects', 'Flagged nodes get an aircraft badge on the map and can be hidden in Map Features. Auto-Favorite exclusion is set in Automation → Auto Favorite.')}
+            </p>
+          </div>
+
+          {/* #5704: ask a newly flagged aircraft for its position. This one
+              TRANSMITS, so it is opt-in and carries its cost beside it. */}
+          <div className="setting-item" data-testid="aircraft-position-requests">
+            <label>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  id="aircraftPositionRequestsEnabled"
+                  type="checkbox"
+                  checked={draft.aircraftPositionRequestsEnabled}
+                  disabled={!draft.aircraftDetectionEnabled}
+                  onChange={(e) => updateField('aircraftPositionRequestsEnabled', e.target.checked)}
+                  style={{ cursor: 'pointer' }}
+                />
+                {t('settings.aircraft.position_requests_enabled', 'Ask new aircraft for their position')}
+              </span>
+            </label>
+            <p className="setting-description">
+              {t('settings.aircraft.position_requests_help', 'When a node is first flagged as an aircraft, MeshRadar asks it for its position 3 times over 4 minutes so its trail shows the flight (at most 2 aircraft an hour on this source). Each request uses airtime. Meshtastic sources only.')}
             </p>
           </div>
 
@@ -2924,36 +3100,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-telemetry') && <div id="settings-telemetry" className="settings-section">
           <h3>{t('settings.telemetry')}</h3>
-          <div className="setting-item">
-            <label htmlFor="telemetryVisualizationHours">
-              {t('settings.telemetry_hours_label')}
-              <span className="setting-description">{t('settings.telemetry_hours_description')}</span>
-            </label>
-            <NumberInput
-              id="telemetryVisualizationHours"
-              min={1}
-              max={168}
-              integer
-              value={draft.telemetryVisualizationHours}
-              onChange={(n) => updateField('telemetryVisualizationHours', n)}
-              className="setting-input"
-            />
-          </div>
-          <div className="setting-item">
-            <label htmlFor="favoriteTelemetryStorageDays">
-              {t('settings.fav_telemetry_label')}
-              <span className="setting-description">{t('settings.fav_telemetry_description')}</span>
-            </label>
-            <NumberInput
-              id="favoriteTelemetryStorageDays"
-              min={7}
-              max={90}
-              integer
-              value={draft.favoriteTelemetryStorageDays}
-              onChange={(n) => updateField('favoriteTelemetryStorageDays', n)}
-              className="setting-input"
-            />
-          </div>
+          <TelemetryRetentionSettings
+            visualizationHours={draft.telemetryVisualizationHours}
+            favoriteStorageDays={draft.favoriteTelemetryStorageDays}
+            onVisualizationHoursChange={(n) => updateField('telemetryVisualizationHours', n)}
+            onFavoriteStorageDaysChange={(n) => updateField('favoriteTelemetryStorageDays', n)}
+          />
         </div>}
 
         {show('settings-security') && <div id="settings-security" className="settings-section">
@@ -2961,6 +3113,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           <div className="setting-item">
             <PkiDmGlobalToggle />
           </div>
+          {/* Reliable PKI default for every source (#5691). Self-saving. */}
+          <div className="setting-item">
+            <ReliablePkiSection scope="global" />
+          </div>
+          {/* Node-name anti-spam (#6382). Admin only; self-saving. */}
+          <NodeNameSanitizerSection />
         </div>}
 
         {/* PKI DM decryption (#5683 follow-up): a MeshRadar-side switch, moved
@@ -2974,33 +3132,19 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           />
         )}
 
+        {/* Reliable PKI (#5691): this source's override of the global default.
+            MeshRadar behaviour for this source's own sends, so it lives on
+            Settings, not Device Configuration. Meshtastic radio sources only. */}
+        {mode === 'source' && hasDeviceConfigurationPage(sourceType) && purgeSourceId && (
+          <ReliablePkiSection key={purgeSourceId} scope="source" sourceId={purgeSourceId} />
+        )}
+
         {show('settings-notifications') && <div id="settings-notifications" className="settings-section">
           <h3>{t('settings.notifications_and_security')}</h3>
-          <div className="setting-item">
-            <label>
-              <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={enableAudioNotifications}
-                  onChange={(e) => setEnableAudioNotifications(e.target.checked)}
-                  style={{ cursor: 'pointer' }}
-                />
-                {t('settings.enable_audio_notifications')}
-              </span>
-              <span className="setting-description">{t('settings.enable_audio_notifications_description')}</span>
-            </label>
-          </div>
-          {enableAudioNotifications && (
-            <div className="setting-item">
-              <label>
-                {t('settings.channel_sounds_label', 'Per-channel notification sound')}
-                <span className="setting-description">
-                  {t('settings.channel_sounds_description', 'Choose which sound plays for new messages on each channel, or silence a channel. Preview each sound before selecting.')}
-                </span>
-              </label>
-              <ChannelSoundPicker />
-            </div>
-          )}
+          <AudioNotificationSettings
+            enabled={enableAudioNotifications}
+            onEnabledChange={setEnableAudioNotifications}
+          />
           <div className="setting-item">
             <label>
               <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
@@ -3019,7 +3163,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
         {show('settings-packet-monitor') && <div id="settings-packet-monitor" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.packetLogEnabled}
@@ -3042,9 +3186,20 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           </div>
         </div>}
 
+        {mode === 'source' && (
+          <div id="settings-solar" className="settings-section">
+            <MovedSettingNote
+              testId="solar-moved"
+              text={t('moved.solar', 'Solar Monitoring moved to Global Settings.')}
+              linkLabel={t('moved.open_global_settings', 'Open Global Settings')}
+              to={`${GLOBAL_SETTINGS_PATH}#settings-solar`}
+            />
+          </div>
+        )}
+
         {show('settings-solar') && <div id="settings-solar" className="settings-section">
           <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', margin: 0, cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 type="checkbox"
                 checked={draft.solarMonitoringEnabled}
@@ -3152,6 +3307,16 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           />
         )}
 
+        {show('settings-anon-mqtt-consent') && canWriteSettings && isMqttConsentFilterSourceType(sourceType) && purgeSourceId && (
+          <AnonMqttConsentSection baseUrl={baseUrl} sourceId={purgeSourceId} canWrite={canWriteSettings} />
+        )}
+
+        {show('settings-mqtt-native-send') && (sourceType === 'mqtt_bridge' || sourceType === 'mqtt_broker') && canReadSources && purgeSourceId && (
+          <MqttNativeSendSection baseUrl={baseUrl} sourceId={purgeSourceId} canWrite={hasPermission('sources', 'write')} />
+        )}
+
+        {show('settings-default-source') && isAdmin && mode === 'global' && <DefaultMeshtasticSourceSection />}
+
         {show('settings-remote-admin') && isAdmin && <div id="settings-remote-admin" className="settings-section">
           <h3>{t('settings.remote_admin_section', 'Remote Administration')}</h3>
           <div className="setting-item">
@@ -3189,6 +3354,23 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               integer
               value={draft.coverageRetentionDays}
               onChange={(n) => updateField('coverageRetentionDays', n)}
+              className="setting-input"
+            />
+          </div>
+          <div className="setting-item">
+            <label htmlFor="directRfRetentionDays">
+              {t('settings.direct_rf_retention_days', 'Direct RF Contacts retention (days)')}
+              <span className="setting-description">
+                {t('settings.direct_rf_retention_help', 'How long the Direct RF Contacts history (nodes your radio heard at zero hops over RF) is kept before the hourly sweep deletes it. Lowering this value permanently deletes older days on the next sweep. Range 1-365; default 30.')}
+              </span>
+            </label>
+            <NumberInput
+              id="directRfRetentionDays"
+              min={DIRECT_RF_RETENTION_MIN_DAYS}
+              max={DIRECT_RF_RETENTION_MAX_DAYS}
+              integer
+              value={draft.directRfRetentionDays}
+              onChange={(n) => updateField('directRfRetentionDays', n)}
               className="setting-input"
             />
           </div>
@@ -3270,7 +3452,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="elevationEnabled"
                 type="checkbox"
@@ -3328,16 +3510,66 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           </div>
         </div>}
 
+        {show('settings-mqtt-root-directory') && isAdmin && <div id="settings-mqtt-root-directory" className="settings-section">
+          <h3>{t('settings.mqtt_root_directory_section', 'MQTT root directory refresh')}</h3>
+          <p className="setting-description">
+            {t(
+              'settings.mqtt_root_directory_section_description',
+              'The MQTT topic finder suggests community roots from a list bundled with MeshRadar. While on, a topic search may also fetch the current list from api.meshtastic.org, at most once a day. The request is a plain GET with no location, broker, topic or user details, but it tells api.meshtastic.org (and Cloudflare, which serves it) this server\'s IP address and that someone used the finder. Nothing is sent over the mesh.'
+            )}
+          </p>
+          <div className="setting-item">
+            <label className={settingsStyles.checkboxRow}>
+              <input
+                id="mqttRootDirectoryRefreshEnabled"
+                type="checkbox"
+                checked={draft.mqttRootDirectoryRefreshEnabled}
+                onChange={(e) => updateField('mqttRootDirectoryRefreshEnabled', e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.mqtt_root_directory_enabled_label', 'Refresh the community root list (contacts api.meshtastic.org)')}</span>
+            </label>
+            <span className="setting-description">
+              {t('settings.mqtt_root_directory_enabled_description', 'Off by default. While off, the finder uses only the bundled list and the server makes no requests for it.')}
+            </span>
+          </div>
+        </div>}
+
+        {show('settings-ducting') && isAdmin && <div id="settings-ducting" className="settings-section">
+          <h3>{t('settings.ducting_section', 'Tropospheric ducting overlay')}</h3>
+          <p className="setting-description">
+            {t(
+              'settings.ducting_section_description',
+              'Adds a Ducting overlay to the Map tab and the Dashboard map: a NOAA GFS forecast of where the lower atmosphere bends radio signals further than usual, now and up to 72 hours ahead. While on, anyone who can view the map can use it. Each forecast step a viewer opens that the server has not cached yet costs one HTTPS request to NOAA (at most 25 per 6-hour GFS cycle). Nothing is sent over the mesh.'
+            )}
+          </p>
+          <div className="setting-item">
+            <label className={settingsStyles.checkboxRow}>
+              <input
+                id="ductingOverlayEnabled"
+                type="checkbox"
+                checked={draft.ductingOverlayEnabled}
+                onChange={(e) => updateField('ductingOverlayEnabled', e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.ducting_enabled_label', 'Enable the ducting overlay (contacts NOAA)')}</span>
+            </label>
+            <span className="setting-description">
+              {t('settings.ducting_enabled_description', 'Off by default. While off, the map toggle is hidden and the server makes no NOAA requests for anyone.')}
+            </span>
+          </div>
+        </div>}
+
         {show('settings-adsb') && isAdmin && <div id="settings-adsb" className="settings-section">
           <h3>{t('settings.adsb_section', 'Flight matching (ADS-B)')}</h3>
           <p className="setting-description">
             {t(
               'settings.adsb_section_description',
-              'When a node becomes a likely aircraft, MeshRadar asks the selected public ADS-B feed which aircraft is at that spot. At most two lookups per flagging. Nothing is sent over the mesh.'
+              'When a node becomes a likely aircraft, MeshRadar asks the selected public ADS-B feed which aircraft is at that spot. Two lookups per flagging, then up to six re-checks as the node moves. Nothing is sent over the mesh.'
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="adsbMatchEnabled"
                 type="checkbox"
@@ -3357,7 +3589,9 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               <span className="setting-description">
                 {draft.adsbFeed === 'adsb.fi'
                   ? t('settings.adsb_feed_terms_adsb_fi', 'adsb.fi: for personal, non-commercial use only.')
-                  : t('settings.adsb_feed_terms_adsb_lol', 'adsb.lol: open data under the ODbL.')}
+                  : draft.adsbFeed === 'opensky'
+                    ? t('settings.adsb_feed_terms_opensky', 'OpenSky Network: non-commercial and research use only. Matches credit "Data: The OpenSky Network". No aircraft type or registration.')
+                    : t('settings.adsb_feed_terms_adsb_lol', 'adsb.lol: open data under the ODbL.')}
               </span>
             </label>
             <select
@@ -3368,9 +3602,55 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               disabled={!draft.adsbMatchEnabled}
             >
               {ADSB_FEED_IDS.map((id) => (
-                <option key={id} value={id}>{ADSB_FEEDS[id].name}</option>
+                <option
+                  key={id}
+                  value={id}
+                  // OpenSky has no anonymous mode (#5877): selectable once both credentials are filled in.
+                  disabled={id === 'opensky' && !openSkyCredsSet && draft.adsbFeed !== 'opensky'}
+                >
+                  {id === 'opensky' && !openSkyCredsSet
+                    ? t('settings.adsb_feed_opensky_needs_creds', '{{name}} (needs client ID and secret)', { name: ADSB_FEEDS[id].name })
+                    : ADSB_FEEDS[id].name}
+                </option>
               ))}
             </select>
+            {draft.adsbFeed === 'opensky' && !openSkyCredsSet && (
+              <span className="setting-description" role="alert">
+                {t('settings.adsb_opensky_creds_missing', 'OpenSky Network needs both a client ID and a client secret. Saving will fail until both are set.')}
+              </span>
+            )}
+          </div>
+          <div className="setting-item">
+            <label htmlFor="adsbOpenSkyClientId">
+              {t('settings.adsb_opensky_client_id_label', 'OpenSky client ID')}
+              <span className="setting-description">
+                {t('settings.adsb_opensky_client_id_description', 'Needed only for the OpenSky Network feed. Create an API client under your OpenSky account. Stored server-side and never shown to non-admins.')}
+              </span>
+            </label>
+            <input
+              id="adsbOpenSkyClientId"
+              type="text"
+              value={draft.adsbOpenSkyClientId}
+              onChange={(e) => updateField('adsbOpenSkyClientId', e.target.value)}
+              className="setting-input"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={!draft.adsbMatchEnabled}
+            />
+          </div>
+          <div className="setting-item">
+            <label htmlFor="adsbOpenSkyClientSecret">
+              {t('settings.adsb_opensky_client_secret_label', 'OpenSky client secret')}
+            </label>
+            <PasswordField
+              id="adsbOpenSkyClientSecret"
+              value={draft.adsbOpenSkyClientSecret}
+              onChange={(e) => updateField('adsbOpenSkyClientSecret', e.target.value)}
+              className="setting-input"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={!draft.adsbMatchEnabled}
+            />
           </div>
           <div className="setting-item">
             <label htmlFor="adsbApiToken">
@@ -3379,9 +3659,8 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
                 {t('settings.adsb_api_key_description', 'Leave empty. Kept for adsb.lol\'s announced future key; sent only when set. Stored server-side and never shown to non-admins.')}
               </span>
             </label>
-            <input
+            <PasswordField
               id="adsbApiToken"
-              type="password"
               value={draft.adsbApiToken}
               onChange={(e) => updateField('adsbApiToken', e.target.value)}
               className="setting-input"
@@ -3391,6 +3670,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             />
           </div>
         </div>}
+
+        {show('settings-meshwars') && isAdmin && (
+        <div id="settings-meshwars" className="settings-section">
+          <MeshWarsSection baseUrl={baseUrl} />
+        </div>
+        )}
 
         {show('settings-translation') && isAdmin && (
           <TranslationConfigSection
@@ -3416,7 +3701,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             )}
           </p>
           <div className="setting-item">
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+            <label className={settingsStyles.checkboxRow}>
               <input
                 id="cotFeedEnabled"
                 type="checkbox"
@@ -3449,6 +3734,48 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               value={draft.cotFeedPort}
               onChange={(n) => updateField('cotFeedPort', n)}
               className="setting-input"
+            />
+          </div>
+        </div>}
+
+        {show('settings-virtual-node-replay') && mode !== 'source' && <div id="settings-virtual-node-replay" className="settings-section">
+          <h3>{t('settings.vn_replay_section', 'Virtual Node message replay')}</h3>
+          <p className="setting-description">
+            {t(
+              'settings.vn_replay_section_description',
+              'When a phone app reconnects to a Virtual Node, re-send the text messages stored while it was asleep (since its last sign of life, minus a 10-minute overlap). The app drops duplicates by packet id, so no gaps and no duplicates. No LoRa airtime — this only travels the local link to the app. Paced 50 ms apart, up to 2000 newest messages; the first connection sends the last 24 hours.'
+            )}
+          </p>
+          <div className="setting-item">
+            <label className={settingsStyles.checkboxRow}>
+              <input
+                id="virtualNodeReplayEnabled"
+                type="checkbox"
+                checked={draft.virtualNodeReplayEnabled}
+                onChange={(e) => updateField('virtualNodeReplayEnabled', e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.vn_replay_enabled_label', 'Replay missed messages on reconnect')}</span>
+            </label>
+            <span className="setting-description">
+              {t('settings.vn_replay_enabled_description', 'Opt-in; off by default. Applies to every Virtual Node source.')}
+            </span>
+          </div>
+          <div className="setting-item">
+            <label htmlFor="virtualNodeReplayExcludeIps">
+              {t('settings.vn_replay_exclude_ips_label', 'Never replay to these IPs')}
+              <span className="setting-description">
+                {t('settings.vn_replay_exclude_ips_description', 'Comma-separated client IPs that never receive a replay (scripts, loggers). Localhost is always excluded. Overrides the VN_REPLAY_EXCLUDE_IPS environment variable when set.')}
+              </span>
+            </label>
+            <input
+              id="virtualNodeReplayExcludeIps"
+              type="text"
+              className="setting-input"
+              placeholder="192.168.1.50, 10.0.0.9"
+              disabled={!draft.virtualNodeReplayEnabled}
+              value={draft.virtualNodeReplayExcludeIps}
+              onChange={(e) => updateField('virtualNodeReplayExcludeIps', e.target.value)}
             />
           </div>
         </div>}
@@ -3686,7 +4013,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           <div className="danger-action">
             <div className="danger-action-info">
               <h4>{t('settings.erase_nodes_title')}</h4>
-              <p>{t('settings.erase_nodes_description')}</p>
+              <p>{t(purgeSourceId ? 'settings.erase_nodes_description_source' : 'settings.erase_nodes_description')}</p>
             </div>
             <button
               className="danger-button"
@@ -3696,42 +4023,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             </button>
           </div>
 
-          <div className="danger-action">
-            <div className="danger-action-info">
-              <h4>{t('settings.purge_telemetry_title')}</h4>
-              <p>{t('settings.purge_telemetry_description')}</p>
-            </div>
-            <button
-              className="danger-button"
-              onClick={handlePurgeTelemetry}
-            >
-              {t('settings.purge_telemetry_button')}
-            </button>
-          </div>
-
-          {isAdmin && (
-            <div className="danger-action">
-              <div className="danger-action-info">
-                <h4>{t('settings.clean_outliers_title')}</h4>
-                <p>{t('settings.clean_outliers_description')}</p>
-              </div>
-              <button
-                className="danger-button"
-                onClick={() => setOutlierDialogOpen(true)}
-              >
-                {t('settings.clean_outliers_button')}
-              </button>
-            </div>
-          )}
-          {isAdmin && (
-            <TelemetryOutlierDialog
-              isOpen={outlierDialogOpen}
-              onClose={() => setOutlierDialogOpen(false)}
-              sourceId={purgeSourceId}
-              sources={availableSources.map(src => ({ id: src.id, name: src.name }))}
-              getTypeLabel={getTelemetryLabel}
-            />
-          )}
+          <TelemetryDataActions
+            sourceId={purgeSourceId}
+            sources={availableSources.map(src => ({ id: src.id, name: src.name }))}
+          />
 
           <div className="danger-action">
             <div className="danger-action-info">
@@ -3759,29 +4054,18 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             </button>
           </div>
 
-          {isDocker !== null && (
-            <div className="danger-action">
-              <div className="danger-action-info">
-                <h4>{isDocker ? t('settings.restart_container_title') : t('settings.shutdown_title')}</h4>
-                <p>
-                  {isDocker
-                    ? t('settings.restart_container_description')
-                    : t('settings.shutdown_description')}
-                </p>
-              </div>
-              <button
-                className="danger-button"
-                onClick={handleRestartContainer}
-                disabled={isRestarting || !isAdmin}
-                title={isAdmin ? undefined : t('settings.restart_admin_only', 'Only an administrator can restart or shut down MeshRadar. It affects every source.')}
-              >
-                {isRestarting
-                  ? (isDocker ? t('settings.restarting') : t('settings.shutting_down'))
-                  : <><UiIcon name={isDocker ? 'refresh' : 'power'} /> {isDocker ? t('settings.restart_button') : t('settings.shutdown_button')}</>}
-              </button>
-            </div>
+          {mode === 'source' && isAdmin && (
+            <MovedSettingNote
+              testId="restart-moved"
+              text={t('moved.restart', 'Restart and shutdown moved to Global Settings.')}
+              linkLabel={t('moved.open_global_settings', 'Open Global Settings')}
+              to={`${GLOBAL_SETTINGS_PATH}#settings-system`}
+            />
           )}
         </div>}
+
+        {show('settings-system') && isAdmin && <SystemRestartSection />}
+      </div>
       </div>
     </div>
     </NumberInputScope>

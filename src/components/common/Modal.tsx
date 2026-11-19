@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import './Modal.css';
+import { UiIcon } from '../icons';
 
 interface ModalProps {
   isOpen: boolean;
@@ -18,6 +19,8 @@ interface ModalProps {
   closeOnEsc?: boolean;
   /** CSS class for the overlay (default: 'modal-overlay') */
   overlayClassName?: string;
+  /** Whether to show the header close button (default: true) */
+  showCloseButton?: boolean;
 }
 
 const Modal: React.FC<ModalProps> = ({
@@ -31,6 +34,7 @@ const Modal: React.FC<ModalProps> = ({
   closeOnOverlayClick = true,
   closeOnEsc = true,
   overlayClassName = 'modal-overlay',
+  showCloseButton = true,
 }) => {
   const contentRef = useRef<HTMLDivElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
@@ -141,13 +145,15 @@ const Modal: React.FC<ModalProps> = ({
       >
         <div className="modal-header">
           <h2 id="modal-title">{title}</h2>
-          <button
-            className="modal-close"
-            onClick={onClose}
-            aria-label="Close dialog"
-          >
-            ×
-          </button>
+          {showCloseButton && (
+            <button
+              className="modal-close"
+              onClick={onClose}
+              aria-label="Close dialog"
+            >
+              <UiIcon name="close" size={20} />
+            </button>
+          )}
         </div>
         <div className="modal-body">
           {children}

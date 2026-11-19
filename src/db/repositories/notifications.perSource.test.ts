@@ -181,6 +181,8 @@ describe('NotificationsRepository — per-source isolation (#4020)', () => {
       ['lowBatteryVoltageThreshold', 3111, 3555],
       ['notifyOnServerEvents', true, false],
       ['notifyOnWaypoint', true, false],
+      ['notifyOnMention', true, false],
+      ['notifyOnAutoTrace', true, false],
       ['waypointRadiusKm', 42, 9],
       ['waypointCenterLat', 12.5, null],
       ['waypointCenterLon', -45.25, null],
@@ -193,6 +195,8 @@ describe('NotificationsRepository — per-source isolation (#4020)', () => {
       ['mutedDMs', [{ nodeUuid: '!aaaa0002', muteUntil: null }], [{ nodeUuid: '!bbbb0003', muteUntil: null }]],
       ['messageTitleTemplate', 'A {{ sender }}', null],
       ['messageBodyTemplate', 'A {{ text }}', 'B {{ text }}'],
+      ['messageTextMaxPush', 250, null],
+      ['messageTextMaxApprise', 1000, 20],
     ];
 
     it('covers every field of NotificationPreferences', async () => {

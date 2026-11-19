@@ -3,6 +3,7 @@
  * from the database for condition evaluation. All reads are best-effort: a miss
  * returns null and the condition resolves to false rather than throwing.
  */
+import { keyedChannelNameFor } from '../../utils/meshcoreKeyedChannels.js';
 import databaseService from '../../../services/database.js';
 import { ALL_SOURCES } from '../../../db/repositories/index.js';
 import type { NodeDataProvider, NodeFacts, StaleCandidate } from './engineContext.js';
@@ -10,11 +11,37 @@ import { sourceProtocol } from './channelUnify.js';
 import { getCachedSignFlipContext, correctLatLon } from '../signFlipCorrection.js';
 import { sourceManagerRegistry } from '../../sourceManagerRegistry.js';
 import { isAnyMeshCoreSourceType } from '../../../utils/nodeTypeCategory.js';
-import { isMeshCoreManager } from '../../sourceManagerTypes.js';
-import { isOwnNodeNum as isOwnedByAnySource, isOwnPublicKey as isOwnedPubkeyByAnySource } from '../../utils/ownNodes.js';
+import { isMeshCoreManager, isMeshtasticManager } from '../../sourceManagerTypes.js';
+import { CHANNEL_DB_OFFSET } from '../../constants/meshtastic.js';
+import { parseHopEmojiOverrides } from '../../../utils/hopEmoji.js';
+import { isOwnNodeNum as isOwnedByAnySource, isOwnPublicKey as isOwnedPubkeyByAnySource, isOwnMeshCoreName as isOwnMeshCoreNameAnySource } from '../../utils/ownNodes.js';
 
 function nodeIdOf(nodeNum: number): string {
   return `!${(nodeNum >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+/**
+ * Name of a virtual channel (#5738). A message decrypted with a Channel
+ * Database key is stored on channel `CHANNEL_DB_OFFSET + id`, which has no row
+ * in the per-source `channels` table. An MQTT source has no channel rows at
+ * all, so every one of its channels is named only here.
+ *
+ * Meshtastic rows only. A MeshCore source resolves a keyed index (#6308) to the
+ * name of the key's channel instead; any other MeshCore index is a device slot
+ * and has no name here.
+ */
+async function virtualChannelName(sourceId: string | null, channelIndex: number): Promise<string | null> {
+  if (!Number.isInteger(channelIndex) || channelIndex < CHANNEL_DB_OFFSET) return null;
+  if (sourceId) {
+    const source = await databaseService.sources.getSource(sourceId);
+    // A MeshCore index is a device slot, not a Channel Database id; only a
+    // keyed index (#6308) has a name, taken from the key that opened it.
+    if (source && isAnyMeshCoreSourceType(source.type)) return keyedChannelNameFor(sourceId, channelIndex);
+  }
+  const entry = await databaseService.channelDatabase.getByIdAsync(channelIndex - CHANNEL_DB_OFFSET);
+  if (!entry || (entry.protocol ?? 'meshtastic') !== 'meshtastic') return null;
+  const name = (entry.name ?? '').trim();
+  return name || null;
 }
 
 export function createMeshNodeDataProvider(): NodeDataProvider {
@@ -67,9 +94,30 @@ export function createMeshNodeDataProvider(): NodeDataProvider {
     async getChannelName(sourceId, channelIndex) {
       try {
         const ch = await databaseService.channels.getChannelById(channelIndex, sourceId ?? undefined);
-        return ch?.name ?? null;
+        // A stored row wins, blank name included: '' is the unnamed primary
+        // slot and a legitimate filter target (#4507).
+        if (ch) return ch.name ?? null;
+        return await virtualChannelName(sourceId, channelIndex);
       } catch {
         return null;
+      }
+    },
+
+    async getMeshCoreMessage(sourceId, messageId) {
+      if (!sourceId) return null;
+      try {
+        const row = await databaseService.meshcore.getMessageForSource(messageId, sourceId);
+        return row ? { text: row.text, fromName: row.fromName ?? null } : null;
+      } catch {
+        return null;
+      }
+    },
+
+    async isOwnMeshCoreName(name) {
+      try {
+        return isOwnMeshCoreNameAnySource(name);
+      } catch {
+        return false;
       }
     },
 
@@ -90,6 +138,28 @@ export function createMeshNodeDataProvider(): NodeDataProvider {
         return s ? sourceProtocol(s.type) : null;
       } catch {
         return null;
+      }
+    },
+
+    async getReticulumDisplayName(sourceId, hash) {
+      try {
+        if (!sourceId || !hash) return null;
+        const dest = await databaseService.reticulum.getDestination(sourceId, hash);
+        return dest?.displayName ?? null;
+      } catch {
+        return null;
+      }
+    },
+
+    async getHopEmojiOverrides(sourceId) {
+      try {
+        const s = databaseService.settings;
+        return parseHopEmojiOverrides(
+          await s.getSettingForSource(sourceId, 'hopEmojiZeroHop'),
+          await s.getSettingForSource(sourceId, 'hopEmojiMqtt'),
+        );
+      } catch {
+        return {};
       }
     },
 
@@ -124,6 +194,19 @@ export function createMeshNodeDataProvider(): NodeDataProvider {
         return isOwnedByAnySource(nodeNum);
       } catch {
         return false;
+      }
+    },
+
+    // Airtime cutoff for the Engine: the same verdict the legacy timers use.
+    // Only a Meshtastic TCP manager measures Channel Utilization; every other
+    // source (MeshCore, Reticulum, MQTT, not connected) reads null → fail open.
+    async getAirtimeGate(sourceId) {
+      try {
+        const m = sourceManagerRegistry.getManager(sourceId);
+        if (!m || !isMeshtasticManager(m) || typeof m.getAirtimeGateVerdict !== 'function') return null;
+        return await m.getAirtimeGateVerdict();
+      } catch {
+        return null;
       }
     },
 

@@ -11,8 +11,12 @@ import databaseService from '../services/database.js';
 import meshcorePacketLogService from './services/meshcorePacketLogService.js';
 import { dataEventEmitter } from './services/dataEventEmitter.js';
 import { notificationService } from './services/notificationService.js';
+import { newNodeAlertGate } from './services/newNodeAlertGate.js';
+import { Ed25519SignatureVerifier } from '@michaelhart/meshcore-decoder';
 import { sourceManagerRegistry } from './sourceManagerRegistry.js';
-import { channelKeyFingerprint, keyedChannelIndex } from './services/meshcoreFrameIngest.js';
+import { channelKeyFingerprint, keyedChannelIndex, frameChannelMessageId } from './services/meshcoreFrameIngest.js';
+import { buildMc1ChannelReaction } from '../utils/meshcoreReactions.js';
+import { mc1HashForChannelWire } from '../utils/meshcoreReactionTarget.js';
 import { buildAdvertFrame, buildGrpTxtFrame } from './test-helpers/meshcoreFrames.js';
 
 const REP = 'src-rep-ingest';
@@ -86,15 +90,156 @@ describe('repeater RAW ingest (#5553, #5551)', () => {
       expect(logSpy).not.toHaveBeenCalled();
     });
 
-    it('fires no new-node notification and no node automation events', async () => {
-      const { feed } = repeater();
-      feed(buildAdvertFrame({ publicKey: 'cd'.repeat(32), name: 'Quiet' }));
-      await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(1));
-      // Only the list-refresh socket event; nothing an automation or a
-      // notification channel listens to.
-      expect(notifySpy).not.toHaveBeenCalled();
-      expect(discoveredSpy).not.toHaveBeenCalled();
-      expect(changedSpy).not.toHaveBeenCalled();
+    describe('new-node alerts behind the shared gate (#6306)', () => {
+      let admitSpy: ReturnType<typeof vi.spyOn>;
+      let learningSpy: ReturnType<typeof vi.spyOn>;
+      let welcomeSpy: ReturnType<typeof vi.spyOn>;
+      let verifySpy: ReturnType<typeof vi.spyOn>;
+      const settle = () => new Promise((r) => setTimeout(r, 30));
+
+      beforeEach(() => {
+        admitSpy = vi.spyOn(newNodeAlertGate, 'admit').mockResolvedValue({ allow: true });
+        learningSpy = vi.spyOn(newNodeAlertGate, 'isLearning').mockResolvedValue(false);
+        welcomeSpy = vi
+          .spyOn(MeshCoreManager.prototype as unknown as { checkAutoWelcome: () => Promise<void> }, 'checkAutoWelcome')
+          .mockResolvedValue(undefined);
+        verifySpy = vi.spyOn(Ed25519SignatureVerifier, 'verifyAdvertisementSignature').mockResolvedValue(true);
+      });
+
+      const keyOf = (c: string) => c.repeat(32);
+
+      it('a new, verified, named advert alerts once, with the stored name', async () => {
+        const { feed } = repeater();
+        const key = keyOf('c1');
+        const frame = buildAdvertFrame({ publicKey: key, advType: 2, name: 'Quiet' });
+        feed(frame);
+        await vi.waitFor(() => expect(notifySpy).toHaveBeenCalledTimes(1));
+        expect(notifySpy.mock.calls[0].slice(0, 5)).toEqual([key, 'Quiet', 'Repeater', REP, expect.any(String)]);
+        expect(notifySpy.mock.calls[0][5]).toBeUndefined();
+        // A second copy and a later advert do not alert.
+        feed(frame);
+        feed(buildAdvertFrame({ publicKey: key, advType: 2, name: 'Quiet', timestamp: 1_800_000_000 }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(3));
+        await settle();
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+        expect(admitSpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('never sends Auto Welcome and never emits automation events', async () => {
+        const { feed } = repeater();
+        feed(buildAdvertFrame({ publicKey: keyOf('c2'), name: 'NoWelcome' }));
+        await vi.waitFor(() => expect(notifySpy).toHaveBeenCalledTimes(1));
+        await settle();
+        expect(welcomeSpy).not.toHaveBeenCalled();
+        expect(discoveredSpy).not.toHaveBeenCalled();
+        expect(changedSpy).not.toHaveBeenCalled();
+      });
+
+      it('nothing alerts while the gate is learning, and those nodes never alert later', async () => {
+        admitSpy.mockResolvedValue({ allow: false, reason: 'learning' });
+        const { feed } = repeater();
+        const key = keyOf('c3');
+        feed(buildAdvertFrame({ publicKey: key, name: 'Early' }));
+        await vi.waitFor(() => expect(admitSpy).toHaveBeenCalledTimes(1));
+        await settle();
+        expect(notifySpy).not.toHaveBeenCalled();
+        // The window ends; the same node advertises again: it is known, no alert.
+        admitSpy.mockResolvedValue({ allow: true });
+        feed(buildAdvertFrame({ publicKey: key, name: 'Early', timestamp: 1_800_000_000 }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(2));
+        await settle();
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
+
+      it('passes the gate suppressed count to the notification', async () => {
+        admitSpy.mockResolvedValue({ allow: true, suppressedSinceLast: 7 });
+        const { feed } = repeater();
+        feed(buildAdvertFrame({ publicKey: keyOf('c4'), name: 'More' }));
+        await vi.waitFor(() => expect(notifySpy).toHaveBeenCalledTimes(1));
+        expect(notifySpy.mock.calls[0][5]).toBe(7);
+      });
+
+      it('a capped advert is dropped and does not alert later', async () => {
+        admitSpy.mockResolvedValue({ allow: false, reason: 'capped' });
+        const { feed } = repeater();
+        const key = keyOf('c5');
+        feed(buildAdvertFrame({ publicKey: key, name: 'Over' }));
+        await vi.waitFor(() => expect(admitSpy).toHaveBeenCalledTimes(1));
+        admitSpy.mockResolvedValue({ allow: true });
+        feed(buildAdvertFrame({ publicKey: key, name: 'Over', timestamp: 1_800_000_000 }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(2));
+        await settle();
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
+
+      it('an advert whose signature does not verify does not alert', async () => {
+        verifySpy.mockResolvedValue(false);
+        const { feed } = repeater();
+        feed(buildAdvertFrame({ publicKey: keyOf('c6'), name: 'Forged' }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(1));
+        await settle();
+        expect(admitSpy).not.toHaveBeenCalled();
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
+
+      it('a nameless advert followed by a named one alerts once', async () => {
+        const { feed } = repeater();
+        const key = keyOf('c7');
+        feed(buildAdvertFrame({ publicKey: key }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(1));
+        await settle();
+        expect(admitSpy).not.toHaveBeenCalled();
+        expect(notifySpy).not.toHaveBeenCalled();
+        feed(buildAdvertFrame({ publicKey: key, name: 'Named', timestamp: 1_800_000_000 }));
+        await vi.waitFor(() => expect(notifySpy).toHaveBeenCalledTimes(1));
+        expect(notifySpy.mock.calls[0][1]).toBe('Named');
+        feed(buildAdvertFrame({ publicKey: key, name: 'Named', timestamp: 1_800_000_100 }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(3));
+        await settle();
+        expect(notifySpy).toHaveBeenCalledTimes(1);
+      });
+
+      it('a nameless advert during the learning window is not parked for a later alert', async () => {
+        learningSpy.mockResolvedValue(true);
+        const { feed } = repeater();
+        const key = keyOf('c8');
+        feed(buildAdvertFrame({ publicKey: key }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(1));
+        await settle();
+        learningSpy.mockResolvedValue(false);
+        feed(buildAdvertFrame({ publicKey: key, name: 'Late', timestamp: 1_800_000_000 }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(2));
+        await settle();
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
+
+      it("the repeater's own key does not alert", async () => {
+        const { feed } = repeater();
+        feed(buildAdvertFrame({ publicKey: SELF_KEY, name: 'Me' }));
+        await settle();
+        expect(admitSpy).not.toHaveBeenCalled();
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
+
+      it('a node the neighbours poll stored first does not alert', async () => {
+        const key = keyOf('c9');
+        await databaseService.meshcore.upsertNode({ publicKey: key, name: 'Polled' }, REP);
+        const { feed } = repeater();
+        feed(buildAdvertFrame({ publicKey: key, name: 'Polled' }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(1));
+        await settle();
+        expect(admitSpy).not.toHaveBeenCalled();
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
+
+      it('a non-Repeater device type never alerts through this path', async () => {
+        const { m, feed } = repeater();
+        (m as unknown as Internals).deviceType = MeshCoreDeviceType.COMPANION;
+        feed(buildAdvertFrame({ publicKey: keyOf('ca'), name: 'Comp' }));
+        await vi.waitFor(() => expect(contactSpy).toHaveBeenCalledTimes(1));
+        await settle();
+        expect(notifySpy).not.toHaveBeenCalled();
+      });
     });
 
     it('does not mark an advert-only node as a zero-hop neighbour, or write link signal', async () => {
@@ -122,6 +267,51 @@ describe('repeater RAW ingest (#5553, #5551)', () => {
       expect(node!.repeaterNeighborAt).toBeGreaterThan(0);
       const all = await m.getAllNodes();
       expect(all.find((n) => n.publicKey === key)?.repeaterNeighborAt).toBeGreaterThan(0);
+    });
+
+    // #6220: the RAW frame carries the relay path; it used to be dropped, so
+    // every advert-ingested node had path_len NULL and showed as 0 hops.
+    describe('heard hop count (#6220)', () => {
+      const pathLenOf = async (key: string) =>
+        (await databaseService.meshcore.getNodeByPublicKeyAndSource(key, REP))?.pathLen ?? null;
+
+      it('stores the relay count of a flood advert, and 0 for one heard direct', async () => {
+        const far = '61'.repeat(32);
+        const near = '62'.repeat(32);
+        const { m, feed } = repeater();
+        feed(buildAdvertFrame({ publicKey: far, advType: 2, name: 'Far', path: [0xa1, 0xb2, 0xc3] }));
+        feed(buildAdvertFrame({ publicKey: near, advType: 2, name: 'Near' }));
+        await vi.waitFor(async () => {
+          expect(await pathLenOf(far)).toBe(3);
+          expect(await pathLenOf(near)).toBe(0);
+        });
+        const all = await m.getAllNodes();
+        expect(all.find((n) => n.publicKey === far)?.pathLen).toBe(3);
+      });
+
+      it('keeps the shortest copy of one flood advert, whatever order the copies arrive in', async () => {
+        const key = '63'.repeat(32);
+        const copy = (path: number[]) => buildAdvertFrame({ publicKey: key, advType: 2, name: 'Hill', path });
+        const { feed } = repeater();
+        feed(copy([0x01, 0x02, 0x03]));
+        await vi.waitFor(async () => expect(await pathLenOf(key)).toBe(3));
+        feed(copy([0x04, 0x05, 0x06, 0x07, 0x08])); // longer route, later: ignored
+        feed(copy([0x09])); // shorter route: wins
+        feed(copy([0x0a, 0x0b])); // longer than the best so far: ignored
+        await vi.waitFor(async () => expect(await pathLenOf(key)).toBe(1));
+        // Let any stray write land, then confirm the shortest still stands.
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await pathLenOf(key)).toBe(1);
+      });
+
+      it('a NEW advert from the node replaces the count, longer or not', async () => {
+        const key = '64'.repeat(32);
+        const { feed } = repeater();
+        feed(buildAdvertFrame({ publicKey: key, advType: 2, timestamp: 1_700_000_000, path: [0x01] }));
+        await vi.waitFor(async () => expect(await pathLenOf(key)).toBe(1));
+        feed(buildAdvertFrame({ publicKey: key, advType: 2, timestamp: 1_700_003_600, path: [0x01, 0x02, 0x03, 0x04] }));
+        await vi.waitFor(async () => expect(await pathLenOf(key)).toBe(4));
+      });
     });
 
     // #5632: a Repeater keeps no in-memory contact map, and the client
@@ -339,6 +529,52 @@ describe('repeater RAW ingest (#5553, #5551)', () => {
       expect((messageSpy.mock.calls[0][0] as MeshCoreMessage).selfOrigin).toBe(true);
       // Still stored: it is real traffic.
       expect((await storedMessages()).map((r) => r.text)).toContain('pong');
+    });
+    describe('reactions (#5761)', () => {
+      const hash = mc1HashForChannelWire('Bob: hello mesh', 1_700_000_000)!;
+      const reactionBody = buildMc1ChannelReaction('Bob', '\u{1F44D}', hash)!;
+
+      it('stores the wire second and the MC1 hash of an ordinary message', async () => {
+        const { feed } = repeater();
+        feed(buildGrpTxtFrame(1_700_000_000, 'Bob: hello mesh', SECRET));
+        await vi.waitFor(() => expect(messageSpy).toHaveBeenCalledTimes(1));
+        const [row] = await storedMessages();
+        expect(row.senderTimestamp).toBe(1_700_000_000);
+        expect(row.mc1Hash).toBe(hash);
+        expect((messageSpy.mock.calls[0][0] as MeshCoreMessage).senderTimestamp).toBe(1_700_000_000);
+      });
+
+      it('stores a reaction as an emoji row resolved to its target; the id stays raw-derived', async () => {
+        const { feed } = repeater();
+        feed(buildGrpTxtFrame(1_700_000_000, 'Bob: hello mesh', SECRET));
+        await vi.waitFor(() => expect(messageSpy).toHaveBeenCalledTimes(1));
+        feed(buildGrpTxtFrame(1_700_000_010, `Alice: ${reactionBody}`, SECRET));
+        await vi.waitFor(() => expect(messageSpy).toHaveBeenCalledTimes(2));
+
+        const all = await storedMessages();
+        const target = all.find((r) => r.text === 'hello mesh')!;
+        const reaction = all.find((r) => r.reactionEmoji)!;
+        expect(reaction.text).toBe('\u{1F44D}');
+        expect(reaction.reactionTargetId).toBe(target.id);
+        expect(reaction.mc1Hash ?? null).toBeNull();
+        expect(reaction.id).toBe(
+          frameChannelMessageId('rpt', REP, channelKeyFingerprint(SECRET), 1_700_000_010, reactionBody),
+        );
+        const ev = messageSpy.mock.calls[1][0] as MeshCoreMessage;
+        expect(ev).toMatchObject({ text: '\u{1F44D}', reactionTargetId: target.id });
+      });
+
+      it('a second reaction by the same reactor with the same emoji is dropped', async () => {
+        const { feed } = repeater();
+        feed(buildGrpTxtFrame(1_700_000_000, 'Bob: hello mesh', SECRET));
+        await vi.waitFor(() => expect(messageSpy).toHaveBeenCalledTimes(1));
+        feed(buildGrpTxtFrame(1_700_000_010, `Alice: ${reactionBody}`, SECRET));
+        await vi.waitFor(() => expect(messageSpy).toHaveBeenCalledTimes(2));
+        feed(buildGrpTxtFrame(1_700_000_020, `Alice: ${reactionBody}`, SECRET));
+        await new Promise((r) => setTimeout(r, 400));
+        expect(messageSpy).toHaveBeenCalledTimes(2);
+        expect((await storedMessages()).filter((r) => r.reactionEmoji)).toHaveLength(1);
+      });
     });
   });
 });

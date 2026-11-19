@@ -1,16 +1,17 @@
-import { useMemo, type ReactNode } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import {
   useDashboardSources,
   useDashboardUnifiedData,
 } from '../../hooks/useDashboardData';
-import { useHopCounts, useTraceroutes } from '../../hooks/useMapAnalysisData';
+import { useTraceroutes } from '../../hooks/useMapAnalysisData';
+import { useHopByKey, hopMapKey } from '../../hooks/useHopByKey';
 import { useLinkQuality } from '../../hooks/useLinkQuality';
 import {
   useTracerouteAnalysis,
   type TracerouteAnalysisInput,
 } from '../../hooks/useTracerouteAnalysis';
 import { getTracerouteOptions } from '../../hooks/useMapAnalysisConfig';
-import { useMapAnalysisCtx } from './MapAnalysisContext';
+import { useMapAnalysisCtx, type SelectedTarget } from './MapAnalysisContext';
 import { resolveNodeLatLng, type MaybePositionedNode } from './nodePositionUtil';
 import { useSettings } from '../../contexts/SettingsContext';
 import { useElevationEnabled } from '../../hooks/useElevationEnabled';
@@ -22,8 +23,11 @@ import {
   type EndpointNodeRecord,
 } from './neighborLinkEndpoints';
 import { UiIcon } from '../icons';
+import { unifiedNodeKey, type IdentifiableNode } from '../../utils/nodeIdentity';
+import { useIsMobileLayoutViewport } from '../../hooks/useIsMobileViewport';
+import styles from './AnalysisInspectorPanel.module.css';
 
-interface NodeRecord extends MaybePositionedNode {
+interface NodeRecord extends MaybePositionedNode, IdentifiableNode {
   nodeNum: number;
   nodeId?: string;
   sourceId?: string;
@@ -49,16 +53,17 @@ interface NodeRecord extends MaybePositionedNode {
   hideFromMap?: boolean | null;
 }
 
-interface HopEntry {
-  sourceId: string;
-  nodeNum: number;
-  hops: number;
-}
-
 /**
  * Right-side inspector. Shows node metadata (with hop count) when a node is
  * selected, segment endpoints when a route segment is selected, or an empty
  * placeholder otherwise. Hidden entirely when `inspectorOpen` is false.
+ *
+ * On the phone layout (portrait or short landscape) the pane is a sheet docked
+ * under (portrait) or beside (landscape) the map that shows only while
+ * something is selected: a fixed 340px column left a 390px-wide phone with a
+ * ~50px map. Its close button dismisses the sheet for that selection only;
+ * the next click on the map selects a new target and opens it again. The
+ * persisted `inspectorOpen` flag is the desktop column's and is left alone.
  */
 export default function AnalysisInspectorPanel() {
   const {
@@ -71,6 +76,10 @@ export default function AnalysisInspectorPanel() {
     setViewMode,
   } = useMapAnalysisCtx();
   const { distanceUnit } = useSettings();
+  const isMobileLayout = useIsMobileLayoutViewport();
+  // The selection the user closed the phone sheet on. Every map click sets a
+  // new object, so comparing by identity reopens the sheet on the next click.
+  const [dismissed, setDismissed] = useState<SelectedTarget | null>(null);
   const elevationEnabled = useElevationEnabled();
   const { data: sources = [] } = useDashboardSources();
   const sourceList = sources as Array<{ id: string; name: string }>;
@@ -79,19 +88,27 @@ export default function AnalysisInspectorPanel() {
       ? sourceList.map((s) => s.id)
       : config.sources;
   const { nodes } = useDashboardUnifiedData(sourceIds, sourceIds.length > 0);
-  const hop = useHopCounts({ enabled: true, sources: sourceIds });
+  const { hopByKey } = useHopByKey({ enabled: true, sources: sourceIds });
 
-  const findNode = (nodeNum: number, sourceId: string | undefined): NodeRecord | undefined => {
+  // `nodeKey` (when the selection carries one) is the identity: a MeshCore
+  // node's nodeNum is synthetic and must never be matched against.
+  const findNode = (
+    nodeNum: number,
+    sourceId: string | undefined,
+    nodeKey?: string,
+  ): NodeRecord | undefined => {
     return ((nodes ?? []) as NodeRecord[]).find(
       (n) =>
-        Number(n.nodeNum) === nodeNum &&
+        (nodeKey !== undefined
+          ? unifiedNodeKey(n as IdentifiableNode)?.toLowerCase() === nodeKey.toLowerCase()
+          : Number(n.nodeNum) === nodeNum) &&
         (sourceId === undefined || n.sourceId === sourceId),
     );
   };
 
   const selectedNode =
     selected?.type === 'node'
-      ? findNode(selected.nodeNum ?? 0, selected.sourceId)
+      ? findNode(selected.nodeNum ?? 0, selected.sourceId, selected.nodeKey)
       : undefined;
   const selectedNodeId =
     selectedNode?.nodeId ??
@@ -161,7 +178,9 @@ export default function AnalysisInspectorPanel() {
   const { data: neighborProfile, isLoading: neighborElevLoading } =
     useElevationProfile(profileEndpointA, profileEndpointB);
 
-  if (!config.inspectorOpen) {
+  if (isMobileLayout) {
+    if (!selected || selected === dismissed) return null;
+  } else if (!config.inspectorOpen) {
     return (
       <button
         type="button"
@@ -175,15 +194,29 @@ export default function AnalysisInspectorPanel() {
   }
 
   const wrap = (body: ReactNode) => (
-    <aside className="map-analysis-inspector">
-      <button
-        type="button"
-        className="map-analysis-inspector-close"
-        aria-label="Collapse detail pane"
-        onClick={() => setInspectorOpen(false)}
-      >
-        <UiIcon name="forward" />
-      </button>
+    <aside
+      className={isMobileLayout ? `map-analysis-inspector ${styles.sheet}` : 'map-analysis-inspector'}
+      data-testid="analysis-inspector"
+    >
+      {isMobileLayout ? (
+        <button
+          type="button"
+          className="map-analysis-inspector-close"
+          aria-label="Close details"
+          onClick={() => setDismissed(selected)}
+        >
+          <UiIcon name="close" />
+        </button>
+      ) : (
+        <button
+          type="button"
+          className="map-analysis-inspector-close"
+          aria-label="Collapse detail pane"
+          onClick={() => setInspectorOpen(false)}
+        >
+          <UiIcon name="forward" />
+        </button>
+      )}
       {body}
     </aside>
   );
@@ -301,12 +334,9 @@ export default function AnalysisInspectorPanel() {
     if (!node) {
       return wrap(<div className="empty">Node not found</div>);
     }
-    const entries = ((hop.data as { entries?: HopEntry[] } | undefined)?.entries ?? []);
-    const hops = entries.find(
-      (e) =>
-        e.sourceId === selected.sourceId &&
-        Number(e.nodeNum) === selected.nodeNum,
-    )?.hops;
+    const hopKey = selected.nodeKey ?? (selected.nodeNum !== undefined ? `mt:${selected.nodeNum}` : undefined);
+    const hops =
+      hopKey !== undefined ? hopByKey.get(hopMapKey(selected.sourceId, hopKey)) : undefined;
     const hex = (selected.nodeNum ?? 0).toString(16);
     const ll = resolveNodeLatLng(node);
     const dm = node.deviceMetrics ?? {};
@@ -413,7 +443,7 @@ export default function AnalysisInspectorPanel() {
   }
 
   if (selected.type === 'trail') {
-    const node = findNode(selected.nodeNum ?? 0, selected.sourceId);
+    const node = findNode(selected.nodeNum ?? 0, selected.sourceId, selected.nodeKey);
     const name = nodeName(node, selected.nodeNum ?? 0);
     const durationMs =
       selected.endMs !== undefined && selected.startMs !== undefined
@@ -453,15 +483,26 @@ export default function AnalysisInspectorPanel() {
   }
 
   // segment
-  const fromNode = findNode(selected.fromNodeNum ?? 0, undefined);
-  const toNode = findNode(selected.toNodeNum ?? 0, undefined);
-  const fromName = nodeName(fromNode, selected.fromNodeNum ?? 0);
-  const toName = nodeName(toNode, selected.toNodeNum ?? 0);
+  // MeshCore ends carry public keys, never node numbers.
+  const fromNode = findNode(
+    selected.fromNodeNum ?? 0,
+    undefined,
+    selected.fromKey ? `mc:${selected.fromKey}` : undefined,
+  );
+  const toNode = findNode(
+    selected.toNodeNum ?? 0,
+    undefined,
+    selected.toKey ? `mc:${selected.toKey}` : undefined,
+  );
+  const endLabel = (key: string | undefined, num: number | undefined): string =>
+    key ? key.slice(0, 12) : `!${(num ?? 0).toString(16)}`;
+  const fromName = fromNode ? nodeName(fromNode, selected.fromNodeNum ?? 0) : endLabel(selected.fromKey, selected.fromNodeNum);
+  const toName = toNode ? nodeName(toNode, selected.toNodeNum ?? 0) : endLabel(selected.toKey, selected.toNodeNum);
   return wrap(
     <>
       <h3>Route Segment</h3>
       <div className="subtitle">
-        !{(selected.fromNodeNum ?? 0).toString(16)} <UiIcon name="forward" size={14} /> !{(selected.toNodeNum ?? 0).toString(16)}
+        {endLabel(selected.fromKey, selected.fromNodeNum)} <UiIcon name="forward" size={14} /> {endLabel(selected.toKey, selected.toNodeNum)}
       </div>
       <hr />
       <dl>

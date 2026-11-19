@@ -28,6 +28,9 @@ vi.mock('../../sourceManagerRegistry.js', () => ({
 vi.mock('../../middleware/rateLimiters.js', () => ({
   messageLimiter: (_req: unknown, _res: unknown, next: () => void) => next(),
   translateLimiter: (_req: unknown, _res: unknown, next: () => void) => next(),
+  // actions.ts (loaded via the v1 barrel) builds its limiter from these at import.
+  meshcoreDeviceLimiter: (_req: unknown, _res: unknown, next: () => void) => next(),
+  protocolLimiter: () => (_req: unknown, _res: unknown, next: () => void) => next(),
 }));
 
 import v1Router from './index.js';
@@ -296,6 +299,20 @@ describe('GET /api/v1/sources/:sourceId/messages/search', () => {
       await seed(harness.sourceA, 0, 'mesh hello');
       const res = await search(harness.admin, harness.sourceA, 'q=hello');
       expect(texts(res.body)).toEqual(['mesh hello']);
+    });
+
+    it('leaves reaction rows out of the results (#5759)', async () => {
+      await seedMc('hello mesh');
+      // A reaction row's text is the emoji, but its raw text keeps the word.
+      await seedMc('hello', {
+        fromName: 'Cara',
+        reactionEmoji: 'hello',
+        reactionFormat: 'mc1-channel',
+        reactionRawText: '@[Bob]hello\nb45pc4ek',
+      });
+      const res = await search(harness.admin, MC_SOURCE, 'q=hello');
+      expect(texts(res.body)).toEqual(['hello mesh']);
+      expect(res.body.total).toBe(1);
     });
   });
 });

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import databaseService from '../../services/database.js';
+import { forgetMqttNativeIdentity } from '../services/mqttNative/mqttNativeState.js';
 import { requirePermission, optionalAuth } from '../auth/authMiddleware.js';
 import { MeshCoreMqttManager, type MeshCoreMqttSourceConfig } from '../meshcoreMqttManager.js';
 import { logger } from '../../utils/logger.js';
@@ -8,16 +9,25 @@ import { sourceManagerRegistry, type ISourceManager } from '../sourceManagerRegi
 import { MeshtasticManager } from '../meshtasticManager.js';
 import { meshcoreConfigFromSource, ensureMeshCoreManagerStarted } from '../meshcoreConfig.js';
 import { MeshCoreManager } from '../meshcoreManager.js';
-import { reticulumConfigFromSource, ensureReticulumManagerStarted } from '../reticulumConfig.js';
-import { isMeshCoreManager, isMeshCoreMqttManager, isMeshtasticManager, isMqttBridgeManager, isReticulumManager } from '../sourceManagerTypes.js';
+import { reticulumConfigFromSource, ensureReticulumManagerStarted, preserveReticulumManagedConfig } from '../reticulumConfig.js';
+import { isMeshCoreManager, isMeshCoreMqttBrokerManager, isMeshCoreMqttManager, isMeshtasticManager, isMqttBridgeManager, isReticulumManager } from '../sourceManagerTypes.js';
+import {
+  findBrokerPortConflict,
+  restartMeshCoreMqttBrokerManager,
+  startMeshCoreMqttBrokerManager,
+} from '../meshcoreMqttBrokerSource.js';
+import { validateMeshCoreBrokerConfig } from '../services/meshcoreMqttBrokerConfig.js';
 import { loRaCenterFrequencyMhz, REGION_SHORT_NAME } from '../../utils/loraFrequency.js';
 import { isMqttProxyLinkMisconfigured } from '../../utils/mqttProxyLink.js';
 import { MqttBrokerManager, MAX_HOP_LIMIT, type MqttBrokerSourceConfig } from '../mqttBrokerManager.js';
 import { MAX_RAISE_TARGET, RAISEABLE_PORTNUMS } from '../mqttHopLimitPolicy.js';
-import { MqttBridgeManager, type MqttBridgeSourceConfig } from '../mqttBridgeManager.js';
+import { MqttBridgeManager, normalizeBridgeClientId, type MqttBridgeSourceConfig } from '../mqttBridgeManager.js';
 import waypointRoutes from './waypoints.js';
 import observerRoutes from './sourceObserverRoutes.js';
+import meshcoreBrokerRoutes from './meshcoreBrokerRoutes.js';
 import aircraftFlightMatchRoutes from './aircraftFlightMatchRoutes.js';
+import pkiExchangeStateRoutes from './pkiExchangeStateRoutes.js';
+import mapMarkerRoutes from './mapMarkerRoutes.js';
 import { PortNum } from '../constants/meshtastic.js';
 import {
   buildSourceNodes,
@@ -25,15 +35,23 @@ import {
   buildSourceTraceroutes,
   buildSourceNeighborInfo,
   buildSourceDashboard,
+  applyDashboardAgeWindow,
+  resolveDashboardAgeWindow,
+  localNodeNums,
+  dashboardNodePrefilter,
 } from '../services/sourceDashboardData.js';
 import { getSourcePkiKeyStore, isPkiDmDecryptionGloballyEnabled } from '../services/sourcePkiKeyStore.js';
 import { mqttGeoSweepService, type GeoSweepStatsSink } from '../services/mqttGeoSweepService.js';
 import type { MqttFilterConfig } from '../mqttPacketFilter.js';
 import { ok, fail } from '../utils/apiResponse.js';
+import { checkMqttRootSave, failInvalidMqttRoot } from '../utils/mqttRootGuard.js';
+import { DEFAULT_MESHTASTIC_SOURCE_SETTING, applyDefaultMeshtasticSource, readConfiguredDefaultMeshtasticSourceId } from '../utils/defaultMeshtasticSource.js';
 import { normalizeBrokerUrl } from '../transports/mqttBrokerClient.js';
 import { observerBrokerKey } from '../meshcoreConfig.js';
 import { getForwardingSummary } from '../services/forwardingStateService.js';
 import { getMeshCoreObserverCredentialStore } from '../services/meshcoreObserverCredentialStore.js';
+import { detachBridgePresetId, fillBridgeConfigFromPreset } from '../services/mqttBrokerPresetFill.js';
+import { findDuplicateTcpEndpoints, describeDuplicateTcpEndpoint } from '../utils/tcpEndpointDuplicates.js';
 import {
   mayViewSourceEndpoint,
   maskSourceConfigForEditor,
@@ -43,6 +61,7 @@ import {
   resolveSourceConfigAudience,
   type SourceConfigAudience,
 } from '../utils/sourceConfigRedaction.js';
+import { loadMqttConsentHiddenSet, dropMessagesNamingHiddenNodes } from '../utils/mqttConsentVisibility.js';
 
 const router = Router();
 
@@ -341,6 +360,15 @@ export function validateObserverConfig(
         };
       }
 
+      const rejectUnauthorized = entry.rejectUnauthorized;
+      if (rejectUnauthorized !== undefined && typeof rejectUnauthorized !== 'boolean') {
+        return {
+          status: 400,
+          error: `observer.brokers[${i}].rejectUnauthorized must be a boolean`,
+          code: 'INVALID_PARAMETER',
+        };
+      }
+
       // validateBrokerUrlValue above already proved entry.url normalizes, so
       // this cannot throw in practice; the catch is defence-in-depth only.
       let key: string;
@@ -495,12 +523,33 @@ function validateMqttBridgeForwardingMode(config: Record<string, any>): string |
 }
 
 /**
+ * Validate and normalise the optional single-mode Client ID (#5893),
+ * `upstream.clientId`. Accepts `!xxxxxxxx` or `xxxxxxxx` (8 hex digits, any
+ * case) and stores lowercase `!xxxxxxxx`; a blank value is removed. Mutates
+ * `config.upstream` (a fresh object, never the caller's nested one).
+ */
+function validateMqttBridgeClientId(config: Record<string, any>): string | null {
+  const upstream = config?.upstream;
+  if (!upstream || typeof upstream !== 'object' || Array.isArray(upstream)) return null;
+  if (!Object.prototype.hasOwnProperty.call(upstream, 'clientId')) return null;
+  const normalized = normalizeBridgeClientId(upstream.clientId);
+  if (normalized === null) {
+    return 'mqtt_bridge upstream.clientId must be 8 hex digits, optionally starting with ! (for example !a1b2c3d4)';
+  }
+  const next = { ...upstream };
+  if (normalized === undefined) delete next.clientId;
+  else next.clientId = normalized;
+  config.upstream = next;
+  return null;
+}
+
+/**
  * Validate the optional boolean uplink overrides on an mqtt_bridge config:
  * `ignoreOkToMqtt` (absent ⇒ honor the bit) and `dropAutomationUplinks`
  * (#5414, absent ⇒ uplink automation sends as before).
  */
 function validateMqttBridgeIgnoreOkToMqtt(config: Record<string, any>): string | null {
-  for (const key of ['ignoreOkToMqtt', 'dropAutomationUplinks'] as const) {
+  for (const key of ['ignoreOkToMqtt', 'dropAutomationUplinks', 'skipRaise', 'relayOtherBridges'] as const) {
     const value = config?.[key];
     if (value === undefined || value === null) continue;
     if (typeof value !== 'boolean') {
@@ -888,6 +937,27 @@ router.get('/:id', requirePermission('sources', 'read'), async (req: Request, re
 });
 
 // Create source
+/**
+ * Log a warning when a saved, enabled Meshtastic TCP source shares its node
+ * with another enabled one (#5974). The exact-match 409 below misses
+ * case/whitespace/port-type variants and rows that predate it; the node only
+ * serves one TCP client, so such a pair disconnects each other forever.
+ * Diagnostic only: never fails the request.
+ */
+async function warnIfSourceSharesTcpEndpoint(source: { id: string; type: string; enabled?: unknown }): Promise<void> {
+  if (source.type !== 'meshtastic_tcp' || !source.enabled) return;
+  try {
+    const all = await databaseService.sources.getAllSources();
+    for (const group of findDuplicateTcpEndpoints(all)) {
+      if (group.sources.some((s) => s.id === source.id)) {
+        logger.warn(describeDuplicateTcpEndpoint(group));
+      }
+    }
+  } catch (err) {
+    logger.debug(`Duplicate TCP endpoint check failed for source ${source.id}:`, err);
+  }
+}
+
 router.post('/', requirePermission('sources', 'write'), async (req: Request, res: Response) => {
   try {
     const { name, type, config, enabled } = req.body;
@@ -895,8 +965,15 @@ router.post('/', requirePermission('sources', 'write'), async (req: Request, res
     if (!name || typeof name !== 'string') {
       return res.status(400).json({ error: 'name is required and must be a string' });
     }
-    if (!['meshtastic_tcp', 'mqtt_broker', 'mqtt_bridge', 'meshcore', 'meshcore_mqtt', 'reticulum'].includes(type)) {
-      return res.status(400).json({ error: 'type must be meshtastic_tcp, mqtt_broker, mqtt_bridge, meshcore, meshcore_mqtt, or reticulum' });
+    if (!['meshtastic_tcp', 'mqtt_broker', 'mqtt_bridge', 'meshcore', 'meshcore_mqtt', 'meshcore_mqtt_broker', 'reticulum'].includes(type)) {
+      return res.status(400).json({ error: 'type must be meshtastic_tcp, mqtt_broker, mqtt_bridge, meshcore, meshcore_mqtt, meshcore_mqtt_broker, or reticulum' });
+    }
+
+    // Embedded MeshCore MQTT broker (#6197): listener, auth and limits are all
+    // structural, so a bad config is refused before anything is stored.
+    if (type === 'meshcore_mqtt_broker') {
+      const brokerErr = await validateMeshCoreBrokerSave(config, undefined);
+      if (brokerErr) return fail(res, brokerErr.status, brokerErr.code, brokerErr.message);
     }
 
     // meshcore_mqtt (#5040) ingests from an Analyzer Observer broker and has no
@@ -945,6 +1022,10 @@ router.post('/', requirePermission('sources', 'write'), async (req: Request, res
       if (ignoreOkErr) {
         return res.status(400).json({ error: ignoreOkErr });
       }
+      const clientIdErr = validateMqttBridgeClientId(config ?? {});
+      if (clientIdErr) {
+        return fail(res, 400, 'INVALID_CLIENT_ID', clientIdErr);
+      }
     }
     if (!config || typeof config !== 'object') {
       return res.status(400).json({ error: 'config is required and must be an object' });
@@ -960,11 +1041,21 @@ router.post('/', requirePermission('sources', 'write'), async (req: Request, res
       if (hopErr) {
         return res.status(400).json({ error: hopErr });
       }
+      // The broker's topic prefix (#6338). Unset (or null) means `msh`; `''` would make
+      // the prefix `/`, so it is refused here.
+      const rootErr = checkMqttRootSave(config.rootTopic ?? undefined, undefined, { allowEmpty: false });
+      if (rootErr) return failInvalidMqttRoot(res, rootErr, 'rootTopic');
     }
 
     const vnErr = await validateVirtualNodeConfig(type, config);
     if (vnErr) {
       return res.status(vnErr.status).json({ error: vnErr.error });
+    }
+
+    // A saved broker preset's login, for a caller who was not shown it (#5794).
+    if (type === 'mqtt_bridge') {
+      const presetErr = await fillBridgeConfigFromPreset(config);
+      if (presetErr) return fail(res, presetErr.status, presetErr.code, presetErr.message);
     }
 
     // Analyzer Observer config gate (#4457 Phase 1).
@@ -1026,6 +1117,8 @@ router.post('/', requirePermission('sources', 'write'), async (req: Request, res
       logger.warn(`Source ${source.id} config exceeds the MySQL varchar(4096) column width; the write may fail or truncate`);
     }
 
+    await warnIfSourceSharesTcpEndpoint(source);
+
     // Start manager if source is enabled and autoConnect is not explicitly false.
     // autoConnect=false means the source is registered but won't start monitoring
     // until a user explicitly clicks Connect (issue #2773).
@@ -1081,6 +1174,12 @@ router.post('/', requirePermission('sources', 'write'), async (req: Request, res
       } catch (err) {
         logger.warn(`Could not start MeshCore MQTT manager for new source ${source.id}:`, err);
       }
+    } else if (source.enabled && source.type === 'meshcore_mqtt_broker' && cfgForStart?.autoConnect !== false) {
+      try {
+        await startMeshCoreMqttBrokerManager(source);
+      } catch (err) {
+        logger.warn(`Could not start MeshCore MQTT broker for new source ${source.id}:`, err);
+      }
     } else if (source.enabled && (source.type === 'mqtt_broker' || source.type === 'mqtt_bridge')) {
       try {
         const manager = buildMqttManagerForSource(
@@ -1127,6 +1226,37 @@ function sameStoredConfig(a: unknown, b: unknown): boolean {
  * in at construction, and a new manager is also what clears an auth stop (five
  * rejected logins in a row). Returns false when the config is incomplete.
  */
+/**
+ * Validate a `meshcore_mqtt_broker` config on create or save (#6197): shape and
+ * limits, a free listener port, and (MySQL only) the varchar(4096) config
+ * column, which a long observer allowlist can outgrow. Refusing beats the
+ * silent truncation the column would otherwise apply.
+ */
+async function validateMeshCoreBrokerSave(
+  config: unknown,
+  sourceId: string | undefined,
+): Promise<{ status: number; code: string; message: string } | null> {
+  const err = validateMeshCoreBrokerConfig(config);
+  if (err) return { status: 400, code: 'INVALID_BROKER_CONFIG', message: err };
+  const port = (config as { listener: { port: number } }).listener.port;
+  const conflict = await findBrokerPortConflict(port, sourceId);
+  if (conflict) {
+    return {
+      status: 409,
+      code: 'PORT_IN_USE',
+      message: `Port ${port} is already used by the broker source "${conflict.name}"`,
+    };
+  }
+  if (databaseService.drizzleDbType === 'mysql' && Buffer.byteLength(JSON.stringify(config), 'utf8') > 4096) {
+    return {
+      status: 400,
+      code: 'CONFIG_TOO_LARGE',
+      message: 'This broker config is too large to store on MySQL (4096 bytes). Shorten the observer allowlists or remove a forwarding target.',
+    };
+  }
+  return null;
+}
+
 async function restartMeshCoreMqttManager(
   source: { id: string; name: string; config: unknown },
 ): Promise<boolean> {
@@ -1157,7 +1287,13 @@ router.put('/:id', requirePermission('sources', 'write'), async (req: Request, r
     // shown everything; anyone else saved the masked config. Everything below
     // validates and compares THIS config — it is what the row will hold.
     const audience = await resolveSourceConfigAudience(req);
-    const config: Record<string, any> | undefined =
+    // A saved broker preset (#5794) is resolved after the merge, so the merge
+    // never sees its id and a stored password still wins over the preset's.
+    const brokerPresetId =
+      incomingConfig !== undefined && existing.type === 'mqtt_bridge'
+        ? detachBridgePresetId(incomingConfig)
+        : undefined;
+    const mergedConfig: Record<string, any> | undefined =
       incomingConfig === undefined
         ? undefined
         : mergeSourceConfigOnSave(
@@ -1168,6 +1304,20 @@ router.put('/:id', requirePermission('sources', 'write'), async (req: Request, r
             incomingConfig,
             audience === 'admin' ? 'admin' : 'editor',
           );
+    // The Reticulum display name and announce interval live on the
+    // Configuration page, not the source form, so a form save keeps them (#6011).
+    const config: Record<string, any> | undefined =
+      mergedConfig !== undefined && existing.type === 'reticulum'
+        ? preserveReticulumManagedConfig(existing.config as Record<string, unknown> | null | undefined, mergedConfig)
+        : mergedConfig;
+    if (config !== undefined && brokerPresetId !== undefined) {
+      const upstream = config.upstream;
+      if (upstream && typeof upstream === 'object' && !Array.isArray(upstream)) {
+        config.upstream = { ...upstream, brokerPresetId };
+        const presetErr = await fillBridgeConfigFromPreset(config);
+        if (presetErr) return fail(res, presetErr.status, presetErr.code, presetErr.message);
+      }
+    }
 
     // The Observer's stored broker login (the single, pre-#5014 one) is used
     // for whichever broker `observer.brokerUrl` names. A non-admin may not
@@ -1209,6 +1359,11 @@ router.put('/:id', requirePermission('sources', 'write'), async (req: Request, r
         return fail(res, observerErr.status, observerErr.code, observerErr.error);
       }
 
+      if (existing.type === 'meshcore_mqtt_broker') {
+        const brokerErr = await validateMeshCoreBrokerSave(config, existing.id);
+        if (brokerErr) return fail(res, brokerErr.status, brokerErr.code, brokerErr.message);
+      }
+
       // Validate mqtt_bridge topic rewrites (#3166) against the post-save
       // config.
       if (existing.type === 'mqtt_bridge') {
@@ -1228,6 +1383,10 @@ router.put('/:id', requirePermission('sources', 'write'), async (req: Request, r
         if (ignoreOkErr) {
           return res.status(400).json({ error: ignoreOkErr });
         }
+        const clientIdErr = validateMqttBridgeClientId(config ?? {});
+        if (clientIdErr) {
+          return fail(res, 400, 'INVALID_CLIENT_ID', clientIdErr);
+        }
       }
 
       // Validate the mqtt_broker downlink hop-limit override (#4081).
@@ -1237,6 +1396,10 @@ router.put('/:id', requirePermission('sources', 'write'), async (req: Request, r
         if (hopErr) {
           return res.status(400).json({ error: hopErr });
         }
+        // The broker's topic prefix (#6338), checked only when it changes.
+        const prevRootTopic = (existing.config as Record<string, unknown> | null | undefined)?.rootTopic;
+        const rootErr = checkMqttRootSave(config.rootTopic ?? undefined, prevRootTopic, { allowEmpty: false });
+        if (rootErr) return failInvalidMqttRoot(res, rootErr, 'rootTopic');
       }
 
       // Prevent duplicate host:port combinations (exclude self)
@@ -1271,6 +1434,8 @@ router.put('/:id', requirePermission('sources', 'write'), async (req: Request, r
     ) {
       logger.warn(`Source ${source.id} config exceeds the MySQL varchar(4096) column width; the write may fail or truncate`);
     }
+
+    await warnIfSourceSharesTcpEndpoint(source);
 
     // Propagate name change to the live MeshCore/Reticulum manager so
     // getStatus() stays fresh without requiring a restart (#3962 WP3b — open
@@ -1338,6 +1503,19 @@ router.put('/:id', requirePermission('sources', 'write'), async (req: Request, r
     } else if (wasEnabled && !isNowEnabled) {
       // Newly disabled: stop manager in the unified registry (no-op when not registered).
       await sourceManagerRegistry.removeManager(source.id);
+    } else if (isNowEnabled && source.type === 'meshcore_mqtt_broker' && (!wasEnabled || config !== undefined)) {
+      // Embedded MeshCore MQTT broker (#6197). A save rebuilds the listener;
+      // nothing here is a safety timer (it never transmits), so a restart
+      // re-arms nothing.
+      try {
+        if (!newAutoConnect) {
+          await sourceManagerRegistry.removeManager(source.id);
+        } else if (!(await restartMeshCoreMqttBrokerManager(source))) {
+          logger.warn(`MeshCore MQTT broker ${source.id} saved with an unusable config; not listening`);
+        }
+      } catch (err) {
+        logger.warn(`Could not restart MeshCore MQTT broker ${source.id}:`, err);
+      }
     } else if (isNowEnabled && source.type === 'meshcore_mqtt' && (!wasEnabled || config !== undefined)) {
       // MeshCore MQTT ingest (#5596): newly enabled, or config saved while
       // enabled. Before this branch a save changed the stored config and left
@@ -1672,6 +1850,20 @@ router.delete('/:id', requirePermission('sources', 'write'), async (req: Request
       logger.warn(`Failed to purge settings for deleted source ${req.params.id}:`, settingsError);
     }
 
+    // #5245: a deleted source can no longer be the default Meshtastic source.
+    // The registry already falls back to Automatic (its manager is gone);
+    // clearing the stored id keeps Settings from showing a source that no
+    // longer exists. Best-effort, like the purges around it.
+    try {
+      const configuredDefault = await readConfiguredDefaultMeshtasticSourceId(databaseService);
+      if (configuredDefault === req.params.id) {
+        await databaseService.settings.setSetting(DEFAULT_MESHTASTIC_SOURCE_SETTING, '');
+        applyDefaultMeshtasticSource(sourceManagerRegistry, null);
+      }
+    } catch (defaultError) {
+      logger.warn(`Failed to clear the default Meshtastic source for deleted source ${req.params.id}:`, defaultError);
+    }
+
     // #5596: per-source secrets live in their own tables, keyed by source id,
     // and nothing removed them — a deleted source left its Analyzer Observer
     // signing key, its Observer broker passwords, and its PKI DM private key
@@ -1683,6 +1875,21 @@ router.delete('/:id', requirePermission('sources', 'write'), async (req: Request
       ['Analyzer Observer key', () => databaseService.meshcoreObserverKeys.deleteBySourceId(req.params.id)],
       ['Analyzer Observer credentials', () => databaseService.meshcoreObserverCredentials.deleteBySourceId(req.params.id)],
       ['PKI DM key', () => databaseService.sourcePkiKeys.deleteBySourceId(req.params.id)],
+      // #4305: the MQTT-native send identity (sealed private key + send state).
+      ['MQTT-native identity', async () => {
+        await databaseService.mqttNativeIdentities.deleteBySourceId(req.params.id);
+        forgetMqttNativeIdentity(req.params.id);
+      }],
+      // #6195: the auto-captured MeshCore Companion device identity key.
+      ['MeshCore device key', () => databaseService.meshcoreSourcePkiKeys.deleteBySourceId(req.params.id)],
+      // The source's channel slots hold their PSKs in the clear
+      // (BACKUP_SECRET_TABLES). At most a few hundred rows per source.
+      ['channel keys', async () => {
+        const slots = await databaseService.channels.getAllChannels(req.params.id);
+        for (const slot of slots) {
+          await databaseService.channels.deleteChannel(slot.id, req.params.id);
+        }
+      }],
     ];
     for (const [label, purge] of secretPurges) {
       try {
@@ -1690,6 +1897,67 @@ router.delete('/:id', requirePermission('sources', 'write'), async (req: Request
       } catch (secretError) {
         logger.warn(`Failed to purge ${label} for deleted source ${req.params.id}:`, secretError);
       }
+    }
+
+    // #5691: Reliable PKI exchange state. Deliberately NOT inside
+    // purgeAllNodesAsync either: purging a live source's nodes must not reset
+    // the hourly priming timer that protects the mesh. Only deleting the
+    // source itself removes it. Best-effort, like the purges above.
+    try {
+      await databaseService.pkiExchangeState.deleteBySourceId(req.params.id);
+    } catch (pkiStateError) {
+      logger.warn(`Failed to purge Reliable PKI state for deleted source ${req.params.id}:`, pkiStateError);
+    }
+
+    // #5686: local map markers belong to their source. Like the PKI state,
+    // only deleting the source removes them; a node purge does not.
+    try {
+      await databaseService.mapMarkers.deleteBySourceId(req.params.id);
+    } catch (markerError) {
+      logger.warn(`Failed to purge map markers for deleted source ${req.params.id}:`, markerError);
+    }
+
+    // #5722: MeshCore per-hop trace SNR history is the source's own reception.
+    try {
+      await databaseService.meshcoreHopSnr.deleteBySourceId(req.params.id);
+    } catch (hopSnrError) {
+      logger.warn(`Failed to purge MeshCore hop SNR history for deleted source ${req.params.id}:`, hopSnrError);
+    }
+
+    // #6276: the source's MeshCore trace attempt log.
+    try {
+      await databaseService.meshcoreTraceRuns.deleteBySourceId(req.params.id);
+    } catch (traceRunsError) {
+      logger.warn(`Failed to purge MeshCore trace runs for deleted source ${req.params.id}:`, traceRunsError);
+    }
+
+    // #6274: the source's MeshCore neighbour-watch ledger. Deleting the source
+    // re-baselines for good; a node purge clears it through the repository.
+    try {
+      await databaseService.meshcore.deleteNeighborWatchForSource(req.params.id);
+    } catch (neighborWatchError) {
+      logger.warn(`Failed to purge MeshCore neighbour watch for deleted source ${req.params.id}:`, neighborWatchError);
+    }
+
+    // #5862: node rename history is what this source heard.
+    try {
+      await databaseService.nodeNameHistory.deleteBySourceId(req.params.id);
+    } catch (nameHistoryError) {
+      logger.warn(`Failed to purge node name history for deleted source ${req.params.id}:`, nameHistoryError);
+    }
+
+    // #5892: MeshCore CLI command history was issued through this source.
+    try {
+      await databaseService.meshcoreCliHistory.deleteBySourceId(req.params.id);
+    } catch (cliHistoryError) {
+      logger.warn(`Failed to purge MeshCore CLI history for deleted source ${req.params.id}:`, cliHistoryError);
+    }
+
+    // #5785: remembered MeshCore remote-admin logins belong to the source.
+    try {
+      await databaseService.meshcoreAdminSessions.deleteBySourceId(req.params.id);
+    } catch (adminSessionError) {
+      logger.warn(`Failed to purge MeshCore admin sessions for deleted source ${req.params.id}:`, adminSessionError);
     }
 
     // NOTE: `mesh_beacon_offers` (#4723) is cleaned up inside
@@ -1796,13 +2064,18 @@ async function mqttProxyUnlinkedFor(
  * object either way.
  *
  * One `lastError` survives: that of a source or gateway that stopped itself
- * after rejected logins (`authStopped`). The manager sets a fixed sentence
+ * after rejected logins (`authStopped`) or repeated evictions (`evictionStopped`, #5893). The manager sets a fixed sentence
  * there, with no host in it, and the UI shows it as the reason (#5596, #5610).
  * A `meshcore_mqtt` source only ever sets that sentence.
  */
 function withoutEndpointDetail(status: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = { ...status };
-  if ('lastError' in out && out.sourceType !== 'meshcore_mqtt' && out.authStopped !== true) {
+  if (
+    'lastError' in out &&
+    out.sourceType !== 'meshcore_mqtt' &&
+    out.authStopped !== true &&
+    out.evictionStopped !== true
+  ) {
     out.lastError = null;
   }
   if (out.publishers && typeof out.publishers === 'object') {
@@ -1810,7 +2083,7 @@ function withoutEndpointDetail(status: Record<string, unknown>): Record<string, 
       Object.entries(out.publishers as Record<string, Record<string, unknown>>).map(
         ([clientId, entry]) => [
           clientId,
-          { ...entry, lastError: entry.authStopped ? entry.lastError : null },
+          { ...entry, lastError: entry.authStopped || entry.evictionStopped ? entry.lastError : null },
         ],
       ),
     );
@@ -1843,11 +2116,11 @@ function withoutEndpointDetail(status: Record<string, unknown>): Record<string, 
  *
  * A per-gateway publisher's id is a node id (`!<8-hex>`). Such a caller still
  * gets how many gateways there are, which are connected, and how many stopped
- * after rejected logins — but not which nodes they are, and not the broker's
+ * after rejected logins or (#5893) evictions — but not which nodes they are, and not the broker's
  * error text for each (it can name the broker host).
  */
 function redactBridgeGatewayIds(status: Record<string, unknown>): Record<string, unknown> {
-  const { authStoppedGateways: _ids, ...rest } = status;
+  const { authStoppedGateways: _ids, evictionStoppedGateways: _evictedIds, ...rest } = status;
   const publishers = rest.publishers;
   if (!publishers || typeof publishers !== 'object') return rest;
   const anonymous: Record<string, unknown> = {};
@@ -1862,7 +2135,8 @@ function redactBridgeGatewayIds(status: Record<string, unknown>): Record<string,
       // (GATEWAY_AUTH_STOPPED_MESSAGE), safe for anyone. Any other value is
       // the broker's or the socket's own words, so it is withheld. Do not
       // "simplify" this to always-null or always-passthrough.
-      lastError: entry.authStopped ? entry.lastError : null,
+      // GATEWAY_EVICTION_STOPPED_MESSAGE (#5893) is fixed text too.
+      lastError: entry.authStopped || entry.evictionStopped ? entry.lastError : null,
     };
   });
   return { ...rest, publishers: anonymous };
@@ -2084,7 +2358,12 @@ router.get('/:id/messages', requirePermission('messages', 'read', { sourceIdFrom
     // filters them out anyway (they render from the `traceroutes` table);
     // letting them occupy slots in the capped window evicts real DMs
     // (issue #2741).
-    const messages = await databaseService.messages.getMessages(limit, offset, source.id, [PortNum.TRACEROUTE_APP]);
+    // #5156: an anonymous caller loses messages from/to consent-hidden nodes.
+    const messages = dropMessagesNamingHiddenNodes(
+      await databaseService.messages.getMessages(limit, offset, source.id, [PortNum.TRACEROUTE_APP]),
+      await loadMqttConsentHiddenSet(req.user, [source.id]),
+      source.id,
+    );
     res.json(messages);
   } catch (error) {
     logger.error('Error fetching messages for source:', error);
@@ -2118,14 +2397,17 @@ router.get('/:id/messages/:messageId/events', optionalAuth(), requirePermission(
 router.get('/:id/messages/:messageId/heard-by', optionalAuth(), requirePermission('messages', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
   try {
     const sourceId = req.params.id;
-    const [rows, nodes] = await Promise.all([
+    const [rows, nodes, hidden] = await Promise.all([
       databaseService.meshtasticHeardRepeaters.getHeardRepeatersForMessage(req.params.messageId, sourceId),
       databaseService.nodes.getAllNodes(sourceId),
+      // #5156: an anonymous caller gets no consent-hidden node as a candidate.
+      loadMqttConsentHiddenSet(req.user, [sourceId]),
     ]);
 
     const heardBy = rows.map((row) => {
       const candidates = nodes
         .filter((node) => (Number(node.nodeNum) & 0xFF) === row.relayByte)
+        .filter((node) => !hidden.hides(sourceId, node.nodeNum))
         .map((node) => ({
           nodeNum: Number(node.nodeNum),
           longName: node.longName ?? undefined,
@@ -2214,7 +2496,16 @@ router.get('/:id/dashboard', optionalAuth(), async (req: Request, res: Response)
     const source = await databaseService.sources.getSource(req.params.id);
     if (!source) return res.status(404).json({ error: 'Source not found' });
     const user = (req as any).user ?? null;
-    const payload = await buildSourceDashboard(source, user);
+    // `ageWindow=settings`: same opt-in age cut as GET /api/unified/dashboard.
+    const ageCut = req.query.ageWindow === 'settings'
+      ? { window: await resolveDashboardAgeWindow(), keep: localNodeNums() }
+      : null;
+    const payload = await buildSourceDashboard(source, user, {
+      nodePrefilter: ageCut ? await dashboardNodePrefilter([source.id], ageCut.window, ageCut.keep) : undefined,
+    });
+    if (ageCut) {
+      applyDashboardAgeWindow([payload], ageCut.window, ageCut.keep);
+    }
     res.json(payload);
   } catch (error) {
     logger.error('Error fetching dashboard data for source:', error);
@@ -2237,13 +2528,14 @@ router.post('/:id/connect', requirePermission('sources', 'write'), async (req: R
       source.type !== 'meshcore' &&
       source.type !== 'reticulum' &&
       source.type !== 'meshcore_mqtt' &&
+      source.type !== 'meshcore_mqtt_broker' &&
       source.type !== 'mqtt_bridge'
     ) {
       return fail(
         res,
         400,
         'CONNECT_NOT_SUPPORTED',
-        'Manual connect is only supported for meshtastic_tcp, meshcore, meshcore_mqtt, mqtt_bridge, and reticulum sources',
+        'Manual connect is only supported for meshtastic_tcp, meshcore, meshcore_mqtt, meshcore_mqtt_broker, mqtt_bridge, and reticulum sources',
       );
     }
     if (source.type === 'mqtt_bridge') {
@@ -2265,6 +2557,17 @@ router.post('/:id/connect', requirePermission('sources', 'write'), async (req: R
       }
       const bridge = buildMqttManagerForSource(source.id, source.name, 'mqtt_bridge', source.config);
       await sourceManagerRegistry.addManager(bridge);
+      return res.json({ success: true });
+    }
+    if (source.type === 'meshcore_mqtt_broker') {
+      // Embedded MeshCore MQTT broker (#6197): a listening broker is left alone.
+      const existingMgr = sourceManagerRegistry.getManager(source.id);
+      if (existingMgr && isMeshCoreMqttBrokerManager(existingMgr) && existingMgr.isConnected()) {
+        return res.json({ success: true, alreadyRunning: true });
+      }
+      if (!(await restartMeshCoreMqttBrokerManager(source))) {
+        return fail(res, 400, 'INCOMPLETE_CONFIG', 'MeshCore MQTT broker source has an unusable config');
+      }
       return res.json({ success: true });
     }
     if (source.type === 'meshcore_mqtt') {
@@ -2507,6 +2810,10 @@ router.post('/:id/prune-outside-roi', requirePermission('sources', 'write'), asy
 // scoped to the path's `:id` parameter.
 router.use('/:id/waypoints', waypointRoutes);
 router.use('/:id/nodes/:nodeNum/flight-match', aircraftFlightMatchRoutes);
+router.use('/:id/nodes/:nodeNum/pki-exchange', pkiExchangeStateRoutes);
+// #5686: local map markers (planning notes; never transmitted).
+router.use('/:id/markers', mapMarkerRoutes);
 router.use('/:id/observer', observerRoutes);
+router.use('/:id/meshcore-broker', meshcoreBrokerRoutes);
 
 export default router;

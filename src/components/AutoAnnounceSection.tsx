@@ -8,12 +8,17 @@ import { useCsrfFetch } from '../hooks/useCsrfFetch';
 import { useSourceQuery } from '../hooks/useSourceQuery';
 import { useSource } from '../contexts/SourceContext';
 import { useSaveBar } from '../hooks/useSaveBar';
-import { UiIcon } from './icons';
+import { ConfigSection } from './shared/config/ConfigSection';
+import { AutomationEngineNote } from './shared/config/AutomationEngineNote';
+import { ConfigGroup } from './shared/config/ConfigGroup';
+import { TokenInsertButtons } from './shared/automation/TokenInsertButtons';
 import apiService from '../services/api';
 import { HopLimitOverrideSelect } from './HopLimitOverrideSelect';
+import { SplitLongMessagesField } from './shared/automation/SplitLongMessagesField';
 import { NumberInput } from './common/NumberInput';
 import { NumberInputScope } from './common/NumberInputScope';
 import { useNumberInputScope } from './common/numberInputScopeContext';
+import { insertTokenAtSelection } from '../utils/tokenInsert';
 
 interface AutoAnnounceSectionProps {
   enabled: boolean;
@@ -35,6 +40,9 @@ interface AutoAnnounceSectionProps {
   /** Hop-limit override (#5121): '' = inherit, '0'–'7' = pinned. */
   hopLimit?: string;
   onHopLimitChange?: (hopLimit: string) => void;
+  /** Split a long announcement into up to 3 marked parts (#6330). */
+  splitLongMessages?: boolean;
+  onSplitLongMessagesChange?: (split: boolean) => void;
   // NodeInfo broadcasting props
   nodeInfoEnabled?: boolean;
   nodeInfoChannels?: number[];
@@ -42,9 +50,25 @@ interface AutoAnnounceSectionProps {
   onNodeInfoEnabledChange?: (enabled: boolean) => void;
   onNodeInfoChannelsChange?: (channels: number[]) => void;
   onNodeInfoDelayChange?: (seconds: number) => void;
+  /** False disables every control, Send Now included. Default true. */
+  canWrite?: boolean;
+  /** True when the source cannot transmit; shows the paused note and disables Send Now. */
+  receiveOnly?: boolean;
 }
 
 const DEFAULT_MESSAGE = 'MeshRadar {VERSION} online for {DURATION} {FEATURES}';
+
+/** Tokens offered as insert buttons under the announcement template. */
+const ANNOUNCE_TOKENS: readonly string[] = [
+  '{VERSION}',
+  '{DURATION}',
+  '{FEATURES}',
+  '{NODECOUNT}',
+  '{DIRECTCOUNT}',
+  '{TOTALNODES}',
+  '{DATE}',
+  '{TIME}',
+];
 
 // Stable default for `nodeInfoChannels`. An inline `= []` default is a new
 // array every render; the re-seed effect below depends on it and sets state,
@@ -70,6 +94,8 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
   onScheduleChange,
   hopLimit = '',
   onHopLimitChange,
+  splitLongMessages = false,
+  onSplitLongMessagesChange,
   // NodeInfo broadcasting props
   nodeInfoEnabled = false,
   nodeInfoChannels = EMPTY_CHANNELS as number[],
@@ -77,6 +103,8 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
   onNodeInfoEnabledChange,
   onNodeInfoChannelsChange,
   onNodeInfoDelayChange,
+  canWrite = true,
+  receiveOnly = false,
 }) => {
   const { t } = useTranslation();
   const csrfFetch = useCsrfFetch();
@@ -91,6 +119,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
   const [localUseSchedule, setLocalUseSchedule] = useState(useSchedule);
   const [localSchedule, setLocalSchedule] = useState(schedule || '0 */6 * * *');
   const [localHopLimit, setLocalHopLimit] = useState(hopLimit);
+  const [localSplitLongMessages, setLocalSplitLongMessages] = useState(splitLongMessages);
   const [scheduleError, setScheduleError] = useState<string | null>(null);
   const [hasChanges, setHasChanges] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -113,10 +142,11 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
     setLocalUseSchedule(useSchedule);
     setLocalSchedule(schedule || '0 */6 * * *');
     setLocalHopLimit(hopLimit);
+    setLocalSplitLongMessages(splitLongMessages);
     setLocalNodeInfoEnabled(nodeInfoEnabled);
     setLocalNodeInfoChannels(nodeInfoChannels);
     setLocalNodeInfoDelaySeconds(nodeInfoDelaySeconds);
-  }, [enabled, intervalHours, message, channelIndexes, announceOnStart, useSchedule, schedule, hopLimit, nodeInfoEnabled, nodeInfoChannels, nodeInfoDelaySeconds]);
+  }, [enabled, intervalHours, message, channelIndexes, announceOnStart, useSchedule, schedule, hopLimit, splitLongMessages, nodeInfoEnabled, nodeInfoChannels, nodeInfoDelaySeconds]);
 
   // Fetch last announcement time (per-source)
   useEffect(() => {
@@ -170,11 +200,12 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
       localUseSchedule !== useSchedule ||
       localSchedule !== (schedule || '0 */6 * * *') ||
       localHopLimit !== hopLimit ||
+      localSplitLongMessages !== splitLongMessages ||
       localNodeInfoEnabled !== nodeInfoEnabled ||
       !arraysEqual(localNodeInfoChannels, nodeInfoChannels) ||
       localNodeInfoDelaySeconds !== nodeInfoDelaySeconds;
     setHasChanges(changed);
-  }, [localEnabled, localInterval, localMessage, localChannelIndexes, localAnnounceOnStart, localUseSchedule, localSchedule, localHopLimit, enabled, intervalHours, message, channelIndexes, announceOnStart, useSchedule, schedule, hopLimit, localNodeInfoEnabled, localNodeInfoChannels, localNodeInfoDelaySeconds, nodeInfoEnabled, nodeInfoChannels, nodeInfoDelaySeconds]);
+  }, [localEnabled, localInterval, localMessage, localChannelIndexes, localAnnounceOnStart, localUseSchedule, localSchedule, localHopLimit, localSplitLongMessages, splitLongMessages, enabled, intervalHours, message, channelIndexes, announceOnStart, useSchedule, schedule, hopLimit, localNodeInfoEnabled, localNodeInfoChannels, localNodeInfoDelaySeconds, nodeInfoEnabled, nodeInfoChannels, nodeInfoDelaySeconds]);
 
   // Reset local state to props (used by SaveBar dismiss)
   const resetChanges = useCallback(() => {
@@ -186,10 +217,11 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
     setLocalUseSchedule(useSchedule);
     setLocalSchedule(schedule || '0 */6 * * *');
     setLocalHopLimit(hopLimit);
+    setLocalSplitLongMessages(splitLongMessages);
     setLocalNodeInfoEnabled(nodeInfoEnabled);
     setLocalNodeInfoChannels(nodeInfoChannels);
     setLocalNodeInfoDelaySeconds(nodeInfoDelaySeconds);
-  }, [enabled, intervalHours, message, channelIndexes, announceOnStart, useSchedule, schedule, hopLimit, nodeInfoEnabled, nodeInfoChannels, nodeInfoDelaySeconds]);
+  }, [enabled, intervalHours, message, channelIndexes, announceOnStart, useSchedule, schedule, hopLimit, splitLongMessages, nodeInfoEnabled, nodeInfoChannels, nodeInfoDelaySeconds]);
 
   // Wrap handleSave for useSaveBar (needs to be defined before useSaveBar call)
   const handleSaveForSaveBar = useCallback(async () => {
@@ -219,6 +251,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
           autoAnnounceUseSchedule: String(localUseSchedule),
           autoAnnounceSchedule: localSchedule,
           autoAnnounceHopLimit: localHopLimit,
+          autoAnnounceSplitLongMessages: String(localSplitLongMessages),
           // NodeInfo broadcasting settings
           autoAnnounceNodeInfoEnabled: String(localNodeInfoEnabled),
           autoAnnounceNodeInfoChannels: JSON.stringify(localNodeInfoChannels),
@@ -239,6 +272,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
       onUseScheduleChange(localUseSchedule);
       onScheduleChange(localSchedule);
       onHopLimitChange?.(localHopLimit);
+      onSplitLongMessagesChange?.(localSplitLongMessages);
       onNodeInfoEnabledChange?.(localNodeInfoEnabled);
       onNodeInfoChannelsChange?.(localNodeInfoChannels);
       onNodeInfoDelayChange?.(localNodeInfoDelaySeconds);
@@ -251,7 +285,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
     } finally {
       setIsSaving(false);
     }
-  }, [localUseSchedule, scheduleError, localEnabled, localInterval, localMessage, localChannelIndexes, localAnnounceOnStart, localSchedule, localHopLimit, localNodeInfoEnabled, localNodeInfoChannels, localNodeInfoDelaySeconds, baseUrl, csrfFetch, showToast, t, onEnabledChange, onIntervalChange, onMessageChange, onChannelIndexesChange, onAnnounceOnStartChange, onUseScheduleChange, onScheduleChange, onHopLimitChange, onNodeInfoEnabledChange, onNodeInfoChannelsChange, onNodeInfoDelayChange]);
+  }, [localUseSchedule, scheduleError, localEnabled, localInterval, localMessage, localChannelIndexes, localAnnounceOnStart, localSchedule, localHopLimit, localSplitLongMessages, localNodeInfoEnabled, localNodeInfoChannels, localNodeInfoDelaySeconds, baseUrl, csrfFetch, showToast, t, onEnabledChange, onIntervalChange, onMessageChange, onChannelIndexesChange, onAnnounceOnStartChange, onUseScheduleChange, onScheduleChange, onHopLimitChange, onSplitLongMessagesChange, onNodeInfoEnabledChange, onNodeInfoChannelsChange, onNodeInfoDelayChange]);
 
   // Register with SaveBar
   const numberScope = useNumberInputScope();
@@ -267,22 +301,19 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
 
   const insertToken = (token: string) => {
     const textarea = textareaRef.current;
-    if (!textarea) {
-      // Fallback: append to end if textarea ref not available
-      setLocalMessage(localMessage + token);
-      return;
-    }
-
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-    const newMessage = localMessage.substring(0, start) + token + localMessage.substring(end);
-
-    setLocalMessage(newMessage);
+    // No textarea mounted: append to the end.
+    const { text, caret } = insertTokenAtSelection(
+      localMessage,
+      token,
+      textarea ? { start: textarea.selectionStart, end: textarea.selectionEnd } : null,
+    );
+    setLocalMessage(text);
+    if (!textarea) return;
 
     // Set cursor position after the inserted token
     setTimeout(() => {
       textarea.focus();
-      textarea.setSelectionRange(start + token.length, start + token.length);
+      textarea.setSelectionRange(caret, caret);
     }, 0);
   };
 
@@ -341,71 +372,45 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
     }
   };
 
+  // Send Now stays off while the section is off, while a send is in flight,
+  // and (#5807) when the source cannot transmit or the user cannot write.
+  const sendNowDisabled = isSendingNow || !localEnabled || receiveOnly || !canWrite;
+
   // Stable callbacks
   const handleSendNowClick = useCallback(() => {
     void handleSendNow();
   }, [handleSendNow]);
 
-  const createInsertTokenHandler = useCallback((token: string) => {
-    return () => insertToken(token);
-  }, [insertToken]);
-
   return (
     <NumberInputScope scope={numberScope}>
-    <>
-      <div className="automation-section-header" style={{
-        display: 'flex',
-        alignItems: 'center',
-        marginBottom: '1.5rem',
-        padding: '1rem 1.25rem',
-        background: 'var(--color-surface-hover)',
-        border: '1px solid var(--color-surface-active)',
-        borderRadius: '8px'
-      }}>
-        <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <input
-            type="checkbox"
-            checked={localEnabled}
-            onChange={(e) => setLocalEnabled(e.target.checked)}
-            style={{ width: 'auto', margin: 0, cursor: 'pointer' }}
-          />
-          {t('automation.auto_announce.title')}
-          <a
-            href="https://meshmonitor.org/features/automation#auto-announce"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              fontSize: '1.2rem',
-              color: '#89b4fa',
-              textDecoration: 'none',
-              marginLeft: '0.5rem'
-            }}
-            title={t('automation.view_docs')}
-          >
-            <UiIcon name="help" size={18} />
-          </a>
-        </h2>
+    <ConfigSection
+      title={t('automation.auto_announce.title')}
+      notice={<AutomationEngineNote />}
+      enabled={localEnabled}
+      onEnabledChange={setLocalEnabled}
+      enableLabel={t('automation.auto_announce.title')}
+      docsUrl="https://meshmonitor.org/features/automation#auto-announce"
+      canWrite={canWrite}
+      receiveOnly={receiveOnly}
+      description={t('automation.auto_announce.description')}
+      headerActions={
         <div className="automation-button-container" style={{ display: 'flex', gap: '0.75rem' }}>
           <button
             onClick={handleSendNowClick}
-            disabled={isSendingNow || !localEnabled}
+            disabled={sendNowDisabled}
             className="btn-primary"
             style={{
               padding: '0.5rem 1.5rem',
               fontSize: '14px',
-              opacity: (localEnabled && !isSendingNow) ? 1 : 0.5,
-              cursor: (localEnabled && !isSendingNow) ? 'pointer' : 'not-allowed'
+              opacity: sendNowDisabled ? 0.5 : 1,
+              cursor: sendNowDisabled ? 'not-allowed' : 'pointer'
             }}
           >
             {isSendingNow ? t('automation.auto_announce.sending') : t('automation.auto_announce.send_now')}
           </button>
         </div>
-      </div>
-
-      <div className="settings-section" style={{ opacity: localEnabled ? 1 : 0.5, transition: 'opacity 0.2s' }}>
-        <p style={{ marginBottom: '1rem', color: '#666', lineHeight: '1.5' }}>
-          {t('automation.auto_announce.description')}
-        </p>
+      }
+    >
 
         {/* #4731: point users at the firmware-native alternative, worded to the
             verified 2.8 behavior — MeshBeacon is a periodic broadcaster (overlaps
@@ -423,21 +428,8 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
           {t('automation.auto_announce.native_notice', "Heads up: firmware 2.8's MeshBeacon module can broadcast a periodic message natively (see the MeshBeacon settings). It's more limited than Auto Announce, though — it's zero-hop (only direct neighbors hear it), capped at a minimum one-hour interval, and currently only in 2.8.0 alpha/prerelease builds, not a stable release — so it isn't a full replacement.")}
         </div>
 
-        {lastAnnouncementTime && (
-          <div style={{
-            marginBottom: '1rem',
-            padding: '0.75rem',
-            background: 'var(--color-surface)',
-            border: '1px solid var(--color-surface-active)',
-            borderRadius: '4px',
-            fontSize: '0.9rem',
-            color: 'var(--color-text-subtle)'
-          }}>
-            <strong>{t('automation.auto_announce.last_announcement')}:</strong> {new Date(lastAnnouncementTime).toLocaleString()}
-          </div>
-        )}
-
-        <div className="setting-item" style={{ marginTop: '1rem' }}>
+        <ConfigGroup name="when" title={t('automation.group.when', 'When')}>
+        <div className="setting-item">
           <label htmlFor="announceOnStart">
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <input
@@ -456,7 +448,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
           </label>
         </div>
 
-        <div className="setting-item" style={{ marginTop: '1rem' }}>
+        <div className="setting-item">
           <label htmlFor="useSchedule">
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <input
@@ -476,7 +468,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
         </div>
 
         {localUseSchedule && (
-          <div className="setting-item" style={{ marginTop: '1rem', marginLeft: '1.5rem' }}>
+          <div className="setting-item" style={{ marginLeft: '1.5rem' }}>
             <label htmlFor="scheduleExpression">
               {t('automation.auto_announce.cron_expression')}
               <span className="setting-description">
@@ -485,7 +477,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
                   href="https://crontab.guru/"
                   target="_blank"
                   rel="noopener noreferrer"
-                  style={{ color: '#89b4fa', textDecoration: 'underline' }}
+                  style={{ color: 'var(--color-accent)', textDecoration: 'underline' }}
                 >
                   {t('automation.auto_announce.cron_help_link')}
                 </a>
@@ -526,7 +518,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
         )}
 
         {!localUseSchedule && (
-          <div className="setting-item" style={{ marginTop: '1rem' }}>
+          <div className="setting-item">
             <label htmlFor="announceInterval">
                 {t('automation.auto_announce.interval')}
               <span className="setting-description">
@@ -546,7 +538,10 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
           </div>
         )}
 
-        <div className="setting-item" style={{ marginTop: '1rem' }}>
+        </ConfigGroup>
+
+        <ConfigGroup name="where" title={t('automation.group.where', 'Where')}>
+        <div className="setting-item">
           <label htmlFor="announceChannel">
             {t('automation.auto_announce.broadcast_channel')}
             <span className="setting-description">
@@ -585,8 +580,22 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
             disabled={!localEnabled}
           />
         </div>
+        {/* Long announcements (#6330): cut to 200 bytes (default) or split into up to 3 sends. */}
+        <div className="setting-item">
+          <label>{t('automation.auto_announce.split_label', 'Long Announcements')}</label>
+          <SplitLongMessagesField
+            id="autoAnnounceSplitLongMessages"
+            protocol="meshtastic"
+            checked={localSplitLongMessages}
+            onChange={setLocalSplitLongMessages}
+            disabled={!localEnabled}
+            perTargetCount={localChannelIndexes.length}
+          />
+        </div>
+        </ConfigGroup>
 
-        <div className="setting-item" style={{ marginTop: '1rem' }}>
+        <ConfigGroup name="message" title={t('automation.group.message', 'Message')}>
+        <div className="setting-item">
           <label htmlFor="announceMessage">
             {t('automation.auto_announce.message_label')}
             <span className="setting-description">
@@ -607,139 +616,14 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
               minHeight: '80px'
             }}
           />
-          <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              onClick={createInsertTokenHandler('{VERSION}')}
-              disabled={!localEnabled}
-              style={{
-                padding: '0.25rem 0.5rem',
-                fontSize: '12px',
-                background: 'var(--color-surface-active)',
-                border: '1px solid var(--color-border-subtle)',
-                borderRadius: '4px',
-                cursor: localEnabled ? 'pointer' : 'not-allowed',
-                opacity: localEnabled ? 1 : 0.5
-              }}
-            >
-              + {'{VERSION}'}
-            </button>
-            <button
-              type="button"
-              onClick={createInsertTokenHandler('{DURATION}')}
-              disabled={!localEnabled}
-              style={{
-                padding: '0.25rem 0.5rem',
-                fontSize: '12px',
-                background: 'var(--color-surface-active)',
-                border: '1px solid var(--color-border-subtle)',
-                borderRadius: '4px',
-                cursor: localEnabled ? 'pointer' : 'not-allowed',
-                opacity: localEnabled ? 1 : 0.5
-              }}
-            >
-              + {'{DURATION}'}
-            </button>
-            <button
-              type="button"
-              onClick={createInsertTokenHandler('{FEATURES}')}
-              disabled={!localEnabled}
-              style={{
-                padding: '0.25rem 0.5rem',
-                fontSize: '12px',
-                background: 'var(--color-surface-active)',
-                border: '1px solid var(--color-border-subtle)',
-                borderRadius: '4px',
-                cursor: localEnabled ? 'pointer' : 'not-allowed',
-                opacity: localEnabled ? 1 : 0.5
-              }}
-            >
-              + {'{FEATURES}'}
-            </button>
-            <button
-              type="button"
-              onClick={createInsertTokenHandler('{NODECOUNT}')}
-              disabled={!localEnabled}
-              style={{
-                padding: '0.25rem 0.5rem',
-                fontSize: '12px',
-                background: 'var(--color-surface-active)',
-                border: '1px solid var(--color-border-subtle)',
-                borderRadius: '4px',
-                cursor: localEnabled ? 'pointer' : 'not-allowed',
-                opacity: localEnabled ? 1 : 0.5
-              }}
-            >
-              + {'{NODECOUNT}'}
-            </button>
-            <button
-              type="button"
-              onClick={createInsertTokenHandler('{DIRECTCOUNT}')}
-              disabled={!localEnabled}
-              style={{
-                padding: '0.25rem 0.5rem',
-                fontSize: '12px',
-                background: 'var(--color-surface-active)',
-                border: '1px solid var(--color-border-subtle)',
-                borderRadius: '4px',
-                cursor: localEnabled ? 'pointer' : 'not-allowed',
-                opacity: localEnabled ? 1 : 0.5
-              }}
-            >
-              + {'{DIRECTCOUNT}'}
-            </button>
-            <button
-              type="button"
-              onClick={createInsertTokenHandler('{TOTALNODES}')}
-              disabled={!localEnabled}
-              style={{
-                padding: '0.25rem 0.5rem',
-                fontSize: '12px',
-                background: 'var(--color-surface-active)',
-                border: '1px solid var(--color-border-subtle)',
-                borderRadius: '4px',
-                cursor: localEnabled ? 'pointer' : 'not-allowed',
-                opacity: localEnabled ? 1 : 0.5
-              }}
-            >
-              + {'{TOTALNODES}'}
-            </button>
-            <button
-              type="button"
-              onClick={createInsertTokenHandler('{DATE}')}
-              disabled={!localEnabled}
-              style={{
-                padding: '0.25rem 0.5rem',
-                fontSize: '12px',
-                background: 'var(--color-surface-active)',
-                border: '1px solid var(--color-border-subtle)',
-                borderRadius: '4px',
-                cursor: localEnabled ? 'pointer' : 'not-allowed',
-                opacity: localEnabled ? 1 : 0.5
-              }}
-            >
-              + {'{DATE}'}
-            </button>
-            <button
-              type="button"
-              onClick={createInsertTokenHandler('{TIME}')}
-              disabled={!localEnabled}
-              style={{
-                padding: '0.25rem 0.5rem',
-                fontSize: '12px',
-                background: 'var(--color-surface-active)',
-                border: '1px solid var(--color-border-subtle)',
-                borderRadius: '4px',
-                cursor: localEnabled ? 'pointer' : 'not-allowed',
-                opacity: localEnabled ? 1 : 0.5
-              }}
-            >
-              + {'{TIME}'}
-            </button>
-          </div>
+          <TokenInsertButtons
+            tokens={ANNOUNCE_TOKENS}
+            onInsert={insertToken}
+            disabled={!localEnabled}
+          />
         </div>
 
-        <div className="setting-item" style={{ marginTop: '1rem' }}>
+        <div className="setting-item">
           <label>
             {t('automation.auto_announce.sample_preview')}
             <span className="setting-description">
@@ -789,10 +673,11 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
             <li>{t('automation.auto_announce.feature_time_sync')}</li>
           </ul>
         </div>
+        </ConfigGroup>
 
+        <ConfigGroup name="extras" title={t('automation.group.extras', 'Extras')}>
         {/* NodeInfo Broadcasting Section */}
         <div style={{
-          marginTop: '2rem',
           padding: '1rem',
           background: 'var(--color-surface)',
           border: '1px solid var(--color-surface-active)',
@@ -816,7 +701,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
 
           {localNodeInfoEnabled && (
             <>
-              <div className="setting-item" style={{ marginTop: '1rem' }}>
+              <div className="setting-item">
                 <label>
                   {t('automation.auto_announce.nodeinfo_channels')}
                   <span className="setting-description">
@@ -860,7 +745,7 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
                 )}
               </div>
 
-              <div className="setting-item" style={{ marginTop: '1rem' }}>
+              <div className="setting-item">
                 <label htmlFor="nodeInfoDelay">
                   {t('automation.auto_announce.nodeinfo_delay')}
                   <span className="setting-description">
@@ -885,8 +770,22 @@ const AutoAnnounceSection: React.FC<AutoAnnounceSectionProps> = ({
             </>
           )}
         </div>
-      </div>
-    </>
+
+        {lastAnnouncementTime && (
+          <div style={{
+            marginTop: '1rem',
+            padding: '0.75rem',
+            background: 'var(--color-surface)',
+            border: '1px solid var(--color-surface-active)',
+            borderRadius: '4px',
+            fontSize: '0.9rem',
+            color: 'var(--color-text-subtle)'
+          }}>
+            <strong>{t('automation.auto_announce.last_announcement')}:</strong> {new Date(lastAnnouncementTime).toLocaleString()}
+          </div>
+        )}
+        </ConfigGroup>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

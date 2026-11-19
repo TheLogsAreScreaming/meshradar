@@ -468,6 +468,30 @@ function runTraceroutesTests(getBackend: () => TestBackend) {
     expect(unrelated[0].fromNodeNum).toBe(5005);
   });
 
+  it('getTraceroutesByNodes - sinceTimestamp drops older rows; absent keeps every age (L5)', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    const now = Date.now();
+    const day = 24 * 60 * 60 * 1000;
+    await repo.insertTraceroute(makeTraceroute({
+      fromNodeNum: 1001, toNodeNum: 2002, packetId: 71,
+      timestamp: now - 30 * day, createdAt: now - 30 * day,
+    }));
+    await repo.insertTraceroute(makeTraceroute({
+      fromNodeNum: 2002, toNodeNum: 1001, packetId: 72,
+      timestamp: now - day, createdAt: now - day,
+    }));
+
+    expect(await repo.getTraceroutesByNodes(1001, 2002, 10, ALL_SOURCES)).toHaveLength(2);
+    const recent = await repo.getTraceroutesByNodes(1001, 2002, 10, ALL_SOURCES, { sinceTimestamp: now - 7 * day });
+    expect(recent).toHaveLength(1);
+    expect(Number(recent[0].timestamp)).toBe(now - day);
+  });
+
   it('getTraceroutesForSources (#5511) - listed sources only, newest first, since + limit', async () => {
     const backend = getBackend();
     if (!backend.available) {
@@ -823,6 +847,35 @@ function runTraceroutesTests(getBackend: () => TestBackend) {
     expect(longest).not.toBeNull();
     expect(longest!.distanceKm).toBeCloseTo(12.3);
     expect(longest!.fromNodeNum).toBe(3003);
+  });
+
+  it('#5156: exclusion picks the best VISIBLE segment, per source; all blocks the source', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    const now = Date.now();
+    await repo.insertRouteSegment(makeSegment({ fromNodeNum: 1001, toNodeNum: 4294967000, distanceKm: 99, timestamp: now, createdAt: now }), 'ex-a');
+    await repo.insertRouteSegment(makeSegment({ fromNodeNum: 1001, toNodeNum: 2002, distanceKm: 40, timestamp: now, createdAt: now }), 'ex-a');
+    await repo.insertRouteSegment(makeSegment({ fromNodeNum: 4294967000, toNodeNum: 2002, distanceKm: 70, timestamp: now, createdAt: now }), 'ex-b');
+
+    const scope = ['ex-a', 'ex-b'];
+    expect((await repo.getLongestActiveRouteSegment(scope))!.distanceKm).toBeCloseTo(99);
+    // Hidden on A only: A's 99 km row drops, B's 70 km row with the same node stays.
+    const onA = await repo.getLongestActiveRouteSegment(scope, undefined, [{ sourceId: 'ex-a', nodeNums: [4294967000] }]);
+    expect(onA!.distanceKm).toBeCloseTo(70);
+    const both = await repo.getLongestActiveRouteSegment(scope, undefined, [
+      { sourceId: 'ex-a', nodeNums: [4294967000] },
+      { sourceId: 'ex-b', nodeNums: [4294967000] },
+    ]);
+    expect(both!.distanceKm).toBeCloseTo(40);
+    const blocked = await repo.getLongestActiveRouteSegment(scope, undefined, [
+      { sourceId: 'ex-a', nodeNums: 'all' },
+      { sourceId: 'ex-b', nodeNums: 'all' },
+    ]);
+    expect(blocked).toBeNull();
   });
 
   it('getLongestActiveRouteSegment - returns null when empty', async () => {

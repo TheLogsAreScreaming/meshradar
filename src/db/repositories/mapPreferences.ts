@@ -52,6 +52,8 @@ export class MapPreferencesRepository extends BaseRepository {
         // defaults on (#5124) — so null reads as true, not false.
         unreadIndicatorEnabled: row.unreadIndicatorEnabled ?? true,
         spreadNodes: row.spreadNodes ?? true,
+        // NULL on a pre-migration-221 row reads as false — the ring is opt-in (#6125).
+        colorNodesBySource: row.colorNodesBySource ?? false,
         // NULL reads as 'mark' (badge the marker, no filtering) — matches
         // today's behaviour for everyone who has not chosen anything else.
         aircraftDisplayMode: row.aircraftDisplayMode ?? 'mark',
@@ -61,6 +63,9 @@ export class MapPreferencesRepository extends BaseRepository {
         positionHistoryHours: row.positionHistoryHours ?? null,
         mapMaxAgeHours: row.mapMaxAgeHours ?? null,
         positionHistoryPointsOnly: row.positionHistoryPointsOnly ?? false,
+        // Per-source "Show MQTT/Bridge Messages" (#5824). Sources the user has
+        // never toggled are absent, so the client keeps its own default.
+        showMqttMessagesBySource: parseBooleanMap(row.showMqttMessagesBySource),
       };
     } catch (error) {
       logger.error('[MapPreferencesRepository] Failed to get map preferences:', error);
@@ -90,6 +95,8 @@ export class MapPreferencesRepository extends BaseRepository {
     showAtakContacts?: boolean;
     unreadIndicatorEnabled?: boolean;
     spreadNodes?: boolean;
+    /** Per-source coloured ring around node markers on Unified maps (#6125). */
+    colorNodesBySource?: boolean;
     /** Likely-aircraft map display choice (#5364/#5365). Null clears to the 'mark' default. */
     aircraftDisplayMode?: string | null;
     /** Flight trails toggle (#5364/#5365 Phase 3). */
@@ -128,6 +135,7 @@ export class MapPreferencesRepository extends BaseRepository {
         if (preferences.showAtakContacts !== undefined) set.showAtakContacts = preferences.showAtakContacts;
         if (preferences.unreadIndicatorEnabled !== undefined) set.unreadIndicatorEnabled = preferences.unreadIndicatorEnabled;
         if (preferences.spreadNodes !== undefined) set.spreadNodes = preferences.spreadNodes;
+        if (preferences.colorNodesBySource !== undefined) set.colorNodesBySource = preferences.colorNodesBySource;
         if (preferences.aircraftDisplayMode !== undefined) set.aircraftDisplayMode = preferences.aircraftDisplayMode;
         if (preferences.showAircraftTrails !== undefined) set.showAircraftTrails = preferences.showAircraftTrails;
         if (preferences.aircraftTrailHours !== undefined) set.aircraftTrailHours = preferences.aircraftTrailHours;
@@ -160,6 +168,7 @@ export class MapPreferencesRepository extends BaseRepository {
           showAtakContacts: preferences.showAtakContacts ?? false,
           unreadIndicatorEnabled: preferences.unreadIndicatorEnabled ?? true,
           spreadNodes: preferences.spreadNodes ?? true,
+          colorNodesBySource: preferences.colorNodesBySource ?? false,
           aircraftDisplayMode: preferences.aircraftDisplayMode ?? null,
           showAircraftTrails: preferences.showAircraftTrails ?? false,
           aircraftTrailHours: preferences.aircraftTrailHours ?? 6,
@@ -174,5 +183,50 @@ export class MapPreferencesRepository extends BaseRepository {
       logger.error('[MapPreferencesRepository] Failed to save map preferences:', error);
       throw error;
     }
+  }
+
+  /**
+   * Set the "Show MQTT/Bridge Messages" toggle for one source (#5824).
+   * Read-modify-write of the JSON map so other sources keep their values.
+   * Creates the preferences row (with defaults) when the user has none.
+   */
+  async setShowMqttMessagesForSource(userId: number, sourceId: string, value: boolean): Promise<void> {
+    try {
+      const table = this.tables.userMapPreferences;
+      const rows = await this.db
+        .select({ id: table.id, showMqttMessagesBySource: table.showMqttMessagesBySource })
+        .from(table)
+        .where(eq(table.userId, userId))
+        .limit(1);
+
+      if (rows.length === 0) {
+        await this.saveMapPreferences(userId, {});
+      }
+      // A Map, not a plain object, so a sourceId can never name a prototype key.
+      const map = new Map(Object.entries(parseBooleanMap(rows[0]?.showMqttMessagesBySource)));
+      map.set(sourceId, value);
+      await this.db
+        .update(table)
+        .set({ showMqttMessagesBySource: JSON.stringify(Object.fromEntries(map)) })
+        .where(eq(table.userId, userId));
+    } catch (error) {
+      logger.error('[MapPreferencesRepository] Failed to save per-source MQTT message toggle:', error);
+      throw error;
+    }
+  }
+}
+
+/** Parse a stored `{ [sourceId]: boolean }` JSON map; anything malformed reads as empty. */
+export function parseBooleanMap(raw: unknown): Record<string, boolean> {
+  if (typeof raw !== 'string' || raw === '') return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const entries = Object.entries(parsed as Record<string, unknown>).filter(
+      (entry): entry is [string, boolean] => typeof entry[1] === 'boolean',
+    );
+    return Object.fromEntries(entries);
+  } catch {
+    return {};
   }
 }

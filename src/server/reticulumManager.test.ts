@@ -40,12 +40,16 @@ const getMessage = vi.fn();
 const updateDestinationPosition = vi.fn().mockResolvedValue(undefined);
 const insertTelemetryBatch = vi.fn().mockResolvedValue(0);
 const replacePaths = vi.fn().mockResolvedValue(undefined);
+const pruneInterfacesNotIn = vi.fn().mockResolvedValue(undefined);
+const getSettingForSource = vi.fn().mockResolvedValue(null);
+const setSourceSetting = vi.fn().mockResolvedValue(undefined);
 
 vi.mock('../services/database.js', () => ({
   default: {
     reticulum: {
       upsertDestination: (...args: unknown[]) => upsertDestination(...args),
       upsertInterface: (...args: unknown[]) => upsertInterface(...args),
+      pruneInterfacesNotIn: (...args: unknown[]) => pruneInterfacesNotIn(...args),
       upsertMessage: (...args: unknown[]) => upsertMessage(...args),
       updateMessageState: (...args: unknown[]) => updateMessageState(...args),
       renameMessageId: (...args: unknown[]) => renameMessageId(...args),
@@ -55,6 +59,10 @@ vi.mock('../services/database.js', () => ({
     },
     telemetry: {
       insertTelemetryBatch: (...args: unknown[]) => insertTelemetryBatch(...args),
+    },
+    settings: {
+      getSettingForSource: (...args: unknown[]) => getSettingForSource(...args),
+      setSourceSetting: (...args: unknown[]) => setSourceSetting(...args),
     },
   },
 }));
@@ -145,6 +153,7 @@ describe('ReticulumManager DB persistence', () => {
     upsertDestination.mockClear();
     upsertInterface.mockClear();
     insertTelemetryBatch.mockClear();
+    pruneInterfacesNotIn.mockClear();
   });
 
   it('announce -> upsertDestination with mapped fields (aspects joined, q renamed to quality)', async () => {
@@ -205,7 +214,53 @@ describe('ReticulumManager DB persistence', () => {
       txBytes: 100,
       rxBytes: 50,
       lastSeenAt: 1_700_000_000_000,
+      // Live RNode gauges (#6120) — null for this non-RNode interface.
+      airtimeShort: null,
+      airtimeLong: null,
+      channelLoadShort: null,
+      channelLoadLong: null,
+      noiseFloor: null,
+      interference: null,
+      interferenceLastTs: null,
+      interferenceLastDbm: null,
+      cpuLoad: null,
+      batteryState: null,
+      batteryPercent: null,
     });
+  });
+
+  it('interface_stats -> upsertInterface passes through the live RNode gauges (#6120)', async () => {
+    const manager = new ReticulumManager('src-a');
+    const rnode: InterfaceStatsEntry = {
+      ...IFACE_A,
+      name: 'RNode LoRa Interface',
+      type: 'RNodeInterface',
+      airtimeShort: 0,
+      airtimeLong: 0.12,
+      channelLoadShort: 2.44,
+      channelLoadLong: 1.15,
+      noiseFloor: -109,
+      interference: -86,
+      interferenceLastTs: 1_700_000_000,
+      interferenceLastDbm: -86,
+      cpuLoad: 4.2,
+      batteryState: 'discharging',
+      batteryPercent: 100,
+    };
+    // @ts-expect-error - exercising the private handler directly
+    await manager.handleInterfaceStats(makeInterfaceStats([rnode]));
+
+    expect(upsertInterface).toHaveBeenCalledWith('src-a', expect.objectContaining({
+      airtimeLong: 0.12,
+      channelLoadShort: 2.44,
+      noiseFloor: -109,
+      interference: -86,
+      interferenceLastTs: 1_700_000_000,
+      interferenceLastDbm: -86,
+      cpuLoad: 4.2,
+      batteryState: 'discharging',
+      batteryPercent: 100,
+    }));
   });
 
   it('a failed upsertInterface for one interface does not block persistence of the others', async () => {
@@ -222,6 +277,39 @@ describe('ReticulumManager DB persistence', () => {
     // @ts-expect-error - exercising the private handler directly
     await manager.handleInterfaceStats(makeInterfaceStats([IFACE_A]));
     expect(insertTelemetryBatch).not.toHaveBeenCalled();
+  });
+
+  it('interface_stats -> prunes interfaces absent from the latest snapshot (#6121)', async () => {
+    const manager = new ReticulumManager('src-a');
+    const ifaceB: InterfaceStatsEntry = { ...IFACE_A, name: 'AutoInterface' };
+
+    // Poll 1 reports two interfaces.
+    // @ts-expect-error - exercising the private handler directly
+    await manager.handleInterfaceStats(makeInterfaceStats([IFACE_A, ifaceB]));
+    expect(pruneInterfacesNotIn).toHaveBeenLastCalledWith('src-a', ['TCP Client', 'AutoInterface']);
+
+    // Poll 2 drops AutoInterface — the prune is called with only the surviving
+    // name, so the repo deletes the now-absent AutoInterface row for this source.
+    // @ts-expect-error - exercising the private handler directly
+    await manager.handleInterfaceStats(makeInterfaceStats([IFACE_A]));
+    expect(pruneInterfacesNotIn).toHaveBeenLastCalledWith('src-a', ['TCP Client']);
+  });
+
+  it('interface_stats -> prune runs even on the first poll, when no throughput rows are produced (#6121)', async () => {
+    const manager = new ReticulumManager('src-a');
+    // @ts-expect-error - exercising the private handler directly
+    await manager.handleInterfaceStats(makeInterfaceStats([IFACE_A]));
+    // First poll writes no telemetry history, but the prune must still run.
+    expect(insertTelemetryBatch).not.toHaveBeenCalled();
+    expect(pruneInterfacesNotIn).toHaveBeenCalledTimes(1);
+    expect(pruneInterfacesNotIn).toHaveBeenCalledWith('src-a', ['TCP Client']);
+  });
+
+  it('interface_stats -> an empty snapshot prunes all interfaces for the source (#6121)', async () => {
+    const manager = new ReticulumManager('src-a');
+    // @ts-expect-error - exercising the private handler directly
+    await manager.handleInterfaceStats(makeInterfaceStats([]));
+    expect(pruneInterfacesNotIn).toHaveBeenCalledWith('src-a', []);
   });
 
   it('a second poll with advanced counters writes throttled tx/rx-rate rows', async () => {
@@ -738,6 +826,79 @@ describe('ReticulumManager connection lifecycle', () => {
     expect(manager.isConnected()).toBe(false);
   });
 
+  // -- initial auto-connect retry (#5955) --
+
+  /** Mock bridge that fails `configure` for the first `failures` sessions, then accepts. */
+  function startFlakyBridge(failures: number): Promise<{ url: string; sessions: () => number }> {
+    let sessions = 0;
+    return startMockBridge((ws, send) => {
+      const session = ++sessions;
+      ws.on('message', (data) => {
+        const env = JSON.parse(String(data)) as Record<string, unknown>;
+        if (env.type === 'hello') {
+          send({ v: 1, type: 'welcome', ts: Date.now(), protocolVersion: 1, bridgeVersion: '0.1.0', rnsVersion: '1.4.2' });
+        } else if (env.type === 'configure') {
+          if (session <= failures) {
+            send({ v: 1, type: 'error', id: env.id, ts: Date.now(), code: 'RNS_INIT_FAILED', message: 'boom' });
+          } else {
+            send({ v: 1, type: 'ready', id: env.id, ts: Date.now() });
+          }
+        }
+      });
+    }).then(({ url }) => ({ url, sessions: () => sessions }));
+  }
+
+  async function waitFor(pred: () => boolean, timeoutMs = 2000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!pred()) {
+      if (Date.now() > deadline) throw new Error('waitFor timed out');
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  it('start() retries a failed initial connect until the bridge accepts (#5955)', async () => {
+    const bridge = await startFlakyBridge(2);
+    const manager = trackManager(new ReticulumManager('src-a'));
+    manager.startRetryInitialMs = 20;
+    manager.startRetryMaxMs = 40;
+    manager.configure({ mode: 'attach', bridgeUrl: bridge.url, token: 't', protocolVersion: 1, configDir: '/rns' });
+
+    await manager.start();
+    expect(manager.isConnected()).toBe(false);
+
+    await waitFor(() => manager.isConnected());
+    expect(bridge.sessions()).toBe(3);
+  });
+
+  it('disconnect() cancels a pending auto-connect retry (#5955)', async () => {
+    const bridge = await startFlakyBridge(Infinity);
+    const manager = trackManager(new ReticulumManager('src-a'));
+    manager.startRetryInitialMs = 30;
+    manager.configure({ mode: 'attach', bridgeUrl: bridge.url, token: 't', protocolVersion: 1, configDir: '/rns' });
+
+    await manager.start();
+    expect(bridge.sessions()).toBe(1);
+    await manager.disconnect();
+    await new Promise((r) => setTimeout(r, 120));
+    expect(bridge.sessions()).toBe(1);
+  });
+
+  it('a manual connect() supersedes a pending auto-connect retry (#5955)', async () => {
+    const bridge = await startFlakyBridge(1);
+    const manager = trackManager(new ReticulumManager('src-a'));
+    manager.startRetryInitialMs = 60;
+    const cfg = { mode: 'attach' as const, bridgeUrl: bridge.url, token: 't', protocolVersion: 1, configDir: '/rns' };
+    manager.configure(cfg);
+
+    await manager.start();
+    await manager.connect(cfg);
+    expect(manager.isConnected()).toBe(true);
+    await new Promise((r) => setTimeout(r, 150));
+    // Only the failed auto-connect and the manual connect; no retry fired.
+    expect(bridge.sessions()).toBe(2);
+    expect(manager.isConnected()).toBe(true);
+  });
+
   it('connect() propagates a bridge-unreachable failure to the caller', async () => {
     const manager = trackManager(new ReticulumManager('src-a'));
     await expect(
@@ -1064,6 +1225,259 @@ describe('ReticulumManager LXMF messaging (#3960 Phase 2 WP3)', () => {
     it('sendMessage throws immediately when not connected', async () => {
       const manager = new ReticulumManager('src-a');
       await expect(manager.sendMessage({ to: 'peer'.padEnd(32, '0'), content: 'hi' })).rejects.toThrow(/not connected/);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LXMF display name + announces (#6011)
+//
+// A stand-in bridge client is put on the manager directly, so the order of
+// bridge commands and the timer behaviour can be checked with fake timers and
+// no WebSocket. The on-connect path is driven through the real `ready`
+// handler.
+// ---------------------------------------------------------------------------
+
+describe('ReticulumManager LXMF display name + announces (#6011)', () => {
+  const HOUR = 60 * 60 * 1000;
+  const T0 = new Date('2026-10-28T12:00:00Z').getTime();
+
+  function fakeClient(calls: string[] = []) {
+    return {
+      calls,
+      connected: true,
+      isConnected() { return this.connected; },
+      setDisplayName: vi.fn(async (name: string) => { calls.push(`set_display_name:${name}`); return {}; }),
+      announceSelf: vi.fn(async () => { calls.push('announce_self'); return {}; }),
+      removeAllListeners: vi.fn(),
+      disconnect: vi.fn(),
+    };
+  }
+
+  function managerWith(client: ReturnType<typeof fakeClient>, cfg: { displayName?: string | null; announceIntervalHours?: number } = {}) {
+    const manager = new ReticulumManager('src-a');
+    manager.configure({ mode: 'attach', bridgeUrl: 'ws://127.0.0.1:8765', token: 't', protocolVersion: 1, configDir: '/rns', ...cfg });
+    (manager as unknown as { client: unknown }).client = client;
+    return manager;
+  }
+
+  /** Fire the real `ready` handler and let its microtask + awaits settle. */
+  async function fireReady(manager: ReticulumManager): Promise<void> {
+    (manager as unknown as { handleReady: (m: unknown) => void }).handleReady({ v: 2, type: 'ready', ts: Date.now() });
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    getSettingForSource.mockReset().mockResolvedValue(null);
+    setSourceSetting.mockReset().mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe('on connect', () => {
+    it('applies the saved name BEFORE the on-connect announce', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client, { displayName: 'Base Camp' });
+      await fireReady(manager);
+      expect(client.calls).toEqual(['set_display_name:Base Camp', 'announce_self']);
+    });
+
+    it('sends an empty name when anonymous, so a long-lived bridge drops a stale one', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await fireReady(manager);
+      expect(client.calls).toEqual(['set_display_name:', 'announce_self']);
+    });
+
+    it('still announces when set_display_name fails', async () => {
+      const client = fakeClient();
+      client.setDisplayName.mockRejectedValueOnce(new Error('boom'));
+      const manager = managerWith(client, { displayName: 'Base Camp' });
+      await fireReady(manager);
+      expect(client.announceSelf).toHaveBeenCalledTimes(1);
+    });
+
+    it('persists the on-connect announce time', async () => {
+      const manager = managerWith(fakeClient());
+      await fireReady(manager);
+      expect(setSourceSetting).toHaveBeenCalledWith('src-a', 'reticulumLastAnnounceAt', String(T0));
+    });
+  });
+
+  describe('setDisplayName', () => {
+    it('applies live while connected and never announces', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await expect(manager.setDisplayName('New')).resolves.toBe(true);
+      expect(client.calls).toEqual(['set_display_name:New']);
+      expect(manager.getDisplayName()).toBe('New');
+    });
+
+    it('only stores the name while disconnected; the next connect applies it', async () => {
+      const client = fakeClient();
+      client.connected = false;
+      const manager = managerWith(client);
+      await expect(manager.setDisplayName('Later')).resolves.toBe(false);
+      expect(client.setDisplayName).not.toHaveBeenCalled();
+      client.connected = true;
+      await fireReady(manager);
+      expect(client.calls).toEqual(['set_display_name:Later', 'announce_self']);
+    });
+  });
+
+  describe('announceNow cooldown', () => {
+    it('refuses a second announce within 60 s of the on-connect announce', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await fireReady(manager);
+      await vi.advanceTimersByTimeAsync(20_000);
+      await expect(manager.announceNow()).resolves.toEqual({ announced: false, retryAfterSeconds: 40 });
+      expect(client.announceSelf).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(40_000);
+      await expect(manager.announceNow()).resolves.toEqual({ announced: true, announcedAt: T0 + 60_000 });
+      expect(client.announceSelf).toHaveBeenCalledTimes(2);
+      expect(setSourceSetting).toHaveBeenLastCalledWith('src-a', 'reticulumLastAnnounceAt', String(T0 + 60_000));
+    });
+
+    it('a restart does not clear the cooldown: a fresh manager reads the persisted time', async () => {
+      getSettingForSource.mockResolvedValue(String(T0 - 15_000));
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await expect(manager.announceNow()).resolves.toEqual({ announced: false, retryAfterSeconds: 45 });
+      expect(client.announceSelf).not.toHaveBeenCalled();
+      expect(getSettingForSource).toHaveBeenCalledWith('src-a', 'reticulumLastAnnounceAt');
+    });
+
+    it('two presses at once send one announce', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      const [a, b] = await Promise.all([manager.announceNow(), manager.announceNow()]);
+      expect([a.announced, b.announced].sort()).toEqual([false, true]);
+      expect(client.announceSelf).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failed announce does not start the cooldown', async () => {
+      const client = fakeClient();
+      client.announceSelf.mockRejectedValueOnce(new Error('bridge down'));
+      const manager = managerWith(client);
+      await expect(manager.announceNow()).rejects.toThrow('bridge down');
+      await expect(manager.announceNow()).resolves.toMatchObject({ announced: true });
+    });
+
+    it('throws when not connected', async () => {
+      const client = fakeClient();
+      client.connected = false;
+      await expect(managerWith(client).announceNow()).rejects.toThrow(/not connected/);
+    });
+  });
+
+  describe('periodic announce', () => {
+    it('is off by default: no announce after a day', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await fireReady(manager);
+      await vi.advanceTimersByTimeAsync(48 * HOUR);
+      expect(client.announceSelf).toHaveBeenCalledTimes(1); // the on-connect one only
+    });
+
+    it('saving the interval never announces by itself; it fires one interval later', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await manager.setAnnounceInterval(6);
+      await vi.advanceTimersByTimeAsync(6 * HOUR - 1000);
+      expect(client.announceSelf).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(client.announceSelf).toHaveBeenCalledTimes(1);
+      expect(setSourceSetting).toHaveBeenCalledWith('src-a', 'reticulumLastAnnounceAt', String(T0 + 6 * HOUR));
+      // And keeps going.
+      await vi.advanceTimersByTimeAsync(6 * HOUR);
+      expect(client.announceSelf).toHaveBeenCalledTimes(2);
+    });
+
+    it('counts from the persisted last announce, so a restart does not re-arm it early or late', async () => {
+      getSettingForSource.mockResolvedValue(String(T0 - 5 * HOUR));
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await manager.setAnnounceInterval(6);
+      expect((await manager.getAnnounceState()).nextPeriodicAnnounceAt).toBe(T0 + HOUR);
+      await vi.advanceTimersByTimeAsync(HOUR - 1000);
+      expect(client.announceSelf).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(client.announceSelf).toHaveBeenCalledTimes(1);
+    });
+
+    it('an overdue schedule waits one full interval instead of firing on save', async () => {
+      getSettingForSource.mockResolvedValue(String(T0 - 30 * HOUR));
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await manager.setAnnounceInterval(6);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(client.announceSelf).not.toHaveBeenCalled();
+      expect((await manager.getAnnounceState()).nextPeriodicAnnounceAt).toBe(T0 + 6 * HOUR);
+    });
+
+    it('clamps the interval to 1-24 hours', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await manager.setAnnounceInterval(500);
+      expect((await manager.getAnnounceState()).announceIntervalHours).toBe(24);
+      expect((await manager.getAnnounceState()).nextPeriodicAnnounceAt).toBe(T0 + 24 * HOUR);
+      await manager.setAnnounceInterval(0.2);
+      expect((await manager.getAnnounceState()).announceIntervalHours).toBe(1);
+      await manager.setAnnounceInterval(0);
+      expect((await manager.getAnnounceState()).nextPeriodicAnnounceAt).toBeNull();
+    });
+
+    it('takes the interval from the source config and arms on connect', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client, { announceIntervalHours: 2 });
+      await fireReady(manager);
+      expect((await manager.getAnnounceState()).nextPeriodicAnnounceAt).toBe(T0 + 2 * HOUR);
+    });
+
+    it('the on-connect announce after a reconnect pushes the periodic one back: no double-up', async () => {
+      getSettingForSource.mockResolvedValue(String(T0 - HOUR + 60_000)); // periodic due in 1 min
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await manager.setAnnounceInterval(1);
+      await fireReady(manager); // reconnect: on-connect announce now
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(client.announceSelf).toHaveBeenCalledTimes(1);
+      expect((await manager.getAnnounceState()).nextPeriodicAnnounceAt).toBe(T0 + HOUR);
+    });
+
+    it('a manual announce also pushes the periodic one back', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await manager.setAnnounceInterval(3);
+      await vi.advanceTimersByTimeAsync(2 * HOUR);
+      await manager.announceNow();
+      expect((await manager.getAnnounceState()).nextPeriodicAnnounceAt).toBe(T0 + 5 * HOUR);
+    });
+
+    it('disconnect clears the timer', async () => {
+      const client = fakeClient();
+      const manager = managerWith(client);
+      await manager.setAnnounceInterval(1);
+      await manager.disconnect();
+      await vi.advanceTimersByTimeAsync(5 * HOUR);
+      expect(client.announceSelf).not.toHaveBeenCalled();
+      expect((await manager.getAnnounceState()).nextPeriodicAnnounceAt).toBeNull();
+    });
+
+    it('a failed periodic announce reschedules one interval out instead of retrying in a loop', async () => {
+      const client = fakeClient();
+      client.announceSelf.mockRejectedValue(new Error('bridge down'));
+      const manager = managerWith(client);
+      await manager.setAnnounceInterval(1);
+      await vi.advanceTimersByTimeAsync(HOUR);
+      expect(client.announceSelf).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(HOUR - 1000);
+      expect(client.announceSelf).toHaveBeenCalledTimes(1);
     });
   });
 });

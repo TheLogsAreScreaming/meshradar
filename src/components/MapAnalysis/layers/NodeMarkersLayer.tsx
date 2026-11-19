@@ -1,13 +1,12 @@
-import { useMemo } from 'react';
 import { Popup } from 'react-leaflet';
 import { useNavigate } from 'react-router-dom';
 import { useDashboardSources } from '../../../hooks/useDashboardData';
-import { useHopCounts } from '../../../hooks/useMapAnalysisData';
+import { useHopByKey, lookupHops } from '../../../hooks/useHopByKey';
 import { useSettings } from '../../../contexts/SettingsContext';
 import { useMapAnalysisCtx } from '../MapAnalysisContext';
 import { useAnalysisNodes, type NodeRecord } from '../useAnalysisNodes';
 import { createNodeIcon } from '../../../utils/mapIcons';
-import { getNodeTypeCategory } from '../../../utils/nodeTypeCategory';
+import { markerRoleProps } from '../../../utils/nodeTypeCategory';
 import { markerAgeOpacity, MIN_MARKER_OPACITY } from '../../../utils/markerAgeOpacity';
 import { isNodeEmphasized, selectionOpacity } from '../../../utils/nodeIdentity';
 import DashboardNodePopup, { type NodeSourceRef } from '../../Dashboard/DashboardNodePopup';
@@ -16,12 +15,6 @@ import { useMapContextOptional } from '../../../contexts/MapContext';
 import { DEFAULT_AIRCRAFT_DISPLAY_MODE } from '../../../utils/aircraftClassification';
 import { isAgedOutAircraft, AGED_OUT_AIRCRAFT_OPACITY } from '../../map/agedOutAircraft';
 import '../../../styles/nodes.css'; // `.node-popup-*` classes used by DashboardNodePopup
-
-interface HopEntry {
-  sourceId: string;
-  nodeNum: number;
-  hops: number;
-}
 
 /**
  * Renders one Marker per node that has a position. When `config.sources` is
@@ -71,19 +64,10 @@ export default function NodeMarkersLayer() {
   const { data: sources = [] } = useDashboardSources();
   const sourceList = sources as Array<{ id: string; name: string }>;
   const sourceIds = sourceList.map((s) => s.id);
-  const hop = useHopCounts({
+  const { hopByKey } = useHopByKey({
     enabled: config.layers.hopShading.enabled,
     sources: config.sources.length === 0 ? sourceIds : config.sources,
   });
-
-  const hopByKey = useMemo(() => {
-    const m = new Map<string, number>();
-    const entries = (hop.data as { entries?: HopEntry[] } | undefined)?.entries ?? [];
-    for (const e of entries) {
-      m.set(`${e.sourceId}:${Number(e.nodeNum)}`, e.hops);
-    }
-    return m;
-  }, [hop.data]);
 
   // Shared identity + visibility computation (issue #3788 WP-B) — the same
   // predicate the node picker (NodeMultiSelect) uses, so the two surfaces
@@ -106,21 +90,18 @@ export default function NodeMarkersLayer() {
   const markers: NodeMarkerDescriptor[] = filteredNodes.map(({ node: n, latLng, key: unifiedKey }) => {
     const [lat, lon] = latLng;
     const sourceId = n.sourceId ?? '';
-    const hopVal = hopByKey.get(`${sourceId}:${Number(n.nodeNum)}`);
+    const hopVal = lookupHops(hopByKey, sourceId, n);
     const hops =
       config.layers.hopShading.enabled && hopVal !== undefined ? hopVal : 999;
+    // MeshCore nodes carry no usable nodeNum: match on the unified key.
     const isSelected =
       selected?.type === 'node' &&
-      selected.nodeNum === Number(n.nodeNum) &&
+      (selected.nodeKey !== undefined
+        ? selected.nodeKey === unifiedKey
+        : selected.nodeNum === Number(n.nodeNum)) &&
       (selected.sourceId ?? '') === sourceId;
-    const roleNum =
-      typeof n.user?.role === 'string'
-        ? parseInt(n.user.role, 10)
-        : typeof n.user?.role === 'number'
-          ? n.user.role
-          : 0;
-    const isRouter = roleNum === 2;
-    const roleCategory = getNodeTypeCategory(n);
+    // #6008: shared role helper, matching every other map surface.
+    const { isRouter, roleCategory } = markerRoleProps(n);
     const markerKey = keyOf(n);
     // Likely-aircraft badge (#5364/#5365 Phase 1 WP4): 'show' never marks.
     // Aged-out aircraft (Phase 2) are only here when "Show aged-out" is on:
@@ -176,6 +157,7 @@ export default function NodeMarkersLayer() {
             type: 'node',
             nodeNum: Number(n.nodeNum),
             sourceId,
+            ...(unifiedKey ? { nodeKey: unifiedKey } : {}),
           }),
       },
       children: (

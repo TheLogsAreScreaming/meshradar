@@ -1,14 +1,34 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { useTranslation } from 'react-i18next';
+import { useTranslation, Trans } from 'react-i18next';
 import { useCsrfFetch } from '../../hooks/useCsrfFetch';
 import { useToast } from '../ToastContainer';
 import { useAuth } from '../../contexts/AuthContext';
 import { useSaveBar } from '../../hooks/useSaveBar';
-import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
-import { ScopeSelectField, type ScopeMode } from './ScopeSelectField';
-import { MeshCoreReceiveOnlyNote } from './MeshCoreReceiveOnlyNote';
+import { UiIcon } from '../icons';
+import { ConfigSection, ConfigHeaderCount } from '../shared/config/ConfigSection';
+import { ConfigEmptyState } from '../shared/config/ConfigEmptyState';
+import { TriggerCard, type TriggerChip } from '../shared/automation/TriggerCard';
+import { TriggerListFilter } from '../shared/automation/TriggerListFilter';
+import { PatternTestBox, type PatternTestResult } from '../shared/automation/PatternTestBox';
+import { TRIGGER_FILTER_THRESHOLD, matchesSearch, newTriggerId } from '../shared/automation/triggerList';
+import { MeshCoreResponderTriggerEditor } from './MeshCoreResponderTriggerEditor';
+import { validateMeshCoreResponderPattern, matchMeshCoreResponderPattern, meshCoreTriggerSyntax } from './meshcoreResponderMatch';
+import { substituteResponderParams } from '../../utils/responderTrigger';
+import ScriptManagement from '../auto-responder/ScriptManagement';
+import AutoResponderDialog from '../auto-responder/AutoResponderDialog';
+import { getFileIcon } from '../auto-responder/utils';
+// The shared script library (/api/scripts) is global, so the Script
+// Management panel here manages the SAME scripts as the Meshtastic responder
+// (#6223). Reuse that panel's canonical metadata type (required `language`).
+import type { ScriptMetadata } from '../auto-responder/types';
+import type {
+  MeshCoreAutoResponderTrigger,
+  MeshCoreChannelRow,
+} from './meshcoreResponderTypes';
+import { meshCoreReceiveOnlyText } from './meshCoreReceiveOnlyText';
+import styles from './MeshCoreAutoResponderSection.module.css';
 
 interface MeshCoreAutoResponderSectionProps {
   baseUrl: string;
@@ -19,69 +39,20 @@ interface MeshCoreAutoResponderSectionProps {
   receiveOnly?: boolean;
 }
 
-/**
- * Mirrors the backend `MeshCoreAutoResponderTrigger` shape. Kept inline
- * for the same reason as the timer trigger: it's a server-only type
- * that crosses the wire as JSON.
- */
-interface MeshCoreAutoResponderTrigger {
-  id: string;
-  name: string;
-  enabled: boolean;
-  pattern: string;
-  /**
-   * `text` (default) sends `response`; `script` runs `scriptPath` and
-   * sends each entry of the script's wouldSendMessages output.
-   */
-  responseType?: 'text' | 'script';
-  response: string;
-  scriptPath?: string;
-  scriptArgs?: string;
-  channels: number[];
-  listenDMs: boolean;
-  replyAsDM: boolean;
-  cooldownSeconds: number;
-  /** Delay (s) after a match before sending the reply. 0 = immediate, max 120 (#3953). */
-  preSendDelaySeconds?: number;
-  /** MeshCore scope/region for the reply (#3833). */
-  scopeMode?: ScopeMode;
-  scopeName?: string;
-}
-
-interface ScriptMetadata {
-  path: string;
-  filename: string;
-  name?: string;
-  emoji?: string;
-  language?: string;
-}
-
-interface MeshCoreChannelRow {
-  id: number;
-  name: string;
-}
-
-const validateRegex = (pattern: string): { valid: boolean; error?: string } => {
-  if (!pattern) return { valid: false, error: 'Pattern is required' };
-  if (pattern.length > 100) return { valid: false, error: 'Pattern too long (max 100 chars)' };
-  if (/(\.\*){2,}|(\+.*\+)|(\*.*\*)|(\{[0-9]{3,}\})|(\{[0-9]+,\})/.test(pattern)) {
-    return { valid: false, error: 'Pattern too complex (possible ReDoS)' };
-  }
-  try {
-    new RegExp(pattern, 'i');
-    return { valid: true };
-  } catch {
-    return { valid: false, error: 'Invalid regex syntax' };
-  }
+/** Infer a display language from a script's extension (mirrors the Meshtastic panel). */
+const inferScriptLanguage = (filename: string): string => {
+  const ext = filename.split('.').pop()?.toLowerCase() || '';
+  return ext === 'py' ? 'Python' : ext === 'js' || ext === 'mjs' ? 'JavaScript' : ext === 'sh' ? 'Shell' : 'Script';
 };
 
 const newTrigger = (): MeshCoreAutoResponderTrigger => ({
-  id: typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : `r-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  id: newTriggerId(),
   name: '',
   enabled: true,
   pattern: '',
+  // New triggers use the placeholder DSL, as on Meshtastic (#5924). Saved
+  // triggers with no syntax stay regex (meshCoreTriggerSyntax).
+  syntax: 'pattern',
   responseType: 'text',
   response: '',
   channels: [],
@@ -106,10 +77,25 @@ export const MeshCoreAutoResponderSection: React.FC<MeshCoreAutoResponderSection
   const [initialTriggers, setInitialTriggers] = useState<MeshCoreAutoResponderTrigger[]>([]);
   const [channels, setChannels] = useState<MeshCoreChannelRow[]>([]);
   const [scripts, setScripts] = useState<ScriptMetadata[]>([]);
+  // Script Management panel state (#6223), mirroring the Meshtastic responder.
+  const [selectedScripts, setSelectedScripts] = useState<Set<string>>(new Set());
+  const [isImporting, setIsImporting] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isDeleting, setIsDeleting] = useState<string | null>(null);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [scriptToDelete, setScriptToDelete] = useState<string | null>(null);
   const [hasChanges, setHasChanges] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [loaded, setLoaded] = useState(false);
-  const [draft, setDraft] = useState<MeshCoreAutoResponderTrigger>(newTrigger());
+  // #5808: one trigger open in its TriggerCard at a time. Regex errors show
+  // live, as before; a missing name or empty pattern shows once Done or Save
+  // has been tried (`attemptedIds`), so a new trigger does not open in red.
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [attemptedIds, setAttemptedIds] = useState<Set<string>>(new Set());
+  const [search, setSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState('all');
 
   // Load triggers
   useEffect(() => {
@@ -152,23 +138,31 @@ export const MeshCoreAutoResponderSection: React.FC<MeshCoreAutoResponderSection
     return () => { cancelled = true; };
   }, [baseUrl, sourceId, csrfFetch]);
 
-  // Load available scripts (responseType='script' picker).
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const res = await csrfFetch(`${baseUrl}/api/scripts`);
-        if (!res.ok) return;
-        const raw = await res.json();
-        if (cancelled) return;
-        const list: ScriptMetadata[] = Array.isArray(raw?.scripts)
-          ? raw.scripts.filter((s: any) => typeof s?.path === 'string')
-          : [];
-        setScripts(list);
-      } catch { /* ignore */ }
-    })();
-    return () => { cancelled = true; };
+  // Load available scripts. Feeds both the responseType='script' picker and
+  // the Script Management panel; re-run after an import/delete to refresh both.
+  const loadScripts = useCallback(async () => {
+    try {
+      const res = await csrfFetch(`${baseUrl}/api/scripts`);
+      if (!res.ok) return;
+      const raw = await res.json();
+      const rawScripts: any[] = Array.isArray(raw?.scripts) ? raw.scripts : [];
+      const list: ScriptMetadata[] = rawScripts
+        .filter((s) => typeof s?.path === 'string')
+        .map((s) => {
+          const filename: string = s.filename ?? String(s.path).split('/').pop() ?? String(s.path);
+          return {
+            path: String(s.path),
+            filename,
+            name: s.name,
+            emoji: s.emoji,
+            language: s.language || inferScriptLanguage(filename),
+          };
+        });
+      setScripts(list);
+    } catch { /* ignore */ }
   }, [baseUrl, csrfFetch]);
+
+  useEffect(() => { void loadScripts(); }, [loadScripts]);
 
   // Detect changes
   useEffect(() => {
@@ -177,13 +171,27 @@ export const MeshCoreAutoResponderSection: React.FC<MeshCoreAutoResponderSection
     setHasChanges(enabled !== initialEnabled || triggersChanged);
   }, [enabled, initialEnabled, triggers, initialTriggers, loaded]);
 
+  // A new trigger needs a name (the old Add card's rule); a saved one keeps
+  // whatever name it has, as before. Every regex is checked.
+  const savedIds = useMemo(() => new Set(initialTriggers.map((tr) => tr.id)), [initialTriggers]);
+  const nameMissing = useCallback(
+    (tr: MeshCoreAutoResponderTrigger) => !savedIds.has(tr.id) && !tr.name.trim(),
+    [savedIds],
+  );
+
   const handleSave = useCallback(async () => {
-    // Validate every trigger's regex up front so the operator sees the
-    // bad one before a round-trip.
+    // Validate every trigger up front so the operator sees the bad one
+    // before a round-trip; open it so the error shows in place.
     for (const tr of triggers) {
-      const v = validateRegex(tr.pattern);
-      if (!v.valid) {
-        showToast(`Trigger "${tr.name || tr.id}": ${v.error}`, 'error');
+      const v = validateMeshCoreResponderPattern(tr.pattern, meshCoreTriggerSyntax(tr));
+      const noName = nameMissing(tr);
+      if (!v.valid || noName) {
+        setAttemptedIds((prev) => new Set(prev).add(tr.id));
+        setExpandedId(tr.id);
+        showToast(
+          `Trigger "${tr.name || tr.id}": ${v.error ?? t('meshcore.automation.responder.name_required', 'Name is required')}`,
+          'error',
+        );
         return;
       }
     }
@@ -208,6 +216,8 @@ export const MeshCoreAutoResponderSection: React.FC<MeshCoreAutoResponderSection
       setInitialEnabled(enabled);
       setInitialTriggers(triggers);
       setHasChanges(false);
+      setExpandedId(null);
+      setAttemptedIds(new Set());
       showToast(t('automation.settings_saved', 'Settings saved'), 'success');
     } catch (err) {
       console.error('Failed to save MeshCore auto-responder settings:', err);
@@ -215,12 +225,14 @@ export const MeshCoreAutoResponderSection: React.FC<MeshCoreAutoResponderSection
     } finally {
       setIsSaving(false);
     }
-  }, [enabled, triggers, baseUrl, sourceId, csrfFetch, showToast, t]);
+  }, [enabled, triggers, baseUrl, sourceId, csrfFetch, showToast, t, nameMissing]);
 
   const handleDismiss = useCallback(() => {
     setEnabled(initialEnabled);
     setTriggers(initialTriggers);
     setHasChanges(false);
+    setExpandedId(null);
+    setAttemptedIds(new Set());
   }, [initialEnabled, initialTriggers]);
 
   const numberScope = useNumberInputScope();
@@ -239,21 +251,170 @@ export const MeshCoreAutoResponderSection: React.FC<MeshCoreAutoResponderSection
   };
   const removeTrigger = (id: string) => {
     setTriggers(prev => prev.filter(t => t.id !== id));
+    setExpandedId((cur) => (cur === id ? null : cur));
+  };
+
+  /** Collapse the open trigger if it is valid. False keeps it open with its errors. */
+  const finishEditing = (id: string | null): boolean => {
+    if (!id) return true;
+    const tr = triggers.find((x) => x.id === id);
+    if (tr) {
+      if (!validateMeshCoreResponderPattern(tr.pattern, meshCoreTriggerSyntax(tr)).valid || nameMissing(tr)) {
+        setAttemptedIds((prev) => new Set(prev).add(id));
+        setExpandedId(id);
+        return false;
+      }
+    }
+    setAttemptedIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    setExpandedId((cur) => (cur === id ? null : cur));
+    return true;
+  };
+
+  const startEditing = (id: string) => {
+    if (expandedId && expandedId !== id && !finishEditing(expandedId)) return;
+    setExpandedId(id);
   };
 
   const addTrigger = () => {
-    const v = validateRegex(draft.pattern);
-    if (!v.valid) {
-      showToast(v.error || 'Invalid pattern', 'error');
-      return;
-    }
-    if (!draft.name.trim()) {
-      showToast(t('meshcore.automation.responder.name_required', 'Name is required'), 'error');
-      return;
-    }
-    setTriggers(prev => [...prev, draft]);
-    setDraft(newTrigger());
+    if (!finishEditing(expandedId)) return;
+    const tr = newTrigger();
+    setTriggers(prev => [...prev, tr]);
+    setSearch('');
+    setTypeFilter('all');
+    setExpandedId(tr.id);
   };
+
+  // Script Management handlers (#6223). The /api/scripts library is global, so
+  // these manage the SAME scripts as the Meshtastic responder panel. After any
+  // import/delete, loadScripts() refreshes both the picker and the panel list.
+  const handleImportScript = async (file: File) => {
+    setIsImporting(true);
+    try {
+      const fileContent = await file.arrayBuffer();
+      const response = await csrfFetch(`${baseUrl}/api/scripts/import`, {
+        method: 'POST',
+        headers: {
+          'x-filename': file.name,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: fileContent,
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || t('auto_responder.script_import_failed'));
+      }
+      showToast(t('auto_responder.script_imported'), 'success');
+      await loadScripts();
+      setShowImportModal(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      showToast(message || t('auto_responder.script_import_failed'), 'error');
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handleExportScripts = async () => {
+    const scriptsToExport = selectedScripts.size > 0
+      ? Array.from(selectedScripts)
+      : scripts.map(s => s.path);
+
+    if (scriptsToExport.length === 0) {
+      showToast(t('auto_responder.no_scripts_to_export'), 'warning');
+      return;
+    }
+
+    setIsExporting(true);
+    try {
+      const response = await csrfFetch(`${baseUrl}/api/scripts/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scripts: scriptsToExport }),
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || t('auto_responder.script_export_failed'));
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'scripts-export.zip';
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      showToast(t('auto_responder.scripts_exported', { count: scriptsToExport.length }), 'success');
+      setShowExportModal(false);
+      setSelectedScripts(new Set());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      showToast(message || t('auto_responder.script_export_failed'), 'error');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleDeleteScript = async (filename: string) => {
+    setIsDeleting(filename);
+    try {
+      const response = await csrfFetch(`${baseUrl}/api/scripts/${encodeURIComponent(filename)}`, {
+        method: 'DELETE',
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || t('auto_responder.script_delete_failed'));
+      }
+      showToast(t('auto_responder.script_deleted'), 'success');
+      await loadScripts();
+      setSelectedScripts(prev => {
+        const next = new Set(prev);
+        next.delete(filename);
+        return next;
+      });
+      setShowDeleteModal(false);
+      setScriptToDelete(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      showToast(message || t('auto_responder.script_delete_failed'), 'error');
+    } finally {
+      setIsDeleting(null);
+    }
+  };
+
+  // Shared by the ×, Cancel and Escape, so every way out resets the picker.
+  const closeImportModal = () => {
+    setShowImportModal(false);
+    const input = document.getElementById('meshcore-script-import-input') as HTMLInputElement | null;
+    const filenameDisplay = document.getElementById('meshcore-script-import-filename');
+    if (input) input.value = '';
+    if (filenameDisplay) {
+      filenameDisplay.textContent = t('auto_responder.no_file_selected');
+      filenameDisplay.style.color = 'var(--color-text-subtle)';
+    }
+  };
+
+  const closeDeleteModal = () => {
+    setShowDeleteModal(false);
+    setScriptToDelete(null);
+  };
+
+  const toggleScriptSelection = (script: string) => {
+    setSelectedScripts(prev => {
+      const next = new Set(prev);
+      if (next.has(script)) next.delete(script);
+      else next.add(script);
+      return next;
+    });
+  };
+
+  const selectAllScripts = () => setSelectedScripts(new Set(scripts.map(s => s.path)));
+  const deselectAllScripts = () => setSelectedScripts(new Set());
 
   const channelMap = useMemo(() => {
     const m = new Map<number, string>();
@@ -263,301 +424,422 @@ export const MeshCoreAutoResponderSection: React.FC<MeshCoreAutoResponderSection
 
   const disabled = !enabled;
 
+  const visible = triggers.filter((tr) =>
+    tr.id === expandedId || (
+      matchesSearch(search, tr.name, tr.pattern, tr.response, tr.scriptPath)
+      && (typeFilter === 'all' || (tr.responseType || 'text') === typeFilter)
+    ));
+
+  // A regex shows as /…/; a DSL pattern shows as written.
+  const patternLabel = (tr: MeshCoreAutoResponderTrigger): string =>
+    meshCoreTriggerSyntax(tr) === 'regex' ? `/${tr.pattern}/` : tr.pattern;
+
+  const summaryOf = (tr: MeshCoreAutoResponderTrigger): React.ReactNode => (
+    <>
+      <code>{patternLabel(tr)}</code> <UiIcon name="forward" size={12} />{' '}
+      {(tr.responseType || 'text') === 'script'
+        ? <code>{tr.scriptPath || t('meshcore.automation.responder.select_script', '(select script)')}{tr.scriptArgs ? ` ${tr.scriptArgs}` : ''}</code>
+        : tr.response}
+    </>
+  );
+
+  const chipsOf = (tr: MeshCoreAutoResponderTrigger): TriggerChip[] => {
+    const chips: TriggerChip[] = [];
+    if ((tr.responseType || 'text') === 'script') {
+      chips.push({ label: t('meshcore.automation.responder.response_script', 'Run script'), tone: 'accent' });
+    }
+    if (tr.listenDMs) chips.push({ label: t('meshcore.automation.responder.chip_dm', 'DMs'), tone: 'info' });
+    tr.channels.forEach((id) => chips.push({ label: channelMap.get(id) ?? `Channel ${id}`, tone: 'info' }));
+    if (tr.replyAsDM) chips.push({ label: t('meshcore.automation.responder.reply_dm', 'Reply as DM') });
+    if (tr.cooldownSeconds > 0) {
+      chips.push({ label: <><UiIcon name="timer" size={12} /> {tr.cooldownSeconds}s</>, title: t('meshcore.automation.responder.cooldown', 'Cooldown (s)') });
+    }
+    if ((tr.preSendDelaySeconds ?? 0) > 0) {
+      chips.push({ label: t('meshcore.automation.responder.chip_delay', '+{{seconds}}s delay', { seconds: tr.preSendDelaySeconds }) });
+    }
+    if (tr.multiline) chips.push({ label: t('meshcore.automation.responder.chip_split', 'Split'), title: t('automation.split_long.toggle', 'Split long messages') });
+    if (tr.scopeMode && tr.scopeMode !== 'inherit') {
+      chips.push({ label: tr.scopeMode === 'named' ? `#${tr.scopeName ?? ''}` : tr.scopeMode, tone: 'caution' });
+    }
+    return chips;
+  };
+
+  // Mirrors the server: every enabled trigger whose pattern matches, in its
+  // own syntax, replies. Channel / DM filters are not applied (the test
+  // message has neither).
+  const matchForTest = (tr: MeshCoreAutoResponderTrigger, text: string): PatternTestResult => {
+    if (!tr.enabled) return { matched: false };
+    const m = matchMeshCoreResponderPattern(tr.pattern, text, meshCoreTriggerSyntax(tr));
+    if (!m.matched) return { matched: false };
+    const params = Object.entries(m.params);
+    const detail = (
+      <>
+        {patternLabel(tr)}
+        {params.length > 0 && ` · ${params.map(([k, v]) => `${k}="${v}"`).join(', ')}`}
+      </>
+    );
+    if ((tr.responseType || 'text') === 'script') {
+      return { matched: true, detail: <>{detail} · {tr.scriptPath}</> };
+    }
+    return { matched: true, detail, response: substituteResponderParams(tr.response, m.params) };
+  };
+
   return (
     <NumberInputScope scope={numberScope}>
-    <>
-      <div className="automation-section-header" style={{
-        display: 'flex',
-        alignItems: 'center',
-        marginBottom: '1.5rem',
-        marginTop: '2rem',
-        padding: '1rem 1.25rem',
-        background: 'var(--color-surface-hover)',
-        border: '1px solid var(--color-surface-active)',
-        borderRadius: '8px',
-      }}>
-        <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            disabled={!canWrite}
-            style={{ width: 'auto', margin: 0, cursor: canWrite ? 'pointer' : 'not-allowed' }}
+      <ConfigSection
+        title={t('meshcore.automation.responder.title', 'Auto-Responder')}
+        enabled={enabled}
+        onEnabledChange={setEnabled}
+        enableLabel={t('meshcore.automation.responder.title', 'Auto-Responder')}
+        docsUrl="https://meshmonitor.org/features/meshcore#auto-responder"
+        canWrite={canWrite}
+        receiveOnly={receiveOnly}
+        receiveOnlyNote={meshCoreReceiveOnlyText(t)}
+        headerActions={
+          <ConfigHeaderCount>
+            {t('automation.trigger_count', '{{count}} triggers', { count: triggers.length })}
+          </ConfigHeaderCount>
+        }
+        description={t(
+          'meshcore.automation.responder.description',
+          'Match incoming messages against operator-defined patterns and reply with a text response. Each trigger supports per-channel filtering, DM listening, and a per-sender cooldown.',
+        )}
+      >
+        {triggers.length > TRIGGER_FILTER_THRESHOLD && (
+          <TriggerListFilter
+            search={search}
+            onSearchChange={setSearch}
+            type={typeFilter}
+            onTypeChange={setTypeFilter}
+            typeOptions={[
+              { value: 'all', label: t('meshcore.automation.responder.filter_all', 'All actions') },
+              { value: 'text', label: t('meshcore.automation.responder.response_text', 'Send text') },
+              { value: 'script', label: t('meshcore.automation.responder.response_script', 'Run script') },
+            ]}
           />
-          {t('meshcore.automation.responder.title', 'Auto-Responder')}
-        </h2>
-        <span style={{ marginLeft: 'auto', fontSize: '0.85rem', color: 'var(--color-text-subtle)' }}>
-          {t('meshcore.automation.responder.count', '{{count}} triggers', { count: triggers.length })}
-        </span>
-      </div>
-
-      <MeshCoreReceiveOnlyNote receiveOnly={receiveOnly} />
-
-      <div className="settings-section" style={{ opacity: enabled ? 1 : 0.5, transition: 'opacity 0.2s' }}>
-        <p style={{ marginBottom: '1rem', color: '#666', lineHeight: 1.5, marginLeft: '1.75rem' }}>
-          {t(
-            'meshcore.automation.responder.description',
-            'Match incoming messages against operator-defined patterns and reply with a text response. Each trigger supports per-channel filtering, DM listening, and a per-sender cooldown.',
-          )}
-        </p>
-
-        {triggers.length === 0 && (
-          <p style={{ marginLeft: '1.75rem', fontSize: '0.9rem', color: 'var(--color-text-subtle)' }}>
-            {t('meshcore.automation.responder.empty', 'No triggers configured yet.')}
-          </p>
         )}
 
-        {triggers.map(tr => {
-          const v = validateRegex(tr.pattern);
+        {triggers.length === 0 && (
+          <ConfigEmptyState className={styles.empty}>
+            {t('meshcore.automation.responder.empty', 'No triggers configured yet.')}
+          </ConfigEmptyState>
+        )}
+
+        {visible.map(tr => {
+          const v = validateMeshCoreResponderPattern(tr.pattern, meshCoreTriggerSyntax(tr));
+          const attempted = attemptedIds.has(tr.id);
+          const patternError = !v.valid && (tr.pattern || attempted) ? v.error : undefined;
+          const nameError = attempted && nameMissing(tr)
+            ? t('meshcore.automation.responder.name_required', 'Name is required')
+            : undefined;
           return (
-            <div key={tr.id} className="meshcore-trigger-card">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.75rem' }}>
-                <input
-                  type="checkbox"
-                  checked={tr.enabled}
-                  onChange={(e) => updateTrigger(tr.id, { enabled: e.target.checked })}
-                  disabled={disabled || !canWrite}
-                  style={{ width: 'auto', margin: 0 }}
-                  aria-label={`Enable ${tr.name}`}
-                />
-                <input
-                  type="text"
-                  value={tr.name}
-                  onChange={(e) => updateTrigger(tr.id, { name: e.target.value })}
-                  disabled={disabled || !canWrite}
-                  placeholder={t('meshcore.automation.responder.name_placeholder', 'Trigger name')}
-                  className="meshcore-input"
-                  style={{ flex: 1 }}
-                />
-                <button
-                  type="button"
-                  onClick={() => removeTrigger(tr.id)}
-                  disabled={!canWrite}
-                  className="meshcore-btn meshcore-btn-danger"
-                >
-                  {t('meshcore.automation.responder.remove', 'Remove')}
-                </button>
-              </div>
-
-              <label style={{ fontSize: '0.85rem', display: 'block', marginBottom: '0.5rem' }}>
-                {t('meshcore.automation.responder.pattern', 'Pattern (regex, case-insensitive)')}
-                <input
-                  type="text"
-                  value={tr.pattern}
-                  onChange={(e) => updateTrigger(tr.id, { pattern: e.target.value })}
-                  disabled={disabled || !canWrite}
-                  placeholder="^(test|ping)"
-                  className="meshcore-input"
-                  style={{ width: '100%', marginTop: '0.25rem', fontFamily: 'monospace' }}
-                />
-                {!v.valid && tr.pattern && (
-                  <div style={{ fontSize: '0.8rem', color: 'var(--color-error)', marginTop: '0.25rem' }}>
-                    {v.error}
-                  </div>
-                )}
-              </label>
-
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '0.75rem', marginBottom: '0.5rem' }}>
-                <label style={{ fontSize: '0.85rem' }}>
-                  {t('meshcore.automation.responder.response_type', 'Action')}
-                  <select
-                    value={tr.responseType || 'text'}
-                    onChange={(e) => updateTrigger(tr.id, { responseType: e.target.value as 'text' | 'script' })}
-                    disabled={disabled || !canWrite}
-                    className="meshcore-select"
-                    style={{ width: '100%', marginTop: '0.25rem' }}
-                  >
-                    <option value="text">{t('meshcore.automation.responder.response_text', 'Send text')}</option>
-                    <option value="script">{t('meshcore.automation.responder.response_script', 'Run script')}</option>
-                  </select>
-                </label>
-                {(tr.responseType || 'text') === 'text' ? (
-                  <label style={{ fontSize: '0.85rem' }}>
-                    {t('meshcore.automation.responder.response', 'Response (token expansion supported)')}
-                    <textarea
-                      value={tr.response}
-                      onChange={(e) => updateTrigger(tr.id, { response: e.target.value })}
-                      disabled={disabled || !canWrite}
-                      rows={2}
-                      className="meshcore-input"
-                      style={{ width: '100%', marginTop: '0.25rem', fontFamily: 'monospace' }}
-                    />
-                  </label>
-                ) : (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
-                    <label style={{ fontSize: '0.85rem' }}>
-                      {t('meshcore.automation.responder.script', 'Script')}
-                      <select
-                        value={tr.scriptPath || ''}
-                        onChange={(e) => updateTrigger(tr.id, { scriptPath: e.target.value })}
-                        disabled={disabled || !canWrite}
-                        className="meshcore-select"
-                        style={{ width: '100%', marginTop: '0.25rem' }}
-                      >
-                        <option value="">{scripts.length === 0 ? t('meshcore.automation.responder.no_scripts', '(no scripts available)') : t('meshcore.automation.responder.select_script', '(select script)')}</option>
-                        {scripts.map(s => (
-                          <option key={s.path} value={s.path}>
-                            {s.emoji ? `${s.emoji} ` : ''}{s.name || s.filename} ({s.language || '?'})
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label style={{ fontSize: '0.85rem' }}>
-                      {t('meshcore.automation.responder.script_args', 'Script args (token expansion)')}
-                      <input
-                        type="text"
-                        value={tr.scriptArgs || ''}
-                        onChange={(e) => updateTrigger(tr.id, { scriptArgs: e.target.value })}
-                        disabled={disabled || !canWrite}
-                        className="meshcore-input"
-                        style={{ width: '100%', marginTop: '0.25rem', fontFamily: 'monospace' }}
-                      />
-                    </label>
-                  </div>
-                )}
-              </div>
-
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', marginBottom: '0.5rem' }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
-                  <input
-                    type="checkbox"
-                    checked={tr.listenDMs}
-                    onChange={(e) => updateTrigger(tr.id, { listenDMs: e.target.checked })}
-                    disabled={disabled || !canWrite}
-                    style={{ width: 'auto', margin: 0 }}
-                  />
-                  {t('meshcore.automation.responder.listen_dms', 'Listen on DMs')}
-                </label>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.85rem' }}>
-                  <input
-                    type="checkbox"
-                    checked={tr.replyAsDM}
-                    onChange={(e) => updateTrigger(tr.id, { replyAsDM: e.target.checked })}
-                    disabled={disabled || !canWrite}
-                    style={{ width: 'auto', margin: 0 }}
-                  />
-                  {t('meshcore.automation.responder.reply_dm', 'Reply as DM')}
-                </label>
-                <label style={{ fontSize: '0.85rem' }}>
-                  {t('meshcore.automation.responder.cooldown', 'Cooldown (s)')}{' '}
-                  <NumberInput
-                    min={0}
-                    max={3600}
-                    integer
-                    value={tr.cooldownSeconds}
-                    onChange={(v) => updateTrigger(tr.id, { cooldownSeconds: v })}
-                    disabled={disabled || !canWrite}
-                    className="meshcore-input"
-                    style={{ width: '80px' }}
-                  />
-                </label>
-                <label
-                  style={{ fontSize: '0.85rem' }}
-                  title={t(
-                    'meshcore.automation.responder.presend_delay_help',
-                    'Wait this long after a match before replying, so a relaying repeater can finish its own transmission first (0 = send immediately, max 120).',
-                  )}
-                >
-                  {t('meshcore.automation.responder.presend_delay', 'Pre-Send Delay (s)')}{' '}
-                  <NumberInput
-                    min={0}
-                    max={120}
-                    integer
-                    value={tr.preSendDelaySeconds ?? 0}
-                    onChange={(v) => updateTrigger(tr.id, { preSendDelaySeconds: v })}
-                    disabled={disabled || !canWrite}
-                    className="meshcore-input"
-                    style={{ width: '80px' }}
-                  />
-                </label>
-              </div>
-
-              {/* Channels */}
-              <fieldset style={{ border: '1px solid var(--color-surface-active)', borderRadius: '4px', padding: '0.5rem' }}>
-                <legend style={{ fontSize: '0.8rem', padding: '0 0.5rem' }}>
-                  {t('meshcore.automation.responder.channels', 'Listen on channels')}
-                </legend>
-                {channels.length === 0 && (
-                  <span style={{ fontSize: '0.8rem', color: 'var(--color-text-subtle)' }}>
-                    {t('meshcore.automation.responder.no_channels', 'No channels loaded')}
-                  </span>
-                )}
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-                  {channels.map(ch => (
-                    <label key={ch.id} style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.8rem' }}>
-                      <input
-                        type="checkbox"
-                        checked={tr.channels.includes(ch.id)}
-                        onChange={(e) => {
-                          if (e.target.checked) updateTrigger(tr.id, { channels: [...tr.channels, ch.id] });
-                          else updateTrigger(tr.id, { channels: tr.channels.filter(c => c !== ch.id) });
-                        }}
-                        disabled={disabled || !canWrite}
-                        style={{ width: 'auto', margin: 0 }}
-                      />
-                      {channelMap.get(ch.id)}
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
-
-              {/* MeshCore scope/region for the reply (#3833) */}
-              <ScopeSelectField
+            <TriggerCard
+              key={tr.id}
+              title={tr.name.trim() || <span className={styles.untitled}>{t('meshcore.automation.responder.untitled', 'New trigger')}</span>}
+              summary={summaryOf(tr)}
+              chips={chipsOf(tr)}
+              enabled={tr.enabled}
+              onEnabledChange={(on) => updateTrigger(tr.id, { enabled: on })}
+              enableLabel={t('meshcore.automation.responder.enable_trigger', 'Enable {{name}}', { name: tr.name.trim() || t('meshcore.automation.responder.untitled', 'New trigger') })}
+              expanded={expandedId === tr.id}
+              onEdit={() => startEditing(tr.id)}
+              onDone={() => finishEditing(tr.id)}
+              onDelete={() => removeTrigger(tr.id)}
+              disabled={disabled}
+              invalid={!!patternError || !!nameError}
+              deletePreview={tr.name || tr.pattern || undefined}
+            >
+              <MeshCoreResponderTriggerEditor
+                trigger={tr}
+                onChange={(patch) => updateTrigger(tr.id, patch)}
+                patternError={patternError}
+                nameError={nameError}
+                channels={channels}
+                scripts={scripts}
                 baseUrl={baseUrl}
                 sourceId={sourceId}
-                allowTrigger
-                idPrefix={`responder-${tr.id}`}
-                value={{ scopeMode: tr.scopeMode, scopeName: tr.scopeName }}
-                onChange={(v) => updateTrigger(tr.id, { scopeMode: v.scopeMode, scopeName: v.scopeName })}
+                disabled={disabled}
               />
-            </div>
+            </TriggerCard>
           );
         })}
 
-        {/* Add new trigger */}
-        <div className="meshcore-add-card" style={{ opacity: disabled ? 0.6 : 1 }}>
-          <h3 style={{ marginTop: 0, fontSize: '1rem' }}>
-            {t('meshcore.automation.responder.add', 'Add trigger')}
-          </h3>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginBottom: '0.5rem' }}>
-            <input
-              type="text"
-              value={draft.name}
-              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-              placeholder={t('meshcore.automation.responder.name_placeholder', 'Trigger name')}
-              disabled={disabled || !canWrite}
-              className="meshcore-input"
-            />
-            <input
-              type="text"
-              value={draft.pattern}
-              onChange={(e) => setDraft({ ...draft, pattern: e.target.value })}
-              placeholder="^(test|ping)"
-              disabled={disabled || !canWrite}
-              className="meshcore-input"
-              style={{ fontFamily: 'monospace' }}
-            />
-          </div>
-          <textarea
-            value={draft.response}
-            onChange={(e) => setDraft({ ...draft, response: e.target.value })}
-            placeholder={t('meshcore.automation.responder.response_placeholder', 'Response text (supports {VERSION}, {DURATION}, …)')}
-            rows={2}
-            disabled={disabled || !canWrite}
-            className="meshcore-input"
-            style={{ width: '100%', marginBottom: '0.5rem', fontFamily: 'monospace' }}
+        {triggers.length > 0 && visible.length === 0 && (
+          <ConfigEmptyState className={styles.empty}>
+            {t('meshcore.automation.responder.no_match', 'No triggers match your search.')}
+          </ConfigEmptyState>
+        )}
+
+        <button
+          type="button"
+          onClick={addTrigger}
+          disabled={disabled}
+          className="meshcore-btn meshcore-btn-primary"
+        >
+          <UiIcon name="plus" size={14} /> {t('meshcore.automation.responder.add_button', 'Add trigger')}
+        </button>
+
+        {/* Local pattern test: never sends, never calls the server */}
+        {triggers.length > 0 && (
+          <PatternTestBox
+            triggers={triggers}
+            mode="all"
+            getKey={(tr) => tr.id}
+            getLabel={(tr) => tr.name || patternLabel(tr)}
+            match={matchForTest}
+            description={t(
+              'meshcore.automation.responder.test_description',
+              'Type sample messages, one per line. Every enabled trigger whose pattern matches, in its own syntax, replies. Captured {name} values are filled in here; tokens such as {VERSION} are filled in when the reply is sent. Nothing is sent from here, and channel filters are not applied.',
+            )}
           />
-          <button
-            type="button"
-            onClick={addTrigger}
-            disabled={disabled || !canWrite}
-            className="meshcore-btn meshcore-btn-primary"
-          >
-            {t('meshcore.automation.responder.add_button', 'Add trigger')}
-          </button>
-        </div>
-      </div>
-    </>
+        )}
+
+        {/* Script Management (#6223): manages the shared, global /api/scripts
+            library — the same scripts the Meshtastic responder panel manages. */}
+        <ScriptManagement
+          availableScripts={scripts}
+          selectedScripts={selectedScripts}
+          isImporting={isImporting}
+          isExporting={isExporting}
+          isDeleting={isDeleting}
+          onImportClick={() => setShowImportModal(true)}
+          onExportClick={() => {
+            if (selectedScripts.size === 0 && scripts.length === 0) {
+              showToast(t('auto_responder.no_scripts_to_export'), 'warning');
+              return;
+            }
+            setShowExportModal(true);
+          }}
+          onDeleteClick={(filename) => {
+            setScriptToDelete(filename);
+            setShowDeleteModal(true);
+          }}
+          onToggleSelection={toggleScriptSelection}
+          onSelectAll={selectAllScripts}
+          onDeselectAll={deselectAllScripts}
+        />
+
+        {/* Import Modal */}
+        {showImportModal && (
+          <AutoResponderDialog onClose={closeImportModal} labelledBy="meshcore-script-import-title">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 id="meshcore-script-import-title" style={{ margin: 0, color: 'var(--color-text)' }}>{t('auto_responder.import_script')}</h3>
+              <button
+                onClick={closeImportModal}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  fontSize: '1.5rem',
+                  color: 'var(--color-text-subtle)',
+                  cursor: 'pointer',
+                  padding: '0',
+                  lineHeight: '1',
+                }}
+              >
+                ×
+              </button>
+            </div>
+            <p style={{ color: 'var(--color-text-subtle)', fontSize: '0.875rem', marginBottom: '1rem' }}>
+              {t('auto_responder.import_script_description')}
+            </p>
+            <input
+              type="file"
+              accept=".js,.mjs,.py,.sh"
+              id="meshcore-script-import-input"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                const filenameDisplay = document.getElementById('meshcore-script-import-filename');
+                if (file) {
+                  if (filenameDisplay) {
+                    filenameDisplay.textContent = t('auto_responder.selected_file', { name: file.name });
+                    filenameDisplay.style.color = 'var(--color-success)';
+                  }
+                  void handleImportScript(file);
+                } else if (filenameDisplay) {
+                  filenameDisplay.textContent = t('auto_responder.no_file_selected');
+                  filenameDisplay.style.color = 'var(--color-text-subtle)';
+                }
+              }}
+              style={{ display: 'none' }}
+            />
+            <label
+              htmlFor="meshcore-script-import-input"
+              style={{
+                display: 'block',
+                padding: '0.75rem 1rem',
+                background: 'var(--color-accent)',
+                color: 'var(--color-bg)',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontWeight: 'bold',
+                textAlign: 'center',
+                fontSize: '0.9rem',
+                marginBottom: '1rem',
+              }}
+            >
+              <UiIcon name="file" size={14} /> {t('auto_responder.choose_file')}
+            </label>
+            <div id="meshcore-script-import-filename" style={{
+              color: 'var(--color-text-subtle)',
+              fontSize: '0.85rem',
+              fontStyle: 'italic',
+              marginBottom: '1rem',
+              minHeight: '1.2rem',
+            }}>
+              {t('auto_responder.no_file_selected')}
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+              <button
+                onClick={closeImportModal}
+                style={{
+                  padding: '0.5rem 1rem',
+                  background: 'var(--color-surface-hover)',
+                  color: 'var(--color-text)',
+                  border: '1px solid var(--color-border-subtle)',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                }}
+              >
+                {t('common.cancel')}
+              </button>
+            </div>
+          </AutoResponderDialog>
+        )}
+
+        {/* Export Modal */}
+        {showExportModal && (
+          <AutoResponderDialog onClose={() => setShowExportModal(false)} labelledBy="meshcore-script-export-title">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 id="meshcore-script-export-title" style={{ margin: 0, color: 'var(--color-text)' }}>{t('auto_responder.export_scripts')}</h3>
+              <button
+                onClick={() => setShowExportModal(false)}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  fontSize: '1.5rem',
+                  color: 'var(--color-text-subtle)',
+                  cursor: 'pointer',
+                  padding: '0',
+                  lineHeight: '1',
+                }}
+              >
+                ×
+              </button>
+            </div>
+            <p style={{ color: 'var(--color-text-subtle)', fontSize: '0.875rem', marginBottom: '1rem' }}>
+              {selectedScripts.size > 0
+                ? t('auto_responder.export_selected_confirm', { count: selectedScripts.size })
+                : t('auto_responder.export_all_confirm', { count: scripts.length })}
+            </p>
+            {selectedScripts.size > 0 && (
+              <div style={{ marginBottom: '1rem', padding: '0.75rem', background: 'var(--color-surface)', borderRadius: '4px', maxHeight: '200px', overflowY: 'auto' }}>
+                <div style={{ fontSize: '0.75rem', color: 'var(--color-text-subtle)', marginBottom: '0.5rem', fontWeight: 'bold' }}>{t('auto_responder.selected_scripts')}</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  {Array.from(selectedScripts).map((script) => {
+                    const filename = script.replace('/data/scripts/', '');
+                    return (
+                      <div key={script} style={{ fontSize: '0.75rem', fontFamily: 'monospace', color: 'var(--color-text)' }}>
+                        <UiIcon name={getFileIcon(filename)} size={14} /> {filename}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setShowExportModal(false)}
+                style={{
+                  padding: '0.5rem 1rem',
+                  background: 'var(--color-surface-hover)',
+                  color: 'var(--color-text)',
+                  border: '1px solid var(--color-border-subtle)',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                }}
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={handleExportScripts}
+                disabled={isExporting}
+                style={{
+                  padding: '0.5rem 1rem',
+                  background: isExporting ? 'var(--color-surface-active)' : 'var(--color-success)',
+                  color: isExporting ? 'var(--color-text-subtle)' : 'var(--color-bg)',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: isExporting ? 'not-allowed' : 'pointer',
+                  fontWeight: 'bold',
+                }}
+              >
+                {isExporting ? t('auto_responder.exporting') : <><UiIcon name="download" size={14} /> {t('auto_responder.download_zip')}</>}
+              </button>
+            </div>
+          </AutoResponderDialog>
+        )}
+
+        {/* Delete Modal */}
+        {showDeleteModal && scriptToDelete && (
+          <AutoResponderDialog onClose={closeDeleteModal} labelledBy="meshcore-script-delete-title">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h3 id="meshcore-script-delete-title" style={{ margin: 0, color: 'var(--color-text)' }}>{t('auto_responder.delete_script')}</h3>
+              <button
+                onClick={closeDeleteModal}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  fontSize: '1.5rem',
+                  color: 'var(--color-text-subtle)',
+                  cursor: 'pointer',
+                  padding: '0',
+                  lineHeight: '1',
+                }}
+              >
+                ×
+              </button>
+            </div>
+            <p style={{ color: 'var(--color-text-subtle)', fontSize: '0.875rem', marginBottom: '1rem' }}>
+              <Trans
+                i18nKey="auto_responder.delete_script_confirm"
+                values={{ name: scriptToDelete }}
+                components={{ strong: <strong style={{ color: 'var(--color-text)' }} /> }}
+              />
+            </p>
+            <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+              <button
+                onClick={closeDeleteModal}
+                style={{
+                  padding: '0.5rem 1rem',
+                  background: 'var(--color-surface-hover)',
+                  color: 'var(--color-text)',
+                  border: '1px solid var(--color-border-subtle)',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                }}
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={() => handleDeleteScript(scriptToDelete)}
+                disabled={isDeleting === scriptToDelete}
+                style={{
+                  padding: '0.5rem 1rem',
+                  background: isDeleting === scriptToDelete ? 'var(--color-surface-active)' : 'var(--color-error)',
+                  color: isDeleting === scriptToDelete ? 'var(--color-text-subtle)' : 'var(--color-bg)',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: isDeleting === scriptToDelete ? 'not-allowed' : 'pointer',
+                  fontWeight: 'bold',
+                }}
+              >
+                {isDeleting === scriptToDelete ? t('auto_responder.deleting') : t('common.delete')}
+              </button>
+            </div>
+          </AutoResponderDialog>
+        )}
+      </ConfigSection>
     </NumberInputScope>
   );
 };

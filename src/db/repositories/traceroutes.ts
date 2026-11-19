@@ -11,12 +11,19 @@
  * passing them through `orientTracerouteRows`. A new read method must do the
  * same, or its callers get the route attached to the wrong end.
  */
-import { eq, and, desc, lt, or, isNull, gte, inArray, notInArray, count, sql, type SQL } from 'drizzle-orm';
+import { eq, and, desc, lt, or, not, isNull, gte, inArray, notInArray, count, sql, type SQL } from 'drizzle-orm';
 import { BaseRepository, DrizzleDatabase, SourceScope, SourceSetScope } from './base.js';
 import { DatabaseType, DbTraceroute, DbRouteSegment } from '../types.js';
 import { tracerouteParticipationKind, type TracerouteParticipation } from '../../utils/tracerouteSegments.js';
 import { classifyNodeTransport, type NodeTransportClass } from '../../utils/nodeTransport.js';
 import { transportClassCondition } from './transportSql.js';
+
+/** #5156: what one source's route-segment reads must leave out for this caller. */
+export interface RouteSegmentExclusion {
+  sourceId: string;
+  /** Node numbers to leave out, or `'all'` for every segment of the source. */
+  nodeNums: number[] | 'all';
+}
 
 /**
  * The columns a traceroute REPLY fills in: the ONE definition every writer of
@@ -207,8 +214,18 @@ export class TraceroutesRepository extends BaseRepository {
    * returned — this prevents history for a node pair on one source (e.g. a
    * local TCP mesh) from bleeding into a view scoped to a different source
    * (e.g. an MQTT feed) where the same nodeNums may also be present.
+   *
+   * `opts.sinceTimestamp` (ms) drops older rows; absent, every age counts.
+   * NeighborInfo eligibility uses it so only a recent direct trace counts
+   * (4.17.3 review L5).
    */
-  async getTraceroutesByNodes(fromNodeNum: number, toNodeNum: number, limit: number = 10, sourceId?: SourceScope): Promise<DbTraceroute[]> {
+  async getTraceroutesByNodes(
+    fromNodeNum: number,
+    toNodeNum: number,
+    limit: number = 10,
+    sourceId?: SourceSetScope,
+    opts: { sinceTimestamp?: number } = {},
+  ): Promise<DbTraceroute[]> {
     const { traceroutes } = this.tables;
     // Search bidirectionally to capture traceroutes initiated from either direction
     // This is especially important for 3rd party traceroutes (e.g., via Virtual Node)
@@ -228,7 +245,8 @@ export class TraceroutesRepository extends BaseRepository {
               eq(traceroutes.toNodeNum, fromNodeNum)
             )
           ),
-          this.withSourceScope(traceroutes, sourceId)
+          this.withSourceScope(traceroutes, sourceId),
+          opts.sinceTimestamp !== undefined ? gte(traceroutes.timestamp, opts.sinceTimestamp) : undefined,
         )
       )
       .orderBy(desc(traceroutes.timestamp))
@@ -441,6 +459,29 @@ export class TraceroutesRepository extends BaseRepository {
   }
 
   /**
+   * #5156: leave out segments that name a node the caller may not see, per
+   * source; `'all'` leaves out every segment of that source (fail closed).
+   * In the WHERE clause, so the "best" row is the best visible one.
+   */
+  private segmentExclusionWhere(exclude?: RouteSegmentExclusion[]): SQL | undefined {
+    if (!exclude || exclude.length === 0) return undefined;
+    const { routeSegments } = this.tables;
+    const parts: SQL[] = [];
+    for (const e of exclude) {
+      if (e.nodeNums === 'all') {
+        parts.push(eq(routeSegments.sourceId, e.sourceId));
+      } else if (e.nodeNums.length > 0) {
+        const named = or(inArray(routeSegments.fromNodeNum, e.nodeNums), inArray(routeSegments.toNodeNum, e.nodeNums));
+        const part = and(eq(routeSegments.sourceId, e.sourceId), named);
+        if (part) parts.push(part);
+      }
+    }
+    if (parts.length === 0) return undefined;
+    const anyExcluded = or(...parts);
+    return anyExcluded ? not(anyExcluded) : undefined;
+  }
+
+  /**
    * Get the longest currently-stored route segment, optionally scoped to a
    * single source (each source tracks its own longest link independently)
    * and/or a transport class (#5101).
@@ -453,7 +494,11 @@ export class TraceroutesRepository extends BaseRepository {
    * a genuinely longer non-record segment has since been seen. The ordinary
    * (unflagged) twin of the record-setting segment stays eligible.
    */
-  async getLongestActiveRouteSegment(sourceId?: SourceScope, transportClass?: NodeTransportClass): Promise<DbRouteSegment| null> {
+  async getLongestActiveRouteSegment(
+    sourceId?: SourceSetScope,
+    transportClass?: NodeTransportClass,
+    exclude?: RouteSegmentExclusion[],
+  ): Promise<DbRouteSegment| null> {
     const { routeSegments } = this.tables;
     const result = await this.db
       .select()
@@ -462,6 +507,7 @@ export class TraceroutesRepository extends BaseRepository {
         or(eq(routeSegments.isRecordHolder, false), isNull(routeSegments.isRecordHolder)),
         this.withSourceScope(routeSegments, sourceId),
         this.segmentClassWhere(transportClass),
+        this.segmentExclusionWhere(exclude),
       ))
       .orderBy(desc(routeSegments.distanceKm))
       .limit(1);
@@ -475,7 +521,11 @@ export class TraceroutesRepository extends BaseRepository {
    * and/or a transport class (#5101) — records are now kept per
    * (source, transport class).
    */
-  async getRecordHolderRouteSegment(sourceId?: SourceScope, transportClass?: NodeTransportClass): Promise<DbRouteSegment| null> {
+  async getRecordHolderRouteSegment(
+    sourceId?: SourceSetScope,
+    transportClass?: NodeTransportClass,
+    exclude?: RouteSegmentExclusion[],
+  ): Promise<DbRouteSegment| null> {
     const { routeSegments } = this.tables;
     const result = await this.db
       .select()
@@ -484,6 +534,7 @@ export class TraceroutesRepository extends BaseRepository {
         eq(routeSegments.isRecordHolder, true),
         this.withSourceScope(routeSegments, sourceId),
         this.segmentClassWhere(transportClass),
+        this.segmentExclusionWhere(exclude),
       ))
       .orderBy(desc(routeSegments.distanceKm))
       .limit(1);

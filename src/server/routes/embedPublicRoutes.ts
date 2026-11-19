@@ -2,7 +2,15 @@
  * Embed Public Routes
  *
  * GET /:profileId/config — returns the public embed configuration
- * GET /:profileId/nodes  — returns nodes filtered by the profile's channels
+ * GET /:profileId/nodes  — returns nodes filtered by the profile's channels,
+ *                          plus the profile's MeshCore nodes (#5999)
+ *
+ * The neighbor-info and traceroute routes draw Meshtastic links, plus MeshCore
+ * links (#6263 P6 S8) under the same `showNeighborInfo` / `showTraceroutes`
+ * toggles (no new profile fields). A MeshCore link is keyed by `mc:` ids
+ * (`nodeKey`/`neighborKey`, `fromKey`/`toKey`; the numeric fields are 0) and is
+ * drawn only when BOTH ends are in `visibleEmbedMeshCoreNodes`, so a node whose
+ * location override is private is never a line end.
  *
  * These routes are mounted outside the API router (no CSRF, no rate limiter).
  * The embed CSP middleware validates the profile and attaches it to the request.
@@ -28,6 +36,17 @@ import { CHANNEL_DB_OFFSET } from '../constants/meshtastic.js';
 import { fail } from '../utils/apiResponse.js';
 import type { EmbedProfile } from '../../db/repositories/embedProfiles.js';
 import type { DbNode } from '../../db/types.js';
+import type { DbMeshCoreNode } from '../../db/repositories/meshcore.js';
+import { buildMeshCorePositionFilter } from '../utils/positionVisibility.js';
+import { applyMeshCorePositionOverrides, loadMeshCorePositionOverrides } from '../utils/meshcorePositionOverride.js';
+import { applySignFlipToMeshCoreRows } from '../services/signFlipCorrection.js';
+import type { SourcePermissions } from '../utils/sourcePermissions.js';
+import { isAnyMeshCoreSourceType } from '../../utils/nodeTypeCategory.js';
+import type { PermissionSet } from '../../types/permission.js';
+import { loadMqttConsentHiddenSet } from '../utils/mqttConsentVisibility.js';
+import { isMeshCoreMqttFedSourceType } from '../../utils/meshcoreSourceTypes.js';
+import { markPublicInstanceExempt } from '../middleware/publicInstanceRedaction.js';
+import { getPublicInstanceConfig } from '../services/publicInstanceConfig.js';
 
 const router = Router();
 
@@ -57,6 +76,9 @@ interface EmbedTracerouteSegmentV2 {
   leg: 'forward' | 'return';
   avgSnr: number | null;
   isMqtt: boolean;
+  /** MeshCore segment only (P6 S8): `mc:` ids of the ends; `fromNum`/`toNum` are 0. */
+  fromKey?: string;
+  toKey?: string;
 }
 
 /**
@@ -103,9 +125,14 @@ async function visibleEmbedNodes(profile: EmbedProfile): Promise<EmbedNode[]> {
   const profileChannels = new Set(profile.channels);
   // #5363: display-only sign-flip correction, per row's own source.
   const signFlip = await loadSignFlipContexts(allNodes.map(rowSourceId));
+  // #5156: embed viewers are anonymous, so a source's MQTT-consent filter
+  // applies. The neighbor-info and traceroute embeds draw only between nodes
+  // returned here, so their edges follow.
+  const hidden = await loadMqttConsentHiddenSet(null, profile.sourceId ? [profile.sourceId] : undefined);
   const visible: EmbedNode[] = [];
   for (const node of allNodes) {
     if (node.hideFromMap) continue;
+    if (hidden.hides(rowSourceId(node), node.nodeNum)) continue;
     if (node.positionOverrideIsPrivate) continue;
     if (!channelInProfile(profileChannels, node.channel)) continue;
     if (!profile.showMqttNodes && node.viaMqtt) continue;
@@ -128,6 +155,125 @@ async function visibleEmbedNodes(profile: EmbedProfile): Promise<EmbedNode[]> {
     });
   }
   return visible;
+}
+
+/** The activity window every embed node list uses: 7 days. */
+const EMBED_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+interface EmbedMeshCoreNode {
+  node: DbMeshCoreNode;
+  latitude: number;
+  longitude: number;
+  altitude: number | null | undefined;
+  /** True when the node came from a MeshCore MQTT ingest source. */
+  viaMqtt: boolean;
+}
+
+/**
+ * The grants an embed profile stands for (#5999). An embed viewer is
+ * anonymous; what it may see is decided by the profile alone, as it is for
+ * Meshtastic nodes above. The profile shows nodes on its own MeshCore sources
+ * (`nodes:viewOnMap` there) and holds nothing else, so `nodes_private:read` is
+ * never granted and a private location override is never shown.
+ */
+function embedProfileGrants(sourceIds: Set<string>): SourcePermissions {
+  const none: PermissionSet = Object.freeze({});
+  return {
+    isAdmin: false,
+    can: (resource, action, sourceId) => resource === 'nodes' && action === 'viewOnMap' && sourceIds.has(sourceId),
+    on: () => none,
+    sourcesWhere: () => [...sourceIds],
+  };
+}
+
+/** The MeshCore sources one profile draws from (#5999), and which of them are MQTT ingest. */
+async function embedMeshCoreSources(profile: EmbedProfile): Promise<{ sourceIds: string[]; mqttSourceIds: Set<string> }> {
+  const sources = profile.sourceId
+    ? [await databaseService.sources.getSource(profile.sourceId)].filter((s): s is NonNullable<typeof s> => !!s)
+    : await databaseService.sources.getAllSources(); // intentional cross-source: profile without a sourceId spans all sources
+  const mcSources = sources.filter((s) => isAnyMeshCoreSourceType(s.type));
+  const mqttSourceIds = new Set(mcSources.filter((s) => isMeshCoreMqttFedSourceType(s.type)).map((s) => s.id));
+  const sourceIds = mcSources
+    .map((s) => s.id)
+    .filter((id) => profile.showMqttNodes || !mqttSourceIds.has(id));
+  return { sourceIds, mqttSourceIds };
+}
+
+/**
+ * The MeshCore nodes one profile shows (#5999), each with the position it is
+ * shown at. MeshCore nodes live in `meshcore_nodes`, which the Meshtastic read
+ * in `visibleEmbedNodes` never touches. The rule:
+ *
+ *  - the profile's source when it is a MeshCore source (device or MQTT
+ *    ingest); every MeshCore source when the profile names none, the same
+ *    reach `ALL_SOURCES` gives the Meshtastic read;
+ *  - heard in the last 7 days (`lastHeard` is epoch MILLISECONDS here);
+ *  - passes `buildMeshCorePositionFilter` with the profile's grants: the row
+ *    exists, and a node whose location override is private is left out
+ *    altogether, as the Meshtastic path does;
+ *  - the position shown is a public override when one is set
+ *    (`applyMeshCorePositionOverrides`, never a private one), else the
+ *    advert position with the #5363 sign-flip correction;
+ *  - nodes from a MeshCore MQTT ingest source only when the profile shows
+ *    MQTT nodes.
+ *
+ * The profile's channel list does NOT apply: it names Meshtastic channel
+ * slots (0-7), and a MeshCore contact has no channel. Kept apart from
+ * `visibleEmbedNodes` because the neighbor and traceroute routes key on a
+ * Meshtastic `nodeNum` and stay Meshtastic-only.
+ *
+ * A node heard by more than one MeshCore source is drawn once, at the copy
+ * heard most recently.
+ */
+async function visibleEmbedMeshCoreNodes(profile: EmbedProfile): Promise<EmbedMeshCoreNode[]> {
+  const { sourceIds, mqttSourceIds } = await embedMeshCoreSources(profile);
+  if (sourceIds.length === 0) return [];
+
+  const nodesBySource = new Map<string, DbMeshCoreNode[]>(await Promise.all(
+    sourceIds.map(async (id) => [id, await databaseService.meshcore.getNodesBySource(id)] as const),
+  ));
+  const canShow = await buildMeshCorePositionFilter(null, sourceIds, nodesBySource, embedProfileGrants(new Set(sourceIds)));
+  const cutoff = Date.now() - EMBED_ACTIVE_WINDOW_MS;
+
+  const byKey = new Map<string, EmbedMeshCoreNode>();
+  for (const sourceId of sourceIds) {
+    const active = (nodesBySource.get(sourceId) ?? []).filter((n) =>
+      n.publicKey
+      && n.lastHeard != null && Number(n.lastHeard) >= cutoff
+      && canShow({ sourceId, publicKey: n.publicKey }));
+    if (active.length === 0) continue;
+    // Effective position: a public override wins (private ones never pass
+    // the filter above, and `false` here never applies one anyway).
+    const overrides = await loadMeshCorePositionOverrides(sourceId);
+    const placed = await applySignFlipToMeshCoreRows(applyMeshCorePositionOverrides(active, overrides, false), sourceId);
+    for (const row of placed) {
+      const lat = row.latitude;
+      const lng = row.longitude;
+      if (lat == null || lng == null) continue;
+      if (lat === 0 && lng === 0) continue;
+      const key = row.publicKey.toLowerCase();
+      const prev = byKey.get(key);
+      if (prev && Number(prev.node.lastHeard ?? 0) >= Number(row.lastHeard ?? 0)) continue;
+      byKey.set(key, {
+        node: row,
+        latitude: lat,
+        longitude: lng,
+        altitude: row.altitude,
+        viaMqtt: mqttSourceIds.has(sourceId),
+      });
+    }
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * The stable id a MeshCore node carries on the embed wire (#5999): `mc:` plus
+ * the first 16 hex digits of its public key. A string, so it can never be
+ * mistaken for a Meshtastic `nodeNum`; built from the key alone, so it does
+ * not name the source that heard the node.
+ */
+export function embedMeshCoreNodeId(publicKey: string): string {
+  return `mc:${publicKey.toLowerCase().slice(0, 16)}`;
 }
 
 // GET /:profileId/config — return public config for the embed profile
@@ -179,6 +325,9 @@ router.get('/:profileId/config', createEmbedCspMiddleware(), (req: Request, res:
     showTraceroutes: profile.showTraceroutes,
     showMqttNodes: profile.showMqttNodes,
     pollIntervalSeconds: profile.pollIntervalSeconds,
+    // Embeds are always served redacted (#5156). Booleans only, so the viewer
+    // can draw positions as approximate and ages as coarse.
+    publicInstance: { ...getPublicInstanceConfig() },
   });
 });
 
@@ -219,7 +368,30 @@ router.get('/:profileId/nodes', createEmbedCspMiddleware(), async (req: Request,
       channel: node.channel ?? 0,
     }));
 
-    res.json(nodes);
+    // #5999: MeshCore nodes, in the same shape. `nodeNum` is 0 (MeshCore has
+    // none); `nodeId` is the key the embed map draws them by. No channel and
+    // no hardware model: MeshCore has neither. `advType` is the MeshCore role.
+    // MeshCore `lastHeard`/`firstHeard` are milliseconds; the wire is seconds.
+    const meshcoreNodes = (await visibleEmbedMeshCoreNodes(profile)).map(({ node, latitude, longitude, altitude, viaMqtt }) => ({
+      nodeNum: 0,
+      nodeId: embedMeshCoreNodeId(node.publicKey),
+      isMeshCore: true,
+      user: {
+        longName: node.name || undefined,
+        // MeshCore has no short name; the first four characters, as the
+        // Dashboard map does.
+        shortName: node.name ? node.name.substring(0, 4) : undefined,
+      },
+      position: { latitude, longitude, altitude },
+      lastHeard: node.lastHeard != null ? Math.floor(Number(node.lastHeard) / 1000) : undefined,
+      firstHeard: node.firstHeard != null ? Math.floor(Number(node.firstHeard) / 1000) : undefined,
+      snr: node.snr ?? undefined,
+      hopsAway: 999,
+      advType: node.advType ?? 0,
+      viaMqtt,
+    }));
+
+    res.json([...nodes, ...meshcoreNodes]);
   } catch (error) {
     logger.error('Error fetching embed nodes:', error);
     fail(res, 500, 'INTERNAL_ERROR', 'Failed to fetch nodes');
@@ -250,7 +422,7 @@ router.get('/:profileId/neighborinfo', createEmbedCspMiddleware(), async (req: R
     const rawNeighbors = await databaseService.neighbors.getAllNeighborInfo(profile.sourceId ?? ALL_SOURCES); // intentional cross-source: profile without a sourceId spans all sources
 
     // Enrich with positions — only include pairs where both nodes are in the filtered set
-    const segments = rawNeighbors
+    const segments: Array<Record<string, unknown>> = rawNeighbors
       .filter(ni => nodeMap.has(ni.nodeNum) && nodeMap.has(ni.neighborNodeNum))
       .map(ni => {
         const nodePos = nodeMap.get(ni.nodeNum)!;
@@ -267,6 +439,37 @@ router.get('/:profileId/neighborinfo', createEmbedCspMiddleware(), async (req: R
           neighborName: neighborPos.name,
         };
       });
+
+    // MeshCore neighbour edges (P6 S8): both ends must be nodes the profile
+    // shows, so a private-override node is never a line end. One line per pair.
+    const mcNodes = new Map<string, EmbedMeshCoreNode>();
+    for (const entry of await visibleEmbedMeshCoreNodes(profile)) mcNodes.set(entry.node.publicKey.toLowerCase(), entry);
+    const mcSourceIds = mcNodes.size > 0 ? (await embedMeshCoreSources(profile)).sourceIds : [];
+    if (mcSourceIds.length > 0) {
+      const seenPairs = new Set<string>();
+      const mcNeighbors = await databaseService.meshcore.getNeighbors(mcSourceIds, Date.now() - EMBED_ACTIVE_WINDOW_MS);
+      for (const n of mcNeighbors) {
+        const a = mcNodes.get(n.publicKey.toLowerCase());
+        const b = mcNodes.get(n.neighborPublicKey.toLowerCase());
+        if (!a || !b || a === b) continue;
+        const pair = [n.publicKey.toLowerCase(), n.neighborPublicKey.toLowerCase()].sort().join('|');
+        if (seenPairs.has(pair)) continue;
+        seenPairs.add(pair);
+        segments.push({
+          nodeNum: 0,
+          neighborNodeNum: 0,
+          nodeKey: embedMeshCoreNodeId(n.publicKey),
+          neighborKey: embedMeshCoreNodeId(n.neighborPublicKey),
+          snr: n.snr ?? null,
+          nodeLatitude: a.latitude,
+          nodeLongitude: a.longitude,
+          nodeName: a.node.name ?? embedMeshCoreNodeId(n.publicKey),
+          neighborLatitude: b.latitude,
+          neighborLongitude: b.longitude,
+          neighborName: b.node.name ?? embedMeshCoreNodeId(n.neighborPublicKey),
+        });
+      }
+    }
 
     res.json(segments);
   } catch (error) {
@@ -333,6 +536,7 @@ router.get('/:profileId/traceroutes', createEmbedCspMiddleware(), async (req: Re
 
       const renderSegments = decomposeTraceroute(tr, { resolvePosition });
       for (const seg of renderSegments) {
+        if (seg.fromNodeNum === undefined || seg.toNodeNum === undefined) continue;
         const fromInfo = nodePositions.get(seg.fromNodeNum);
         const toInfo = nodePositions.get(seg.toNodeNum);
         // Both endpoints resolved (decomposeTraceroute already guarantees
@@ -361,6 +565,45 @@ router.get('/:profileId/traceroutes', createEmbedCspMiddleware(), async (req: Re
           leg: seg.leg as 'forward' | 'return',
           avgSnr: seg.avgSnr,
           isMqtt: seg.isMqtt,
+        });
+      }
+    }
+
+    // MeshCore trace segments (P6 S8): resolved hop links of the last 24 h,
+    // drawn only when both ends are nodes the profile shows. Same cap below.
+    const mcNodes = new Map<string, EmbedMeshCoreNode>();
+    for (const entry of await visibleEmbedMeshCoreNodes(profile)) mcNodes.set(entry.node.publicKey.toLowerCase(), entry);
+    const mcSourceIds = mcNodes.size > 0 ? (await embedMeshCoreSources(profile)).sourceIds : [];
+    for (const sourceId of mcSourceIds) {
+      const links = await databaseService.meshcoreHopSnr.getResolvedLinks(sourceId, cutoffMs);
+      for (const h of links) {
+        if (!h.senderPublicKey || !h.receiverPublicKey) continue;
+        const from = mcNodes.get(h.senderPublicKey.toLowerCase());
+        const to = mcNodes.get(h.receiverPublicKey.toLowerCase());
+        if (!from || !to || from === to) continue;
+        const fromKey = embedMeshCoreNodeId(h.senderPublicKey);
+        const toKey = embedMeshCoreNodeId(h.receiverPublicKey);
+        const mapKey = `forward:${fromKey}-${toKey}`;
+        const timestamp = Number(h.timestamp);
+        const existing = segmentMap.get(mapKey);
+        if (existing && existing.timestamp >= timestamp) continue;
+        const snr = Number.isFinite(h.snrQuarterDb) ? h.snrQuarterDb / 4 : null;
+        segmentMap.set(mapKey, {
+          fromNum: 0,
+          toNum: 0,
+          fromKey,
+          toKey,
+          fromLat: from.latitude,
+          fromLng: from.longitude,
+          fromName: from.node.name ?? fromKey,
+          toLat: to.latitude,
+          toLng: to.longitude,
+          toName: to.node.name ?? toKey,
+          snr,
+          timestamp,
+          leg: 'forward',
+          avgSnr: snr,
+          isMqtt: false,
         });
       }
     }
@@ -404,6 +647,7 @@ router.get('/:profileId/geojson/layers/:id/data', createEmbedCspMiddleware(), (r
   try {
     const data = geojsonService.getPublicLayerData(req.params.id);
     res.setHeader('Content-Type', 'application/geo+json');
+    markPublicInstanceExempt(res);
     return res.send(data);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

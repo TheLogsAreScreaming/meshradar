@@ -1,17 +1,35 @@
-import React, { useRef, useMemo, useCallback, useState } from 'react';
+import React, { useMemo, useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { UiIcon } from '../icons';
 import { useSaveBar } from '../../hooks/useSaveBar';
+import { useSectionBaseline } from '../../hooks/useSectionBaseline';
 import { useDashboardSources } from '../../hooks/useDashboardData';
 import { useSource } from '../../contexts/SourceContext';
 import { useAuth } from '../../contexts/AuthContext';
-import apiService from '../../services/api';
+import apiService, { ApiError } from '../../services/api';
+import { queryClient } from '../../config/queryClient';
 import { logger } from '../../utils/logger';
 import ModuleAvailabilityNotice from './ModuleAvailabilityNotice';
 import { isMqttProxyLinkMisconfigured, MQTT_TRAFFIC_DOCS_URL } from '../../utils/mqttProxyLink';
 import { NumberInput } from '../common/NumberInput';
 import { NumberInputScope } from '../common/NumberInputScope';
 import { useNumberInputScope } from '../common/numberInputScopeContext';
+import BrokerPresetSelector from '../MQTT/BrokerPresetSelector';
+import { MqttRootFinder } from '../MQTT/MqttRootFinder';
+import { MqttRootFieldError } from '../MQTT/MqttRootFieldError';
+import { isChangedInvalidMqttRoot } from '../../utils/mqttRootTopic';
+import { defaultDeviceRegionRoot } from '../MQTT/mqttRootDefaults';
+import { MqttDocsLinks } from '../MQTT/MqttDocsLinks';
+import {
+  applyPresetToDevice,
+  devicePresetDraft,
+  matchDevicePreset,
+  type BrokerPreset,
+  type KeptCredentials,
+} from '../MQTT/brokerPresets';
+import { ConfigSection } from '../shared/config/ConfigSection';
+import { PasswordField } from '../shared/config/PasswordField';
+import { ConfigGroup } from '../shared/config/ConfigGroup';
 
 interface MQTTConfigSectionProps {
   mqttEnabled: boolean;
@@ -26,6 +44,8 @@ interface MQTTConfigSectionProps {
   mapReportingEnabled: boolean;
   mapPublishIntervalSecs: number;
   mapPositionPrecision: number;
+  // MapReportSettings.should_report_location (fw 2.6.8+).
+  mapShouldReportLocation: boolean;
   // True when this source's node is bridged (serial/BLE radio behind a TCP
   // proxy, no native IP). Such a node can only use MQTT via Client Proxy.
   isBridged?: boolean;
@@ -45,11 +65,22 @@ interface MQTTConfigSectionProps {
   setMapReportingEnabled: (value: boolean) => void;
   setMapPublishIntervalSecs: (value: number) => void;
   setMapPositionPrecision: (value: number) => void;
+  setMapShouldReportLocation: (value: boolean) => void;
   isSaving: boolean;
-  onSave: () => Promise<void>;
+  /**
+   * Resolves true when the node accepted the save. `brokerPresetId`: a saved
+   * preset whose hidden login the server fills in (#5794).
+   */
+  onSave: (extra?: { brokerPresetId?: number }) => Promise<boolean>;
+  /** Bumped when the page reloads config from the node (#5797). */
+  configVersion?: number;
+  /** The radio's LoRa region code; seeds where the topic finder searches (#6287). */
+  loraRegion?: number;
 }
 
 const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
+  configVersion,
+  loraRegion,
   mqttEnabled,
   mqttAddress,
   mqttUsername,
@@ -62,6 +93,7 @@ const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
   mapReportingEnabled,
   mapPublishIntervalSecs,
   mapPositionPrecision,
+  mapShouldReportLocation,
   isBridged = false,
   proxyClientAttached = false,
   setMqttEnabled,
@@ -76,17 +108,22 @@ const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
   setMapReportingEnabled,
   setMapPublishIntervalSecs,
   setMapPositionPrecision,
+  setMapShouldReportLocation,
   isSaving,
   onSave
 }) => {
   const { t } = useTranslation();
   const { sourceId: currentSourceId } = useSource();
-  // PR-C: gate the form by `sources:write` on the current source. `useAuth()`
-  // binds the check to the active SourceContext, so passing the explicit
-  // sourceId here just makes the intent obvious to readers. Admins are
-  // short-circuited to true inside hasPermission.
+  // Gate the form on the permission the save route checks:
+  // `POST /api/config/mqtt` requires `configuration:write`. It used to check
+  // `sources:write`, which locked out users who could save and let others
+  // edit a form whose save was then refused. Admins are short-circuited to
+  // true inside hasPermission.
   const { hasPermission } = useAuth();
-  const canEditMqtt = hasPermission('sources', 'write', { sourceId: currentSourceId });
+  const canEditMqtt = hasPermission('configuration', 'write', { sourceId: currentSourceId });
+  // Quick configure also writes `mqttLink` into this source's config
+  // (PUT /api/sources/:id) on Save, so it needs `sources:write` as well.
+  const canQuickConfig = canEditMqtt && hasPermission('sources', 'write', { sourceId: currentSourceId });
 
   // Quick-configure: list of valid client-proxy targets the user can point
   // this device at with one click. Two shapes (issue #3134):
@@ -102,10 +139,16 @@ const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
       ),
     [allSources],
   );
+  // The quick-configure target picked since the last save. It fills the form
+  // fields AND stages this source's `mqttLink` (#5831): nothing is written
+  // until Save, which sends the device config first and then the link.
+  // Dismiss drops both. '' = nothing staged.
   const [quickConfigSelection, setQuickConfigSelection] = useState('');
+  const [mqttLinkError, setMqttLinkError] = useState<string | null>(null);
   const applyQuickConfig = useCallback(
     (sourceId: string) => {
       setQuickConfigSelection(sourceId);
+      setMqttLinkError(null);
       if (!sourceId) return;
       const src = proxyTargets.find((s) => s.id === sourceId);
       if (!src) return;
@@ -167,24 +210,9 @@ const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
           if (trimmed) setMqttRoot(trimmed);
         }
       }
-
-      // Stamp the parent Meshtastic source's mqttLink so MeshRadar
-      // relays this device's proxy traffic to the selected target. The
-      // PUT triggers reconfigureMqttLink server-side without restarting
-      // the transport. Best-effort — failure is logged, not surfaced.
-      if (currentSourceId) {
-        const source = allSources.find((s) => s.id === currentSourceId);
-        if (source && source.type === 'meshtastic_tcp') {
-          const nextConfig = { ...(source.config ?? {}), mqttLink: { enabled: true, mqttBrokerSourceId: sourceId } };
-          apiService.put(`/api/sources/${currentSourceId}`, { config: nextConfig })
-            .catch((err) => logger.warn('Failed to stamp mqttLink on parent source:', err));
-        }
-      }
     },
     [
       proxyTargets,
-      allSources,
-      currentSourceId,
       setMqttEnabled,
       setMqttAddress,
       setMqttUsername,
@@ -196,33 +224,50 @@ const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
     ],
   );
 
-  // Track initial values for change detection
-  const initialValuesRef = useRef({
+  // Broker presets (#5689): fill address, TLS and login only (a saved preset
+  // may add the root topic, #5794). The fields reach the radio only through
+  // the existing Save, unchanged.
+  const matchPreset = useCallback(
+    (candidates: readonly BrokerPreset[]) => matchDevicePreset({ address: mqttAddress, tlsEnabled }, candidates),
+    [mqttAddress, tlsEnabled],
+  );
+  // A saved preset whose hidden login the server fills in on save (#5794).
+  const [serverFillPreset, setServerFillPreset] = useState<BrokerPreset | null>(null);
+  const applyBrokerPreset = useCallback(
+    (preset: BrokerPreset): KeptCredentials => {
+      const { fields, kept } = applyPresetToDevice(preset, {
+        address: mqttAddress,
+        username: mqttUsername,
+        password: mqttPassword,
+        tlsEnabled,
+      });
+      setMqttAddress(fields.address);
+      setMqttUsername(fields.username);
+      setMqttPassword(fields.password);
+      setTlsEnabled(fields.tlsEnabled);
+      if (fields.root !== undefined) setMqttRoot(fields.root);
+      setServerFillPreset(kept.serverFill ? preset : null);
+      return kept;
+    },
+    [mqttAddress, mqttUsername, mqttPassword, tlsEnabled, setMqttAddress, setMqttUsername, setMqttPassword, setTlsEnabled, setMqttRoot],
+  );
+
+  // What the node holds; moves on a successful save or a reload (#5797)
+  const values = {
     mqttEnabled, mqttAddress, mqttUsername, mqttPassword,
     mqttEncryptionEnabled, mqttJsonEnabled, mqttRoot, tlsEnabled,
-    proxyToClientEnabled, mapReportingEnabled, mapPublishIntervalSecs, mapPositionPrecision
-  });
+    proxyToClientEnabled, mapReportingEnabled, mapPublishIntervalSecs, mapPositionPrecision,
+    mapShouldReportLocation
+  };
+  const { baseline, hasChanges: deviceHasChanges, commit } = useSectionBaseline(values, { reseedKey: configVersion, keepOnReseed: ['mapShouldReportLocation'] });
 
-  // Calculate if there are unsaved changes
-  const hasChanges = useMemo(() => {
-    const initial = initialValuesRef.current;
-    return (
-      mqttEnabled !== initial.mqttEnabled ||
-      mqttAddress !== initial.mqttAddress ||
-      mqttUsername !== initial.mqttUsername ||
-      mqttPassword !== initial.mqttPassword ||
-      mqttEncryptionEnabled !== initial.mqttEncryptionEnabled ||
-      mqttJsonEnabled !== initial.mqttJsonEnabled ||
-      mqttRoot !== initial.mqttRoot ||
-      tlsEnabled !== initial.tlsEnabled ||
-      proxyToClientEnabled !== initial.proxyToClientEnabled ||
-      mapReportingEnabled !== initial.mapReportingEnabled ||
-      mapPublishIntervalSecs !== initial.mapPublishIntervalSecs ||
-      mapPositionPrecision !== initial.mapPositionPrecision
-    );
-  }, [mqttEnabled, mqttAddress, mqttUsername, mqttPassword,
-      mqttEncryptionEnabled, mqttJsonEnabled, mqttRoot, tlsEnabled,
-      proxyToClientEnabled, mapReportingEnabled, mapPublishIntervalSecs, mapPositionPrecision]);
+  // A staged link counts only for a Meshtastic TCP source the caller may edit.
+  const linkSource = currentSourceId ? allSources.find((s) => s.id === currentSourceId) : undefined;
+  const stagedLinkTarget =
+    canQuickConfig && quickConfigSelection && linkSource?.type === 'meshtastic_tcp' ? quickConfigSelection : '';
+  const hasChanges = deviceHasChanges || stagedLinkTarget !== '';
+  // The server refuses a changed root that breaks the root rules (#6338).
+  const rootBlocksSave = isChangedInvalidMqttRoot(mqttRoot, baseline.mqttRoot);
 
   // Detect the "client proxy on, but nothing to proxy through" misconfiguration:
   // the form has MQTT and proxyToClientEnabled on, and the parent Meshtastic
@@ -244,36 +289,74 @@ const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
     [mqttEnabled, proxyToClientEnabled, currentSourceId, allSources, proxyClientAttached],
   );
 
-  // Reset to initial values (for SaveBar dismiss)
+  // Reset to initial values (for SaveBar dismiss), staged link included
   const resetChanges = useCallback(() => {
-    const initial = initialValuesRef.current;
-    setMqttEnabled(initial.mqttEnabled);
-    setMqttAddress(initial.mqttAddress);
-    setMqttUsername(initial.mqttUsername);
-    setMqttPassword(initial.mqttPassword);
-    setMqttEncryptionEnabled(initial.mqttEncryptionEnabled);
-    setMqttJsonEnabled(initial.mqttJsonEnabled);
-    setMqttRoot(initial.mqttRoot);
-    setTlsEnabled(initial.tlsEnabled);
-    setProxyToClientEnabled(initial.proxyToClientEnabled);
-    setMapReportingEnabled(initial.mapReportingEnabled);
-    setMapPublishIntervalSecs(initial.mapPublishIntervalSecs);
-    setMapPositionPrecision(initial.mapPositionPrecision);
-  }, [setMqttEnabled, setMqttAddress, setMqttUsername, setMqttPassword,
+    setQuickConfigSelection('');
+    setMqttLinkError(null);
+    setMqttEnabled(baseline.mqttEnabled);
+    setMqttAddress(baseline.mqttAddress);
+    setMqttUsername(baseline.mqttUsername);
+    setMqttPassword(baseline.mqttPassword);
+    setMqttEncryptionEnabled(baseline.mqttEncryptionEnabled);
+    setMqttJsonEnabled(baseline.mqttJsonEnabled);
+    setMqttRoot(baseline.mqttRoot);
+    setTlsEnabled(baseline.tlsEnabled);
+    setProxyToClientEnabled(baseline.proxyToClientEnabled);
+    setMapReportingEnabled(baseline.mapReportingEnabled);
+    setMapPublishIntervalSecs(baseline.mapPublishIntervalSecs);
+    setMapPositionPrecision(baseline.mapPositionPrecision);
+    setMapShouldReportLocation(baseline.mapShouldReportLocation);
+  }, [baseline, setMqttEnabled, setMqttAddress, setMqttUsername, setMqttPassword,
       setMqttEncryptionEnabled, setMqttJsonEnabled, setMqttRoot, setTlsEnabled,
-      setProxyToClientEnabled, setMapReportingEnabled, setMapPublishIntervalSecs, setMapPositionPrecision]);
+      setProxyToClientEnabled, setMapReportingEnabled, setMapPublishIntervalSecs, setMapPositionPrecision,
+      setMapShouldReportLocation]);
 
-  // Update initial values after successful save
-  const handleSave = useCallback(async () => {
-    await onSave();
-    initialValuesRef.current = {
-      mqttEnabled, mqttAddress, mqttUsername, mqttPassword,
-      mqttEncryptionEnabled, mqttJsonEnabled, mqttRoot, tlsEnabled,
-      proxyToClientEnabled, mapReportingEnabled, mapPublishIntervalSecs, mapPositionPrecision
-    };
-  }, [onSave, mqttEnabled, mqttAddress, mqttUsername, mqttPassword,
-      mqttEncryptionEnabled, mqttJsonEnabled, mqttRoot, tlsEnabled,
-      proxyToClientEnabled, mapReportingEnabled, mapPublishIntervalSecs, mapPositionPrecision]);
+  /**
+   * Stamp this source's mqttLink so MeshRadar relays the device's proxy
+   * traffic to the chosen target. The server then calls reconfigureMqttLink;
+   * the transport does not restart. A failure is shown, not just logged.
+   */
+  const writeMqttLink = async (targetId: string): Promise<boolean> => {
+    if (!linkSource || !currentSourceId) return false;
+    const nextConfig = { ...(linkSource.config ?? {}), mqttLink: { enabled: true, mqttBrokerSourceId: targetId } };
+    try {
+      await apiService.put(`/api/sources/${currentSourceId}`, { config: nextConfig });
+      void queryClient.invalidateQueries({ queryKey: ['dashboard', 'sources'] });
+      return true;
+    } catch (err) {
+      logger.warn('Failed to stamp mqttLink on parent source:', err);
+      const detail = err instanceof ApiError ? err.message : (err as Error)?.message ?? '';
+      setMqttLinkError(
+        t(
+          'mqtt_config.quick_configure_link_failed',
+          'The device settings were saved, but linking this source to the MQTT source failed: {{error}}. Save again to retry.',
+          { error: detail },
+        ),
+      );
+      return false;
+    }
+  };
+
+  // Device config first (only when it changed: each save is one
+  // set_module_config and usually a reboot), then the staged link. The
+  // baseline moves only when the node took the save; the staged link clears
+  // only when the link write succeeded, so Save retries just what is left.
+  const handleSave = async () => {
+    setMqttLinkError(null);
+    if (deviceHasChanges) {
+      // Only while the address still reaches that preset; the server checks again.
+      const brokerPresetId =
+        serverFillPreset?.savedId !== undefined && matchDevicePreset({ address: mqttAddress, tlsEnabled }, [serverFillPreset])
+          ? serverFillPreset.savedId
+          : undefined;
+      if (!(await onSave(brokerPresetId !== undefined ? { brokerPresetId } : undefined))) return;
+      setServerFillPreset(null);
+      commit(values);
+    }
+    if (stagedLinkTarget && (await writeMqttLink(stagedLinkTarget))) {
+      setQuickConfigSelection('');
+    }
+  };
 
   // Register with SaveBar — but only surface unsaved-changes state to the bar
   // when the caller can actually persist them. If they can't write to this
@@ -288,29 +371,13 @@ const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
     isSaving,
     onSave: handleSave,
     onDismiss: resetChanges,
-    numberScope
+    numberScope,
+    invalid: rootBlocksSave
   });
 
   return (
     <NumberInputScope scope={numberScope}>
-    <div className="settings-section">
-      <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        {t('mqtt_config.title')}
-        <a
-          href="https://meshmonitor.org/features/device#mqtt-configuration"
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{
-            fontSize: '1.2rem',
-            color: '#89b4fa',
-            textDecoration: 'none'
-          }}
-          title={t('mqtt_config.view_docs')}
-        >
-          <UiIcon name="help" />
-        </a>
-      </h3>
-      <ModuleAvailabilityNotice />
+    <ConfigSection canWrite={canEditMqtt} title={t('mqtt_config.title')} docsUrl="https://meshmonitor.org/features/device#mqtt-configuration" notice={<ModuleAvailabilityNotice />}>
       {isBridged && (
         <div
           role="note"
@@ -411,239 +478,315 @@ const MQTTConfigSection: React.FC<MQTTConfigSectionProps> = ({
           </div>
         </div>
       )}
-      {proxyTargets.length > 0 && (
-        <div className="setting-item">
-          <label htmlFor="mqttQuickConfig">
-            {t('mqtt_config.quick_configure', 'Quick configure from a MeshRadar MQTT source')}
-            <span className="setting-description">
-              {t(
-                'mqtt_config.quick_configure_description',
-                'Auto-fill these fields to point the device at an MQTT source configured in MeshRadar. Brokers receive device traffic locally; bridges forward it straight upstream.',
-              )}
-            </span>
-          </label>
-          <select
-            id="mqttQuickConfig"
-            className="setting-input"
-            value={quickConfigSelection}
-            onChange={(e) => applyQuickConfig(e.target.value)}
-          >
-            <option value="">{t('common.select', 'Select…')}</option>
-            {proxyTargets.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.type === 'mqtt_bridge'
-                  ? t('mqtt_config.quick_configure_bridge_option', '{{name}} (bridge → upstream)', { name: s.name })
-                  : t('mqtt_config.quick_configure_broker_option', '{{name}} (embedded broker)', { name: s.name })}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
-      <div className="setting-item">
-        <label htmlFor="mqttEnabled" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
-          <input
-            id="mqttEnabled"
-            type="checkbox"
-            checked={mqttEnabled}
-            onChange={(e) => setMqttEnabled(e.target.checked)}
-            style={{ marginTop: '0.2rem', flexShrink: 0 }}
-          />
-          <div style={{ flex: 1 }}>
-            <div>{t('mqtt_config.enable')}</div>
-            <span className="setting-description">{t('mqtt_config.enable_description')}</span>
+      <ConfigGroup title={t('mqtt_config.group_connection', 'Connection')} name="connection">
+        {proxyTargets.length > 0 && (
+          <div className="setting-item">
+            <label htmlFor="mqttQuickConfig">
+              {t('mqtt_config.quick_configure', 'Quick configure from a MeshRadar MQTT source')}
+              <span className="setting-description">
+                {t(
+                  'mqtt_config.quick_configure_description',
+                  'Auto-fill these fields to point the device at an MQTT source configured in MeshRadar. Brokers receive device traffic locally; bridges forward it straight upstream.',
+                )}
+              </span>
+            </label>
+            <MqttDocsLinks />
+            <select
+              id="mqttQuickConfig"
+              className="setting-input"
+              value={quickConfigSelection}
+              onChange={(e) => applyQuickConfig(e.target.value)}
+              disabled={!canQuickConfig}
+            >
+              <option value="">{t('common.select', 'Select…')}</option>
+              {proxyTargets.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.type === 'mqtt_bridge'
+                    ? t('mqtt_config.quick_configure_bridge_option', '{{name}} (bridge → upstream)', { name: s.name })
+                    : t('mqtt_config.quick_configure_broker_option', '{{name}} (embedded broker)', { name: s.name })}
+                </option>
+              ))}
+            </select>
+            {stagedLinkTarget && (
+              <p className="setting-description" role="status" data-testid="mqtt-quick-config-staged">
+                {t(
+                  'mqtt_config.quick_configure_staged',
+                  'Filled in from {{name}}. Saving also links this source to it; Dismiss undoes both.',
+                  { name: proxyTargets.find((s) => s.id === stagedLinkTarget)?.name ?? '' },
+                )}
+              </p>
+            )}
+            {mqttLinkError && (
+              <div role="alert" className="setting-description" data-testid="mqtt-quick-config-link-error" style={{ color: 'var(--color-error)' }}>
+                {mqttLinkError}
+              </div>
+            )}
           </div>
-        </label>
-      </div>
+        )}
+        <div className="setting-item">
+          <label htmlFor="mqttEnabled" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+            <input
+              id="mqttEnabled"
+              type="checkbox"
+              checked={mqttEnabled}
+              onChange={(e) => setMqttEnabled(e.target.checked)}
+              style={{ marginTop: '0.2rem', flexShrink: 0 }}
+            />
+            <div style={{ flex: 1 }}>
+              <div>{t('mqtt_config.enable')}</div>
+              <span className="setting-description">{t('mqtt_config.enable_description')}</span>
+            </div>
+          </label>
+        </div>
+        {mqttEnabled && (
+          <>
+            <BrokerPresetSelector
+              id="mqttBrokerPreset"
+              layout="settings"
+              matchPreset={matchPreset}
+              onApplyPreset={applyBrokerPreset}
+              getDraft={() => devicePresetDraft({
+                address: mqttAddress,
+                tlsEnabled,
+                username: mqttUsername,
+                password: mqttPassword,
+                root: mqttRoot,
+              })}
+            />
+            <div className="setting-item">
+              <label htmlFor="mqttAddress">
+                {t('mqtt_config.server_address')}
+                <span className="setting-description">{t('mqtt_config.server_address_description')}</span>
+              </label>
+              <input
+                id="mqttAddress"
+                type="text"
+                value={mqttAddress}
+                onChange={(e) => setMqttAddress(e.target.value)}
+                className="setting-input"
+                placeholder="mqtt.meshtastic.org"
+              />
+            </div>
+            <div className="setting-item">
+              <label htmlFor="tlsEnabled" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                <input
+                  id="tlsEnabled"
+                  type="checkbox"
+                  checked={tlsEnabled}
+                  onChange={(e) => setTlsEnabled(e.target.checked)}
+                  style={{ marginTop: '0.2rem', flexShrink: 0 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div>{t('mqtt_config.tls_enabled')}</div>
+                  <span className="setting-description">{t('mqtt_config.tls_description')}</span>
+                </div>
+              </label>
+            </div>
+          </>
+        )}
+      </ConfigGroup>
       {mqttEnabled && (
         <>
-          <div className="setting-item">
-            <label htmlFor="mqttAddress">
-              {t('mqtt_config.server_address')}
-              <span className="setting-description">{t('mqtt_config.server_address_description')}</span>
-            </label>
-            <input
-              id="mqttAddress"
-              type="text"
-              value={mqttAddress}
-              onChange={(e) => setMqttAddress(e.target.value)}
-              className="setting-input"
-              placeholder="mqtt.meshtastic.org"
-            />
-          </div>
-          <div className="setting-item">
-            <label htmlFor="mqttUsername">
-              {t('mqtt_config.username')}
-              <span className="setting-description">{t('mqtt_config.username_description')}</span>
-            </label>
-            <input
-              id="mqttUsername"
-              type="text"
-              value={mqttUsername}
-              onChange={(e) => setMqttUsername(e.target.value)}
-              className="setting-input"
-            />
-          </div>
-          <div className="setting-item">
-            <label htmlFor="mqttPassword">
-              {t('mqtt_config.password')}
-              <span className="setting-description">{t('mqtt_config.password_description')}</span>
-            </label>
-            <input
-              id="mqttPassword"
-              type="password"
-              value={mqttPassword}
-              onChange={(e) => setMqttPassword(e.target.value)}
-              className="setting-input"
-            />
-          </div>
-          <div className="setting-item">
-            <label htmlFor="mqttRoot">
-              {t('mqtt_config.root_topic')}
-              <span className="setting-description">{t('mqtt_config.root_topic_description')}</span>
-            </label>
-            <input
-              id="mqttRoot"
-              type="text"
-              value={mqttRoot}
-              onChange={(e) => setMqttRoot(e.target.value)}
-              className="setting-input"
-              placeholder="msh/US"
-            />
-          </div>
-          <div className="setting-item">
-            <label htmlFor="mqttEncryption" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+          <ConfigGroup title={t('mqtt_config.group_credentials', 'Credentials')} name="credentials">
+            <div className="setting-item">
+              <label htmlFor="mqttUsername">
+                {t('mqtt_config.username')}
+                <span className="setting-description">{t('mqtt_config.username_description')}</span>
+              </label>
               <input
-                id="mqttEncryption"
-                type="checkbox"
-                checked={mqttEncryptionEnabled}
-                onChange={(e) => setMqttEncryptionEnabled(e.target.checked)}
-                style={{ marginTop: '0.2rem', flexShrink: 0 }}
+                id="mqttUsername"
+                type="text"
+                value={mqttUsername}
+                onChange={(e) => setMqttUsername(e.target.value)}
+                className="setting-input"
               />
-              <div style={{ flex: 1 }}>
-                <div>{t('mqtt_config.encryption_enabled')}</div>
-                <span className="setting-description">{t('mqtt_config.encryption_description')}</span>
-              </div>
-            </label>
-          </div>
-          <div className="setting-item">
-            <label htmlFor="mqttJson" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
-              <input
-                id="mqttJson"
-                type="checkbox"
-                checked={mqttJsonEnabled}
-                onChange={(e) => setMqttJsonEnabled(e.target.checked)}
-                style={{ marginTop: '0.2rem', flexShrink: 0 }}
-              />
-              <div style={{ flex: 1 }}>
-                <div>{t('mqtt_config.json_enabled')}</div>
-                <span className="setting-description">{t('mqtt_config.json_description')}</span>
-              </div>
-            </label>
-          </div>
-          <div className="setting-item">
-            <label htmlFor="tlsEnabled" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
-              <input
-                id="tlsEnabled"
-                type="checkbox"
-                checked={tlsEnabled}
-                onChange={(e) => setTlsEnabled(e.target.checked)}
-                style={{ marginTop: '0.2rem', flexShrink: 0 }}
-              />
-              <div style={{ flex: 1 }}>
-                <div>{t('mqtt_config.tls_enabled')}</div>
-                <span className="setting-description">{t('mqtt_config.tls_description')}</span>
-              </div>
-            </label>
-          </div>
-          <div className="setting-item">
-            <label htmlFor="proxyToClientEnabled" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
-              <input
-                id="proxyToClientEnabled"
-                type="checkbox"
-                checked={proxyToClientEnabled}
-                onChange={(e) => setProxyToClientEnabled(e.target.checked)}
-                style={{ marginTop: '0.2rem', flexShrink: 0 }}
-              />
-              <div style={{ flex: 1 }}>
-                <div>{t('mqtt_config.proxy_to_client')}</div>
-                <span className="setting-description">{t('mqtt_config.proxy_to_client_description')}</span>
-                <span className="setting-description" style={{ display: 'block', marginTop: '0.25rem', fontStyle: 'italic' }}>
-                  {t('mqtt_config.proxy_to_client_meshmonitor_note')}{' '}
-                  <a
-                    href="https://meshmonitor.org/add-ons/mqtt-proxy.html#mqtt-client-proxy"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ color: '#89b4fa' }}
-                  >
-                    {t('mqtt_config.proxy_to_client_docs_link')}
-                  </a>
-                </span>
-              </div>
-            </label>
-          </div>
-          <div className="setting-item">
-            <label htmlFor="mapReportingEnabled" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
-              <input
-                id="mapReportingEnabled"
-                type="checkbox"
-                checked={mapReportingEnabled}
-                onChange={(e) => setMapReportingEnabled(e.target.checked)}
-                style={{ marginTop: '0.2rem', flexShrink: 0 }}
-              />
-              <div style={{ flex: 1 }}>
-                <div>{t('mqtt_config.map_reporting')}</div>
-                <span className="setting-description">{t('mqtt_config.map_reporting_description')}</span>
-              </div>
-            </label>
-          </div>
-          {mapReportingEnabled && (
-            <div style={{
-              marginLeft: '1rem',
-              paddingLeft: '1rem',
-              borderLeft: '2px solid var(--color-surface-active)',
-              marginTop: '0.5rem',
-              marginBottom: '1rem'
-            }}>
-              <div className="setting-item">
-                <label htmlFor="mapPublishIntervalSecs">
-                  {t('mqtt_config.map_publish_interval')}
-                  <span className="setting-description">{t('mqtt_config.map_publish_interval_description')}</span>
-                </label>
-                <NumberInput
-                  id="mapPublishIntervalSecs"
-                  min={0}
-                  max={4294967295}
-                  integer
-                  value={mapPublishIntervalSecs}
-                  onChange={setMapPublishIntervalSecs}
-                  className="setting-input"
-                  style={{ width: '150px' }}
-                />
-              </div>
-              <div className="setting-item">
-                <label htmlFor="mapPositionPrecision">
-                  {t('mqtt_config.map_position_precision')}
-                  <span className="setting-description">{t('mqtt_config.map_position_precision_description')}</span>
-                </label>
-                <NumberInput
-                  id="mapPositionPrecision"
-                  min={10}
-                  max={19}
-                  alsoValid={[0]}
-                  zeroHint={t('zero_hint.map_position_precision')}
-                  integer
-                  value={mapPositionPrecision}
-                  onChange={setMapPositionPrecision}
-                  className="setting-input"
-                  style={{ width: '100px' }}
-                />
-              </div>
             </div>
-          )}
+            <div className="setting-item">
+              <label htmlFor="mqttPassword">
+                {t('mqtt_config.password')}
+                <span className="setting-description">{t('mqtt_config.password_description')}</span>
+              </label>
+              <PasswordField
+                id="mqttPassword"
+                value={mqttPassword}
+                onChange={(e) => setMqttPassword(e.target.value)}
+                className="setting-input"
+              />
+            </div>
+          </ConfigGroup>
+          <ConfigGroup title={t('mqtt_config.group_topics', 'Topics & format')} name="topics">
+            <div className="setting-item">
+              <label htmlFor="mqttRoot">
+                {t('mqtt_config.root_topic')}
+                <span className="setting-description">{t('mqtt_config.root_topic_description')}</span>
+              </label>
+              <input
+                id="mqttRoot"
+                type="text"
+                value={mqttRoot}
+                onChange={(e) => setMqttRoot(e.target.value)}
+                className="setting-input"
+                placeholder="msh/US"
+              />
+              <MqttRootFieldError value={mqttRoot} />
+              <MqttRootFinder
+                context="device"
+                sourceId={currentSourceId}
+                disabled={!canEditMqtt}
+                currentRoot={mqttRoot}
+                defaultRegionRoot={defaultDeviceRegionRoot(mqttRoot, loraRegion)}
+                getTarget={() => ({
+                  broker: { address: mqttAddress, tlsEnabled },
+                  username: mqttUsername,
+                  password: mqttPassword,
+                  brokerPresetId:
+                    serverFillPreset?.savedId !== undefined &&
+                    matchDevicePreset({ address: mqttAddress, tlsEnabled }, [serverFillPreset])
+                      ? serverFillPreset.savedId
+                      : null,
+                })}
+                onPickRoot={setMqttRoot}
+              />
+            </div>
+            <div className="setting-item">
+              <label htmlFor="mqttEncryption" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                <input
+                  id="mqttEncryption"
+                  type="checkbox"
+                  checked={mqttEncryptionEnabled}
+                  onChange={(e) => setMqttEncryptionEnabled(e.target.checked)}
+                  style={{ marginTop: '0.2rem', flexShrink: 0 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div>{t('mqtt_config.encryption_enabled')}</div>
+                  <span className="setting-description">{t('mqtt_config.encryption_description')}</span>
+                </div>
+              </label>
+            </div>
+            <div className="setting-item">
+              <label htmlFor="mqttJson" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                <input
+                  id="mqttJson"
+                  type="checkbox"
+                  checked={mqttJsonEnabled}
+                  onChange={(e) => setMqttJsonEnabled(e.target.checked)}
+                  style={{ marginTop: '0.2rem', flexShrink: 0 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div>{t('mqtt_config.json_enabled')}</div>
+                  <span className="setting-description">{t('mqtt_config.json_description')}</span>
+                </div>
+              </label>
+            </div>
+          </ConfigGroup>
+          <ConfigGroup title={t('mqtt_config.group_proxy', 'Proxy')} name="proxy">
+            <div className="setting-item">
+              <label htmlFor="proxyToClientEnabled" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                <input
+                  id="proxyToClientEnabled"
+                  type="checkbox"
+                  checked={proxyToClientEnabled}
+                  onChange={(e) => setProxyToClientEnabled(e.target.checked)}
+                  style={{ marginTop: '0.2rem', flexShrink: 0 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div>{t('mqtt_config.proxy_to_client')}</div>
+                  <span className="setting-description">{t('mqtt_config.proxy_to_client_description')}</span>
+                  <span className="setting-description" style={{ display: 'block', marginTop: '0.25rem', fontStyle: 'italic' }}>
+                    {t('mqtt_config.proxy_to_client_meshmonitor_note')}{' '}
+                    <a
+                      href="https://meshmonitor.org/add-ons/mqtt-proxy.html#mqtt-client-proxy"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: '#89b4fa' }}
+                    >
+                      {t('mqtt_config.proxy_to_client_docs_link')}
+                    </a>
+                  </span>
+                </div>
+              </label>
+            </div>
+          </ConfigGroup>
+          <ConfigGroup title={t('mqtt_config.group_privacy', 'Privacy & location')} name="privacy">
+            <div className="setting-item">
+              <label htmlFor="mapReportingEnabled" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                <input
+                  id="mapReportingEnabled"
+                  type="checkbox"
+                  checked={mapReportingEnabled}
+                  onChange={(e) => setMapReportingEnabled(e.target.checked)}
+                  style={{ marginTop: '0.2rem', flexShrink: 0 }}
+                />
+                <div style={{ flex: 1 }}>
+                  <div>{t('mqtt_config.map_reporting')}</div>
+                  <span className="setting-description">{t('mqtt_config.map_reporting_description')}</span>
+                </div>
+              </label>
+            </div>
+            {mapReportingEnabled && (
+              <div style={{
+                marginLeft: '1rem',
+                paddingLeft: '1rem',
+                borderLeft: '2px solid var(--color-surface-active)',
+                marginTop: '0.5rem',
+                marginBottom: '1rem'
+              }}>
+                <div className="setting-item">
+                  <label htmlFor="mapPublishIntervalSecs">
+                    {t('mqtt_config.map_publish_interval')}
+                    <span className="setting-description">{t('mqtt_config.map_publish_interval_description')}</span>
+                  </label>
+                  <NumberInput
+                    id="mapPublishIntervalSecs"
+                    min={0}
+                    max={4294967295}
+                    integer
+                    value={mapPublishIntervalSecs}
+                    onChange={setMapPublishIntervalSecs}
+                    className="setting-input"
+                    style={{ width: '150px' }}
+                  />
+                </div>
+                <div className="setting-item">
+                  <label htmlFor="mapPositionPrecision">
+                    {t('mqtt_config.map_position_precision')}
+                    <span className="setting-description">{t('mqtt_config.map_position_precision_description')}</span>
+                  </label>
+                  <NumberInput
+                    id="mapPositionPrecision"
+                    min={10}
+                    max={19}
+                    alsoValid={[0]}
+                    zeroHint={t('zero_hint.map_position_precision')}
+                    integer
+                    value={mapPositionPrecision}
+                    onChange={setMapPositionPrecision}
+                    className="setting-input"
+                    style={{ width: '100px' }}
+                  />
+                </div>
+                <div className="setting-item">
+                  <label htmlFor="mapShouldReportLocation" style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+                    <input
+                      id="mapShouldReportLocation"
+                      type="checkbox"
+                      checked={mapShouldReportLocation}
+                      onChange={(e) => setMapShouldReportLocation(e.target.checked)}
+                      style={{ marginTop: '0.2rem', flexShrink: 0 }}
+                    />
+                    <div style={{ flex: 1 }}>
+                      <div>{t('mqtt_config.map_report_location')}</div>
+                      <span className="setting-description">{t('mqtt_config.map_report_location_description')}</span>
+                    </div>
+                  </label>
+                </div>
+              </div>
+            )}
+          </ConfigGroup>
         </>
       )}
       </fieldset>
-    </div>
+    </ConfigSection>
     </NumberInputScope>
   );
 };

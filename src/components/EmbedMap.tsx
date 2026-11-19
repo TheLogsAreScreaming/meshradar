@@ -5,6 +5,8 @@ import 'leaflet/dist/leaflet.css';
 import { DEFAULT_TILESET_ID } from '../config/tilesets';
 import { createNodeIcon, getHopColor } from '../utils/mapIcons';
 import { getHardwareModelName, getRoleName } from '../utils/nodeHelpers';
+import { meshcoreRoleLabel, isMeshCoreInfrastructureAdvType } from './MeshCore/meshcoreRole';
+import { markerRoleProps } from '../utils/nodeTypeCategory';
 import GeoJsonOverlay from './GeoJsonOverlay';
 import type { GeoJsonLayer } from '../server/services/geojsonService.js';
 import { getOverlayColors, getSchemeForTileset } from '../config/overlayColors';
@@ -17,6 +19,9 @@ import api from '../services/api';
 import { usePrivacyLinks, privacyLinkHref } from '../hooks/usePrivacyLinks';
 import { PRIVACY_LINK_FALLBACK_LABEL } from '../types/privacy';
 import { appBasename } from '../init';
+import { applyPrecisionCellOffsets } from '../utils/precisionOffset';
+import { viewerPrecisionBits, type RedactionConfig } from '../utils/publicInstanceMode';
+import { formatRelativeTime } from '../utils/datetime';
 
 interface EmbedConfig {
   id: string;
@@ -34,6 +39,8 @@ interface EmbedConfig {
   showNeighborInfo: boolean;
   showMqttNodes: boolean;
   pollIntervalSeconds: number;
+  /** Redaction flags (#5156). Absent on an older server. Embeds are always redacted. */
+  publicInstance?: RedactionConfig;
 }
 
 interface EmbedNode {
@@ -55,11 +62,26 @@ interface EmbedNode {
   role?: number;
   viaMqtt?: boolean;
   channel?: number;
+  /** #5999: a MeshCore node. `nodeNum` is 0; `nodeId` (`mc:…`) identifies it. */
+  isMeshCore?: boolean;
+  /** #5999: MeshCore role (1 companion, 2 repeater, 3 room server, 4 sensor). */
+  advType?: number;
+}
+
+/**
+ * The key a node's marker is drawn by. A MeshCore node has no `nodeNum`, so it
+ * keys on its `mc:` id, which can never equal a Meshtastic node number.
+ */
+function embedNodeKey(node: EmbedNode): string {
+  return node.isMeshCore && node.nodeId ? node.nodeId : String(node.nodeNum);
 }
 
 interface EmbedNeighborSegment {
   nodeNum: number;
   neighborNodeNum: number;
+  /** MeshCore edge: `mc:` ids; the numeric fields are 0. */
+  nodeKey?: string;
+  neighborKey?: string;
   snr: number | null;
   nodeLatitude: number;
   nodeLongitude: number;
@@ -80,6 +102,9 @@ interface EmbedTracerouteSegment {
   toName: string;
   snr: number | null;
   timestamp: number;
+  /** MeshCore segment: `mc:` ids of the ends; `fromNum`/`toNum` are 0. */
+  fromKey?: string;
+  toKey?: string;
   // Additive fields (#4047 P6 WP1) — the server now emits these on every
   // response, but they're typed optional here so a stale/cached response
   // from a not-yet-upgraded server (old shape) is tolerated defensively,
@@ -93,8 +118,9 @@ interface EmbedMapProps {
   profileId: string;
 }
 
-function formatLastHeard(lastHeard?: number): string {
+function formatLastHeard(lastHeard?: number, coarseHour = false): string {
   if (!lastHeard) return 'Unknown';
+  if (coarseHour) return formatRelativeTime(lastHeard * 1000, '24', 'MM/DD/YYYY', false, { coarseHour: true });
   const seconds = Math.floor(Date.now() / 1000) - lastHeard;
   if (seconds < 60) return `${seconds}s ago`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
@@ -243,23 +269,53 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
 
   // Build icon map
   const iconMap = useMemo(() => {
-    const map = new Map<number, L.DivIcon>();
+    const map = new Map<string, L.DivIcon>();
     for (const node of filteredNodes) {
       const hops = node.hopsAway ?? 999;
-      const isRouter = (node.role ?? 0) === 2;
+      // A MeshCore repeater or room server draws as infrastructure, as a
+      // Meshtastic router does. Meshtastic roles go through the shared helper
+      // (#6008) and pass their category, so the embed draws the same glyphs and
+      // corner badges as the app's maps.
+      const meshtasticRole = node.isMeshCore ? null : markerRoleProps({ role: node.role });
+      const isRouter = meshtasticRole
+        ? meshtasticRole.isRouter
+        : isMeshCoreInfrastructureAdvType(node.advType);
       const icon = createNodeIcon({
         hops,
         isSelected: false,
         isRouter,
+        roleCategory: meshtasticRole?.roleCategory,
         shortName: node.user?.shortName,
         showLabel: false,
         pinStyle: 'meshmonitor',
       });
-      map.set(node.nodeNum, icon);
+      map.set(embedNodeKey(node), icon);
     }
     return map;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filteredNodes.map(n => `${n.nodeNum}-${n.hopsAway}-${n.role}-${n.user?.shortName}`).join(',')]);
+  }, [filteredNodes.map(n => `${embedNodeKey(n)}-${n.hopsAway}-${n.role}-${n.advType}-${n.user?.shortName}`).join(',')]);
+
+  // Public-instance mode (#5156): positions arrive snapped to a coarse cell, so
+  // spread same-cell markers inside it as the app's maps do, and show ages as
+  // coarse as the hour-floored times they come from.
+  const publicOn = config?.publicInstance?.enabled === true;
+  const coarseTime = publicOn && config?.publicInstance?.roundTimestamps === true;
+  const markerPositions = useMemo(() => {
+    const map = new Map<string, [number, number]>();
+    const placed = applyPrecisionCellOffsets(
+      filteredNodes.map((node) => ({
+        item: node,
+        id: embedNodeKey(node),
+        latLng: [node.position!.latitude!, node.position!.longitude!] as [number, number],
+        bits: viewerPrecisionBits(undefined, publicOn),
+        isOverride: false,
+      })),
+      { enabled: publicOn },
+    );
+    for (const { item, latLng } of placed) map.set(embedNodeKey(item), latLng);
+    return map;
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on a position signature so polling does not re-place unchanged markers
+  }, [publicOn, filteredNodes.map(n => `${embedNodeKey(n)}@${n.position?.latitude},${n.position?.longitude}`).join(',')]);
 
   // Traceroute palette (#4047 P6 §3.1) — the embed bundle has no
   // SettingsProvider, so the SNR palette is derived directly from the
@@ -282,7 +338,7 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
     () => tracerouteSegments.map((s) => {
       const leg = s.leg ?? 'forward';
       return {
-        key: `${leg}:${s.fromNum}-${s.toNum}`,
+        key: `${leg}:${s.fromKey ?? s.fromNum}-${s.toKey ?? s.toNum}`,
         from: [s.fromLat, s.fromLng] as [number, number],
         to: [s.toLat, s.toLng] as [number, number],
         fromNodeNum: s.fromNum,
@@ -302,7 +358,7 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
     const map = new Map<string, EmbedTracerouteSegment>();
     for (const s of tracerouteSegments) {
       const leg = s.leg ?? 'forward';
-      map.set(`${leg}:${s.fromNum}-${s.toNum}`, s);
+      map.set(`${leg}:${s.fromKey ?? s.fromNum}-${s.toKey ?? s.toNum}`, s);
     }
     return map;
   }, [tracerouteSegments]);
@@ -457,20 +513,23 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
 
         {/* Node markers */}
         {filteredNodes.map((node) => {
-          const icon = iconMap.get(node.nodeNum);
+          const markerKey = embedNodeKey(node);
+          const icon = iconMap.get(markerKey);
           const hops = node.hopsAway ?? 999;
-          const hwModelName = getHardwareModelName(node.user?.hwModel);
-          const roleName = getRoleName(node.role);
+          const hwModelName = node.isMeshCore ? null : getHardwareModelName(node.user?.hwModel);
+          const roleName = node.isMeshCore
+            ? (node.advType ? meshcoreRoleLabel(node.advType) : null)
+            : getRoleName(node.role);
 
           return (
             <Marker
-              key={node.nodeNum}
-              position={[node.position!.latitude!, node.position!.longitude!]}
+              key={markerKey}
+              position={markerPositions.get(markerKey) ?? [node.position!.latitude!, node.position!.longitude!]}
               icon={icon}
             >
               {config.showTooltips && (
                 <Tooltip direction="top" offset={[0, -20]} permanent={false}>
-                  <span>{node.user?.longName || node.user?.shortName || `!${node.nodeNum.toString(16)}`}</span>
+                  <span>{node.user?.longName || node.user?.shortName || (node.isMeshCore ? node.nodeId : `!${node.nodeNum.toString(16)}`)}</span>
                 </Tooltip>
               )}
               {config.showPopups && (
@@ -479,7 +538,7 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
                     {/* Header */}
                     <div className="embed-popup-header" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                       <div className="embed-popup-title">
-                        {node.user?.longName || `Node ${node.nodeNum}`}
+                        {node.user?.longName || node.user?.shortName || (node.isMeshCore ? node.nodeId : `Node ${node.nodeNum}`)}
                       </div>
                       {node.user?.shortName && (
                         <div className="embed-popup-subtitle">{node.user.shortName}</div>
@@ -549,7 +608,7 @@ export function EmbedMap({ profileId }: EmbedMapProps) {
                     <div className="embed-popup-footer">
                       <span className="embed-popup-icon"><UiIcon name="time" size={16} /></span>
                       <span>{formatTimestamp(node.lastHeard)}</span>
-                      <span className="embed-popup-ago">({formatLastHeard(node.lastHeard)})</span>
+                      <span className="embed-popup-ago">({formatLastHeard(node.lastHeard, coarseTime)})</span>
                     </div>
 
                     {/* MQTT badge */}

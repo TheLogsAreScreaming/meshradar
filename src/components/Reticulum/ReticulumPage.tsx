@@ -18,11 +18,12 @@
  * their real components into the marked seams without needing to touch this
  * file's structure.
  */
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useReticulum } from './hooks/useReticulum';
 import { ReticulumSubToolbar } from './ReticulumSubToolbar';
 import { SourceNavLayout } from '../nav/SourceNavLayout';
+import { readSidebarPinned, useSidebarPin } from '../nav/useSidebarPin';
 import { ReticulumDestinationsView } from './ReticulumDestinationsView';
 import { ReticulumInterfacesView } from './ReticulumInterfacesView';
 import { ReticulumDmsView } from './ReticulumDmsView';
@@ -31,7 +32,7 @@ import { ReticulumSettingsView } from './ReticulumSettingsView';
 import { ReticulumMap } from './ReticulumMap';
 import { ReticulumConfigurationView } from './ReticulumConfigurationView';
 import { ReticulumPathsView } from './ReticulumPathsView';
-import type { ReticulumStatus, ReticulumView } from '../../types/reticulum';
+import type { ReticulumStatus, ReticulumView, ReticulumInterfaceRow } from '../../types/reticulum';
 import { UiIcon } from '../icons';
 import styles from './ReticulumPage.module.css';
 
@@ -44,9 +45,12 @@ interface ReticulumPageProps {
   /** When provided, the parent renders its own connection chip (see
    *  `ReticulumSourcePage`'s topbar) and can mirror this page's status. */
   onStatusChange?: (status: ReticulumStatus | null) => void;
+  /** When provided, mirrors the polled interface list to the parent so the
+   *  source header can read the live RNode gauges (battery / Ch / Air, #6120). */
+  onInterfacesChange?: (interfaces: ReticulumInterfaceRow[]) => void;
 }
 
-export const ReticulumPage: React.FC<ReticulumPageProps> = ({ baseUrl, sourceId, enabled, onStatusChange }) => {
+export const ReticulumPage: React.FC<ReticulumPageProps> = ({ baseUrl, sourceId, enabled, onStatusChange, onInterfacesChange }) => {
   const { t } = useTranslation();
   const {
     status, destinations, interfaces, loading, error, refresh, toggleFavorite,
@@ -56,11 +60,26 @@ export const ReticulumPage: React.FC<ReticulumPageProps> = ({ baseUrl, sourceId,
   } = useReticulum({ sourceId, enabled });
 
   const [view, setView] = useState<ReticulumView>('destinations');
-  const [toolbarExpanded, setToolbarExpanded] = useState(false);
+  // Same Pin sidebar behaviour as the Meshtastic and MeshCore sidebars
+  // (#5481/#6118): one global pin, the nav starts expanded when pinned, and an
+  // unpinned nav collapses after a nav click.
+  const { isPinned: navPinned, togglePin: toggleNavPin } = useSidebarPin();
+  const [toolbarExpanded, setToolbarExpanded] = useState(readSidebarPinned);
+  const selectView = useCallback((next: ReticulumView) => {
+    setView(next);
+    if (!navPinned) setToolbarExpanded(false);
+  }, [navPinned]);
+  const handleToggleNavPin = useCallback(() => {
+    if (toggleNavPin()) setToolbarExpanded(true);
+  }, [toggleNavPin]);
 
   useEffect(() => {
     onStatusChange?.(status);
   }, [status, onStatusChange]);
+
+  useEffect(() => {
+    onInterfacesChange?.(interfaces);
+  }, [interfaces, onInterfacesChange]);
 
   const connected = status?.connected ?? false;
 
@@ -109,9 +128,11 @@ export const ReticulumPage: React.FC<ReticulumPageProps> = ({ baseUrl, sourceId,
         nav={(
           <ReticulumSubToolbar
             view={view}
-            onSelect={setView}
+            onSelect={selectView}
             expanded={toolbarExpanded}
             onToggleExpanded={() => setToolbarExpanded(v => !v)}
+            pinned={navPinned}
+            onTogglePin={handleToggleNavPin}
             sourceMode={status?.mode ?? null}
           />
         )}
@@ -163,10 +184,10 @@ export const ReticulumPage: React.FC<ReticulumPageProps> = ({ baseUrl, sourceId,
           <ReticulumMap destinations={destinations} paths={paths} loading={loading} />
         )}
         {view === 'configuration' && (
-          <ReticulumConfigurationView sourceId={sourceId} />
+          <ReticulumConfigurationView sourceId={sourceId} showRadio={status?.mode === 'own'} />
         )}
         {view === 'info' && (
-          <ReticulumInfoView status={status} loading={loading} />
+          <ReticulumInfoView status={status} interfaces={interfaces} loading={loading} />
         )}
         {view === 'settings' && (
           <ReticulumSettingsView sourceId={sourceId} />
