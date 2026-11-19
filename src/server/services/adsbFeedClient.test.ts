@@ -54,7 +54,7 @@ describe('fetchAircraftNear', () => {
     const [url, init] = (http as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe('https://api.adsb.lol/v2/point/25.8000/-80.3000/3');
     expect(init.headers['User-Agent']).toBe(ADSB_USER_AGENT);
-    expect(ADSB_USER_AGENT).toMatch(/^MeshRadar\/\S+ \(\+https:\/\/github\.com\/charlottemeshtastic\/meshradar\)$/);
+    expect(ADSB_USER_AGENT).toMatch(/^MeshRadar\/\S+ \(\+https:\/\/github\.com\/TheLogsAreScreaming\/meshradar\)$/);
     expect(init.headers[ADSB_API_KEY_HEADER]).toBeUndefined();
   });
 

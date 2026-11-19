@@ -172,7 +172,7 @@ POSTGRES_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:5432/${
 docker run --rm \
     -v "$PWD/$BACKUP_DIR/meshmonitor.db:/data/meshmonitor.db:ro" \
     --network host \
-    ghcr.io/charlottemeshtastic/meshradar:latest \
+    ghcr.io/thelogsarescreaming/meshradar:latest \
     npm run migrate-db -- \
     --from "sqlite:/data/meshmonitor.db" \
     --to "$POSTGRES_URL"
